@@ -37,8 +37,8 @@ export function seed(now: number): Conversation[] {
     const recipient = identities[id === 'plan' ? 1 : 0];
     const to = [{ name: recipient.name, email: recipient.email }];
     const linked: Attachment = { id: 'site-notes', name: 'Site notes', type: 'text/plain', size: 0, link: 'https://example.com/drive/site-notes' };
-    const message = { id: `${id}-latest`, from, to, date, subject, text, attachments: id === 'plan' ? attachments : id === 'visit' ? [linked] : [], remoteImages: id === 'plan' || id === 'prize' };
-    const messages = id === 'plan' ? [{ ...message, id: 'plan-first', date: '2026-11-19T13:00:00.000Z', text: 'Hi Alex, I’ll send over the revised drawings this week.', attachments: [], remoteImages: false }, message] : [message];
+    const message = { id: `${id}-latest`, from, to, date, subject, text, attachments: id === 'plan' ? attachments : id === 'visit' ? [linked] : [], remoteImages: id === 'plan' || id === 'prize', hasHtml: id === 'plan' };
+    const messages = id === 'plan' ? [{ ...message, id: 'plan-first', date: '2026-11-19T13:00:00.000Z', text: 'Hi Alex, I’ll send over the revised drawings this week.', attachments: [], remoteImages: false, hasHtml: false }, message] : [message];
     return { id, subject, from, date, snippet: text.replace(/\s+/g, ' '), unread, labelIds, mailboxId, starred: id === 'visit', messages, count: messages.length, hasAttachments: message.attachments.length > 0, ...(['spam', 'trash'].includes(mailboxId) ? { expiresAt: now + 30 * 86400_000 } : {}) };
   });
 }

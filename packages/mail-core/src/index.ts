@@ -16,7 +16,7 @@ export type Message = {
   /** Populated only on the sender's own sent copy. */
   bcc?: Address[];
   date: string; subject: string;
-  text: string; attachments: Attachment[]; remoteImages?: boolean;
+  text: string; attachments: Attachment[]; remoteImages?: boolean; hasHtml?: boolean;
 };
 export type Thread = {
   id: string; subject: string; snippet: string; date: string; from: Address;
@@ -42,6 +42,8 @@ export interface MailApi {
   listMailboxes(): Promise<Mailbox[]>;
   listThreads(filter: ThreadFilter): Promise<Thread[]>;
   getThread(id: string): Promise<Conversation | undefined>;
+  /** Returns an isolated body URL, never raw message HTML. */
+  getMessageContent(id: string, options: { remoteImages: boolean }): Promise<string | undefined>;
   updateThread(id: string, update: ThreadUpdate): Promise<void>;
   listLabels(): Promise<Label[]>;
   createLabel(name: string): Promise<Label>;

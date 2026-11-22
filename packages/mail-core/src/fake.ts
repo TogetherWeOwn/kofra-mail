@@ -13,7 +13,7 @@ const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const normalizeSubject = (subject: string) => subject.trim().replace(/^(?:(?:re|fwd?):\s*)+/i, '').toLowerCase();
 const addresses = (values: string[]) => values.map((email) => ({ name: email, email }));
 
-export function createFakeMailApi(clock: () => number = Date.now): MailApi {
+export function createFakeMailApi(clock: () => number = Date.now, options: { contentOrigin?: string } = {}): MailApi {
   const threads = new Map(seed(clock()).map((t) => [t.id, copy(t)]));
   const allLabels = copy(labels);
   const pending = new Map<string, PendingSend & { draft: Draft }>();
@@ -87,6 +87,16 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
       }).sort((a, b) => b.date.localeCompare(a.date)).map(({ messages: _messages, ...thread }) => copy(thread));
     },
     async getThread(id) { refresh(clock()); return copy(threads.get(id)); },
+    async getMessageContent(id, { remoteImages }) {
+      // Fixture routes only. The real adapter will receive a short-lived URL
+      // from an authorized service, not turn a message ID into an endpoint.
+      refresh(clock());
+      const thread = threads.get('plan');
+      if (!options.contentOrigin || id !== 'plan-latest' || !thread || hidden(thread.mailboxId)) return undefined;
+      const url = new URL('/body/plan-latest', options.contentOrigin);
+      if (remoteImages) url.searchParams.set('images', '1');
+      return url.href;
+    },
     async updateThread(id, update) {
       const now = clock();
       refresh(now);
