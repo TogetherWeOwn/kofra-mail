@@ -13,7 +13,13 @@ export type Alert = (event: AlertEvent) => Promise<void>;
 export async function deliver(body: unknown, ports: DeliveryPorts): Promise<void> {
   if (!isDeliveryId(body)) throw new Error('Invalid queue delivery id');
   const row = await ports.outbox.get(body);
-  if (!row || row.state !== 'pending') return;
+  if (!row || row.state === 'failed') return;
+  // If completion succeeded but its release did not, a redelivery only retries
+  // the idempotent holder release, never the indexing.
+  if (row.state === 'done') {
+    await ports.release(row.workspaceId, row.rawKey, row.id);
+    return;
+  }
   for (const mailboxId of row.mailboxIds) await ports.index(row.workspaceId, mailboxId, row.id);
   if (await ports.outbox.complete(row.id, ports.now())) {
     await ports.release(row.workspaceId, row.rawKey, row.id);

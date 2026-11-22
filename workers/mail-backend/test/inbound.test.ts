@@ -133,15 +133,19 @@ test('queue failure leaves pending, then an acknowledgement marks done before re
   const ports = {
     outbox: box,
     index: async (_workspaceId: string, _mailboxId: string, received: string) => { indexed++; assert.equal(received, id); },
-    release: async () => { assert.equal((await box.get(id))?.state, 'done'); released++; },
+    release: async () => {
+      assert.equal((await box.get(id))?.state, 'done');
+      if (++released === 1) throw new Error('sweeper unavailable');
+    },
     now: () => 200,
   };
   await assert.rejects(deliver(id, { ...ports, index: async () => { throw new Error('DO unavailable'); } }), /DO unavailable/);
   assert.equal((await box.get(id))?.state, 'pending');
-  await deliver(id, ports);
+  await assert.rejects(deliver(id, ports), /sweeper unavailable/);
+  assert.equal((await box.get(id))?.state, 'done');
   await deliver(id, ports);
   assert.equal(indexed, 1);
-  assert.equal(released, 1);
+  assert.equal(released, 2);
 });
 
 test('DLQ emits a redacted signal even for malformed input', async () => {
