@@ -1,11 +1,12 @@
 <script lang="ts">
   import { secureHttpsLink, type Attachment, type Conversation, type Label, type ThreadUpdate } from '@kofra/mail-core';
-  import { Archive, ArrowLeft, Download, HardDrive, Inbox, OctagonAlert, Paperclip, Tag, Trash2 } from '@lucide/svelte';
+  import { Archive, ArrowLeft, Download, Forward, HardDrive, Inbox, OctagonAlert, Paperclip, Reply, Tag, Trash2 } from '@lucide/svelte';
 
-  let { thread, labels, onBack, onUpdate, onDownload, onSaveToDrive }: {
+  let { thread, labels, onBack, onUpdate, onDownload, onSaveToDrive, onCompose }: {
     thread: Conversation; labels: Label[]; onBack: () => void;
     onUpdate: (update: ThreadUpdate) => void; onDownload: (file: Attachment) => void;
     onSaveToDrive: (file: Attachment) => void;
+    onCompose: (mode: 'reply' | 'forward', message: Conversation['messages'][number]) => void;
   } = $props();
   let showLabels = $state(false);
   const date = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' });
@@ -61,6 +62,9 @@
                 </li>
               {/each}
             </ul>
+          {/if}
+          {#if thread.mailboxId !== 'spam' && thread.mailboxId !== 'trash'}
+            <div class="reply-actions"><button class="pill" onclick={() => onCompose('reply', message)}><Reply size={17} /> Reply</button><button class="pill" onclick={() => onCompose('forward', message)}><Forward size={17} /> Forward</button></div>
           {/if}
         </div>
       </details>
