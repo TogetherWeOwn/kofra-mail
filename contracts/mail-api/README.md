@@ -68,7 +68,13 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 **`Idempotency-Key`:**
 - Routes with `idempotency: 'required'` reject a request without the header with 428 `precondition_required`.
 - The key is 1 to 64 characters of `[A-Za-z0-9_-]`. The client makes one key per user action (a UUID) and reuses it on every retry of that action.
-- **Checks before the key:** authentication, CSRF, `access`, re-authentication, rate limits, `If-Match` (428 and 412) and the in-progress check all run before an idempotency record is created. Their answers are never stored.
+- **Order of checks:**
+  1. Authentication, CSRF, `access`, re-authentication, rate limits and missing headers (428).
+  2. **A committed key replays here**, before any existence or `If-Match` check: a replayed `sendDraft` succeeds although its draft is gone.
+  3. A key in progress answers 409 (below).
+  4. Existence (404), `If-Match` (412) and validation, then the effect.
+  Answers from steps 1, 3 and 4 are never stored.
+- **In progress:** before the operation's first await (for example an upload's streaming PUT), the server writes the key with an in-progress marker. A failed operation deletes the marker; a marker left by a crash expires after 5 minutes.
 - The server keeps a key for `idempotencyRetentionSeconds` (24 h), scoped to the mailbox (or the workspace, for admin routes), together with a fingerprint of the operation, path parameters and body. The record commits in the same transaction as the operation's effect.
 - **A replay** returns the stored status and body, with `Idempotency-Replayed: true`. One exception: a replayed `sendDraft` returns the send's current state (`getSend`), so a stale `pending` and `undoRemainingMs` are never shown after release.
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
@@ -206,13 +212,13 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
 - Recipient and attachment counts may not exceed the send limits.
 - Address syntax is not checked, because drafts may be incomplete.
-- `inReplyTo` and `forwardOf` must name messages in this mailbox.
+- `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
 
 **Attachment references:**
 - `upload`: an unexpired upload of this mailbox.
 - `message`: an attachment part of a message in this mailbox (forwarding). The draft holds a reference on that part, so Trash expiry of the source message cannot remove it before the draft is sent or deleted.
 - `link`: a credential-free `https:` URL; it is sent as a link in the body and does not count toward `attachmentsPerMessage`.
-- **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft over the attachment budget is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
+- **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft whose encoded size exceeds `outboundMessageBytes` is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
 - An upload referred to by a draft does not expire.
 
 **`sendDraft` checks** (each a 422 code):
@@ -246,7 +252,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Downloads:** `getAttachmentUrl` returns a content-origin URL valid for `contentUrlSeconds` (5 minutes). It always downloads as `application/octet-stream` with `Content-Disposition: attachment`, and is never rendered by the app.
 
-**The client's size check:** the client warns before sending using `attachmentBudget(limits, bodyBytes)`. The server's encoded-size check is final. Files over the budget go as a Drive link.
+**The client's size check:** `attachmentBudget(limits, bodyBytes)` is a conservative estimate: files within it always pass. Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
 
 ### 8.5 Drive
 
@@ -262,7 +268,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 ### 8.6 Admin
 
 **Domains:**
-- `addDomain` registers a `secondary` or `alias` domain as `pending`. Routing and sending turn `active` only after their onboarding. The domain must be a DNS zone the operator controls, which is checked outside this API.
+- `addDomain` registers a `secondary` or `alias` domain as `pending`. Routing and sending turn `active` only after their onboarding. The domain must be a DNS zone the operator controls, which is checked outside this API. Domain names are unique across workspaces; the operator confirms ownership before routing turns on and can release a `pending` domain that another workspace added without owning it.
 - A duplicate domain answers 409 `domain_exists`.
 
 **Mailboxes:**
@@ -330,6 +336,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
 6. **Isolation:**
    - Ids of `member`'s thread, message, draft, upload, label and send answer `not_found` to `other` on reads.
    - On writes too: `other`'s `updateThreads`, `getAttachmentUrl`, `saveAttachmentToDrive` (when `features.drive`; otherwise `feature_unavailable` comes first), `replaceDraft`, `sendDraft`, `undoSend` and `renameLabel` on those ids answer `not_found`; `other`'s `deleteDraft`, `deleteLabel` and `deleteUpload` answer 204, and the resource still exists for `member` afterwards.
+   - `other`'s `createDraft` naming `member`'s message in `inReplyTo`, `forwardOf` or a `kind: 'message'` attachment answers `not_found`.
    - `other`'s lists do not contain them.
    - A message delivered to `other` never appears for `member`.
    - `foreignAdmin`'s `updateMailbox` and `createAlias` with W1 mailbox ids answer `not_found`; its `deleteAlias` of a W1 alias answers 204 and the alias still exists; its lists contain nothing of W1.
@@ -362,7 +369,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
 13. **Send checks:**
     - 0 recipients or a malformed address answers `invalid_recipients`; 51 recipients answers `too_many_recipients`.
     - 33 file attachments answers `too_many_attachments`.
-    - Attachments over `attachmentBudget` answer `message_too_large` with `limit`.
+    - A file of exactly `attachmentBudget(limits, bodyBytes)` bytes passes the size check; a file whose base64 alone exceeds `outboundMessageBytes` answers `message_too_large` with `limit`.
     - A stale `If-Match` answers `revision_mismatch`.
 14. **Send and undo:**
     - `sendDraft` returns `state: 'pending'`, `undoUntil` equal to now plus `undoSeconds`, and the draft leaves `listDrafts`.
@@ -373,6 +380,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - `uploadBytes + 1` bytes answers `payload_too_large`.
     - An unattached upload is gone after `advance(24 h)`, and a draft that refers to it then answers `not_found`.
     - An upload referred to by a draft survives the same advance.
+    - A forward draft (`forwardOf` plus a `kind: 'message'` attachment) of a message moved to Trash survives `advance(30 days)`: `replaceDraft` carrying the same values still succeeds, the draft sends, and `getAttachmentUrl` works on the sent copy's attachment.
 16. **Settings:**
     - A partial `updateSettings` changes only the given fields.
     - A `defaultFrom` that is not an active identity answers `invalid_sender`.
@@ -415,6 +423,8 @@ The M2 UI calls `MailApi` in `@kofra/mail-core`, an in-process port that predate
 | `releaseAttachment` | `deleteUpload` | |
 | `listDriveFiles`, `attachFromDrive` | `importFromDrive` | The Drive-hosted picker replaces the in-app list |
 | `saveToDrive(id)` | `saveAttachmentToDrive(messageId, part)` | |
+| `listLabels`, `createLabel(name)` | `listLabels`, `createLabel({ name }, { idempotencyKey })` | Create takes an idempotency key |
+| `listIdentities` | `listIdentities` | Returns `{ items }`; each identity has `kind` and `sendAs` |
 | `listUsers` | `listMailboxes` | Paged; aliases included |
 | `addUser` | `createMailbox` | Needs `ownerUserId` from `listMembers` |
 | `listDomains`, `addDomain(name, kind)` | `listDomains`, `addDomain` | Only `secondary` or `alias`; the primary domain is set when the workspace is created |

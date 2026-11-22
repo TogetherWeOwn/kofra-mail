@@ -209,7 +209,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const draft = await mail.createDraft(input, key('draft'));
       const outgoing = await mail.createDraft(input, key('outgoing'));
       const send = await mail.sendDraft(outgoing.id, { ...key('send'), ifMatch: outgoing.revision });
-      const otherInput = draftInput(requiredMailbox(await other.getSession()).primaryAddress);
+      const otherSession = await other.getSession();
+      const otherInput = draftInput(requiredMailbox(otherSession).primaryAddress);
       const withUpload = (input: DraftInput): DraftInput => ({ ...input, attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
       await rejects(other.getThread(threadId), 'not_found');
       await rejects(other.getBodyUrl(messageId, { remoteImages: false }), 'not_found');
@@ -217,9 +218,12 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(other.getSend(send.id), 'not_found');
       // Uploads have no get route. The key used in member's mailbox is independent.
       await rejects(other.createDraft(withUpload(otherInput), key('draft')), 'not_found');
+      await rejects(other.createDraft({ ...otherInput, inReplyTo: messageId }, key('reply')), 'not_found');
+      await rejects(other.createDraft({ ...otherInput, forwardOf: messageId }, key('forward')), 'not_found');
+      await rejects(other.createDraft({ ...otherInput, attachments: [{ kind: 'message', messageId, part }] }, key('attach-message')), 'not_found');
       await rejects(other.updateThreads({ ids: [threadId], set: { folder: 'trash' } }), 'not_found');
       await rejects(other.getAttachmentUrl(messageId, part), 'not_found');
-      await rejects(other.saveAttachmentToDrive(messageId, part, key('save')), 'not_found');
+      await rejects(other.saveAttachmentToDrive(messageId, part, key('save')), otherSession.features.drive ? 'not_found' : 'feature_unavailable');
       await rejects(other.replaceDraft(draft.id, otherInput, { ifMatch: draft.revision }), 'not_found');
       await rejects(other.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision }), 'not_found');
       await rejects(other.undoSend(send.id, key('undo')), 'not_found');
@@ -379,8 +383,21 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         (opts) => mail.createLabel({ name: 'Another label' }, opts), 'label');
       const draft = await verify((opts) => mail.createDraft(input, opts),
         (opts) => mail.createDraft({ ...input, subject: 'Different' }, opts), 'draft');
-      const uploaded = await verify((opts) => mail.createUpload(upload(), opts),
-        (opts) => mail.createUpload(upload(new Blob(['XYZ'])), opts), 'upload');
+      const uploadKey = key('upload');
+      // An HTTP harness must let the calls overlap before the key commits.
+      const concurrentUploads = await Promise.allSettled([
+        mail.createUpload(upload(), uploadKey),
+        mail.createUpload(upload(), uploadKey),
+      ]);
+      const committed = concurrentUploads.filter((result) => result.status === 'fulfilled');
+      const rejected = concurrentUploads.filter((result) => result.status === 'rejected');
+      assert.equal(committed.length, 1);
+      assert.equal(rejected.length, 1);
+      await rejects(Promise.reject(rejected[0].reason), 'idempotency_in_progress');
+      const uploaded = committed[0].value;
+      assert.deepEqual(await mail.createUpload(upload(), uploadKey), uploaded);
+      await rejects(mail.createUpload(upload(new Blob(['XYZ'])), uploadKey), 'idempotency_key_reused');
+      await rejects(mail.createUpload(upload(), noKey), 'precondition_required');
       assert.deepEqual((await mail.listLabels()).items.filter((item) => item.name === label.name), [label]);
       assert.deepEqual((await mail.listDrafts({})).items.filter((item) => item.subject === draft.subject), [draft]);
       // Uploads have no list route. The replayed id must address the original upload.
@@ -444,8 +461,17 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(send({ attachments }, 'parts'), 'too_many_attachments');
       const rawBudget = attachmentBudget(limits, Buffer.byteLength(input.body));
       const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
-      assert.equal((await send({ attachments: [{ kind: 'upload', uploadId: boundary.id }] }, 'fits')).state, 'pending');
-      const large = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget + 1)])), key('large'));
+      const boundaryDraft = await mail.createDraft({ ...input, attachments: [{ kind: 'upload', uploadId: boundary.id }] }, key('draft-fits'));
+      try {
+        const boundarySend = await mail.sendDraft(boundaryDraft.id, { ...key('send-fits'), ifMatch: boundaryDraft.revision });
+        assert.equal(boundarySend.state, 'pending');
+      } catch (error) {
+        if (!isMailApiError(error)) throw error;
+        assert.notEqual(error.code, 'message_too_large');
+        assert.notEqual(error.code, 'payload_too_large');
+      }
+      const tooLargeRaw = Math.ceil(limits.outboundMessageBytes * 3 / 4) + 1;
+      const large = await mail.createUpload(upload(new Blob([new Uint8Array(tooLargeRaw)])), key('large'));
       const oversize = await rejects(send({ attachments: [{ kind: 'upload', uploadId: large.id }] }, 'oversize'), 'message_too_large');
       assert.equal(oversize.limit, limits.outboundMessageBytes);
       const current = await mail.createDraft(input, key('stale'));
@@ -511,6 +537,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const [{ part }] = delivered.attachments;
       await mail.updateThreads({ ids: [source.threadId], set: { folder: 'trash' } });
       const forwardInput = draftInput(mailbox.primaryAddress, {
+        forwardOf: source.messageId,
         attachments: [{ kind: 'message', messageId: source.messageId, part }],
       });
       const forwarded = await mail.createDraft(forwardInput, key('forward'));
@@ -520,6 +547,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.deepEqual((await mail.getDraft(forwarded.id)).attachments, expected);
       await rejects(mail.createDraft(forwardInput, key('expired-source')), 'not_found');
       const edited = await mail.replaceDraft(forwarded.id, { ...forwardInput, subject: 'Forward after expiry' }, { ifMatch: forwarded.revision });
+      assert.equal(edited.forwardOf, source.messageId);
       assert.deepEqual(edited.attachments, expected);
       const send = await mail.sendDraft(edited.id, { ...key('send-forward'), ifMatch: edited.revision });
       assert.equal(send.state, 'pending');
@@ -529,9 +557,18 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const copies = await mail.listThreads({ view: 'sent' });
       const messages = (await Promise.all(copies.items.map(({ id }) => mail.getThread(id)))).flatMap(({ messages }) => messages);
       const sentCopy = messages.find(({ id }) => id === sent.messageId);
-      assert.deepEqual(sentCopy?.attachments.map(({ name, type, size }) => ({ name, type, size })), [
+      assert.ok(sentCopy);
+      assert.deepEqual(sentCopy.attachments.map(({ name, type, size }) => ({ name, type, size })), [
         { name: file.name, type: file.type, size: file.bytes.length },
       ]);
+      const sentPart = sentCopy.attachments[0].part;
+      const url = new URL((await mail.getAttachmentUrl(sentCopy.id, sentPart)).url);
+      assert.equal(url.origin, new URL(h.contentOrigin).origin);
+      const token = decodeContentUrl(url);
+      assert.equal(token.purpose, 'att');
+      assert.equal(token.claims.mb, mailbox.id);
+      assert.equal(token.claims.msg, sentCopy.id);
+      assert.equal(token.claims.part, sentPart);
     });
 
     run('16. settings patch only specified fields and validate sender and undo duration', async (_h, mail) => {

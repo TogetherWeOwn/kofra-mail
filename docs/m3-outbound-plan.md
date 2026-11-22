@@ -13,8 +13,8 @@ Status: plan, version 1. It implements the send half of the [Mail API contract](
 - **No live sends** except in M3-0 and M3-12, and only to the approved test route's addresses. No production deploy, no new spend, and no DNS or suppression-list writes.
 - **The mailbox Durable Object owns all send state.** Queues carry ids only (`{ ws, mb, sendId }`); a queue message is limited to 128 KB.
 - **No content in logs or alerts:** no message content, subjects or addresses. Addresses appear only as counts or as the first 8 characters of a SHA-256.
-- **Send state is journalled.** `sends` rows, ledger changes and each sent copy's index row (raw key, flags, labels, the Bcc list) are non-derived state. They go in the mailbox journal with the same 60-second recovery point as drafts (M1 decision 3), so a restore cannot bring back a deleted draft without its send, or drop a sent copy from Sent. Outside recipients' sent copies have no `deliveries` row, so the journal is their only recovery path.
-- **Restores pause sending.** While the mailbox is `restoring`, `claimSend`, `recordResult` and `delaySend` answer a retryable error, so the queue retries after the restore.
+- **Send state is journalled.** `sends` rows, ledger changes and each sent copy's index row (raw key, flags, labels, the Bcc list) are non-derived state. They go in the mailbox journal. The journal normally flushes drafts and settings within 60 seconds and flags within an hour, and a restore loads the latest snapshot plus the published deltas. A send can finish faster than 60 seconds (the shortest undo window is 5 seconds), so the send path adds a **flush barrier**: nothing leaves the mailbox (release step 5, and therefore every `EMAIL.send()`) until the journal delta holding that send's `sendDraft` event and its release commit (step 4) is durably published, meaning the delta object is written and the manifest's `last_seq` covers it. Then a restore can never bring back a draft whose message went out, or drop that message's sent copy. Outside recipients' sent copies have no `deliveries` row, so the journal is their only recovery path. Cost: about two extra journal writes per send.
+- **Restores pause sending, then resume it.** While the mailbox is `restoring`, `claimSend`, `recordResult` and `delaySend` answer a retryable error. A consumer that holds a confirmed `send()` result and gets that error enqueues a record-only message carrying the result (ids and provider message ids, well under 128 KB) and acknowledges; the record-only message retries `recordResult` and never calls `send()`. After loading, the restore epilogue rebuilds the timers from the restored `sends` rows (`send_release` for `pending`, `send_retry` for `releasing`, `send_delayed` for `delayed`) and re-enqueues every `queued` and `sending` send, because their queue messages may already have been acknowledged.
 - **Stop rule for every package:** if a package needs a change to the inbound design decisions (storage keys, holder ordering, journal recovery boundary), stop and write a design note for Opus. Do not adapt them locally.
 
 ## 2. Send state machine
@@ -46,10 +46,11 @@ sendDraft ──► pending ──(undo)──► cancelled
 The alarm never enqueues a `cancelled` send, and the consumer re-checks the state before calling `send()`.
 
 **Release** (alarm), in order:
-1. **Commit:** `pending` → `releasing`, plus a retry timer at +60 s. The commit fixes the message's `Date` and derives the MIME boundary from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change.
+1. **Commit:** `pending` → `releasing`, plus a retry timer at +60 s. The commit fixes the message's `Date` and derives the MIME boundary and our `Message-ID` from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change. If M3-0 shows the provider replaces `Message-ID`, the index records the delivered id for threading; the stored bytes keep ours.
 2. **Re-check send-as and limits.** An alias may have been removed during the undo window. A send that now fails the checks becomes `failed` with reason `invalid_sender` or `message_too_large`.
 3. **Store the sent copy:** build the MIME of the sent copy, register its holder with the sweeper, and PUT it to object storage (holder before PUT, as on the inbound path). The stored MIME never contains a `Bcc` header; Bcc recipients live only in the `sends` row and the sender's index.
 4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows (`pending`, one per external recipient). Set `releasing` → `queued`.
+4a. **Flush barrier:** publish the journal delta up to this commit (section 1). If the publish fails, stop here; the retry timer runs release again.
 5. **Enqueue:** `await SEND.send({ ws, mb, sendId })`, then delete the retry timer.
 
 **If release crashes:**
@@ -67,7 +68,7 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 5. **Record:** RPC `recordResult(sendId, fence, result)`, which sets each recipient to `sent` (with `messageId`), `failed` (with a reason) or `suppressed`. A stale fence cannot record.
 6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed`, and the sent copy's `send.state` follows. A transient error returns the `attempting` recipients to `pending` and throws, so the queue retries.
 
-**Duplicate policy (a deliberate change from the suite plan, which said a retry sends only to recipients still `pending`):** `send()` has no idempotency key. If the consumer dies after `send()` returns but before `recordResult`, the retry finds those recipients `attempting` under an expired fence and sends to them again.
+**Duplicate policy (a deliberate change from the earlier design rule that a retry sends only to recipients still `pending`):** `send()` has no idempotency key. If the consumer dies after `send()` returns but before `recordResult`, the retry finds those recipients `attempting` under an expired fence and sends to them again.
 - So **a recipient may receive a message twice, and never zero times.** A lost message is the worse failure for personal mail.
 - The window is one RPC long. Each occurrence raises the metric `send_ambiguous_retry`, so we measure how often it happens before considering anything stronger.
 
@@ -143,7 +144,8 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 - Conformance cases 13 and 14 pass against the backend.
 - **Two sends in one undo window; undo one:** only the other is released.
 - **Crash injection** after each release step (the state commit, the PUT, the index commit, `queue.send`): there is always exactly one sent copy and at least one queue message.
-- **Restore during each send state** (`pending`, `queued`, `delayed`, `sending`, `sent`): after the restore the send completes exactly once, the draft does not reappear, and the sent copy is in Sent.
+- **Restore during each send state** (`pending`, `releasing`, `queued`, `delayed`, `sending`, `sent`), including a restore that starts after `send()` returned and before `recordResult`: after the restore every send reaches a terminal state, every recipient receives the message at least once (at most one duplicate, per the duplicate policy), a draft whose message went out does not reappear, and the sent copy is in Sent.
+- **Flush barrier:** with the journal publish failing, no queue message and no `EMAIL.send()` happen.
 - **Undo racing the alarm:** either `cancelled` with no queue message ever, or released with undo answering `send_not_pending`. Never both.
 
 **Stop rule:** if the Durable Object's single-threaded ordering cannot give the undo-or-release guarantee without a lock, stop and redesign. Do not add a timer guess.
@@ -152,6 +154,7 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 
 **Change:** build the structured `send()` request and the RFC 5322 MIME of the sent copy:
 - UTF-8 headers as RFC 2047 encoded words;
+- the text part in quoted-printable or base64, whichever is smaller, so it is never larger than base64 (the client's `attachmentBudget` relies on this);
 - `multipart/mixed` with a `text/plain` part and base64 attachments;
 - `In-Reply-To`, and `References` trimmed to the first id and the last 10;
 - the encoded size, which is the server's `message_too_large` check.

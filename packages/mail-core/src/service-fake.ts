@@ -12,6 +12,12 @@ const maxAuthAge = 600;
 const copy = structuredClone;
 const iso = (ms: number) => new Date(ms).toISOString();
 const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
+// The client's 16 KiB budget allowance also covers per-part padding and final CRLFs.
+const mimeHeadersReserve = 15 * 1024;
+function base64MimeBytes(rawBytes: number): number {
+  const encoded = 4 * Math.ceil(rawBytes / 3);
+  return encoded + 2 * Math.ceil(encoded / 76);
+}
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const normalized = (s: string) => s.normalize('NFKC').toLowerCase();
 const subjectKey = (s: string) => normalized(s.trim().replace(/^(?:(?:re|fwd?):\s*)+/i, ''));
@@ -71,9 +77,9 @@ interface Replay {
 }
 interface ReplayScope {
   committed: Map<string, Replay>;
-  inProgress: Map<string, Promise<string>>;
+  inProgress: Set<string>;
 }
-const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Map() });
+const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set() });
 interface Workspace {
   id: Id;
   boxes: Map<Id, Mailbox>;
@@ -231,30 +237,24 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const byThread = (a: Cursor['position'], b: Cursor['position']) => ascending(b, a);
 
   async function replay<T>(keys: ReplayScope, opts: Idempotent | undefined, op: Operation, args: unknown[],
-    fingerprintBody: unknown | (() => Promise<unknown>), run: () => T,
-    options?: { beforeStart?: () => void; onReplay?: (value: T) => T }): Promise<T> {
+    fingerprintBody: unknown | (() => Promise<unknown>), run: () => T, onReplay?: (value: T) => T): Promise<T> {
     const key = opts?.idempotencyKey;
     if (key === undefined) fail('precondition_required');
     if (typeof key !== 'string' || key.length > limits.idempotencyKeyChars || !/^[A-Za-z0-9_-]+$/.test(key)) invalid('/idempotencyKey');
-    const existing = keys.committed.get(key);
-    const inProgress = keys.inProgress.get(key);
-    if (!existing && !inProgress) options?.beforeStart?.();
-    const fingerprint = async () => canonical([
+    const getFingerprint = async () => canonical([
       op, args, typeof fingerprintBody === 'function' ? await fingerprintBody() : fingerprintBody,
     ]);
+    const existing = keys.committed.get(key);
     if (existing) {
-      if (await fingerprint() !== existing.fingerprint) fail('idempotency_key_reused');
+      if (await getFingerprint() !== existing.fingerprint) fail('idempotency_key_reused');
       const value = copy(existing.value as T);
-      return options?.onReplay ? options.onReplay(value) : value;
+      return onReplay ? onReplay(value) : value;
     }
-    if (inProgress) {
-      if (await fingerprint() !== await inProgress) fail('idempotency_key_reused');
-      fail('idempotency_in_progress', { retryAfterSeconds: 1 });
-    }
-    const pendingFingerprint = fingerprint();
-    keys.inProgress.set(key, pendingFingerprint);
+    if (keys.inProgress.has(key)) fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    // Reserve the key before fingerprinting can start reading an upload stream.
+    keys.inProgress.add(key);
     try {
-      const fingerprint = await pendingFingerprint;
+      const fingerprint = await getFingerprint();
       // Mutate and record the success synchronously; no caller sees one without the other.
       const value = run();
       keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
@@ -314,7 +314,10 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     boundedText(input.subject, limits.subjectBytes, '/subject');
     boundedText(input.body, limits.bodyBytes, '/body');
     const { subject, body, inReplyTo, forwardOf } = input;
-    for (const ref of [inReplyTo, forwardOf]) if (ref !== undefined) need(box.messages.get(ref));
+    for (const field of ['inReplyTo', 'forwardOf'] as const) {
+      const ref = input[field];
+      if (ref !== undefined && ref !== previous?.[field]) need(box.messages.get(ref));
+    }
     const cleanAddresses = (field: 'to' | 'cc' | 'bcc') => input[field].map((value, i) => {
       fields(value, ['name', 'email']);
       const { name, email } = value;
@@ -696,27 +699,20 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async sendDraft(draftId, opts) {
         const box = mailbox();
         requireRevision(opts);
-        const currentDraft = () => {
+        return replay(box.keys, opts, 'sendDraft', [draftId], null, () => {
           const draft = need(box.drafts.get(draftId));
           checkRevision(draft, opts);
-          return draft;
-        };
-        return replay(box.keys, opts, 'sendDraft', [draftId], null, () => {
-          // Re-check in the mutation step in case a different key or an edit raced the preflight.
-          const draft = currentDraft();
           checkCounts(draft);
           const all = [...draft.to, ...draft.cc, ...draft.bcc];
           if (!all.length || all.some(({ email }) => !validEmail(email))) fail('invalid_recipients');
           const from = address(sender(box, draft.from, true));
           let bodyBytes = bytes(draft.body);
-          let fileBytes = 0;
+          let encodedFileBytes = 0;
           for (const attachment of draft.attachments) {
             if (attachment.kind === 'link') bodyBytes += bytes(`\r\n${attachment.name}: ${attachment.url}`);
-            else fileBytes += attachment.size;
+            else encodedFileBytes += base64MimeBytes(attachment.size);
           }
-          // No MIME is generated here. Model the same expansion and overhead as attachmentBudget;
-          // actual MIME has per-part padding and line breaks, which the production encoder measures.
-          const size = bodyBytes + 16 * 1024 + Math.ceil(fileBytes * 4 * 78 / (3 * 76));
+          const size = mimeHeadersReserve + base64MimeBytes(bodyBytes) + encodedFileBytes;
           if (size > limits.outboundMessageBytes) fail('message_too_large', { limit: limits.outboundMessageBytes });
           const undoRemainingMs = box.settings.undoSeconds * second;
           const send: Send = {
@@ -727,10 +723,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           box.sends.set(send.id, { send, pending: { draft, size, from, references: replyReferences(box, draft.inReplyTo) } });
           bump(box);
           return send;
-        }, {
-          beforeStart: currentDraft,
-          onReplay: ({ id }) => sendResult(need(box.sends.get(id)).send),
-        });
+        }, ({ id }) => sendResult(need(box.sends.get(id)).send));
       },
       async listSends(query) {
         const box = mailbox();

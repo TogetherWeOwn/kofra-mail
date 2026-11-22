@@ -100,11 +100,15 @@ export const LIMITS = {
 } as const satisfies Limits;
 
 /**
- * Raw attachment bytes that fit in one outbound message with `bodyBytes` of
- * body text. Base64 grows bytes by 4/3 and MIME adds CRLF after every 76
- * encoded characters (78/76); 16 KiB is reserved for headers and MIME
- * structure. The server's encoded-size check at send time is authoritative.
+ * A conservative estimate of the raw attachment bytes that fit in one
+ * outbound message with `bodyBytes` of UTF-8 body text. Base64 grows bytes by
+ * 4/3 and MIME adds CRLF after every 76 encoded characters (78/76); the body
+ * is counted at the same rate (the backend never encodes it larger than
+ * base64), and 16 KiB is reserved for headers and MIME structure. Files within
+ * the budget always pass the server's encoded-size check; files above it may
+ * still pass. The server's check at send time is authoritative.
  */
 export function attachmentBudget(limits: Pick<Limits, 'outboundMessageBytes'>, bodyBytes: number): number {
-  return Math.max(0, Math.floor(((limits.outboundMessageBytes - bodyBytes - 16 * KiB) * 3 * 76) / (4 * 78)));
+  const encoded = (raw: number) => Math.ceil((raw * 4 * 78) / (3 * 76));
+  return Math.max(0, Math.floor(((limits.outboundMessageBytes - encoded(bodyBytes) - 16 * KiB) * 3 * 76) / (4 * 78)));
 }
