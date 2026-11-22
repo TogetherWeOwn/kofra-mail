@@ -37,6 +37,7 @@ export function normalizeAddress(address: string): string {
   if (at <= 0 || at === address.length - 1) throw new Error('Invalid envelope recipient');
   const domain = address.slice(at + 1).toLowerCase().normalize('NFC');
   const local = address.slice(0, at).normalize('NFC').toLowerCase().normalize('NFC').split('+', 1)[0];
+  if (!local) throw new Error('Invalid envelope recipient');
   return `${local}@${domain}`;
 }
 

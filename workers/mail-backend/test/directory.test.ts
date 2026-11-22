@@ -51,6 +51,10 @@ test('normalizes Unicode addresses idempotently', () => {
   }
 });
 
+test('does not return a directory key when a plus tag has no base local part', () => {
+  assert.throws(() => normalizeAddress('+alerts@example.test'), /Invalid envelope recipient/);
+});
+
 test('resolves the exact Unicode address a directory writer normalized before storing', async () => {
   const address = 'josÉ@example.test';
   await db.prepare('DELETE FROM addresses WHERE address_norm = ?').bind('josé@example.test').run();
