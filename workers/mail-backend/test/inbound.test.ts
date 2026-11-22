@@ -56,7 +56,8 @@ test('outbox accepts a lowercase workspace ID and rejects IDs that cannot name a
     mailboxId: 'box', envelopeFrom: 'sender@example.test', envelopeTo: 'box@example.test',
     rawKey, authResults: null, createdAt: 100,
   };
-  for (const workspaceId of [row.workspaceId.toUpperCase(), `${row.workspaceId}-`]) {
+  for (const workspaceId of [row.workspaceId.toUpperCase(), `${row.workspaceId}-`,
+    'w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal']) {
     await assert.rejects(outbox.insert({ ...row, workspaceId }), /CHECK constraint failed: length\(workspace_id\)/);
   }
   await outbox.insert(row);
