@@ -216,7 +216,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
 - Recipient and attachment counts may not exceed the send limits.
 - Address syntax is not checked, because drafts may be incomplete.
-- **Header text:** a subject, display name or address that contains a control character other than tab (CR and LF included) answers 422 `invalid_header`, with the field in `errors`. It is never stripped. `hasHeaderControl` in `src/headers.ts` is the rule. Link names and URLs with control characters answer 400 `invalid_request`; file names are checked when uploaded (section 8.4).
+- **Header text:** a subject, display name or address (and, on admin routes, a mailbox `displayName`, which is the From name of its identities) that contains a control character other than tab (CR and LF included) answers 422 `invalid_header`, with the field in `errors`. It is never stripped. `hasHeaderControl` in `src/headers.ts` is the rule. Link names and URLs with control characters answer 400 `invalid_request`; file names are checked when uploaded (section 8.4).
 - `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. When `inReplyTo` is first set, the server copies the parent's `Message-ID` and `References` into the draft, so the reply keeps its threading headers even if the parent later expires. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
 
 **Attachment references:**
@@ -279,7 +279,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 **`saveAttachmentToDrive`:** uploads the attachment to the user's Drive with a `drive.upload` token for that one action.
 - The upload carries the operation id of section 5. Drive must store it with the file, durably, and answer a repeat of the same operation id with the original file instead of a new one.
 - **`features.drive` stays off until Drive offers that.** Without it, a lost reply after Drive stored the file would let a retry create a second file.
-- Mail writes its in-progress marker before the Drive call. A retry after a crash, a 5xx or a lost reply calls Drive again with the same operation id, then stores the returned file as the result.
+- Mail writes its in-progress marker before the Drive call. A retry after a crash, a 5xx or a lost reply first asks Drive for the operation id's file, before reading the attachment again, so it succeeds even if the source message expired in between; only an unknown operation id reads the attachment and uploads it. Mail then stores the returned file as the result.
 
 ### 8.6 Admin
 
@@ -420,11 +420,11 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - The 31st alias answers `limit_reached`.
     - After `deleteAlias`, the identity is gone.
     - After `updateMailbox` moves mailbox A to the invited member, `member`'s next `listThreads` answers `forbidden`.
-20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`. With `driveFaults`: a `saveAttachmentToDrive` whose reply is lost after Drive stored the file answers `unavailable`; the same-key retry returns one file, Drive holds exactly one new file, and a new key makes a second.
+20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`. With `driveFaults`: a `saveAttachmentToDrive` whose reply is lost after Drive stored the file answers `unavailable`; after the source then expires from Trash, the same-key retry still returns that file, Drive holds exactly one new file, and a new key answers `not_found`.
 21. **Header text and threading:**
-    - CR, LF or NUL in a subject, display name or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged.
+    - CR, LF or NUL in a subject, display name or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged; so does CR LF in a mailbox `displayName` on `updateMailbox`.
     - A reply in a thread of 12 messages with legal 200-byte `Message-ID`s: the sent copy's `In-Reply-To` is the parent, and its `References` fits `headerValueBytes`, starts with the first id, ends with the parent, keeps chain order and holds 10 ids.
-    - The sent copy has no `Bcc` header and no Bcc address.
+    - The sent copy has no `Bcc` header and no Bcc address, and every value `sentHeaders` returns is unfolded, including a To list with a long encoded name.
 22. **Owner change before release:** a send made just before an admin moves the mailbox to another member ends `failed` with `invalid_sender` for each recipient, with no sent copy.
 23. **State:** the routes with `state: true` report the same value at the same moment; a delivery, a label, a thread update, a draft and a send each move it.
 

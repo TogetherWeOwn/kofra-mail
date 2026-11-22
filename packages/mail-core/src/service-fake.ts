@@ -49,25 +49,25 @@ function mimeFilename(name: string): string {
   return `filename*=UTF-8''${encoded}`;
 }
 
-// The sent copy's header fields (lower-case names, unfolded values). Bcc addresses are envelope recipients, never headers.
-function sentHeaderFields(draft: Pick<Draft, 'to' | 'cc' | 'subject'>, from: Address, threading: ThreadingHeaders, messageId: string, date: string): Record<string, string> {
+// The sent copy's header fields, lower-case names, folded as they are written. Bcc addresses are envelope recipients, never headers.
+function foldedHeaderFields(draft: Pick<Draft, 'to' | 'cc' | 'subject'>, from: Address, threading: ThreadingHeaders, messageId: string, date: string): Record<string, string> {
   return {
-    from: mimeAddress(from), subject: mimeHeaderText(draft.subject).replaceAll('\r\n', ''),
+    from: mimeAddress(from), subject: mimeHeaderText(draft.subject),
     date: new Date(date).toUTCString().replace('GMT', '+0000'), 'message-id': messageId, 'mime-version': '1.0',
-    ...(draft.to.length && { to: draft.to.map(mimeAddress).join(', ') }),
-    ...(draft.cc.length && { cc: draft.cc.map(mimeAddress).join(', ') }),
+    ...(draft.to.length && { to: draft.to.map(mimeAddress).join(',\r\n ') }),
+    ...(draft.cc.length && { cc: draft.cc.map(mimeAddress).join(',\r\n ') }),
     ...(threading.inReplyTo !== undefined && { 'in-reply-to': threading.inReplyTo }),
     ...(threading.references !== undefined && { references: threading.references }),
   };
 }
+// RFC 5322 unfolding: a CRLF followed by white space is removed.
+const unfolded = (fields: Record<string, string>) => Object.fromEntries(Object.entries(fields).map(([name, value]) => [name, value.replace(/\r\n(?=[ \t])/g, '')]));
 const headerName = (name: string) => name.replace(/(^|-)([a-z])/g, (_, dash: string, letter: string) => dash + letter.toUpperCase());
 
 // Count a representative encoded MIME message without materializing the body or file bytes.
 function outboundMimeBytes(draft: Draft, from: Address, threading: ThreadingHeaders): number {
-  const fields = sentHeaderFields(draft, from, threading, '<demo-00000000@mail.example>', '2026-11-22T12:00:00Z');
-  // Unfolded values are a lower bound on the folded size; the address lists fold at each comma.
-  const lines = Object.entries(fields).map(([name, value]) => `${headerName(name)}: ${
-    name === 'to' || name === 'cc' ? value.replaceAll(', ', ',\r\n ') : name === 'subject' ? mimeHeaderText(draft.subject) : value}`);
+  const fields = foldedHeaderFields(draft, from, threading, '<demo-00000000@mail.example>', '2026-11-22T12:00:00Z');
+  const lines = Object.entries(fields).map(([name, value]) => `${headerName(name)}: ${value}`);
   let size = bytes(`${lines.join('\r\n')}\r\n`);
   const files = draft.attachments.filter((attachment) => attachment.kind !== 'link');
   const links = draft.attachments.flatMap((attachment) => attachment.kind === 'link' ? [`${attachment.name}: ${attachment.url}`] : []);
@@ -153,6 +153,8 @@ interface Replay {
 interface ReplayScope {
   committed: Map<string, Replay>;
   inProgress: Set<string>;
+  /** Re-checks access after replay's await (the mailbox may have changed owner meanwhile). */
+  recheck?: () => void;
 }
 const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set() });
 interface Workspace {
@@ -178,7 +180,7 @@ interface Mailbox {
   training: Map<string, { spam: number; ham: number }>;
   /** Stand-in for the user's Drive: its files, and the operation ids it has deduplicated durably. */
   driveFiles: Map<Id, { name: string; size: number; type: string }>;
-  driveOperations: Map<string, Id>;
+  driveOperations: Map<string, { driveFileId: Id; name: string }>;
   settings: Settings;
 }
 interface Cursor { binding: string; position: readonly [string, string] }
@@ -348,6 +350,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     const existing = keys.committed.get(key);
     if (existing) {
       if (await getFingerprint() !== existing.fingerprint) fail('idempotency_key_reused');
+      keys.recheck?.();
       const value = copy(existing.value as T);
       return onReplay ? onReplay(value) : value;
     }
@@ -357,6 +360,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     try {
       const fingerprint = await getFingerprint();
       // Mutate and record the success synchronously; no caller sees one without the other.
+      keys.recheck?.();
       const value = run(fingerprint);
       keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
       return value;
@@ -420,6 +424,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   }
   function makeDraft(box: Mailbox, draftId: Id, input: DraftInput, previous?: Draft): Draft {
     fields(input, ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'inReplyTo', 'forwardOf', 'attachments']);
+    if (typeof input.from === 'string' && hasHeaderControl(input.from)) badHeader('/from');
     const from = sender(box, input.from, false).email;
     checkCounts(input);
     boundedText(input.subject, limits.subjectBytes, '/subject');
@@ -567,7 +572,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       verdict: { level: 'none', reasons: [] }, send: { id: send.id, state: 'sent' },
     }, {
       messageId: `<${send.id}@mail.example>`, references,
-      fields: (messageId) => sentHeaderFields(draft, from, threadingHeaders(references, limits), messageId, date),
+      fields: (messageId) => unfolded(foldedHeaderFields(draft, from, threadingHeaders(references, limits), messageId, date)),
     });
     send.messageId = message.id;
     send.state = 'sent';
@@ -628,6 +633,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   }
   function displayName(name: string): string {
     boundedText(name, limits.displayNameBytes, '/displayName');
+    // The mailbox name is every identity's From display name.
+    if (hasHeaderControl(name)) badHeader('/displayName');
     if (!name.trim()) invalid('/displayName', 'required');
     return name.trim();
   }
@@ -645,6 +652,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       if (!box) fail('forbidden');
       return box;
     };
+    // The mailbox's idempotency scope, re-checking that this session still owns it when replay resumes.
+    const owned = (box: Mailbox): ReplayScope => ({ ...box.keys, recheck: () => { if (resolveMailbox() !== box) fail('forbidden'); } });
     const service: MailService = {
       async getSession() {
         const box = resolveMailbox();
@@ -743,27 +752,28 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(box.keys, opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
-          const { name, size, type } = part(box, messageId, number);
-          // A stable operation id that Drive deduplicates durably: a retry after a lost reply returns the same file.
+        return replay(owned(box), opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
+          // A stable operation id that Drive deduplicates durably. A retry asks Drive first, so a lost reply
+          // returns the stored file even if the source message expired in between.
           const operation = createHash('sha256').update(`${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
-          let driveFileId = box.driveOperations.get(operation);
-          if (driveFileId === undefined) {
-            driveFileId = id();
-            box.driveFiles.set(driveFileId, { name, size, type });
-            box.driveOperations.set(operation, driveFileId);
+          let saved = box.driveOperations.get(operation);
+          if (saved === undefined) {
+            const { name, size, type } = part(box, messageId, number);
+            saved = { driveFileId: id(), name };
+            box.driveFiles.set(saved.driveFileId, { name, size, type });
+            box.driveOperations.set(operation, saved);
           }
           if (loseNextDriveSaveReply) {
             loseNextDriveSaveReply = false;
             fail('unavailable', { retryAfterSeconds: 1 });
           }
-          return { driveFileId, name };
+          return { ...saved };
         });
       },
       async listLabels() { const box = mailbox(); return { items: [...box.labels.values()], state: state(box) }; },
       async createLabel(input, opts) {
         const box = mailbox();
-        return replay(box.keys, opts, 'createLabel', [], input, () => {
+        return replay(owned(box), opts, 'createLabel', [], input, () => {
           fields(input, ['name']);
           const name = labelName(box, input.name);
           if (box.labels.size >= limits.labelsPerMailbox) fail('limit_reached', { limit: limits.labelsPerMailbox });
@@ -816,7 +826,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async getDraft(draftId) { return need(mailbox().drafts.get(draftId)); },
       async createDraft(input, opts) {
         const box = mailbox();
-        return replay(box.keys, opts, 'createDraft', [], input, () => {
+        return replay(owned(box), opts, 'createDraft', [], input, () => {
           const draft = makeDraft(box, id(), input);
           box.drafts.set(draft.id, draft);
           bump(box);
@@ -847,7 +857,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async sendDraft(draftId, opts) {
         const box = mailbox();
         requireRevision(opts);
-        return replay(box.keys, opts, 'sendDraft', [draftId], null, () => {
+        return replay(owned(box), opts, 'sendDraft', [draftId], null, () => {
           const draft = need(box.drafts.get(draftId));
           checkRevision(draft, opts);
           checkCounts(draft);
@@ -872,7 +882,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           };
           box.drafts.delete(draftId);
           box.replyRefs.delete(draftId);
-          box.sends.set(send.id, { send, pending: { draft, size, from, references, ownerUserId: box.directory.ownerUserId } });
+          // The authenticated submitter, never the directory's current owner.
+          box.sends.set(send.id, { send, pending: { draft, size, from, references, ownerUserId: user.id } });
           bump(box);
           return copy(send);
         }, ({ id }) => sendResult(need(box.sends.get(id)).send));
@@ -888,7 +899,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async getSend(sendId) { return sendResult(need(mailbox().sends.get(sendId)).send); },
       async undoSend(sendId, opts) {
         const box = mailbox();
-        return replay(box.keys, opts, 'undoSend', [sendId], null, () => {
+        return replay(owned(box), opts, 'undoSend', [sendId], null, () => {
           const entry = need(box.sends.get(sendId));
           if (!entry.pending) fail('send_not_pending');
           const draft = { ...entry.pending.draft, revision: id(), updatedAt: iso(now) };
@@ -912,7 +923,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           digest = await sha256(blob);
           return [name, type, digest];
         };
-        return replay(box.keys, opts, 'createUpload', [], fingerprint, () => {
+        return replay(owned(box), opts, 'createUpload', [], fingerprint, () => {
           fields(input, ['name', 'type', 'bytes']);
           if (!(blob instanceof Blob)) invalid('/bytes');
           if (blob.size > limits.uploadBytes) fail('payload_too_large', { limit: limits.uploadBytes });
@@ -929,7 +940,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async importFromDrive(input, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(box.keys, opts, 'importFromDrive', [], input, () => {
+        return replay(owned(box), opts, 'importFromDrive', [], input, () => {
           fields(input, ['pickId', 'mode']);
           const pick = need(picks.get(input.pickId));
           if (pick.mailboxId !== box.directory.id) fail('not_found');

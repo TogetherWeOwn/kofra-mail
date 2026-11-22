@@ -518,6 +518,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.notEqual(undo.revision, draft.revision);
       assert.equal((await mail.getSend(send.id)).state, 'cancelled');
       assert.deepEqual(await mail.undoSend(send.id, key('undo')), undo);
+      // The draft exists again under a new revision; the old key still replays before any If-Match check.
+      const afterUndo = await mail.sendDraft(draft.id, options);
+      assert.equal(afterUndo.id, send.id);
+      assert.equal(afterUndo.state, 'cancelled');
       assert.ok(ids(await mail.listDrafts({})).includes(draft.id));
       await h.advance(undoSeconds * second);
       assert.equal((await mail.getSend(send.id)).state, 'cancelled');
@@ -737,16 +741,23 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(delivered.id, messageId);
       const [{ part }] = delivered.attachments;
       const before = await h.driveFaults.savedFiles();
+      // The source sits in Trash and expires between the lost reply and the retry.
+      const { limits } = session;
+      await mail.updateThreads({ ids: [delivered.threadId], set: { folder: 'trash' } });
+      await h.advance(limits.spamTrashRetentionDays * day - 60 * 60 * second);
       await h.driveFaults.loseNextSaveReply();
       const lost = await rejects(mail.saveAttachmentToDrive(messageId, part, key('save')), 'unavailable');
       assert.ok(Number.isInteger(lost.retryAfterSeconds));
+      assert.equal(await h.driveFaults.savedFiles(), before + 1, 'Drive stored the file before the reply was lost');
+      await h.advance(2 * 60 * 60 * second);
+      await rejects(mail.getThread(delivered.threadId), 'not_found');
       const saved = await mail.saveAttachmentToDrive(messageId, part, key('save'));
       assert.equal(saved.name, file.name);
       assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('save')), saved);
       assert.equal(await h.driveFaults.savedFiles(), before + 1);
-      const another = await mail.saveAttachmentToDrive(messageId, part, key('save-again'));
-      assert.notEqual(another.driveFileId, saved.driveFileId);
-      assert.equal(await h.driveFaults.savedFiles(), before + 2);
+      // A new key is a new action, and the expired source can no longer be saved.
+      await rejects(mail.saveAttachmentToDrive(messageId, part, key('save-again')), 'not_found');
+      assert.equal(await h.driveFaults.savedFiles(), before + 1);
     });
 
     run('21. header text is refused, and threading headers fit the header byte limit', async (h, mail) => {
@@ -760,6 +771,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         [{ to: [{ name: 'Casey\r\nBcc: victim@example.net', email: 'casey@example.net' }] }, '/to/0/name'],
         [{ cc: [{ email: 'casey@example.net\r\nBcc: victim@example.net' }] }, '/cc/0/email'],
         [{ bcc: [{ name: 'Null\u0000name', email: 'casey@example.net' }] }, '/bcc/0/name'],
+        [{ from: `${mailbox.primaryAddress}\n` }, '/from'],
       ];
       for (const [i, [patch, field]] of bad.entries()) {
         const refused = await rejects(mail.createDraft({ ...input, ...patch }, key(`bad-${i}`)), 'invalid_header');
@@ -769,6 +781,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(mail.replaceDraft(draft.id, { ...input, subject: 'Edited\r\nX-Injected: 1' }, { ifMatch: draft.revision }), 'invalid_header');
       assert.deepEqual(await mail.getDraft(draft.id), draft);
       assert.ok(!hasHeaderControl('Tab\tseparated'));
+      // The mailbox name is the From display name of every identity.
+      const admin = h.as('admin');
+      const named = await rejects(admin.updateMailbox(mailbox.id, { displayName: 'Mailbox\r\nBcc: victim@example.net' }), 'invalid_header');
+      assert.deepEqual(named.errors, [{ field: '/displayName', code: 'invalid' }]);
 
       // A thread of 12 messages, each with a legal 200-byte Message-ID: 11 of them would exceed headerValueBytes.
       const idBytes = 200;
@@ -788,6 +804,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(parent);
       const reply = await mail.createDraft(draftInput(mailbox.primaryAddress, {
         subject: 'Re: Long thread', inReplyTo: parent.messageId, bcc: [{ email: 'hidden@example.net' }],
+        to: [{ name: 'é'.repeat(60), email: 'casey@example.net' }, { email: 'morgan@example.net' }],
       }), key('reply'));
       const send = await mail.sendDraft(reply.id, { ...key('send-reply'), ifMatch: reply.revision });
       await h.advance((await mail.getSettings()).undoSeconds * second);
@@ -807,6 +824,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(!Object.hasOwn(headers, 'bcc'), 'no stored MIME carries Bcc');
       assert.ok(!JSON.stringify(headers).includes('hidden@example.net'));
       for (const name of ['from', 'to', 'subject', 'date', 'message-id']) assert.ok(headers[name], name);
+      for (const [name, value] of Object.entries(headers)) assert.ok(!/[\r\n]/.test(value), `${name} is unfolded`);
     });
 
     run('22. a pending send never goes out after the mailbox changes owner', async (h, mail) => {
@@ -826,6 +844,18 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'invalid_sender' }]);
       const copies = await newOwner.listThreads({ view: 'sent', q: 'subject:"before reassignment"' });
       assert.deepEqual(copies.items, []);
+
+      // The same, with the send racing the reassignment: it is refused, or it fails at release.
+      await h.as('admin').updateMailbox(mailbox.id, { ownerUserId: session.user.id });
+      const racing = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Racing reassignment' }), key('racing-draft'));
+      const [raced] = await Promise.allSettled([
+        mail.sendDraft(racing.id, { ...key('racing-send'), ifMatch: racing.revision }),
+        h.as('admin').updateMailbox(mailbox.id, { ownerUserId: user.id }),
+      ]);
+      await h.advance(undoSeconds * second);
+      if (raced.status === 'rejected') await rejects(Promise.reject(raced.reason), 'forbidden');
+      else assert.equal((await newOwner.getSend(raced.value.id)).state, 'failed');
+      assert.deepEqual((await newOwner.listThreads({ view: 'sent', q: 'subject:"racing reassignment"' })).items, []);
     });
 
     run('23. mailbox reads carry one state, and every change moves it', async (h, mail) => {
