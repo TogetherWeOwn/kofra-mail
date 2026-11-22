@@ -9,10 +9,13 @@
   let images = $state(false);
   let pending = $state(false);
   let unavailable = $state(false);
+  // A metadata refresh can replace the whole message object without changing eligibility.
+  const allowedOrigin = $derived(message.hasHtml ? origin : undefined);
+  const frameSrc = $derived(contentFrameUrl(src, allowedOrigin));
   let revision = 0;
   onDestroy(() => { revision++; });
   $effect(() => {
-    if (origin && message.hasHtml) untrack(() => { void load(false); });
+    if (allowedOrigin) untrack(() => { void load(false); });
     else {
       revision++;
       src = undefined;
@@ -45,14 +48,14 @@
 
 {#if message.remoteImages}
   <div class="notice image-notice"><ImageOff size={18} /><span>{images ? 'Remote images shown for this message' : 'Remote images blocked'}</span>
-    {#if origin && (src || pending)}
+    {#if allowedOrigin && (frameSrc || pending)}
       <button class="pill" disabled={pending} onclick={() => load(!images)}>{images ? 'Hide images' : 'Show images'}</button>
     {/if}
   </div>
 {/if}
 {#if unavailable}<p class="muted" role="status">Formatted message unavailable. Showing plain text.</p>{/if}
-{#if origin && src}
-  <iframe title={`Formatted message: ${message.subject}`} {src} sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
+{#if frameSrc}
+  <iframe title={`Formatted message: ${message.subject}`} src={frameSrc} sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
   <details class="text-fallback"><summary>View plain text</summary><p class="plain-message">{message.text}</p></details>
 {:else}
   <p class="plain-message">{message.text}</p>

@@ -14,7 +14,7 @@ const server = createServer((request, response) => {
     });
     response.end(`<!doctype html><html lang="en"><meta charset="utf-8"><title>Demo formatted message</title><style>
       html { color-scheme: light dark; font: 16px/1.4 system-ui; overflow-wrap: anywhere; } img { display: block; max-width: 100%; }
-      </style><body data-fixture-body><main><h1>Plan update</h1><p>Kitchen measurements revised.</p>${images ? '<img src="/image/plan-latest.svg" alt="Demo floor plan" width="160" height="52">' : ''}</main></body></html>`);
+      </style><body data-fixture-body><main><h1>Plan update</h1><p>Hi Alex,</p><p>Kitchen measurements revised. Could you review the attached floor plan notes and budget before Tuesday?</p><p>Thanks,<br>Mira</p>${images ? '<img src="/image/plan-latest.svg" alt="Demo floor plan" width="160" height="52">' : ''}</main></body></html>`);
     return;
   }
   if (url.pathname === '/image/plan-latest.svg') {

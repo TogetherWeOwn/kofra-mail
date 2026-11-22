@@ -43,6 +43,7 @@ test('only loads formatted content and then opted-in images from a separate sand
   expect(await element.getAttribute('srcdoc')).toBeNull();
   const frame = element.contentFrame();
   await expect(frame.getByText('Kitchen measurements revised.')).toBeVisible();
+  await expect(frame.getByText('before Tuesday?')).toBeVisible();
   await expect(page.locator('[data-fixture-body]')).toHaveCount(0);
   expect(await element.evaluate((node: HTMLIFrameElement) => node.contentDocument === null)).toBe(true);
   expect(imageRequests).toEqual([]);
@@ -50,10 +51,17 @@ test('only loads formatted content and then opted-in images from a separate sand
   await expect(element).toHaveAttribute('src', `${content}/body/plan-latest?images=1`);
   await expect(frame.getByRole('img', { name: 'Demo floor plan' })).toBeVisible();
   await expect.poll(() => imageRequests).toEqual([`${content}/image/plan-latest.svg`]);
+  await page.getByRole('button', { name: 'Manage labels' }).click();
+  await page.getByRole('checkbox', { name: 'Finance', exact: true }).check();
+  await expect(page.locator('.thread-title').getByText('Finance', { exact: true })).toBeVisible();
+  await expect(element).toHaveAttribute('src', `${content}/body/plan-latest?images=1`);
+  await expect.poll(() => imageRequests).toEqual([`${content}/image/plan-latest.svg`]);
   await page.getByRole('button', { name: 'Hide images' }).click();
   await expect(element).toHaveAttribute('src', `${content}/body/plan-latest`);
   await expect(frame.getByText('Kitchen measurements revised.')).toBeVisible();
   await expect(frame.getByRole('img')).toHaveCount(0);
+  await page.getByText('View plain text', { exact: true }).click();
+  await expect(page.getByText(/I’ve attached the latest floor plan/)).toBeVisible();
   // Axe's cross-frame injection cannot execute in a scriptless sandbox.
   // Check the frame title above, scan the app without injection into it, and
   // scan the authored document separately at its own origin.
