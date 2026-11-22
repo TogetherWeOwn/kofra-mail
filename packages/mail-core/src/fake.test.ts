@@ -61,7 +61,7 @@ test('search applies operators to the same message and excludes spam by default'
 test('individual operators constrain the result and starred only returns starred threads', async () => {
   const api = createFakeMailApi();
   const cases = [
-    ['to:alex@example.com', 'to:nobody@example.com'], ['label:projects', 'label:finance'],
+    ['to:hello@example.com', 'to:nobody@example.com'], ['label:projects', 'label:finance'],
     ['after:2026-11-21', 'after:2026-11-24'], ['larger:200', 'larger:1m'],
     ['subject:"floor plan"', 'subject:"winter schedule"']
   ];
@@ -89,14 +89,62 @@ test('undo restores the exact draft before the deadline, but not at the deadline
   let now = 100_000;
   const api = createFakeMailApi(() => now);
   const [from] = await api.listIdentities();
-  const draft = { from: from.email, to: ['recipient@example.com'], cc: [], bcc: [], subject: 'Demo', body: 'Hello', attachments: [] };
+  const file = await api.uploadAttachment(new Blob(['restored attachment bytes']), 'demo.txt');
+  const draft = { from: from.email, to: ['recipient@example.com'], cc: [], bcc: [], subject: 'Demo', body: 'Hello', attachments: [file] };
   const first = await api.send(draft);
-  assert.deepEqual(await api.undoSend(first.id), draft);
+  const restored = (await api.undoSend(first.id))!;
+  assert.ok(restored.id);
+  assert.deepEqual(restored, { ...draft, id: restored.id });
+  assert.deepEqual(await api.listDrafts(), [restored]);
+  assert.equal(await (await api.downloadAttachment(restored.attachments[0].id)).text(), 'restored attachment bytes');
   assert.equal(await api.undoSend(first.id), undefined);
-  const next = await api.send(draft);
+  const next = await api.send(restored);
+  assert.deepEqual(await api.listDrafts(), []);
+  assert.equal(await (await api.downloadAttachment(file.id)).text(), 'restored attachment bytes');
   now = next.undoUntil;
   assert.equal(await api.undoSend(next.id), undefined);
-  assert.equal((await api.listThreads({ mailboxId: 'sent' })).length, 1);
+  const [sent] = await api.listThreads({ mailboxId: 'sent' });
+  assert.equal(sent?.id, next.id);
+  const [sentFile] = (await api.getThread(sent.id))!.messages[0].attachments;
+  assert.equal(await (await api.downloadAttachment(sentFile.id)).text(), 'restored attachment bytes');
+});
+
+test('uses the normalized subject to thread replies and retains Cc and Bcc on the sent copy', async () => {
+  let now = Date.UTC(2026, 10, 22);
+  const api = createFakeMailApi(() => now);
+  const [from] = await api.listIdentities();
+  const original = (await api.getThread('plan'))!;
+  const draft = { from: from.email, to: [], cc: ['copy@example.com'], bcc: ['blind@example.com'], subject: `Re: ${original.subject}`, body: 'Hello', attachments: [], replyToThreadId: 'plan' };
+  now = (await api.send(draft)).undoUntil;
+  const reply = (await api.getThread('plan'))!.messages.at(-1) as { cc?: { email: string }[]; bcc?: { email: string }[] };
+  assert.equal(reply.cc?.[0]?.email, 'copy@example.com');
+  assert.equal(reply.bcc?.[0]?.email, 'blind@example.com');
+  const changed = await api.send({ ...draft, subject: 'Different subject' });
+  now = changed.undoUntil;
+  assert.equal((await api.getThread(changed.id))?.subject, 'Different subject');
+  assert.equal((await api.getThread('plan'))?.count, original.count + 1);
+});
+
+test('rejects domain inputs that contain paths, ports or malformed DNS labels', async () => {
+  const api = createFakeMailApi();
+  for (const domain of ['example.com/support', 'example.com:443', 'bad-.example.com', 'one..example.com']) {
+    await assert.rejects(() => api.addDomain(domain, 'Primary'), /Enter a valid domain/);
+  }
+  await api.addDomain('sales.example.com', 'Alias');
+  assert.ok((await api.listDomains()).some((domain) => domain.name === 'sales.example.com'));
+});
+
+test('discard releases uploaded bytes unless a stored message or another draft refers to them', async () => {
+  const api = createFakeMailApi();
+  const file = await api.uploadAttachment(new Blob(['notes']), 'notes.txt');
+  const draft = { from: 'alex@example.com', to: [], cc: [], bcc: [], subject: '', body: '', attachments: [file] };
+  const saved = await api.saveDraft(draft);
+  await api.releaseAttachment(file.id);
+  assert.equal(await (await api.downloadAttachment(file.id)).text(), 'notes');
+  await api.discardDraft(saved.id!);
+  await assert.rejects(() => api.downloadAttachment(file.id), /Attachment not found/);
+  await api.releaseAttachment('plan');
+  assert.ok((await api.downloadAttachment('plan')).size > 0);
 });
 
 test('rejects unknown From addresses and supports Drive link and copy fixtures', async () => {

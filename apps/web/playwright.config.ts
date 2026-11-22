@@ -1,6 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 
-const baseURL = 'http://127.0.0.1:4173';
+const port = 4178;
+const baseURL = `http://127.0.0.1:${port}`;
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
@@ -10,5 +11,5 @@ export default defineConfig({
     { name: 'desktop-light', use: { ...devices['Desktop Chrome'], colorScheme: 'light' } },
     { name: 'phone-dark', use: { ...devices['Pixel 7'], colorScheme: 'dark', defaultBrowserType: 'chromium' } }
   ],
-  webServer: { command: 'npm run dev -- --host 127.0.0.1 --port 4173 --strictPort', url: baseURL, reuseExistingServer: false }
+  webServer: { command: `npm run dev -- --host 127.0.0.1 --port ${port} --strictPort`, url: baseURL, reuseExistingServer: false }
 });

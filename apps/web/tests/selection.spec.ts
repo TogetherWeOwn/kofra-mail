@@ -4,7 +4,7 @@ test('a selected thread that leaves the view cannot be moved by bulk controls', 
   await page.goto('/');
   await expect(page.getByRole('searchbox')).toBeEnabled();
   const starred = page.getByRole('button', { name: 'Starred', exact: true });
-  if (!(await starred.isVisible())) await page.getByRole('button', { name: 'Toggle mail navigation' }).click();
+  if (!(await starred.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await starred.click();
   await page.getByRole('checkbox', { name: 'Select Site visit next week' }).check();
   await page.getByRole('button', { name: 'Unstar Site visit next week' }).click();

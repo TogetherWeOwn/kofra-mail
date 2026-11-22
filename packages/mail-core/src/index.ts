@@ -12,7 +12,10 @@ export function secureHttpsLink(link: string): string | undefined {
 }
 export type Label = { id: string; name: string };
 export type Message = {
-  id: string; from: Address; to: Address[]; date: string; subject: string;
+  id: string; from: Address; to: Address[]; cc?: Address[];
+  /** Populated only on the sender's own sent copy. */
+  bcc?: Address[];
+  date: string; subject: string;
   text: string; attachments: Attachment[]; remoteImages?: boolean;
 };
 export type Thread = {
@@ -50,6 +53,7 @@ export interface MailApi {
   undoSend(id: string): Promise<Draft | undefined>;
   uploadAttachment(file: Blob, name: string): Promise<Attachment>;
   downloadAttachment(id: string): Promise<Blob>;
+  releaseAttachment(id: string): Promise<void>;
   listDriveFiles(): Promise<DriveFile[]>;
   attachFromDrive(id: string, mode: 'copy' | 'link'): Promise<Attachment>;
   saveToDrive(id: string): Promise<void>;

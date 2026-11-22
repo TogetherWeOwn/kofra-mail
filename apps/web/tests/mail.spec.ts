@@ -2,7 +2,7 @@ import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
 
 async function mailbox(page: Page, name: string) {
-  if (!(await page.getByRole('button', { name, exact: true }).isVisible())) await page.getByRole('button', { name: 'Toggle mail navigation' }).click();
+  if (!(await page.getByRole('button', { name, exact: true }).isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await page.getByRole('button', { name, exact: true }).click();
 }
 
@@ -39,7 +39,7 @@ test('a long unbroken label fits the actual viewport', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByRole('searchbox')).toBeEnabled();
   const create = page.getByRole('button', { name: 'Create label' });
-  if (!(await create.isVisible())) await page.getByRole('button', { name: 'Toggle mail navigation' }).click();
+  if (!(await create.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await create.click();
   const longName = 'W'.repeat(72);
   await page.getByLabel('Label name').fill(longName);
