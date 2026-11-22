@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ImageOff } from '@lucide/svelte';
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import type { MailApi, Message } from '@kofra/mail-core';
   import { contentFrameUrl } from './content-origin';
 
@@ -11,7 +11,16 @@
   let unavailable = $state(false);
   let revision = 0;
   onDestroy(() => { revision++; });
-  onMount(() => { if (origin && message.hasHtml) void load(false); });
+  $effect(() => {
+    if (origin && message.hasHtml) untrack(() => { void load(false); });
+    else {
+      revision++;
+      src = undefined;
+      images = false;
+      pending = false;
+      unavailable = false;
+    }
+  });
 
   async function load(showImages: boolean) {
     const current = ++revision;
@@ -36,13 +45,13 @@
 
 {#if message.remoteImages}
   <div class="notice image-notice"><ImageOff size={18} /><span>{images ? 'Remote images shown for this message' : 'Remote images blocked'}</span>
-    {#if src || pending}
+    {#if origin && (src || pending)}
       <button class="pill" disabled={pending} onclick={() => load(!images)}>{images ? 'Hide images' : 'Show images'}</button>
     {/if}
   </div>
 {/if}
 {#if unavailable}<p class="muted" role="status">Formatted message unavailable. Showing plain text.</p>{/if}
-{#if src}
+{#if origin && src}
   <iframe title={`Formatted message: ${message.subject}`} {src} sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
   <details class="text-fallback"><summary>View plain text</summary><p class="plain-message">{message.text}</p></details>
 {:else}

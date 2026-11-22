@@ -28,6 +28,7 @@ test('Spam keeps formatted bodies and remote images blocked', async ({ page }) =
   await expect(page.getByText('Remote images blocked')).toBeVisible();
   await expect(page.locator('iframe')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Show images' })).toHaveCount(0);
+  await expect(page.getByText('Formatted message unavailable. Showing plain text.')).toHaveCount(0);
 });
 
 test('only loads formatted content and then opted-in images from a separate sandbox', async ({ page }) => {
@@ -50,6 +51,8 @@ test('only loads formatted content and then opted-in images from a separate sand
   await expect(frame.getByRole('img', { name: 'Demo floor plan' })).toBeVisible();
   await expect.poll(() => imageRequests).toEqual([`${content}/image/plan-latest.svg`]);
   await page.getByRole('button', { name: 'Hide images' }).click();
+  await expect(element).toHaveAttribute('src', `${content}/body/plan-latest`);
+  await expect(frame.getByText('Kitchen measurements revised.')).toBeVisible();
   await expect(frame.getByRole('img')).toHaveCount(0);
   // Axe's cross-frame injection cannot execute in a scriptless sandbox.
   // Check the frame title above, scan the app without injection into it, and
