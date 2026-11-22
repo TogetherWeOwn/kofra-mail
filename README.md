@@ -18,6 +18,8 @@ npm run test:e2e
 
 `packages/mail-core` defines the TypeScript interface consumed by `apps/web` and its in-memory implementation. The interface is not a published HTTP or JMAP contract. `npm run build` builds a Worker locally; it does not deploy.
 
+`contracts/mail-api` is the backend wire contract (types, routes, errors, limits and a conformance suite) that the web app will move to. See also [docs/content-origin.md](docs/content-origin.md) and [docs/m3-outbound-plan.md](docs/m3-outbound-plan.md).
+
 ## Formatted message demo
 
 Formatted message rendering is off by default; the app uses plain text when no content origin is configured. To try the authored fixture locally, run these in two terminals from the repository root:

@@ -4,5 +4,6 @@
   "private": true,
   "type": "module",
   "exports": { ".": "./src/index.ts", "./fake": "./src/fake.ts" },
-  "scripts": { "check": "tsc --noEmit" }
+  "scripts": { "check": "tsc --noEmit" },
+  "dependencies": { "@kofra/mail-contract": "0.0.0" }
 }
