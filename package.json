@@ -1,0 +1,15 @@
+{
+  "name": "kofra-mail",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/web", "packages/mail-core"],
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "dev": "npm run dev -w @kofra/mail-web",
+    "check": "npm run check -w @kofra/mail-core && npm run check -w @kofra/mail-web",
+    "test": "node --test packages/mail-core/src/*.test.ts",
+    "build": "npm run build -w @kofra/mail-web",
+    "test:e2e": "npm run test:e2e -w @kofra/mail-web"
+  },
+  "devDependencies": { "@types/node": "24.19.2", "typescript": "5.9.3" }
+}
