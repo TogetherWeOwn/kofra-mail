@@ -28,10 +28,14 @@ export function matchesQuery(thread: Conversation, query: string, labels: Label[
       case 'has': return value === 'attachment' && message.attachments.length > 0;
       case 'before':
       case 'after': {
-        const boundary = Date.parse(value);
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || !Number.isFinite(boundary) || new Date(boundary).toISOString().slice(0, 10) !== value) return false;
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+        const [year, month, day] = value.split('-').map(Number);
+        const boundary = new Date(0);
+        boundary.setHours(0, 0, 0, 0);
+        boundary.setFullYear(year, month - 1, day);
+        if (boundary.getFullYear() !== year || boundary.getMonth() !== month - 1 || boundary.getDate() !== day) return false;
         const date = Date.parse(message.date);
-        return op === 'before' ? date < boundary : date >= boundary;
+        return op === 'before' ? date < boundary.getTime() : date >= boundary.getTime();
       }
       case 'larger': return new TextEncoder().encode(message.text).length + message.attachments.reduce((sum, file) => sum + file.size, 0) > size(value);
       default: return contains(`${message.subject} ${message.text} ${message.from.name} ${message.from.email} ${message.attachments.map((file) => file.name).join(' ')}`, value);

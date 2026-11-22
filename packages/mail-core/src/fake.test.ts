@@ -62,7 +62,7 @@ test('individual operators constrain the result and starred only returns starred
   const api = createFakeMailApi();
   const cases = [
     ['to:alex@example.com', 'to:nobody@example.com'], ['label:projects', 'label:finance'],
-    ['after:2026-11-22', 'after:2026-11-23'], ['larger:200', 'larger:1m'],
+    ['after:2026-11-21', 'after:2026-11-24'], ['larger:200', 'larger:1m'],
     ['subject:"floor plan"', 'subject:"winter schedule"']
   ];
   for (const [matches, misses] of cases) {
@@ -70,6 +70,19 @@ test('individual operators constrain the result and starred only returns starred
     assert.equal((await api.listThreads({ query: `from:mira ${misses}` })).length, 0, misses);
   }
   assert.deepEqual((await api.listThreads({ starred: true })).map((thread) => thread.id), ['visit']);
+});
+
+test('date filters use the same local calendar day as the displayed date', async () => {
+  const original = process.env.TZ;
+  try {
+    process.env.TZ = 'Pacific/Auckland';
+    const api = createFakeMailApi();
+    assert.deepEqual((await api.listThreads({ query: 'from:mira has:attachment after:2026-11-23' })).map((thread) => thread.id), ['plan']);
+    assert.equal((await api.listThreads({ query: 'from:mira has:attachment before:2026-11-23' })).length, 0);
+  } finally {
+    if (original === undefined) delete process.env.TZ;
+    else process.env.TZ = original;
+  }
 });
 
 test('undo restores the exact draft before the deadline, but not at the deadline', async () => {

@@ -48,6 +48,14 @@ test('a long unbroken label fits the actual viewport', async ({ page }) => {
   await accessible(page);
 });
 
+test('a Drive attachment is an HTTPS link without an opener or referrer', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /^Jordan Park.*Site visit next week/ }).click();
+  const link = page.getByRole('link', { name: 'Open Drive link for Site notes' });
+  await expect(link).toHaveAttribute('href', 'https://example.com/drive/site-notes');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+});
+
 test('searches and can star the result', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('searchbox', { name: 'Search mail' }).fill('from:mira@example.com has:attachment');
