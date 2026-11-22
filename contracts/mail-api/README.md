@@ -78,8 +78,8 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - The server keeps a key for `idempotencyRetentionSeconds` (24 h), scoped to the mailbox (or the workspace, for admin routes), together with a fingerprint of the operation, path parameters and body. The record commits in the same transaction as the operation's effect.
 - **A replay** returns the stored status and body, with `Idempotency-Replayed: true`. One exception: a replayed `sendDraft` returns the send's current state (`getSend`), so a stale `pending` and `undoRemainingMs` are never shown after release.
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
-- **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After: 1`.
-- **Only successful (2xx) results are stored.** A 4xx or 5xx had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
+- **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After`. This answer also means the operation may already have taken effect (for example a `sendDraft` committed but not yet confirmed durable), so the client retries with the same key until it gets another answer.
+- **Only successful (2xx) results are stored.** Any 4xx other than `idempotency_in_progress`, and any 5xx, had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
 
 **`If-Match`:**
 - Drafts carry a `revision`. `replaceDraft` and `sendDraft` require `If-Match: <revision>`; `deleteDraft` accepts it.

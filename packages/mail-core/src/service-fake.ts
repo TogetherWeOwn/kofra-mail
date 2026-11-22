@@ -701,6 +701,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         if (!draft) return;
         checkRevision(draft, opts);
         box.drafts.delete(draftId);
+        box.replyRefs.delete(draftId);
         releaseDraftUploads(box, draft, true);
         bump(box);
       },
@@ -727,8 +728,10 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
             id: id(), draftId, state: 'pending', createdAt: iso(now), undoUntil: iso(now + undoRemainingMs), undoRemainingMs,
             recipients: all.map(({ email }) => ({ email, state: 'pending' })),
           };
+          const references = box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo);
           box.drafts.delete(draftId);
-          box.sends.set(send.id, { send, pending: { draft, size, from, references: box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo) } });
+          box.replyRefs.delete(draftId);
+          box.sends.set(send.id, { send, pending: { draft, size, from, references } });
           bump(box);
           return send;
         }, ({ id }) => sendResult(need(box.sends.get(id)).send));
@@ -749,6 +752,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           if (!entry.pending) fail('send_not_pending');
           const draft = { ...entry.pending.draft, revision: id(), updatedAt: iso(now) };
           box.drafts.set(draft.id, draft);
+          if (draft.inReplyTo !== undefined) box.replyRefs.set(draft.id, entry.pending.references);
           entry.send.state = 'cancelled';
           entry.send.undoRemainingMs = 0;
           delete entry.pending;
