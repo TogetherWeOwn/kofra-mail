@@ -89,12 +89,14 @@ test('undo restores the exact draft before the deadline, but not at the deadline
   let now = 100_000;
   const api = createFakeMailApi(() => now);
   const [from] = await api.listIdentities();
-  const draft = { from: from.email, to: ['recipient@example.com'], cc: [], bcc: [], subject: 'Demo', body: 'Hello', attachments: [] };
+  const file = await api.uploadAttachment(new Blob(['restored attachment bytes']), 'demo.txt');
+  const draft = { from: from.email, to: ['recipient@example.com'], cc: [], bcc: [], subject: 'Demo', body: 'Hello', attachments: [file] };
   const first = await api.send(draft);
   const restored = (await api.undoSend(first.id))!;
   assert.ok(restored.id);
   assert.deepEqual(restored, { ...draft, id: restored.id });
   assert.deepEqual(await api.listDrafts(), [restored]);
+  assert.equal(await (await api.downloadAttachment(restored.attachments[0].id)).text(), 'restored attachment bytes');
   assert.equal(await api.undoSend(first.id), undefined);
   const next = await api.send(draft);
   now = next.undoUntil;

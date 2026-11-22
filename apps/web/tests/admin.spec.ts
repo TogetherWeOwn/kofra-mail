@@ -38,4 +38,6 @@ test('adds demo domains, users, aliases and moderated groups', async ({ page }) 
   await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
   await home.click();
   await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole('heading', { name: 'Domains', exact: true })).toBeVisible();
 });

@@ -2,7 +2,7 @@
   import '@fontsource-variable/ibm-plex-sans';
   import 'suite-shell/styles.css';
   import '$lib/mail.css';
-  import { replaceState } from '$app/navigation';
+  import { pushState, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { TopBar } from 'suite-shell';
   import { Archive, File, Inbox, Mail, OctagonAlert, Paperclip, Pencil, Plus, RefreshCw, Shield, Search, Send, Star, Tag, Trash2 } from '@lucide/svelte';
@@ -82,6 +82,7 @@
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.defaultPrevented) return;
       if (!(event.target instanceof Element) || !event.target.closest('a[href="#mail"]')) return;
       event.preventDefault();
+      if (location.hash !== '#mail') pushState('#mail', page.state);
       void navigate('inbox');
     };
     document.addEventListener('click', followMailLink, true);
