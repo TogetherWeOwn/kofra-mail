@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check workflow syntax and security
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ZIZMOR_VERSION: 1.32.0
+          ZIZMOR_SHA256: bb110cc765eca9cd7efb2e284a956be5974c60027b0970f16397d86208a9957b
+        run: |
+          set -euo pipefail
+          a="$RUNNER_TEMP/actionlint.tgz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "$a" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${a}" | sha256sum --check -
+          tar -xzf "$a" -C "$RUNNER_TEMP" actionlint
+          z="$RUNNER_TEMP/zizmor.tgz"
+          curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 -o "$z" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZIZMOR_SHA256}  ${z}" | sha256sum --check -
+          tar -xzf "$z" -C "$RUNNER_TEMP" zizmor
+          "$RUNNER_TEMP/actionlint" -shellcheck= -pyflakes=
+          "$RUNNER_TEMP/zizmor" --offline --no-config --no-ignores .github/workflows
+
+  ci-ok:
+    name: ci-ok
+    needs: [workflow-lint]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CI job to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          jq -e 'length > 0 and all(.[]; .result == "success")' <<< "$NEEDS_JSON"
