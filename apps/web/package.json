@@ -1,0 +1,28 @@
+{
+  "name": "@kofra/mail-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource-variable/ibm-plex-sans": "5.3.0",
+    "@kofra/mail-core": "0.0.0",
+    "@lucide/svelte": "1.77.0"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@playwright/test": "1.65.1",
+    "@sveltejs/adapter-cloudflare": "7.2.10",
+    "@sveltejs/kit": "2.70.4",
+    "@sveltejs/vite-plugin-svelte": "6.2.4",
+    "svelte": "5.59.1",
+    "svelte-check": "4.7.8",
+    "vite": "7.3.8",
+    "wrangler": "4.166.0"
+  }
+}
