@@ -6,7 +6,7 @@ import { attachmentBudget, LIMITS } from './limits.ts';
 import { ROUTES } from './routes.ts';
 import type { ConformanceHarness, TestMessage } from './harness.ts';
 import type { Conditional, Idempotent, MailService } from './service.ts';
-import type { DraftInput, View } from './wire.ts';
+import type { DraftInput, Session, View } from './wire.ts';
 
 const second = 1000;
 const day = 86_400 * second;
@@ -24,6 +24,26 @@ const draftInput = (from: string, patch: Partial<DraftInput> = {}): DraftInput =
   from, to: [{ email: 'casey@example.net' }], cc: [], bcc: [], subject: 'Test draft', body: 'Hello', attachments: [], ...patch,
 });
 const ids = (page: { items: { id: string }[] }) => page.items.map(({ id }) => id);
+
+function requiredMailbox(session: Session): NonNullable<Session['mailbox']> {
+  assert.ok(session.mailbox, 'expected this principal to own a mailbox');
+  return session.mailbox;
+}
+
+// Inspect the public token format only; MAC verification belongs to the content Worker.
+function decodeContentUrl(url: URL) {
+  const match = /^\/v1\/(body|att)\/[^./]+\.([A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+$/.exec(url.pathname);
+  assert.ok(match, 'expected a v1 body or attachment token');
+  const [, purpose, payload] = match;
+  const decoded = Buffer.from(payload, 'base64url');
+  assert.equal(decoded.toString('base64url'), payload);
+  const claims = JSON.parse(decoded.toString('utf8')) as Record<string, unknown>;
+  assert.equal(claims.v, 1);
+  const { iat, exp } = claims;
+  assert.ok(typeof iat === 'number' && Number.isInteger(iat));
+  assert.ok(typeof exp === 'number' && Number.isInteger(exp) && exp > iat);
+  return { purpose, claims, ttl: exp - iat };
+}
 
 function json<T>(result: T): T {
   if (result === undefined) return result; // No response body (DELETE and harness control calls).
@@ -83,14 +103,28 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       });
     }
 
-    run('1. session identifies the mailbox and its primary identity', async (_h, mail) => {
+    run('1. sessions identify the user even before a mailbox is provisioned', async (h, mail) => {
       const session = await mail.getSession();
+      const mailbox = requiredMailbox(session);
       assert.equal(session.workspace.role, 'member');
-      assert.ok(session.mailbox.id);
-      assert.ok(session.mailbox.primaryAddress);
+      assert.ok(mailbox.id);
+      assert.ok(mailbox.primaryAddress);
       assert.ok(session.csrfToken);
       for (const field of Object.keys(LIMITS)) assert.ok(Object.hasOwn(session.limits, field), field);
-      assert.ok((await mail.listIdentities()).items.some((id) => id.primary && id.email === session.mailbox.primaryAddress));
+      assert.ok((await mail.listIdentities()).items.some((id) => id.primary && id.email === mailbox.primaryAddress));
+
+      const newAdmin = h.as('newAdmin');
+      const before = await newAdmin.getSession();
+      assert.equal(before.workspace.id, session.workspace.id);
+      assert.equal(before.workspace.role, 'admin');
+      assert.ok(!Object.hasOwn(before, 'mailbox'));
+      await rejects(newAdmin.listThreads({ view: 'inbox' }), 'forbidden');
+      assert.ok((await newAdmin.listMembers({})).items.some(({ id, hasMailbox }) => id === before.user.id && !hasMailbox));
+      const created = await newAdmin.createMailbox({
+        primaryAddress: `conformance-new-admin@${mailbox.primaryAddress.split('@').at(-1)}`,
+        displayName: before.user.name, ownerUserId: before.user.id,
+      }, key('new-admin-mailbox'));
+      assert.deepEqual((await newAdmin.getSession()).mailbox, { id: created.id, primaryAddress: created.primaryAddress });
     });
 
     run('2. results are JSON-safe, with null allowed only on the last page cursor', async (h, mail) => {
@@ -162,24 +196,41 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(mail.getThread(missing), 'not_found');
     });
 
-    run('6. resources and listings are isolated by session mailbox', async (h, mail) => {
+    run('6. reads, writes and listings respect mailbox and workspace boundaries', async (h, mail) => {
       const other = h.as('other');
-      const { primaryAddress } = (await mail.getSession()).mailbox;
+      const session = await mail.getSession();
+      const mailbox = requiredMailbox(session);
+      const input = draftInput(mailbox.primaryAddress);
       const { threadId, messageId } = await h.deliver(message('Private', { html: '<p>Private</p>', attachments: [file] }));
+      const { messages: [delivered] } = await mail.getThread(threadId);
+      const [{ part }] = delivered.attachments;
       const label = await mail.createLabel({ name: 'Private' }, key('label'));
       const uploaded = await mail.createUpload(upload(), key('file'));
-      const draft = await mail.createDraft(draftInput(primaryAddress), key('draft'));
-      const outgoing = await mail.createDraft(draftInput(primaryAddress), key('outgoing'));
+      const draft = await mail.createDraft(input, key('draft'));
+      const outgoing = await mail.createDraft(input, key('outgoing'));
       const send = await mail.sendDraft(outgoing.id, { ...key('send'), ifMatch: outgoing.revision });
+      const otherInput = draftInput(requiredMailbox(await other.getSession()).primaryAddress);
+      const withUpload = (input: DraftInput): DraftInput => ({ ...input, attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
       await rejects(other.getThread(threadId), 'not_found');
       await rejects(other.getBodyUrl(messageId, { remoteImages: false }), 'not_found');
       await rejects(other.getDraft(draft.id), 'not_found');
-      await rejects(other.renameLabel(label.id, { name: 'Renamed' }), 'not_found');
       await rejects(other.getSend(send.id), 'not_found');
-      const otherFrom = (await other.getSession()).mailbox.primaryAddress;
-      await rejects(other.createDraft(draftInput(otherFrom, {
-        attachments: [{ kind: 'upload', uploadId: uploaded.id }],
-      }), key('draft')), 'not_found'); // The key used in member's mailbox is independent.
+      // Uploads have no get route. The key used in member's mailbox is independent.
+      await rejects(other.createDraft(withUpload(otherInput), key('draft')), 'not_found');
+      await rejects(other.updateThreads({ ids: [threadId], set: { folder: 'trash' } }), 'not_found');
+      await rejects(other.getAttachmentUrl(messageId, part), 'not_found');
+      await rejects(other.saveAttachmentToDrive(messageId, part, key('save')), 'not_found');
+      await rejects(other.replaceDraft(draft.id, otherInput, { ifMatch: draft.revision }), 'not_found');
+      await rejects(other.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision }), 'not_found');
+      await rejects(other.undoSend(send.id, key('undo')), 'not_found');
+      await rejects(other.renameLabel(label.id, { name: 'Renamed' }), 'not_found');
+      assert.equal(await other.deleteDraft(draft.id), undefined);
+      assert.equal(await other.deleteLabel(label.id), undefined);
+      assert.equal(await other.deleteUpload(uploaded.id), undefined);
+      assert.deepEqual(await mail.getDraft(draft.id), draft);
+      assert.ok((await mail.listLabels()).items.some(({ id, name }) => id === label.id && name === label.name));
+      const attached = await mail.createDraft(withUpload(input), key('surviving-upload'));
+      assert.deepEqual(attached.attachments, [{ kind: 'upload', uploadId: uploaded.id, name: uploaded.name, type: uploaded.type, size: uploaded.size }]);
       assert.ok(!ids(await other.listThreads({ view: 'all' })).includes(threadId));
       assert.ok(!ids(await other.listLabels()).includes(label.id));
       assert.ok(!ids(await other.listDrafts({})).includes(draft.id));
@@ -187,6 +238,37 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const received = await h.deliver(message('Other mailbox'), 'other');
       assert.ok(ids(await other.listThreads({ view: 'all' })).includes(received.threadId));
       assert.ok(!ids(await mail.listThreads({ view: 'all' })).includes(received.threadId));
+
+      const admin = h.as('admin');
+      const foreign = h.as('foreignAdmin');
+      const foreignSession = await foreign.getSession();
+      const foreignMailbox = requiredMailbox(foreignSession);
+      assert.equal(foreignSession.workspace.role, 'admin');
+      assert.notEqual(foreignSession.workspace.id, session.workspace.id);
+      const alias = await admin.createAlias({
+        mailboxId: mailbox.id, address: `conformance-private@${mailbox.primaryAddress.split('@').at(-1)}`, sendAs: true,
+      }, key('private-alias'));
+      await rejects(foreign.updateMailbox(mailbox.id, { displayName: 'Foreign update' }), 'not_found');
+      const foreignDomain = foreignMailbox.primaryAddress.split('@').at(-1);
+      assert.ok(foreignDomain);
+      await rejects(foreign.createAlias({
+        mailboxId: mailbox.id, address: `conformance-foreign@${foreignDomain}`, sendAs: true,
+      }, key('foreign-alias')), 'not_found');
+      assert.equal(await foreign.deleteAlias(alias.address), undefined);
+      const localBoxes = await admin.listMailboxes({ limit: session.limits.pageSizeMax });
+      const localBox = localBoxes.items.find(({ id }) => id === mailbox.id);
+      assert.ok(localBox?.aliases.some(({ address }) => address === alias.address));
+      const foreignBoxes = await foreign.listMailboxes({ limit: foreignSession.limits.pageSizeMax });
+      assert.ok(ids(foreignBoxes).includes(foreignMailbox.id));
+      assert.ok(ids(foreignBoxes).every((id) => !ids(localBoxes).includes(id)));
+      const localMembers = await admin.listMembers({ limit: session.limits.pageSizeMax });
+      const foreignMembers = await foreign.listMembers({ limit: foreignSession.limits.pageSizeMax });
+      assert.ok(ids(foreignMembers).includes(foreignSession.user.id));
+      assert.ok(ids(foreignMembers).every((id) => !ids(localMembers).includes(id)));
+      const localDomains = (await admin.listDomains()).items.map(({ name }) => name);
+      const foreignDomains = (await foreign.listDomains()).items.map(({ name }) => name);
+      assert.ok(foreignDomains.includes(foreignDomain));
+      assert.ok(foreignDomains.every((name) => !localDomains.includes(name)));
     });
 
     run('7. thread updates set values atomically and update unread counts', async (h, mail) => {
@@ -283,9 +365,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(thread.messages.every((m) => !m.labelIds.includes(label.id)));
     });
 
-    run('11. idempotency replays creates and rejects mismatched or missing keys', async (h, mail) => {
-      const { mailbox, limits } = await mail.getSession();
-      const input = draftInput(mailbox.primaryAddress);
+    run('11. idempotency replays successes but lets failed actions retry', async (h, mail) => {
+      const session = await mail.getSession();
+      const input = draftInput(requiredMailbox(session).primaryAddress);
       async function verify<T>(create: (options: Idempotent) => Promise<T>, change: (options: Idempotent) => Promise<T>, token: string) {
         const first = await create(key(token));
         assert.deepEqual(await create(key(token)), first);
@@ -308,14 +390,24 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.deepEqual(await mail.createDraft({ ...rest, from }, key('draft')), draft);
       await rejects(mail.createLabel({ name: label.name }, key('duplicate')), 'label_exists');
       await mail.deleteLabel(label.id);
-      await rejects(mail.createLabel({ name: label.name }, key('duplicate')), 'label_exists');
-      await h.advance(limits.idempotencyRetentionSeconds * second);
       const recreated = await mail.createLabel({ name: label.name }, key('duplicate'));
       assert.notEqual(recreated.id, label.id);
+      assert.equal(recreated.name, label.name);
+
+      const sendOptions = key('revision-retry');
+      await rejects(mail.sendDraft(attached.id, { ...sendOptions, ...noRevision }), 'precondition_required');
+      await rejects(mail.sendDraft(attached.id, { ...sendOptions, ifMatch: draft.revision }), 'revision_mismatch');
+      const sent = await mail.sendDraft(attached.id, { ...sendOptions, ifMatch: attached.revision });
+      assert.equal(sent.draftId, attached.id);
+      assert.equal(sent.state, 'pending');
+
+      await h.advance(session.limits.idempotencyRetentionSeconds * second);
+      const afterExpiry = await mail.createLabel({ name: 'After key expiry' }, key('duplicate'));
+      assert.notEqual(afterExpiry.id, recreated.id);
     });
 
     run('12. drafts require current revisions and valid send-as identities', async (_h, mail) => {
-      const input = draftInput((await mail.getSession()).mailbox.primaryAddress);
+      const input = draftInput(requiredMailbox(await mail.getSession()).primaryAddress);
       const draft = await mail.createDraft(input, key('draft'));
       assert.ok(draft.revision);
       const replaced = await mail.replaceDraft(draft.id, { ...input, subject: 'Edited' }, { ifMatch: draft.revision });
@@ -332,7 +424,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
     });
 
     run('13. send checks enforce valid recipients, file count, size and revision', async (_h, mail) => {
-      const { limits, mailbox } = await mail.getSession();
+      const session = await mail.getSession();
+      const { limits } = session;
+      const mailbox = requiredMailbox(session);
       const input = draftInput(mailbox.primaryAddress);
       const send = async (patch: Partial<DraftInput>, token: string) => {
         const draft = await mail.createDraft({ ...input, ...patch }, key(`draft-${token}`));
@@ -348,9 +442,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         attachments.push({ kind: 'upload', uploadId: file.id });
       }
       await rejects(send({ attachments }, 'parts'), 'too_many_attachments');
-      const rawBytes = Math.ceil(limits.outboundMessageBytes * 3 / 4) + 1;
-      assert.ok(rawBytes > attachmentBudget(limits, Buffer.byteLength(input.body)));
-      const large = await mail.createUpload(upload(new Blob([new Uint8Array(rawBytes)])), key('large'));
+      const rawBudget = attachmentBudget(limits, Buffer.byteLength(input.body));
+      const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
+      assert.equal((await send({ attachments: [{ kind: 'upload', uploadId: boundary.id }] }, 'fits')).state, 'pending');
+      const large = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget + 1)])), key('large'));
       const oversize = await rejects(send({ attachments: [{ kind: 'upload', uploadId: large.id }] }, 'oversize'), 'message_too_large');
       assert.equal(oversize.limit, limits.outboundMessageBytes);
       const current = await mail.createDraft(input, key('stale'));
@@ -367,8 +462,11 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(Date.parse(send.undoUntil), Date.parse(send.createdAt) + undoSeconds * second);
       assert.ok(!ids(await mail.listDrafts({})).includes(draft.id));
       const other = await mail.createDraft(draftInput(defaultFrom, { subject: 'Send this one' }), key('other-draft'));
-      const releasing = await mail.sendDraft(other.id, { ...key('other-send'), ifMatch: other.revision });
-      assert.deepEqual(await mail.sendDraft(draft.id, options), send);
+      const releaseOptions = { ...key('other-send'), ifMatch: other.revision };
+      const releasing = await mail.sendDraft(other.id, releaseOptions);
+      const replayed = await mail.sendDraft(draft.id, options);
+      assert.equal(replayed.id, send.id);
+      assert.equal(replayed.state, 'pending');
       assert.deepEqual(new Set(ids(await mail.listSends({ active: true }))), new Set([send.id, releasing.id]));
       const undo = await mail.undoSend(send.id, key('undo'));
       assert.equal(undo.id, draft.id);
@@ -381,6 +479,11 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const released = await mail.getSend(releasing.id);
       assert.notEqual(released.state, 'pending');
       assert.ok(released.messageId);
+      assert.equal(released.undoRemainingMs, 0);
+      const releasedReplay = await mail.sendDraft(other.id, releaseOptions);
+      assert.equal(releasedReplay.id, released.id);
+      assert.equal(releasedReplay.state, released.state);
+      assert.equal(releasedReplay.undoRemainingMs, 0);
       const sent = await mail.listThreads({ view: 'sent' });
       const copies = (await Promise.all(sent.items.map(({ id }) => mail.getThread(id)))).flatMap(({ messages }) => messages);
       assert.ok(copies.some((m) => m.id === released.messageId && m.sent));
@@ -388,8 +491,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(mail.undoSend(releasing.id, key('too-late')), 'send_not_pending');
     });
 
-    run('15. uploads enforce byte bounds and keep only referenced files past expiry', async (h, mail) => {
-      const { limits, mailbox } = await mail.getSession();
+    run('15. drafts keep referenced uploads and forwarded parts past source expiry', async (h, mail) => {
+      const session = await mail.getSession();
+      const { limits } = session;
+      const mailbox = requiredMailbox(session);
       await rejects(mail.createUpload(upload(new Blob([new Uint8Array(limits.uploadBytes + 1)])), key('huge')), 'payload_too_large');
       const loose = await mail.createUpload(upload(), key('loose'));
       const retained = await mail.createUpload(upload(), key('retained'));
@@ -400,6 +505,33 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.deepEqual((await mail.getDraft(draft.id)).attachments, draft.attachments);
       const replaced = await mail.replaceDraft(draft.id, withUpload(retained.id), { ifMatch: draft.revision });
       assert.deepEqual(replaced.attachments, draft.attachments);
+
+      const source = await h.deliver(message('Forward this file', { attachments: [file] }));
+      const { messages: [delivered] } = await mail.getThread(source.threadId);
+      const [{ part }] = delivered.attachments;
+      await mail.updateThreads({ ids: [source.threadId], set: { folder: 'trash' } });
+      const forwardInput = draftInput(mailbox.primaryAddress, {
+        attachments: [{ kind: 'message', messageId: source.messageId, part }],
+      });
+      const forwarded = await mail.createDraft(forwardInput, key('forward'));
+      const expected = [{ kind: 'message', messageId: source.messageId, part, name: file.name, type: file.type, size: file.bytes.length }];
+      await h.advance(limits.spamTrashRetentionDays * day);
+      await rejects(mail.getThread(source.threadId), 'not_found');
+      assert.deepEqual((await mail.getDraft(forwarded.id)).attachments, expected);
+      await rejects(mail.createDraft(forwardInput, key('expired-source')), 'not_found');
+      const edited = await mail.replaceDraft(forwarded.id, { ...forwardInput, subject: 'Forward after expiry' }, { ifMatch: forwarded.revision });
+      assert.deepEqual(edited.attachments, expected);
+      const send = await mail.sendDraft(edited.id, { ...key('send-forward'), ifMatch: edited.revision });
+      assert.equal(send.state, 'pending');
+      await h.advance((await mail.getSettings()).undoSeconds * second);
+      const sent = await mail.getSend(send.id);
+      assert.ok(sent.messageId);
+      const copies = await mail.listThreads({ view: 'sent' });
+      const messages = (await Promise.all(copies.items.map(({ id }) => mail.getThread(id)))).flatMap(({ messages }) => messages);
+      const sentCopy = messages.find(({ id }) => id === sent.messageId);
+      assert.deepEqual(sentCopy?.attachments.map(({ name, type, size }) => ({ name, type, size })), [
+        { name: file.name, type: file.type, size: file.bytes.length },
+      ]);
     });
 
     run('16. settings patch only specified fields and validate sender and undo duration', async (_h, mail) => {
@@ -413,28 +545,47 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.deepEqual(await mail.getSettings(), expected);
     });
 
-    run('17. content URLs use the configured content origin and short expiry', async (h, mail) => {
-      const { limits } = await mail.getSession();
+    run('17. content URLs carry scoped claims on the configured content origin', async (h, mail) => {
+      const session = await mail.getSession();
+      const { limits, workspace, user } = session;
+      const mailbox = requiredMailbox(session);
       const html = await h.deliver(message('Formatted', {
         html: '<p>Formatted</p><img src="https://example.net/image.png">', remoteImages: true, attachments: [file],
       }));
       const { messages: [delivered] } = await mail.getThread(html.threadId);
       const now = Date.parse(delivered.receivedAt);
+      const [{ part }] = delivered.attachments;
       const without = await mail.getBodyUrl(html.messageId, { remoteImages: false });
       const withImages = await mail.getBodyUrl(html.messageId, { remoteImages: true });
-      const attachment = await mail.getAttachmentUrl(html.messageId, delivered.attachments[0].part);
+      const attachment = await mail.getAttachmentUrl(html.messageId, part);
       const plain = await h.deliver(message('Plain'));
-      const [after] = (await mail.getThread(plain.threadId)).messages;
-      for (const content of [without, withImages, attachment]) {
+      const plainBody = await mail.getBodyUrl(plain.messageId, { remoteImages: false });
+      // Bracket the mint times with deliveries so this also works over HTTP.
+      const marker = await h.deliver(message('After URL minting'));
+      const [after] = (await mail.getThread(marker.threadId)).messages;
+      const cases = [
+        { content: without, purpose: 'body', msg: html.messageId, ri: false },
+        { content: withImages, purpose: 'body', msg: html.messageId, ri: true },
+        { content: attachment, purpose: 'att', msg: html.messageId, part },
+        { content: plainBody, purpose: 'body', msg: plain.messageId, ri: false },
+      ];
+      for (const { content, purpose, msg, ri, part } of cases) {
         const url = new URL(content.url);
         assert.equal(url.origin, new URL(h.contentOrigin).origin);
         assert.ok(url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)));
+        const token = decodeContentUrl(url);
+        assert.equal(token.purpose, purpose);
+        assert.equal(token.claims.ws, workspace.id);
+        assert.equal(token.claims.mb, mailbox.id);
+        assert.equal(token.claims.msg, msg);
+        assert.equal(token.claims.sub, user.id);
+        assert.equal(token.claims.ri, ri);
+        assert.equal(token.claims.part, part);
+        assert.ok(token.ttl <= limits.contentUrlSeconds);
         assert.ok(Date.parse(content.expiresAt) > now);
         assert.ok(Date.parse(content.expiresAt) <= Date.parse(after.receivedAt) + limits.contentUrlSeconds * second);
       }
-      assert.notEqual(without.url, withImages.url);
-      await rejects(mail.getBodyUrl(plain.messageId, { remoteImages: false }), 'no_html_body');
-      await rejects(mail.getAttachmentUrl(html.messageId, delivered.attachments[0].part + 1), 'not_found');
+      await rejects(mail.getAttachmentUrl(html.messageId, part + 1), 'not_found');
     });
 
     run('18. every admin route enforces role and admin writes enforce recent sign-in', async (h, mail) => {
@@ -454,11 +605,19 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         assert.equal(error.maxAgeSeconds, 600);
       }
       await stale.listDomains();
+      const domain = { name: 'reauth.example.com', kind: 'secondary' } as const;
+      const options = key('admin-replay');
+      await h.as('admin').addDomain(domain, options);
+      await rejects(mail.addDomain(domain, options), 'forbidden');
+      const error = await rejects(stale.addDomain(domain, options), 'reauth_required');
+      assert.equal(error.maxAgeSeconds, 600);
     });
 
     run('19. admin directory validates domains, mailbox addresses and alias limits', async (h, mail) => {
       const admin = h.as('admin');
-      const { limits, mailbox } = await mail.getSession();
+      const session = await mail.getSession();
+      const { limits } = session;
+      const mailbox = requiredMailbox(session);
       const domain = { name: 'secondary.example.com', kind: 'secondary' } as const;
       const primaryDomain = mailbox.primaryAddress.split('@').at(-1);
       const added = await admin.addDomain(domain, key('domain'));
@@ -466,8 +625,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(added.sending, 'pending');
       await rejects(admin.addDomain(domain, key('domain-again')), 'domain_exists');
       assert.ok((await admin.listDomains()).items.some(({ name }) => name === added.name));
-      const owner = (await admin.listMembers({})).items.find(({ hasMailbox }) => !hasMailbox);
-      assert.ok(owner, 'harness needs a workspace member without a mailbox');
+      const members = (await admin.listMembers({})).items;
+      const invited = members.find(({ status, hasMailbox }) => status === 'invited' && !hasMailbox);
+      assert.ok(invited, 'harness needs an invited member without a mailbox');
+      const { user: owner } = await h.as('newAdmin').getSession();
       const input = { displayName: 'New owner', ownerUserId: owner.id };
       await rejects(admin.createMailbox({ ...input, primaryAddress: 'new@unknown.example.net' }, key('unknown')), 'domain_not_in_workspace');
       await rejects(admin.createMailbox({ ...input, primaryAddress: mailbox.primaryAddress }, key('taken')), 'address_taken');
@@ -489,14 +650,18 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(error.limit, limits.aliasesPerMailbox);
       await admin.deleteAlias(alias.address);
       assert.ok(!(await mail.listIdentities()).items.some(({ email }) => email === alias.address));
+      const transferred = await admin.updateMailbox(mailbox.id, { ownerUserId: invited.id });
+      assert.equal(transferred.ownerUserId, invited.id);
+      await rejects(mail.listThreads({ view: 'inbox' }), 'forbidden');
     });
 
     run('20. Drive copy grants produce usable uploads, or Drive is unavailable', async (h, mail) => {
-      const { features, mailbox } = await mail.getSession();
-      if (!features.drive) {
+      const session = await mail.getSession();
+      if (!session.features.drive) {
         await rejects(mail.importFromDrive({ pickId: missing, mode: 'copy' }, key('drive')), 'feature_unavailable');
         return;
       }
+      const mailbox = requiredMailbox(session);
       assert.ok(h.drivePick);
       const { attachments } = await mail.importFromDrive({ pickId: await h.drivePick(), mode: 'copy' }, key('drive'));
       assert.equal(attachments.length, 1);

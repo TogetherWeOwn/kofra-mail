@@ -47,10 +47,10 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - No public route serves this API before I1.
 
 **Rules for every request:**
-- **`GET /session`** returns the user, mailbox, workspace role, `csrfToken`, `authTime`, `limits`, `features` and `state`. The client calls it first.
+- **`GET /session`** returns the user, mailbox, workspace role, `csrfToken`, `authTime`, `limits`, `features` and `state`. The client calls it first. It answers every signed-in workspace member, including one without a mailbox (then `mailbox` is absent).
 - **No session or an expired session:** 401 `unauthenticated`. The client starts sign-in again.
 - **CSRF:** every non-GET request must send `X-CSRF-Token` with the session's token. The server also checks `Origin` against the app origin. A failed check answers 403 `csrf_failed`. The token is an HMAC of the session id, so it changes whenever the session does.
-- **Mailbox binding:** the user is bound to a mailbox by the directory row created by an admin (`ownerUserId`). If the session's user has no mailbox, every user route answers 403 `forbidden`.
+- **Mailbox binding:** the user is bound to a mailbox by the directory row created by an admin (`ownerUserId`). The server resolves the mailbox on every request, never from a cached session value, so an owner change takes effect on the next request; it also closes the previous owner's live-update sockets. If the session's user has no mailbox, every user route except `getSession` answers 403 `forbidden`; admin routes still work.
 - **Admin:** routes with `access: 'admin'` need `workspace.role === 'admin'`, otherwise 403 `forbidden`.
 - **Re-authentication:** routes with `reauth: true` also need `authTime` at most 10 minutes old. Otherwise the server answers 403 `reauth_required` with `maxAgeSeconds: 600`. The client signs in again with `max_age=600` and then retries.
 - **Existence is not leaked:** a resource id that is not in the session's mailbox (or workspace, for admin routes) answers 404 `not_found`, exactly like an id that never existed.
@@ -68,11 +68,12 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 **`Idempotency-Key`:**
 - Routes with `idempotency: 'required'` reject a request without the header with 428 `precondition_required`.
 - The key is 1 to 64 characters of `[A-Za-z0-9_-]`. The client makes one key per user action (a UUID) and reuses it on every retry of that action.
-- The server keeps a key for `idempotencyRetentionSeconds` (24 h), scoped to the mailbox (or the workspace, for admin routes), together with a fingerprint of the operation, path parameters and body.
-- **A replay** returns the stored status and body, with `Idempotency-Replayed: true`.
+- **Checks before the key:** authentication, CSRF, `access`, re-authentication, rate limits, `If-Match` (428 and 412) and the in-progress check all run before an idempotency record is created. Their answers are never stored.
+- The server keeps a key for `idempotencyRetentionSeconds` (24 h), scoped to the mailbox (or the workspace, for admin routes), together with a fingerprint of the operation, path parameters and body. The record commits in the same transaction as the operation's effect.
+- **A replay** returns the stored status and body, with `Idempotency-Replayed: true`. One exception: a replayed `sendDraft` returns the send's current state (`getSend`), so a stale `pending` and `undoRemainingMs` are never shown after release.
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
 - **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After: 1`.
-- Only successful results and 4xx results are stored. A 5xx is not stored, so the retry runs again.
+- **Only successful (2xx) results are stored.** A 4xx or 5xx had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
 
 **`If-Match`:**
 - Drafts carry a `revision`. `replaceDraft` and `sendDraft` require `If-Match: <revision>`; `deleteDraft` accepts it.
@@ -83,7 +84,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - `updateThreads`, `updateSettings`, `renameLabel` and `updateMailbox` set values, so repeating them has the same effect.
 - `DELETE` answers 204 whether or not the resource still exists in the session's scope.
 
-**`state`:** every mailbox read returns `state`, and every mailbox write returns the new `state`. Live updates push only the new `state` (section 9).
+**`state`:** every mailbox read returns `state`, and `updateThreads` returns the new `state`. Other writes return the resource they changed; every change is announced by the live-update push of the new `state` (section 9).
 
 ## 6. Errors
 
@@ -113,7 +114,7 @@ Errors are RFC 9457 `application/problem+json`, in the same shape as the Kofra A
 | `listThreads` | `GET /threads?view=&labelId=&q=&tz=&cursor=&limit=` | `view` is required; `q` searches within the view |
 | `getThread` | `GET /threads/{threadId}` | At most 100 messages, so it is not paged |
 | `updateThreads` | `POST /threads/update` | `{ ids (≤100), set }`; all or nothing |
-| `getBodyUrl` | `POST /messages/{messageId}/body-url` | `{ remoteImages }` → signed content URL; 404 `no_html_body` |
+| `getBodyUrl` | `POST /messages/{messageId}/body-url` | `{ remoteImages }` → signed content URL, for HTML and plain-text messages |
 | `getAttachmentUrl` | `POST /messages/{messageId}/attachments/{part}/url` | Signed download URL |
 | `saveAttachmentToDrive` | `POST /messages/{messageId}/attachments/{part}/save-to-drive` | Idem; needs `features.drive` |
 | `listLabels`, `createLabel`, `renameLabel`, `deleteLabel` | `/labels`, `/labels/{labelId}` | Create is Idem; delete removes the label from every message |
@@ -171,7 +172,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Message text:**
 - `text` holds at most `messageTextBytes` of plain text, with `textTruncated` set when there is more.
-- The full message is always available through `getBodyUrl`. The content origin renders plain-text-only messages as escaped text.
+- The full message is always available through `getBodyUrl`, for every message. The content origin renders plain-text-only messages as escaped text.
 
 ### 8.2 Search
 
@@ -209,8 +210,9 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Attachment references:**
 - `upload`: an unexpired upload of this mailbox.
-- `message`: an attachment part of a message in this mailbox (forwarding).
+- `message`: an attachment part of a message in this mailbox (forwarding). The draft holds a reference on that part, so Trash expiry of the source message cannot remove it before the draft is sent or deleted.
 - `link`: a credential-free `https:` URL; it is sent as a link in the body and does not count toward `attachmentsPerMessage`.
+- **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft over the attachment budget is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
 - An upload referred to by a draft does not expire.
 
 **`sendDraft` checks** (each a 422 code):
@@ -230,7 +232,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - A retried undo with the same key returns the same draft.
 
 **After release:**
-- The sent copy appears in this mailbox (`sent: true`, folder `archive`, or `inbox` when sent to oneself) with `send.state`.
+- The sent copy appears in this mailbox (`sent: true`, folder `archive`, or `inbox` when sent to oneself) with `send.state`. Bcc recipients are kept only in the sender's index, never in any stored or delivered MIME.
 - `getSend` reports per-recipient status: `pending`, `sent`, `failed` or `suppressed`.
 - `delayed` means the shared daily sending quota is reached. `delayedUntil` gives the next attempt, and the message is not lost.
 
@@ -278,7 +280,8 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 
 - `GET /api/v1/events` upgrades to a WebSocket on the same session.
 - The server sends `{"type":"state","state":"<new state>"}` after any change to the mailbox. The client refetches what it shows.
-- The socket carries no message data. It is closed when the session ends, and the client reconnects with backoff.
+- The upgrade checks `Origin` against the app origin, like every non-GET request, because `SameSite=Lax` cookies are also sent from sibling same-site hosts.
+- The socket carries no message data. It is closed when the session ends or the mailbox changes owner, and the client reconnects with backoff.
 
 ## 10. Limits
 
@@ -310,9 +313,9 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 - `packages/mail-core` runs the suite against the fake in CI;
 - the backend runs it over HTTP against local workerd once it serves `/api/v1`.
 
-The harness (`src/harness.ts`) provides sessions for four principals, inbound delivery, a clock and the content origin. Each case gets a fresh harness. Cases:
+The harness (`src/harness.ts`) provides sessions for six principals in two workspaces, inbound delivery, a clock and the content origin. Each case gets a fresh harness. Content URLs follow the format of [content-origin.md](../../docs/content-origin.md) section 2.1, so the suite decodes their claims (it does not verify the MAC; tampering and expiry are the content Worker's own acceptance tests). Cases:
 
-1. **Session:** `getSession` has the member's mailbox, `role: 'member'`, a non-empty `csrfToken` and every `LIMITS` key. The primary address is an identity with `primary: true`.
+1. **Session:** `getSession` has the member's mailbox, `role: 'member'`, a non-empty `csrfToken` and every `LIMITS` key. The primary address is an identity with `primary: true`. `newAdmin` gets a session with no `mailbox`, gets `forbidden` on `listThreads`, and can call `listMembers` and `createMailbox` for itself.
 2. **JSON:** every result of every call in this suite equals its own `JSON.parse(JSON.stringify(…))`, and has no `null` except `nextCursor`.
 3. **Errors:** every failure is a `MailApiError` whose `code` is in the catalogue and whose `status` equals `ERROR_STATUS[code]`.
 4. **Listing:**
@@ -325,9 +328,11 @@ The harness (`src/harness.ts`) provides sessions for four principals, inbound de
    - Text longer than `messageTextBytes` is cut to that size, with `textTruncated: true`.
    - An unknown id answers `not_found`.
 6. **Isolation:**
-   - Ids of `member`'s thread, message, draft, upload, label and send answer `not_found` to `other`.
+   - Ids of `member`'s thread, message, draft, upload, label and send answer `not_found` to `other` on reads.
+   - On writes too: `other`'s `updateThreads`, `getAttachmentUrl`, `saveAttachmentToDrive` (when `features.drive`; otherwise `feature_unavailable` comes first), `replaceDraft`, `sendDraft`, `undoSend` and `renameLabel` on those ids answer `not_found`; `other`'s `deleteDraft`, `deleteLabel` and `deleteUpload` answer 204, and the resource still exists for `member` afterwards.
    - `other`'s lists do not contain them.
    - A message delivered to `other` never appears for `member`.
+   - `foreignAdmin`'s `updateMailbox` and `createAlias` with W1 mailbox ids answer `not_found`; its `deleteAlias` of a W1 alias answers 204 and the alias still exists; its lists contain nothing of W1.
 7. **Thread updates:**
    - Moving to `trash` shows the thread in `trash` with `expiresAt` 30 days ahead, and removes it from `inbox` and `all`.
    - Repeating the same update gives the same result.
@@ -362,7 +367,7 @@ The harness (`src/harness.ts`) provides sessions for four principals, inbound de
 14. **Send and undo:**
     - `sendDraft` returns `state: 'pending'`, `undoUntil` equal to now plus `undoSeconds`, and the draft leaves `listDrafts`.
     - `undoSend` returns the draft under the same id, and the send becomes `cancelled`. Replaying the undo with the same key returns the same draft.
-    - Replaying `sendDraft` with its key returns the same send id and creates no second send.
+    - Replaying `sendDraft` with its key returns the same send id and creates no second send; after release, the replay reports the current state with `undoRemainingMs: 0`.
     - **Two sends in one undo window:** undo one; after `advance(undoSeconds)` only the other leaves `pending`. Its sent copy is in view `sent` with `sent: true`, and undoing it answers `send_not_pending`.
 15. **Uploads:**
     - `uploadBytes + 1` bytes answers `payload_too_large`.
@@ -374,9 +379,9 @@ The harness (`src/harness.ts`) provides sessions for four principals, inbound de
     - `undoSeconds: 7` answers `invalid_request`.
 17. **Content URLs:**
     - For an HTML message, `getBodyUrl` returns an `https:` URL (or loopback `http:` in tests) on `contentOrigin`, never on the app origin, with `expiresAt` at most `contentUrlSeconds` ahead.
-    - `remoteImages: true` and `remoteImages: false` give different URLs.
-    - A text-only message answers `no_html_body`.
-    - `getAttachmentUrl` returns a URL on `contentOrigin`; an unknown part answers `not_found`.
+    - Decoded claims: purpose `body`, the message id, the session's mailbox and `ri` equal to the `remoteImages` asked for; `exp - iat ≤ contentUrlSeconds`.
+    - A text-only message also gets a `body` URL.
+    - `getAttachmentUrl` returns a URL on `contentOrigin` with purpose `att` and the part; an unknown part answers `not_found`.
 18. **Admin access:**
     - `member` gets `forbidden` on every admin operation.
     - `staleAdmin` gets `reauth_required`, with `maxAgeSeconds: 600`, on every admin operation with `reauth: true`.
@@ -386,6 +391,7 @@ The harness (`src/harness.ts`) provides sessions for four principals, inbound de
     - `createAlias` with `sendAs: true` appears in the owner's `listIdentities` (owner session) with `kind: 'alias'`.
     - The 31st alias answers `limit_reached`.
     - After `deleteAlias`, the identity is gone.
+    - After `updateMailbox` moves mailbox A to the invited member, `member`'s next `listThreads` answers `forbidden`.
 20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`.
 
 ## 12. Moving the M2 UI to this contract
@@ -401,12 +407,17 @@ The M2 UI calls `MailApi` in `@kofra/mail-core`, an in-process port that predate
 | `getMessageContent` | `getBodyUrl` | Returns `{ url, expiresAt }`; re-mint after expiry |
 | `downloadAttachment` (Blob) | `getAttachmentUrl` | Download from the content origin; no blob on the app origin |
 | `saveDraft` | `createDraft` / `replaceDraft` | Idempotency key on create, `If-Match` on replace |
+| `discardDraft` | `deleteDraft` | |
+| `listDrafts` | `listDrafts` | Paged |
 | `send(draft)` | `replaceDraft`, then `sendDraft` | `undoRemainingMs` drives the toast |
 | `undoSend` | `undoSend` | Takes an idempotency key |
 | `uploadAttachment` | `createUpload` | Returns `Upload`; the draft refers to it by id |
 | `releaseAttachment` | `deleteUpload` | |
 | `listDriveFiles`, `attachFromDrive` | `importFromDrive` | The Drive-hosted picker replaces the in-app list |
 | `saveToDrive(id)` | `saveAttachmentToDrive(messageId, part)` | |
+| `listUsers` | `listMailboxes` | Paged; aliases included |
 | `addUser` | `createMailbox` | Needs `ownerUserId` from `listMembers` |
+| `listDomains`, `addDomain(name, kind)` | `listDomains`, `addDomain` | Only `secondary` or `alias`; the primary domain is set when the workspace is created |
+| `getSettings`, `updateSettings` | `getSettings`, `updateSettings` | `PATCH` is partial |
 | `addAlias(userEmail, alias)` | `createAlias({ mailboxId, address, sendAs })` | |
 | `listGroups`, `addGroup` | not in version 1 | Demo-only |

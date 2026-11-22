@@ -101,9 +101,10 @@ export const LIMITS = {
 
 /**
  * Raw attachment bytes that fit in one outbound message with `bodyBytes` of
- * body text: base64 grows bytes by 4/3, and 16 KiB is reserved for headers and
- * MIME structure. The server's encoded-size check at send time is authoritative.
+ * body text. Base64 grows bytes by 4/3 and MIME adds CRLF after every 76
+ * encoded characters (78/76); 16 KiB is reserved for headers and MIME
+ * structure. The server's encoded-size check at send time is authoritative.
  */
 export function attachmentBudget(limits: Pick<Limits, 'outboundMessageBytes'>, bodyBytes: number): number {
-  return Math.max(0, Math.floor(((limits.outboundMessageBytes - bodyBytes - 16 * KiB) * 3) / 4));
+  return Math.max(0, Math.floor(((limits.outboundMessageBytes - bodyBytes - 16 * KiB) * 3 * 76) / (4 * 78)));
 }

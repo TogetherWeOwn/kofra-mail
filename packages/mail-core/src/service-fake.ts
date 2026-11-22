@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS as limits, MailApiError, ROUTES, VIEWS, isMailApiError, problem } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, problem } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
   DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
-  Message, Operation, Page, Principal, Problem, Send, Settings, TestMessage, ThreadSummary, Upload, View,
+  Message, Operation, Page, Principal, Send, Settings, TestMessage, ThreadSummary, Upload, View,
 } from '@kofra/mail-contract';
 
 const second = 1000;
@@ -65,11 +65,24 @@ interface StoredSend {
   pending?: { draft: Draft; size: number; from: Address; references: Id[] };
 }
 interface Replay {
-  fingerprint: Promise<string>;
+  fingerprint: string;
   expires: number;
-  outcome?: { value: unknown } | { error: Problem };
+  value: unknown;
+}
+interface ReplayScope {
+  committed: Map<string, Replay>;
+  inProgress: Map<string, Promise<string>>;
+}
+const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Map() });
+interface Workspace {
+  id: Id;
+  boxes: Map<Id, Mailbox>;
+  members: Map<Id, Omit<Member, 'hasMailbox'>>;
+  domains: Map<string, Domain>;
+  keys: ReplayScope;
 }
 interface Mailbox {
+  workspace: Workspace;
   directory: AdminMailbox;
   version: number;
   threads: Map<Id, StoredMessage[]>;
@@ -78,7 +91,7 @@ interface Mailbox {
   drafts: Map<Id, Draft>;
   sends: Map<Id, StoredSend>;
   uploads: Map<Id, Upload>;
-  keys: Map<string, Replay>;
+  keys: ReplayScope;
   training: Map<string, { spam: number; ham: number }>;
   driveFiles: Map<Id, { name: string; size: number; type: string }>;
   settings: Settings;
@@ -156,38 +169,45 @@ async function sha256(blob: Blob): Promise<string> {
 
 /** Test/demo fixture. Never binds a real session, delivers mail, or serves content bytes. */
 export function createFakeMailHarness(options: { contentOrigin?: string; start?: number } = {}): ConformanceHarness {
-  const contentOrigin = new URL(options.contentOrigin ?? 'https://content.example-usercontent.net').origin;
+  const contentOrigin = new URL(options.contentOrigin ?? 'https://content.usercontent.example').origin;
   const start = options.start ?? Date.parse('2026-11-22T12:00:00Z');
   let now = start;
   let sequence = 0;
   const id = () => `demo-${(++sequence).toString(36).padStart(8, '0')}`;
-  const boxes = new Map<Id, Mailbox>();
-  const members = new Map<Id, Omit<Member, 'hasMailbox'>>();
-  const domains = new Map<string, Domain>([
-    ['example.com', { name: 'example.com', kind: 'primary', routing: 'active', sending: 'active' }],
-    ['example.net', { name: 'example.net', kind: 'alias', aliasOf: 'example.com', routing: 'active', sending: 'active' }],
-  ]);
-  const workspaceKeys = new Map<string, Replay>();
+  const workspaceFixture = (id: Id, domain: string): Workspace => ({
+    id, boxes: new Map(), members: new Map(), keys: replayScope(),
+    domains: new Map([[domain, { name: domain, kind: 'primary', routing: 'active', sending: 'active' }]]),
+  });
+  const local = workspaceFixture('demo-workspace', 'example.com');
+  local.domains.set('example.net', { name: 'example.net', kind: 'alias', aliasOf: 'example.com', routing: 'active', sending: 'active' });
+  const foreign = workspaceFixture('demo-foreign-workspace', 'example.org');
+  const workspaces = [local, foreign];
+  const workspaceFor = (principal: Principal) => principal === 'foreignAdmin' ? foreign : local;
+  const userIdFor = (principal: Principal) => principal === 'staleAdmin' ? 'admin' : principal;
   const cursors = new Map<string, Cursor>();
   const picks = new Map<string, { mailboxId: Id; expires: number }>();
-  const driveFile = { name: 'demo.txt', type: 'text/plain', bytes: new Blob(['Demo Drive file']) };
+  const driveFileText = 'Demo Drive file';
+  const driveFile = { name: 'demo.txt', type: 'text/plain', size: bytes(driveFileText), digest: createHash('sha256').update(driveFileText).digest('hex') };
 
-  function newMailbox(primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
+  function newMailbox(workspace: Workspace, primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
     const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
-    boxes.set(directory.id, {
-      directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), sends: new Map(),
-      uploads: new Map(), keys: new Map(), training: new Map(), driveFiles: new Map(),
+    workspace.boxes.set(directory.id, {
+      workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), sends: new Map(),
+      uploads: new Map(), keys: replayScope(), training: new Map(), driveFiles: new Map(),
       settings: { signature: '', undoSeconds: 10, defaultFrom: primaryAddress, replyFromReceivedAddress: true },
     });
     return directory;
   }
-  for (const [user, name] of [['member', 'Member'], ['other', 'Other Member'], ['admin', 'Administrator'], ['invited', 'Invited Member']]) {
-    const email = `${user}@example.com`;
+  for (const [user, name] of [['member', 'Member'], ['other', 'Other Member'], ['admin', 'Administrator'], ['invited', 'Invited Member'], ['newAdmin', 'New Administrator']]) {
+    const email = `${user.toLowerCase()}@example.com`;
     const invited = user === 'invited';
-    members.set(user, { id: user, name, email, status: invited ? 'invited' : 'active' });
-    if (!invited) newMailbox(email, name, user);
+    local.members.set(user, { id: user, name, email, status: invited ? 'invited' : 'active' });
+    if (!invited && user !== 'newAdmin') newMailbox(local, email, name, user);
   }
-  const ownerBox = (userId: Id) => [...boxes.values()].find(({ directory }) => directory.ownerUserId === userId);
+  const foreignAdmin = { id: 'foreignAdmin', name: 'Foreign Administrator', email: 'admin@example.org', status: 'active' } as const;
+  foreign.members.set(foreignAdmin.id, foreignAdmin);
+  newMailbox(foreign, foreignAdmin.email, foreignAdmin.name, foreignAdmin.id);
+  const ownerBox = (workspace: Workspace, userId: Id) => [...workspace.boxes.values()].find(({ directory }) => directory.ownerUserId === userId);
   const state = (box: Mailbox) => `${box.directory.id}-${box.version}`;
   const bump = (box: Mailbox) => { box.version++; };
 
@@ -210,34 +230,37 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const byTime = ([left, a]: Cursor['position'], [right, b]: Cursor['position']) => compare(right, left) || compare(a, b);
   const byThread = (a: Cursor['position'], b: Cursor['position']) => ascending(b, a);
 
-  async function replay<T>(keys: Map<string, Replay>, opts: Idempotent | undefined, op: Operation, args: unknown[],
-    fingerprintBody: unknown | (() => Promise<unknown>), run: () => T | Promise<T>): Promise<T> {
+  async function replay<T>(keys: ReplayScope, opts: Idempotent | undefined, op: Operation, args: unknown[],
+    fingerprintBody: unknown | (() => Promise<unknown>), run: () => T,
+    options?: { beforeStart?: () => void; onReplay?: (value: T) => T }): Promise<T> {
     const key = opts?.idempotencyKey;
     if (key === undefined) fail('precondition_required');
     if (typeof key !== 'string' || key.length > limits.idempotencyKeyChars || !/^[A-Za-z0-9_-]+$/.test(key)) invalid('/idempotencyKey');
-    const existing = keys.get(key);
-    const outcome = existing?.outcome;
-    const fingerprint = Promise.resolve().then(async () => canonical([
+    const existing = keys.committed.get(key);
+    const inProgress = keys.inProgress.get(key);
+    if (!existing && !inProgress) options?.beforeStart?.();
+    const fingerprint = async () => canonical([
       op, args, typeof fingerprintBody === 'function' ? await fingerprintBody() : fingerprintBody,
-    ]));
+    ]);
     if (existing) {
-      if (await fingerprint !== await existing.fingerprint) fail('idempotency_key_reused');
-      if (!outcome) fail('idempotency_in_progress', { retryAfterSeconds: 1 });
-      if ('error' in outcome) throw new MailApiError(copy(outcome.error));
-      return copy(outcome.value as T);
+      if (await fingerprint() !== existing.fingerprint) fail('idempotency_key_reused');
+      const value = copy(existing.value as T);
+      return options?.onReplay ? options.onReplay(value) : value;
     }
-    const entry: Replay = { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second };
-    keys.set(key, entry);
+    if (inProgress) {
+      if (await fingerprint() !== await inProgress) fail('idempotency_key_reused');
+      fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    }
+    const pendingFingerprint = fingerprint();
+    keys.inProgress.set(key, pendingFingerprint);
     try {
-      // Take a fingerprint before any side effects, even for invalid business inputs.
-      await fingerprint;
-      const value = await run();
-      entry.outcome = { value: copy(value) };
+      const fingerprint = await pendingFingerprint;
+      // Mutate and record the success synchronously; no caller sees one without the other.
+      const value = run();
+      keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
       return value;
-    } catch (error) {
-      if (isMailApiError(error) && error.status >= 400 && error.status < 500) entry.outcome = { error: copy(error.problem) };
-      else keys.delete(key);
-      throw error;
+    } finally {
+      keys.inProgress.delete(key);
     }
   }
 
@@ -247,7 +270,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     const explicit = aliases.filter((alias) => alias.sendAs !== 'off').map(({ address: email, sendAs }): Identity => ({
       name, email, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending',
     }));
-    const implicit = [...domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
+    const implicit = [...box.workspace.domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
       .flatMap((d) => [primary, ...explicit].filter((source) => source.email.endsWith(`@${d.aliasOf}`)).map((source): Identity => ({
         name, email: `${source.email.split('@')[0]}@${d.name}`, kind: 'alias_domain', primary: false,
         sendAs: source.sendAs === 'active' && d.sending === 'active' ? 'active' : 'pending',
@@ -284,7 +307,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       fail('too_many_attachments', { limit: limits.attachmentsPerMessage });
     }
   }
-  function makeDraft(box: Mailbox, draftId: Id, input: DraftInput): Draft {
+  function makeDraft(box: Mailbox, draftId: Id, input: DraftInput, previous?: Draft): Draft {
     fields(input, ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'inReplyTo', 'forwardOf', 'attachments']);
     const from = sender(box, input.from, false).email;
     checkCounts(input);
@@ -309,6 +332,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         case 'message': {
           fields(ref, ['kind', 'messageId', 'part']);
           const { messageId, part: number } = ref;
+          // The draft can keep its own snapshot after expiry, but cannot acquire a new reference to an expired source.
+          const retained = previous?.attachments.find((a) => a.kind === 'message' && a.messageId === messageId && a.part === number);
+          if (retained?.kind === 'message') return retained;
           const { name, type, size } = part(box, messageId, number);
           return { kind: 'message', messageId, part: number, name, type, size };
         }
@@ -414,7 +440,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   function advance(ms: number): void {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError('The fake clock can only move forward.');
     const end = now + ms;
-    const due = [...boxes.values()].flatMap((box) => [...box.sends.values()].flatMap((entry) =>
+    const boxes = workspaces.flatMap((workspace) => [...workspace.boxes.values()]);
+    const due = boxes.flatMap((box) => [...box.sends.values()].flatMap((entry) =>
       entry.pending && Date.parse(entry.send.undoUntil) <= end ? [{ box, entry, at: Date.parse(entry.send.undoUntil) }] : []));
     for (const { box, entry, at } of due.sort((a, b) => a.at - b.at)) {
       now = at;
@@ -422,14 +449,23 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       release(box, entry);
     }
     now = end;
-    for (const box of boxes.values()) expire(box);
-    for (const keys of [workspaceKeys, ...[...boxes.values()].map((box) => box.keys)]) {
-      for (const [key, entry] of keys) if (entry.outcome && entry.expires <= now) keys.delete(key);
+    for (const box of boxes) expire(box);
+    for (const { committed } of [...workspaces.map((workspace) => workspace.keys), ...boxes.map((box) => box.keys)]) {
+      for (const [key, entry] of committed) if (entry.expires <= now) committed.delete(key);
     }
     for (const [pick, entry] of picks) if (entry.expires <= now) picks.delete(pick);
   }
 
-  function contentUrl() { return { url: `${contentOrigin}/v1/c/${randomUUID()}`, expiresAt: iso(now + limits.contentUrlSeconds * second) }; }
+  function contentUrl(box: Mailbox, msg: Id, target: { purpose: 'body'; ri: boolean } | { purpose: 'att'; part: number }) {
+    const { purpose, ...claims } = target;
+    const iat = Math.floor(now / second);
+    const exp = iat + limits.contentUrlSeconds;
+    const payload = Buffer.from(JSON.stringify({
+      v: 1, ws: box.workspace.id, mb: box.directory.id, msg, ...claims, sub: box.directory.ownerUserId, ep: 1, iat, exp,
+    })).toString('base64url');
+    // This fake does not sign tokens; the key id and MAC are format-only placeholders.
+    return { url: `${contentOrigin}/v1/${purpose}/demo.${payload}.ZmFrZQ`, expiresAt: iso(exp * second) };
+  }
   function labelName(box: Mailbox, value: string, except?: Id): string {
     if (typeof value !== 'string') invalid('/name');
     const name = value.trim();
@@ -438,18 +474,18 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     if ([...box.labels.values()].some((label) => label.id !== except && label.name.toLowerCase() === name.toLowerCase())) fail('label_exists');
     return name;
   }
-  function directoryAddress(value: string, field: string): string {
+  function directoryAddress(workspace: Workspace, value: string, field: string): string {
     if (typeof value !== 'string') invalid(field);
     const email = value.trim().toLowerCase();
     if (!validEmail(email)) invalid(field);
-    const domain = domains.get(email.split('@')[1]);
+    const domain = workspace.domains.get(email.split('@')[1]);
     if (!domain || domain.kind === 'alias') fail('domain_not_in_workspace');
-    if ([...boxes.values()].some(({ directory }) => directory.primaryAddress === email || directory.aliases.some((a) => a.address === email))) fail('address_taken');
+    if ([...workspace.boxes.values()].some(({ directory }) => directory.primaryAddress === email || directory.aliases.some((a) => a.address === email))) fail('address_taken');
     return email;
   }
-  function availableOwner(userId: Id): void {
-    need(members.get(userId));
-    if (ownerBox(userId)) invalid('/ownerUserId', 'not_allowed');
+  function availableOwner(workspace: Workspace, userId: Id): void {
+    need(workspace.members.get(userId));
+    if (ownerBox(workspace, userId)) invalid('/ownerUserId', 'not_allowed');
   }
   function displayName(name: string): string {
     boundedText(name, limits.displayNameBytes, '/displayName');
@@ -458,21 +494,27 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   }
 
   function bind(principal: Principal): MailService {
-    const admin = principal === 'admin' || principal === 'staleAdmin';
-    const user = need(members.get(admin ? 'admin' : principal));
+    const admin = principal !== 'member' && principal !== 'other';
+    const workspace = workspaceFor(principal);
+    const { boxes, domains, members, keys: workspaceKeys } = workspace;
+    const user = need(members.get(userIdFor(principal)));
     const authTime = principal === 'staleAdmin' ? start - 11 * 60 * second : start;
     const csrfToken = randomUUID();
+    const resolveMailbox = () => ownerBox(workspace, user.id);
     const mailbox = () => {
-      const box = ownerBox(user.id);
+      const box = resolveMailbox();
       if (!box) fail('forbidden');
       return box;
     };
     const service: MailService = {
       async getSession() {
-        const box = mailbox();
-        const { id, primaryAddress } = box.directory;
-        return { user: { id: user.id, name: user.name }, mailbox: { id, primaryAddress }, workspace: { id: 'demo-workspace', role: admin ? 'admin' : 'member' },
-          csrfToken, authTime: iso(authTime), limits, features: { drive: true, htmlContent: true }, state: state(box) };
+        const box = resolveMailbox();
+        return {
+          user: { id: user.id, name: user.name },
+          ...(box && { mailbox: { id: box.directory.id, primaryAddress: box.directory.primaryAddress } }),
+          workspace: { id: workspace.id, role: admin ? 'admin' : 'member' },
+          csrfToken, authTime: iso(authTime), limits, features: { drive: true, htmlContent: true }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
+        };
       },
       async listViews() {
         const box = mailbox();
@@ -548,14 +590,16 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         return { state: state(box) };
       },
       async getBodyUrl(messageId, input) {
+        const box = mailbox();
         fields(input, ['remoteImages']);
         if (typeof input.remoteImages !== 'boolean') invalid('/remoteImages');
-        if (!need(mailbox().messages.get(messageId)).message.hasHtml) fail('no_html_body');
-        return contentUrl();
+        need(box.messages.get(messageId));
+        return contentUrl(box, messageId, { purpose: 'body', ri: input.remoteImages });
       },
       async getAttachmentUrl(messageId, number) {
-        part(mailbox(), messageId, number);
-        return contentUrl();
+        const box = mailbox();
+        part(box, messageId, number);
+        return contentUrl(box, messageId, { purpose: 'att', part: number });
       },
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
@@ -634,7 +678,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         requireRevision(opts);
         const previous = need(box.drafts.get(draftId));
         checkRevision(previous, opts);
-        const draft = makeDraft(box, draftId, input);
+        const draft = makeDraft(box, draftId, input, previous);
         box.drafts.set(draftId, draft);
         releaseDraftUploads(box, previous, false);
         bump(box);
@@ -652,19 +696,27 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async sendDraft(draftId, opts) {
         const box = mailbox();
         requireRevision(opts);
-        return replay(box.keys, opts, 'sendDraft', [draftId], null, () => {
+        const currentDraft = () => {
           const draft = need(box.drafts.get(draftId));
           checkRevision(draft, opts);
+          return draft;
+        };
+        return replay(box.keys, opts, 'sendDraft', [draftId], null, () => {
+          // Re-check in the mutation step in case a different key or an edit raced the preflight.
+          const draft = currentDraft();
           checkCounts(draft);
           const all = [...draft.to, ...draft.cc, ...draft.bcc];
           if (!all.length || all.some(({ email }) => !validEmail(email))) fail('invalid_recipients');
           const from = address(sender(box, draft.from, true));
-          // This fake does not generate MIME. Model its body plus encoded files, including base64 line breaks and header/part overhead.
-          const size = bytes(draft.body) + 16 * 1024 + draft.attachments.reduce((sum, a) => {
-            if (a.kind === 'link') return sum + bytes(`\r\n${a.name}: ${a.url}`);
-            const base64 = 4 * Math.ceil(a.size / 3);
-            return sum + base64 + 2 * Math.ceil(base64 / 76) + bytes(a.name) + bytes(a.type);
-          }, 0);
+          let bodyBytes = bytes(draft.body);
+          let fileBytes = 0;
+          for (const attachment of draft.attachments) {
+            if (attachment.kind === 'link') bodyBytes += bytes(`\r\n${attachment.name}: ${attachment.url}`);
+            else fileBytes += attachment.size;
+          }
+          // No MIME is generated here. Model the same expansion and overhead as attachmentBudget;
+          // actual MIME has per-part padding and line breaks, which the production encoder measures.
+          const size = bodyBytes + 16 * 1024 + Math.ceil(fileBytes * 4 * 78 / (3 * 76));
           if (size > limits.outboundMessageBytes) fail('message_too_large', { limit: limits.outboundMessageBytes });
           const undoRemainingMs = box.settings.undoSeconds * second;
           const send: Send = {
@@ -675,6 +727,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           box.sends.set(send.id, { send, pending: { draft, size, from, references: replyReferences(box, draft.inReplyTo) } });
           bump(box);
           return send;
+        }, {
+          beforeStart: currentDraft,
+          onReplay: ({ id }) => sendResult(need(box.sends.get(id)).send),
         });
       },
       async listSends(query) {
@@ -721,14 +776,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       async importFromDrive(input, opts) {
         const box = mailbox();
-        return replay(box.keys, opts, 'importFromDrive', [], input, async () => {
+        return replay(box.keys, opts, 'importFromDrive', [], input, () => {
           fields(input, ['pickId', 'mode']);
           const pick = need(picks.get(input.pickId));
           if (pick.mailboxId !== box.directory.id) fail('not_found');
           if (input.mode === 'link') return { attachments: [{ kind: 'link', url: 'https://example.com/drive/demo', name: driveFile.name }] };
           if (input.mode !== 'copy') invalid('/mode');
-          const digest = await sha256(driveFile.bytes);
-          return { attachments: [uploadRef(storeUpload(box, driveFile.name, driveFile.type, driveFile.bytes.size, digest))] };
+          return { attachments: [uploadRef(storeUpload(box, driveFile.name, driveFile.type, driveFile.size, driveFile.digest))] };
         });
       },
       async listDomains() { return { items: [...domains.values()].sort((a, b) => compare(a.name, b.name)) }; },
@@ -739,7 +793,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           if (input.aliasOf !== undefined && typeof input.aliasOf !== 'string') invalid('/aliasOf');
           const name = input.name.trim().toLowerCase();
           if (!validDomain(name)) invalid('/name');
-          if (domains.has(name)) fail('domain_exists');
+          // Inbound delivery must resolve a domain to a single workspace.
+          if (workspaces.some((candidate) => candidate.domains.has(name))) fail('domain_exists');
           const { kind } = input;
           const aliasOf = input.aliasOf?.trim().toLowerCase();
           if (kind === 'alias') {
@@ -753,14 +808,14 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       async listMailboxes(query) {
         fields(query, ROUTES.listMailboxes.query);
-        return page([...boxes.values()].map(({ directory }) => directory), 'workspace', 'listMailboxes', query, (d) => [d.primaryAddress, d.id], ascending);
+        return page([...boxes.values()].map(({ directory }) => directory), workspace.id, 'listMailboxes', query, (d) => [d.primaryAddress, d.id], ascending);
       },
       async createMailbox(input, opts) {
         return replay(workspaceKeys, opts, 'createMailbox', [], input, () => {
           fields(input, ['primaryAddress', 'displayName', 'ownerUserId']);
-          const primary = directoryAddress(input.primaryAddress, '/primaryAddress');
-          availableOwner(input.ownerUserId);
-          return newMailbox(primary, displayName(input.displayName), input.ownerUserId);
+          const primary = directoryAddress(workspace, input.primaryAddress, '/primaryAddress');
+          availableOwner(workspace, input.ownerUserId);
+          return newMailbox(workspace, primary, displayName(input.displayName), input.ownerUserId);
         });
       },
       async updateMailbox(mailboxId, patch) {
@@ -768,7 +823,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         const box = need(boxes.get(mailboxId));
         const name = patch.displayName === undefined ? box.directory.displayName : displayName(patch.displayName);
         const owner = patch.ownerUserId ?? box.directory.ownerUserId;
-        if (owner !== box.directory.ownerUserId) availableOwner(owner);
+        if (owner !== box.directory.ownerUserId) availableOwner(workspace, owner);
         if (owner !== box.directory.ownerUserId || name !== box.directory.displayName) {
           box.directory.ownerUserId = owner;
           box.directory.displayName = name;
@@ -780,7 +835,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         return replay(workspaceKeys, opts, 'createAlias', [], input, () => {
           fields(input, ['mailboxId', 'address', 'sendAs']);
           const box = need(boxes.get(input.mailboxId));
-          const email = directoryAddress(input.address, '/address');
+          const email = directoryAddress(workspace, input.address, '/address');
           if (typeof input.sendAs !== 'boolean') invalid('/sendAs');
           if (box.directory.aliases.length >= limits.aliasesPerMailbox) fail('limit_reached', { limit: limits.aliasesPerMailbox });
           const alias: Alias = { address: email, mailboxId: input.mailboxId, sendAs: input.sendAs ? 'pending' : 'off' };
@@ -798,8 +853,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       async listMembers(query) {
         fields(query, ROUTES.listMembers.query);
-        const items = [...members.values()].map((m): Member => ({ ...m, hasMailbox: ownerBox(m.id) !== undefined }));
-        return page(items, 'workspace', 'listMembers', query, (m) => [m.name, m.id], ascending);
+        const items = [...members.values()].map((m): Member => ({ ...m, hasMailbox: ownerBox(workspace, m.id) !== undefined }));
+        return page(items, workspace.id, 'listMembers', query, (m) => [m.name, m.id], ascending);
       },
     };
     // All callers get detached snapshots; access checks precede route validation and replay.
@@ -811,7 +866,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           if (route.access === 'admin') {
             if (!admin) fail('forbidden');
             if (route.reauth && now - authTime > maxAuthAge * second) fail('reauth_required', { maxAgeSeconds: maxAuthAge });
-          } else mailbox();
+          } else if (op !== 'getSession') mailbox();
           return copy(await Reflect.apply(target[op], target, copy(input)));
         };
       },
@@ -821,12 +876,15 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     return { ...send, undoRemainingMs: send.state === 'pending' ? Math.max(0, Date.parse(send.undoUntil) - now) : 0 };
   }
 
-  const sessions = { member: bind('member'), other: bind('other'), admin: bind('admin'), staleAdmin: bind('staleAdmin') };
+  const sessions = {
+    member: bind('member'), other: bind('other'), admin: bind('admin'), staleAdmin: bind('staleAdmin'),
+    newAdmin: bind('newAdmin'), foreignAdmin: bind('foreignAdmin'),
+  };
   return {
     as: (principal) => sessions[principal],
     contentOrigin,
     async deliver(input: TestMessage, principal = 'member') {
-      const box = need(ownerBox(principal === 'staleAdmin' ? 'admin' : principal));
+      const box = need(ownerBox(workspaceFor(principal), userIdFor(principal)));
       const date = iso(now);
       const attachments = (input.attachments ?? []).map((a, i) => ({ part: i + 1, name: a.name, type: a.type, size: a.bytes.length, inline: a.inline ?? false }));
       const message = append(box, input.inReplyTo, {
@@ -839,7 +897,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     },
     async advance(ms) { advance(ms); },
     async drivePick() {
-      const box = need(ownerBox('member'));
+      const box = need(ownerBox(local, 'member'));
       const token = randomUUID();
       picks.set(token, { mailboxId: box.directory.id, expires: now + 5 * 60 * second });
       return token;

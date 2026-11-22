@@ -18,9 +18,9 @@ Status: design, version 1. It pairs with the [Mail API contract](../contracts/ma
 
 **The `mail-content` Worker:**
 - It runs on `content.<content-domain>` and holds the URL-signing keys.
-- It has read-only object-store credentials scoped to the mail bucket.
+- It has read-only object-store credentials covering only the workspaces' mail buckets (`mail-<workspace_id>`, one per workspace). It derives the bucket from the verified `ws` claim, never from other input, and reads only keys of the form `raw/<sha256>/<gen>` or `att/<sha256>/<gen>` that the mailbox Durable Object returned. If storage keys cannot be scoped to the `mail-` buckets, it holds one read-only key per workspace bucket, selected by `ws`.
 - It has a binding to the mailbox Durable Objects and a service binding to the account service.
-- It has no write access to anything.
+- It has no write access to anything, and no VPC, Tunnel or other binding into a private network.
 
 **The app:**
 - It reads the content origin from trusted server configuration and checks it with `separateContentOrigin` (`apps/web/src/lib/content-origin.ts`): `https:`, a different registrable domain, and no credentials or path.
@@ -159,7 +159,8 @@ Cache-Control: private, no-store
 **Elements:**
 - **Kept:** `a abbr b blockquote br caption center code col colgroup dd del div dl dt em font h1 h2 h3 h4 h5 h6 hr i img ins li ol p pre q s small span strike strong style sub sup table tbody td tfoot th thead tr tt u ul wbr`.
 - **Unwrapped** (tag removed, children kept): `html head body` and unknown elements.
-- **Removed with their content:** `script noscript template iframe frame frameset object embed applet form input button select textarea option svg math link meta base title audio video source track canvas`.
+- **Removed with their content:** `script noscript template iframe frame frameset object embed applet form input button select textarea option svg math link meta base title audio video source track canvas xmp noembed noframes plaintext listing`.
+- **Raw-text elements are never unwrapped.** `HTMLRewriter` passes the contents of raw-text and RCDATA elements through as unescaped text, so unwrapping one would turn its text into live markup that the attribute and URL rules never saw. Every element whose contents the HTML tokenizer reads as raw text or RCDATA (`script style textarea title xmp iframe noembed noframes noscript plaintext`) is either removed with its content or, for `style`, kept with its text sanitised as CSS.
 - **Comments are removed**, including Outlook conditional comments.
 
 **Attributes:**
@@ -190,7 +191,7 @@ Cache-Control: private, no-store
 1. **Methods:** `GET` only; `HEAD` answers 405.
 2. **URL:**
    - only `http:` and `https:`, ports 80 and 443, no user information, at most 2,048 bytes;
-   - the host must be a DNS name. IP literals (IPv4, IPv6 and integer forms) are refused.
+   - the host must be a DNS name. IP literals (IPv4, IPv6 and integer forms) are refused. A DNS name that resolves to a private address cannot reach anything: Workers `fetch` has no route into private networks, and `mail-content` has no VPC, Tunnel or other private binding (section 1).
    - Refused host names: `localhost`, `*.localhost`, `*.local`, `*.internal`, `*.arpa`, the suite domain, the content domain, the storage and account domains, and the account's `workers.dev` subdomain, all as configuration. This stops the proxy from reaching our own services or itself.
 3. **The fetch:**
    - `redirect: 'manual'`, following at most `remoteImageRedirects` (3) hops. Each `Location` is resolved and checked again under rule 2.
@@ -230,7 +231,7 @@ Cache-Control: private, no-store
    - A deleted message fails.
    - A token for mailbox A never reads mailbox B, even when B's ids are substituted into the path.
 3. **Sanitiser:**
-   - A corpus of at least 150 vectors (html5sec-style plus real newsletter samples written for the tests) leaves no element, attribute, URL scheme or CSS construct outside section 4.
+   - A corpus of at least 150 vectors (html5sec-style plus real newsletter samples written for the tests) leaves no element, attribute, URL scheme or CSS construct outside section 4. It includes markup hidden inside `xmp`, `noembed`, `noframes`, `plaintext`, `listing`, `textarea`, `title` and `noscript`, and a phishing message whose links must all lose `href`.
    - A Playwright test loads every vector in the real iframe and sees no script execution, no network request outside the content host, and no top navigation.
 4. **Proxy:**
    - Refusals: IP literals, private and own-zone names, a fourth redirect, a redirect to a refused host, SVG, a mislabelled HTML body, more than 5 MiB, and over 10 s.

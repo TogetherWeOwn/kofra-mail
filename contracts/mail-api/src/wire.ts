@@ -16,8 +16,12 @@ export interface AddressInput { name?: string; email: string }
 export interface Session {
   /** The account user id (`sub` of the suite's sign-in), never an email address. */
   user: { id: Id; name: string };
-  /** The one mailbox this session reads and writes. URLs never name a mailbox. */
-  mailbox: { id: Id; primaryAddress: string };
+  /**
+   * The one mailbox this session reads and writes; URLs never name a mailbox.
+   * Absent when the user has no mailbox yet (for example a new workspace's
+   * first admin): then every user route answers 403 `forbidden`, admin routes still work.
+   */
+  mailbox?: { id: Id; primaryAddress: string };
   workspace: { id: Id; role: 'member' | 'admin' };
   /** Sent back as `X-CSRF-Token` on every non-GET request. */
   csrfToken: string;
@@ -141,7 +145,7 @@ export interface Message {
   /** Plain text, at most `limits.messageTextBytes`. */
   text: string;
   textTruncated: boolean;
-  /** A formatted body exists; fetch it with `getBodyUrl`. */
+  /** A formatted body exists. `getBodyUrl` serves every message: HTML sanitised, plain text escaped. */
   hasHtml: boolean;
   /** The formatted body references remote images (blocked until the user asks). */
   remoteImages: boolean;
@@ -240,6 +244,7 @@ export interface Draft extends Omit<DraftInput, 'attachments'> {
   attachments: DraftAttachment[];
 }
 
+/** Server-internal steps between `pending` and `sending` (release, enqueue) report as `sending`. */
 export type SendState = 'pending' | 'sending' | 'sent' | 'partial' | 'failed' | 'delayed' | 'cancelled';
 export type RecipientState = 'pending' | 'sent' | 'failed' | 'suppressed';
 
@@ -258,7 +263,7 @@ export interface Send {
   createdAt: UTCDate;
   /** Undo is possible until the server releases the message, never before this time. */
   undoUntil: UTCDate;
-  /** Milliseconds left at response time, so clients need not trust their clock. */
+  /** Milliseconds left at response time (0 unless `pending`), so clients need not trust their clock. */
   undoRemainingMs: number;
   /** The sent copy in this mailbox, once released. */
   messageId?: Id;

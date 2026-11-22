@@ -11,7 +11,6 @@ export const ERROR_STATUS = {
   csrf_failed: 403,
   reauth_required: 403,
   not_found: 404,
-  no_html_body: 404,
   label_exists: 409,
   address_taken: 409,
   domain_exists: 409,

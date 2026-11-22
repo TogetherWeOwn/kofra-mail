@@ -13,6 +13,8 @@ Status: plan, version 1. It implements the send half of the [Mail API contract](
 - **No live sends** except in M3-0 and M3-12, and only to the approved test route's addresses. No production deploy, no new spend, and no DNS or suppression-list writes.
 - **The mailbox Durable Object owns all send state.** Queues carry ids only (`{ ws, mb, sendId }`); a queue message is limited to 128 KB.
 - **No content in logs or alerts:** no message content, subjects or addresses. Addresses appear only as counts or as the first 8 characters of a SHA-256.
+- **Send state is journalled.** `sends` rows, ledger changes and each sent copy's index row (raw key, flags, labels, the Bcc list) are non-derived state. They go in the mailbox journal with the same 60-second recovery point as drafts (M1 decision 3), so a restore cannot bring back a deleted draft without its send, or drop a sent copy from Sent. Outside recipients' sent copies have no `deliveries` row, so the journal is their only recovery path.
+- **Restores pause sending.** While the mailbox is `restoring`, `claimSend`, `recordResult` and `delaySend` answer a retryable error, so the queue retries after the restore.
 - **Stop rule for every package:** if a package needs a change to the inbound design decisions (storage keys, holder ordering, journal recovery boundary), stop and write a design note for Opus. Do not adapt them locally.
 
 ## 2. Send state machine
@@ -26,24 +28,27 @@ sendDraft ──► pending ──(undo)──► cancelled
                               └─ delayed ◄┘  (daily quota reached: timer until reset)
 ```
 
+`releasing` and `queued` are internal; the contract reports both as `sending`.
+
 **`sendDraft`** runs in one Durable Object transaction:
 1. Validate the draft (contract section 8.3).
 2. Insert the `sends` row as `pending`. It points at the immutable stored draft revision and its attachment holders.
-3. Delete the draft row.
+3. Delete the draft row. Steps 2 and 3 are one journal event, so a restore replays both or neither.
 4. Add the timer `send_release` at `undoUntil`.
 5. Store the idempotency result.
 
 **`undoSend`** runs in one transaction, and only from `pending`:
 1. Set the state to `cancelled`.
 2. Delete its own timer row. Other sends' timers are untouched.
-3. Restore the draft under its old id with a new revision.
+3. Restore the draft under its old id with a new revision (one journal event with step 1).
+4. Store the idempotency result, so a retry after a lost response returns the restored draft.
 
 The alarm never enqueues a `cancelled` send, and the consumer re-checks the state before calling `send()`.
 
 **Release** (alarm), in order:
-1. **Commit:** `pending` → `releasing`, plus a retry timer at +60 s.
+1. **Commit:** `pending` → `releasing`, plus a retry timer at +60 s. The commit fixes the message's `Date` and derives the MIME boundary from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change.
 2. **Re-check send-as and limits.** An alias may have been removed during the undo window. A send that now fails the checks becomes `failed` with reason `invalid_sender` or `message_too_large`.
-3. **Store the sent copy:** build the MIME of the sent copy, register its holder with the sweeper, and PUT it to object storage (holder before PUT, as on the inbound path).
+3. **Store the sent copy:** build the MIME of the sent copy, register its holder with the sweeper, and PUT it to object storage (holder before PUT, as on the inbound path). The stored MIME never contains a `Bcc` header; Bcc recipients live only in the `sends` row and the sender's index.
 4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows (`pending`, one per external recipient). Set `releasing` → `queued`.
 5. **Enqueue:** `await SEND.send({ ws, mb, sendId })`, then delete the retry timer.
 
@@ -55,13 +60,14 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 1. **Claim:** RPC `claimSend(sendId)` returns the send request and the `pending` recipients, with a lease of 5 minutes and a fencing counter.
    - It refuses a `cancelled` or terminal send.
    - It refuses a send whose live lease another claim holds; the queue retries later.
+   - **On every attempt** it repeats the send-as check (`from` is still an active identity of the mailbox) and checks that the mailbox still has the same owner. A `delayed` send can wait hours, so release-time checks are not enough. A failed check ends the send `failed` with `invalid_sender`.
 2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). If the quota is exhausted: RPC `delaySend(sendId, until, fence)`, which sets `delayed` and a timer, then acknowledge.
 3. **Mark:** set the claimed recipients to `attempting` (with the fence).
-4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all.
+4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all. On a retry to a subset (after a partial failure), each pending recipient stays in the field it was in (To, Cc or Bcc). If M3-0 shows that `send()` accepts envelope recipients separately from the visible To and Cc lists, the retry keeps the original lists visible; otherwise the retried copy shows only the retried recipients, which is a recorded limitation.
 5. **Record:** RPC `recordResult(sendId, fence, result)`, which sets each recipient to `sent` (with `messageId`), `failed` (with a reason) or `suppressed`. A stale fence cannot record.
 6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed`, and the sent copy's `send.state` follows. A transient error returns the `attempting` recipients to `pending` and throws, so the queue retries.
 
-**Duplicate policy:** `send()` has no idempotency key. If the consumer dies after `send()` returns but before `recordResult`, the retry finds those recipients `attempting` under an expired fence and sends to them again.
+**Duplicate policy (a deliberate change from the suite plan, which said a retry sends only to recipients still `pending`):** `send()` has no idempotency key. If the consumer dies after `send()` returns but before `recordResult`, the retry finds those recipients `attempting` under an expired fence and sends to them again.
 - So **a recipient may receive a message twice, and never zero times.** A lost message is the worse failure for personal mail.
 - The window is one RPC long. Each occurrence raises the metric `send_ambiguous_retry`, so we measure how often it happens before considering anything stronger.
 
@@ -84,13 +90,15 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 | M3-10 | From rewriting for group re-sends | Sol, Opus review | T0 | groups designed (not in version 1) | 0.5 day, gated |
 | M3-11 | Compose UI on the real send path | Sol | T1 | M3-3, the M2 wiring lane | 0.5 to 1 day |
 | M3-12 | End-to-end send matrix | Sol runs, Opus triages | T1 | all above, test route | 1 day |
+| M3-13 | Revocable file links for outside recipients (`/f/<token>`) | **Opus** (token and authorisation), Sol (UI) | T0 | M3-2, a contract revision | 1 to 1.5 days |
 
 **Critical path:** M3-1 → M3-2 → M3-3 → M3-5 → M3-8 → M3-12, about 5.5 to 8 working days. M3-0 runs in parallel as soon as a test route is approved. M3-4, M3-6, M3-7 and M3-9 overlap the path.
 
 ### M3-0 Measurements (Sol)
 
 **Acceptance:** a receipt with the raw results for:
-- **Size:** the real outbound limit, from sends of 6, 18 and 24 MiB encoded. It sets `LIMITS.outboundMessageBytes`.
+- **Size:** the real outbound limit, from sends of 4.9, 5.1, 6, 18, 24 and 25 MiB encoded (just under and over each documented value). It sets `LIMITS.outboundMessageBytes`.
+- **Envelope:** whether `send()` accepts envelope recipients separately from the visible To and Cc lists (for partial retries).
 - **Message-ID:** whether `send()`'s `messageId` equals the delivered `Message-ID` header.
 - **Suppression:** how a dropped (suppressed) recipient is reported in the `send()` result.
 - **Errors:** the error codes for quota, header-size and invalid-recipient failures.
@@ -119,7 +127,8 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 **Change:**
 - **Drafts:** each revision is an immutable stored object, with a holder registered before its PUT. `If-Match` is checked against the stored revision.
 - **Uploads:** streamed to `att/<sha256>/<gen>` with the holder registered first. An `upload_expiry` timer runs 24 h after creation and is cancelled while a draft refers to the upload.
-- **Idempotency:** the `idempotency(scope, key, fingerprint, status, body, created_at)` table stores the fingerprint of contract section 5. Rows expire after 24 h.
+- **Forwarded parts:** a draft's `message` attachment reference registers the draft as a holder of that part's object (or of the source raw object for small parts), so Trash expiry of the source cannot remove it before the draft is sent or deleted.
+- **Idempotency:** the `idempotency(scope, key, fingerprint, status, body, created_at)` table stores the fingerprint of contract section 5. Only 2xx results are stored, in the same transaction as the effect; pre-checks (`If-Match`, re-authentication, rate limits) run before the record. Rows expire after 24 h.
 - **Journal:** draft changes are journalled within the 60-second recovery point.
 
 **Acceptance:** conformance cases 11, 12 and 15 pass against the backend over HTTP in local workerd. Two tabs saving the same draft: one wins, the other gets `revision_mismatch`.
@@ -134,6 +143,7 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 - Conformance cases 13 and 14 pass against the backend.
 - **Two sends in one undo window; undo one:** only the other is released.
 - **Crash injection** after each release step (the state commit, the PUT, the index commit, `queue.send`): there is always exactly one sent copy and at least one queue message.
+- **Restore during each send state** (`pending`, `queued`, `delayed`, `sending`, `sent`): after the restore the send completes exactly once, the draft does not reappear, and the sent copy is in Sent.
 - **Undo racing the alarm:** either `cancelled` with no queue message ever, or released with undo answering `send_not_pending`. Never both.
 
 **Stop rule:** if the Durable Object's single-threaded ordering cannot give the undo-or-release guarantee without a lock, stop and redesign. Do not add a timer guess.
@@ -164,6 +174,8 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
   - A partial failure gives `partial` with per-recipient reasons.
   - The quota error gives `delayed` with a timer.
   - A DLQ message sets `failed`, and is acknowledged only after the fake alert binding answers 2xx.
+  - An alias removed (or the mailbox given to another owner) while a send is `delayed`: the next attempt ends `failed` with `invalid_sender`, with no `EMAIL` call.
+  - While the mailbox is `restoring`, `claimSend` answers a retryable error and nothing is sent.
 
 **Stop rule:** if a confirmed `send()` result cannot be recorded reliably within one RPC, stop and report. Do not add sleeps or retries around `send()`.
 
@@ -202,6 +214,7 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 
 **Acceptance:**
 - An internal recipient receives the message with no `EMAIL` call.
+- An internal To recipient and an internal Bcc recipient each receive a copy with no Bcc addresses in it (the delivered MIME is the stored sent copy, which never has a `Bcc` header).
 - An inbound message carrying any "internal" header is still scored as inbound.
 - Mixed internal and external recipients each reach a terminal state.
 
@@ -244,10 +257,18 @@ The alarm never enqueues a `cancelled` send, and the consumer re-checks the stat
 
 **Acceptance:** a receipt with each outcome. Any lost message stops the matrix.
 
+### M3-13 Revocable file links (Opus, Sol)
+
+**Why:** uploads may be 25 MiB while outbound mail may be capped at 5 MiB, and Drive links reach workspace members only. Until this package lands, the contract refuses an over-budget draft with `message_too_large` (contract section 8.3).
+
+**Change:** first a contract revision: a `file_link` attachment kind, a link expiry chosen by the sender, and routes to list and revoke links. Then the `links` table in the mailbox, a random token per link, and `mail.<suite-domain>/f/<token>` answering with a 5-minute signed download on the content origin.
+
+**Acceptance:** a revoked or expired link answers 404 at once; a token never reveals the mailbox or other files; the download headers follow content-origin section 3.4.
+
 ## 4. Done
 
 M3 is done when all of the following hold:
-- M3-0 to M3-9, M3-11 and M3-12 are merged with their acceptance receipts;
+- M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
 - the conformance suite passes against the backend;
 - the end-to-end matrix shows zero lost messages.
 
@@ -255,11 +276,11 @@ M3-10 waits for groups.
 
 ## 5. Security review checklist (Opus, high effort)
 
-The security review of M3-2, M3-3, M3-5, M3-6, M3-7 and M3-8 checks at least:
+The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at least:
 
 1. **Send-as:**
    - `from` cannot be spoofed through a display name, an encoded word or a header.
-   - A removed alias cannot send after the undo window.
+   - A removed alias cannot send after the undo window, including a `delayed` send's later attempts.
    - The allow-list and the app check agree.
 2. **Header injection:** CR or LF is rejected in every name, address, subject and file name. The recipient count cannot grow through a header.
 3. **Cross-mailbox references:**
@@ -270,7 +291,7 @@ The security review of M3-2, M3-3, M3-5, M3-6, M3-7 and M3-8 checks at least:
    - Every holder is registered before its PUT and released only after its index row is gone.
    - Fencing stops a stale consumer from recording.
 5. **Quota and cost:** one mailbox cannot exhaust the account's daily quota beyond the gate, and the monthly ceiling cannot be passed by concurrency.
-6. **Trust:** internal delivery is trusted only from the `deliveries.source` column, never from MIME.
+6. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
 7. **Secrets and privacy:**
    - No message content, subject, address or token in logs, alerts or errors.
    - `EMAIL` and storage credentials are never echoed.

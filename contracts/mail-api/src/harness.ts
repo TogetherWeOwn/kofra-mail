@@ -2,13 +2,17 @@ import type { MailService } from './service.ts';
 import type { Address, Id } from './wire.ts';
 
 /**
- * Who a conformance case calls as. All four are in one workspace.
+ * Who a conformance case calls as. The first five are in workspace W1.
  * - `member`: owns mailbox A; workspace role `member`.
  * - `other`: owns mailbox B; role `member`. Used to prove isolation.
  * - `admin`: owns mailbox C; role `admin`, signed in within the last minute.
  * - `staleAdmin`: the same admin with an `authTime` 11 minutes old.
+ * - `newAdmin`: role `admin`, signed in within the last minute, no mailbox.
+ * - `foreignAdmin`: role `admin` of a second workspace W2 with its own
+ *   mailbox, signed in within the last minute. Used to prove workspace isolation.
+ * W1 also has one invited member without a mailbox, listed by `listMembers`.
  */
-export type Principal = 'member' | 'other' | 'admin' | 'staleAdmin';
+export type Principal = 'member' | 'other' | 'admin' | 'staleAdmin' | 'newAdmin' | 'foreignAdmin';
 
 export interface TestAttachment { name: string; type: string; bytes: Uint8Array; inline?: boolean }
 
