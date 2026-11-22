@@ -20,20 +20,28 @@ before(async () => {
     db.prepare("INSERT INTO domains VALUES ('d1','w1','example.test','primary',NULL,'ready','ready')"),
     db.prepare("INSERT INTO domains VALUES ('d2','w1','alias.test','alias','d1','ready','ready')"),
     db.prepare("INSERT INTO domains VALUES ('d3','w2','other.test','primary',NULL,'ready','ready')"),
-    db.prepare("INSERT INTO mailboxes VALUES ('m1','w1','u1','José@example.test')"),
-    db.prepare("INSERT INTO addresses VALUES ('José@example.test','w1','mailbox','m1','primary','allowed')"),
+    db.prepare("INSERT INTO mailboxes VALUES ('m1','w1','u1','josé@example.test')"),
+    db.prepare("INSERT INTO addresses VALUES ('josé@example.test','w1','mailbox','m1','primary','allowed')"),
     db.prepare("INSERT INTO addresses VALUES ('billing@example.test','w1','mailbox','m1','alias','allowed')"),
   ]);
 });
 after(() => mf.dispose());
 
-test('maps an alias domain and plus tag and normalizes NFC without folding the local part', async () => {
-  assert.deepEqual(await lookupRecipient(db, 'José+tag@ALIAS.Test'), { workspaceId: 'w1', mailboxId: 'm1' });
-  assert.equal(await lookupRecipient(db, 'josé@example.test'), null);
+test('maps an alias domain and plus tag, normalizing NFC and folding the local part', async () => {
+  for (const address of ['JOSÉ+x@ALIAS.test', 'José+tag@ALIAS.Test', 'José+tag@ALIAS.Test']) {
+    assert.deepEqual(await lookupRecipient(db, address), { workspaceId: 'w1', mailboxId: 'm1' }, address);
+  }
 });
 
-test('resolves a user alias to its mailbox', async () => {
-  assert.deepEqual(await lookupRecipient(db, 'billing@example.test'), { workspaceId: 'w1', mailboxId: 'm1' });
+test('resolves a user alias to its mailbox regardless of case', async () => {
+  assert.deepEqual(await lookupRecipient(db, 'BILLING@example.test'), { workspaceId: 'w1', mailboxId: 'm1' });
+});
+
+test('rejects ASCII uppercase in a stored address', async () => {
+  await assert.rejects(
+    db.prepare("INSERT INTO addresses VALUES ('Billing@example.test','w1','mailbox','m1','alias','allowed')").run(),
+    /CHECK constraint failed: address_norm = lower\(address_norm\)/,
+  );
 });
 
 test('returns null on a successful point-lookup miss', async () => {
@@ -71,6 +79,23 @@ test('derives a distinct valid storage bucket for each workspace without changin
     assert.throws(() => bucket(invalid), /Invalid workspace storage ID/);
   }
 });
+
+for (const [table, sql] of [
+  ['domains', "INSERT INTO domains VALUES ('d7',?,'ulid.test','primary',NULL,'ready','ready')"],
+  ['mailboxes', "INSERT INTO mailboxes VALUES ('m2',?,'u2','mailbox@ulid.test')"],
+  ['addresses', "INSERT INTO addresses VALUES ('alias@ulid.test',?,'mailbox','m3','alias','allowed')"],
+]) {
+  test(`${table} accepts a lowercase workspace ID and rejects IDs that cannot name a mail bucket`, async () => {
+    const valid = '01arz3ndektsv4rrffq69g5fav';
+    if (table === 'addresses') {
+      await db.prepare("INSERT INTO mailboxes VALUES ('m3',?,'u3','target@ulid.test')").bind(valid).run();
+    }
+    for (const invalid of [valid.toUpperCase(), `${valid}-`]) {
+      await assert.rejects(db.prepare(sql).bind(invalid).run(), /CHECK constraint failed: length\(workspace_id\)/);
+    }
+    assert.equal((await db.prepare(sql).bind(valid).run()).meta.changes, 1);
+  });
+}
 
 test('lookup uses indexes for domain names, alias targets and address keys', async () => {
   let query = '';

@@ -34,7 +34,7 @@ export async function lookupRecipient(db: DirectoryDatabase, envelopeTo: string)
   const at = address.lastIndexOf('@');
   if (at <= 0 || at === address.length - 1) throw new Error('Invalid envelope recipient');
   const domain = address.slice(at + 1).toLowerCase().normalize('NFC');
-  const local = address.slice(0, at).split('+', 1)[0];
+  const local = address.slice(0, at).normalize('NFC').toLowerCase().split('+', 1)[0];
   // A stale replica miss must not cause a permanent SMTP bounce.
   const row = await db.withSession('first-primary').prepare(LOOKUP).bind(domain, local)
     .first<{ domainId: string | null; workspaceId: string; mailboxId: string | null }>();

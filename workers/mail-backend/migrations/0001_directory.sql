@@ -1,6 +1,6 @@
 CREATE TABLE domains (
   id TEXT PRIMARY KEY NOT NULL,
-  workspace_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'),
   name TEXT NOT NULL UNIQUE CHECK (name = lower(name)),
   kind TEXT NOT NULL CHECK (kind IN ('primary', 'secondary', 'alias')),
   alias_of TEXT,
@@ -14,7 +14,7 @@ CREATE TABLE domains (
 
 CREATE TABLE mailboxes (
   id TEXT PRIMARY KEY NOT NULL,
-  workspace_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'),
   user_id TEXT NOT NULL,
   primary_address TEXT NOT NULL,
   UNIQUE (workspace_id, id),
@@ -23,8 +23,9 @@ CREATE TABLE mailboxes (
 );
 
 CREATE TABLE addresses (
-  address_norm TEXT PRIMARY KEY NOT NULL,
-  workspace_id TEXT NOT NULL,
+  -- SQLite lower() folds ASCII only; JavaScript folds the rest at lookup.
+  address_norm TEXT PRIMARY KEY NOT NULL CHECK (address_norm = lower(address_norm)),
+  workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'),
   target_kind TEXT NOT NULL CHECK (target_kind = 'mailbox'),
   target_id TEXT NOT NULL,
   kind TEXT NOT NULL,
