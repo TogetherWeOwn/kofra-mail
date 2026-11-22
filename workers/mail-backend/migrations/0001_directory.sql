@@ -34,3 +34,21 @@ CREATE TABLE addresses (
 
 CREATE INDEX domains_by_alias ON domains (workspace_id, alias_of);
 CREATE INDEX addresses_by_mailbox ON addresses (workspace_id, target_id);
+
+CREATE TRIGGER domains_direct_alias_insert BEFORE INSERT ON domains
+WHEN NEW.kind = 'alias' AND (
+  NOT EXISTS (SELECT 1 FROM domains WHERE workspace_id = NEW.workspace_id AND id = NEW.alias_of AND kind <> 'alias')
+  OR EXISTS (SELECT 1 FROM domains WHERE workspace_id = NEW.workspace_id AND alias_of = NEW.id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Alias must point to a canonical domain');
+END;
+
+CREATE TRIGGER domains_direct_alias_update BEFORE UPDATE ON domains
+WHEN NEW.kind = 'alias' AND (
+  NOT EXISTS (SELECT 1 FROM domains WHERE workspace_id = NEW.workspace_id AND id = NEW.alias_of AND kind <> 'alias')
+  OR EXISTS (SELECT 1 FROM domains WHERE workspace_id = NEW.workspace_id AND alias_of = NEW.id)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Alias must point to a canonical domain');
+END;

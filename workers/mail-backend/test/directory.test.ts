@@ -14,7 +14,8 @@ let db: D1Database;
 before(async () => {
   db = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
   const url = new URL('../migrations/0001_directory.sql', import.meta.url);
-  await db.batch((await readFile(url, 'utf8')).split(';').filter(s => s.trim()).map(s => db.prepare(s)));
+  const statements = (await readFile(url, 'utf8')).split(/;\s*\n(?=\s*(?:CREATE |$))/).filter(s => s.trim());
+  await db.batch(statements.map(s => db.prepare(s)));
   await db.batch([
     db.prepare("INSERT INTO domains VALUES ('d1','w1','example.test','primary',NULL,'ready','ready')"),
     db.prepare("INSERT INTO domains VALUES ('d2','w1','alias.test','alias','d1','ready','ready')"),
@@ -46,7 +47,13 @@ test('never routes an address belonging to a different domain workspace', async 
 });
 
 test('refuses a cross-workspace alias target', async () => {
-  await assert.rejects(db.prepare("INSERT INTO domains VALUES ('d4','w2','foreign.test','alias','d1','ready','ready')").run(), /FOREIGN KEY/);
+  await assert.rejects(db.prepare("INSERT INTO domains VALUES ('d4','w2','foreign.test','alias','d1','ready','ready')").run(), /canonical domain/);
+});
+
+test('rejects alias chains on insert and cannot turn a referenced canonical domain into an alias', async () => {
+  await db.prepare("INSERT INTO domains VALUES ('d5','w1','second.test','secondary',NULL,'ready','ready')").run();
+  await assert.rejects(db.prepare("INSERT INTO domains VALUES ('d6','w1','chain.test','alias','d2','ready','ready')").run(), /canonical domain/);
+  await assert.rejects(db.prepare("UPDATE domains SET kind = 'alias', alias_of = 'd5' WHERE id = 'd1'").run(), /canonical domain/);
 });
 
 test('propagates database unavailability rather than returning a miss', async () => {
