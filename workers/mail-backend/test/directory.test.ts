@@ -78,7 +78,7 @@ test('derives a distinct valid storage bucket for each workspace without changin
   assert.equal(bucket('w2'), 'mail-w2');
   assert.equal(bucket('a'.repeat(58)).length, 63);
   assert.equal(bucket('w1-s3alias-archive'), 'mail-w1-s3alias-archive');
-  for (const invalid of ['', 'W1', '../w1', 'w1-', 'a'.repeat(59), ...reservedWorkspaceIds]) {
+  for (const invalid of ['', 'W1', '../w1', 'w1-', 'a'.repeat(59), 'w1\0extra', ...reservedWorkspaceIds]) {
     assert.throws(() => bucket(invalid), /Invalid workspace storage ID/);
   }
 });
@@ -93,8 +93,8 @@ for (const [table, sql] of [
     if (table === 'addresses') {
       await db.prepare("INSERT INTO mailboxes VALUES ('m3',?,'u3','target@ulid.test')").bind(valid).run();
     }
-    for (const invalid of [valid.toUpperCase(), `${valid}-`, ...reservedWorkspaceIds]) {
-      await assert.rejects(db.prepare(sql).bind(invalid).run(), /CHECK constraint failed: length\(workspace_id\)/);
+    for (const invalid of [valid.toUpperCase(), `${valid}-`, ...reservedWorkspaceIds, `${valid}\0extra`]) {
+      await assert.rejects(db.prepare(sql).bind(invalid).run(), /CHECK constraint failed: length\(workspace_id\)/, JSON.stringify(invalid));
     }
     assert.equal((await db.prepare(sql).bind(valid).run()).meta.changes, 1);
   });
