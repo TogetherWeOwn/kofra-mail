@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { URL } from 'node:url';
 import { Miniflare } from 'miniflare';
-import { lookupRecipient } from '../src/directory.ts';
+import { lookupRecipient, workspaceMailBucket } from '../src/directory.ts';
 
 const mf = new Miniflare({
   modules: true,
@@ -60,6 +60,16 @@ test('propagates database unavailability rather than returning a miss', async ()
   const unavailable = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
   const prepare = () => unavailable.prepare('SELECT * FROM missing_table');
   await assert.rejects(lookupRecipient({ withSession: () => ({ prepare }) }, 'billing@example.test'), /no such table/);
+});
+
+test('derives a distinct valid storage bucket for each workspace without changing its ID', () => {
+  const bucket = workspaceMailBucket;
+  assert.equal(bucket('w1'), 'mail-w1');
+  assert.equal(bucket('w2'), 'mail-w2');
+  assert.equal(bucket('a'.repeat(58)).length, 63);
+  for (const invalid of ['', 'W1', '../w1', 'w1-', 'a'.repeat(59)]) {
+    assert.throws(() => bucket(invalid), /Invalid workspace storage ID/);
+  }
 });
 
 test('lookup uses indexes for domain names, alias targets and address keys', async () => {
