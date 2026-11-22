@@ -15,7 +15,7 @@ test('Kofra S3 adapter signs a fixed bucket path and preserves bytes', async t =
   const bytes = new Uint8Array([0x01, 0xff, 0x03]);
   const fake = t.mock.method(globalThis, 'fetch', async (request: Request) => {
     assert.equal(request.url, `https://storage.example.test/local-bucket/${key}`);
-    assert.equal(request.redirect, 'error');
+    assert.equal(request.redirect, 'manual');
     assert.ok(request.headers.get('authorization')?.startsWith('AWS4-HMAC-SHA256 '));
     if (request.method === 'PUT') {
       assert.deepEqual(new Uint8Array(await request.arrayBuffer()), bytes);
@@ -28,6 +28,15 @@ test('Kofra S3 adapter signs a fixed bucket path and preserves bytes', async t =
   await store.put(key, bytes);
   assert.deepEqual(await store.get(key), bytes);
   assert.equal(fake.mock.callCount(), 2);
+});
+
+test('rejects a redirect without sending the signed request to its destination', async t => {
+  const fake = t.mock.method(globalThis, 'fetch', async (request: Request) => {
+    assert.equal(request.redirect, 'manual');
+    return new Response(null, { status: 307, headers: { location: 'https://other.example.test/' } });
+  });
+  await assert.rejects(kofra(config, 'workspace').put(key, new Uint8Array(1)), /failed \(307\)/);
+  assert.equal(fake.mock.callCount(), 1);
 });
 
 test('Kofra adapter cannot cross workspace or reference arbitrary paths', async t => {

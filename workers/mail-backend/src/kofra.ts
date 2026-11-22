@@ -25,7 +25,7 @@ export function kofra(config: KofraConfig, workspaceId: string) {
     // The client signs a fixed origin, bucket and validated path; never follow redirects.
     let response: Response;
     try {
-      response = await s3.fetch(`${url.origin}/${bucket}/${key}`, { method, body, redirect: 'error',
+      response = await s3.fetch(`${url.origin}/${bucket}/${key}`, { method, body, redirect: 'manual',
         headers: body ? { 'content-type': 'application/octet-stream' } : undefined });
     } catch {
       throw new Error(`Kofra object ${method} failed`);
