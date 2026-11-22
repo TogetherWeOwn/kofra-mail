@@ -47,6 +47,10 @@ jobs:
           policy="$(mktemp -d "$RUNNER_TEMP/gitleaks-policy.XXXXXX")"
           printf '[extend]\nuseDefault = true\n' > "$policy/gitleaks.toml"
           : > "$policy/.gitleaksignore"
+          # PR and merge checks cover the checked-out commit's full ancestry.
+          # Nightly scans also cover fetched branches and tags.
+          refs=HEAD
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then refs='--all HEAD'; fi
           "$RUNNER_TEMP/gitleaks" git . --redact --exit-code 1 \
-            --log-opts='--text --diff-merges=first-parent HEAD' --ignore-gitleaks-allow \
+            --log-opts="--text --diff-merges=first-parent $refs" --ignore-gitleaks-allow \
             --config "$policy/gitleaks.toml" --gitleaks-ignore-path "$policy/.gitleaksignore"
