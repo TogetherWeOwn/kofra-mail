@@ -9,6 +9,9 @@ const hidden = (id: MailboxId) => id === 'spam' || id === 'trash';
 const copy = structuredClone;
 const email = /^[^\s@,]+@[^\s@,.]+(?:\.[^\s@,.]+)+$/;
 const attachmentLimit = 25 * 1024 * 1024;
+const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const normalizeSubject = (subject: string) => subject.trim().replace(/^(?:(?:re|fwd?):\s*)+/i, '').toLowerCase();
+const addresses = (values: string[]) => values.map((email) => ({ name: email, email }));
 
 export function createFakeMailApi(clock: () => number = Date.now): MailApi {
   const threads = new Map(seed(clock()).map((t) => [t.id, copy(t)]));
@@ -25,7 +28,11 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
   const nextId = () => `demo-${++serial}`;
 
   function refresh(now: number) {
-    for (const [id, thread] of threads) if (thread.expiresAt !== undefined && now >= thread.expiresAt) threads.delete(id);
+    for (const [id, thread] of threads) {
+      if (thread.expiresAt === undefined || now < thread.expiresAt) continue;
+      threads.delete(id);
+      for (const message of thread.messages) for (const file of message.attachments) release(file.id);
+    }
     for (const [id, entry] of pending) {
       if (now < entry.undoUntil) continue;
       pending.delete(id);
@@ -34,8 +41,8 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
       const previous = draft.replyToThreadId ? threads.get(draft.replyToThreadId) : undefined;
       const date = new Date(entry.undoUntil).toISOString();
       const from = { name: sender.name, email: sender.email };
-      const message = { id, from, to: draft.to.map((email) => ({ name: email, email })), date, subject: draft.subject, text: draft.body, attachments: draft.attachments };
-      if (previous && !hidden(previous.mailboxId) && previous.messages.length < 100) {
+      const message = { id, from, to: addresses(draft.to), cc: addresses(draft.cc), bcc: addresses(draft.bcc), date, subject: draft.subject, text: draft.body, attachments: draft.attachments };
+      if (previous && !hidden(previous.mailboxId) && previous.messages.length < 100 && normalizeSubject(previous.subject) === normalizeSubject(draft.subject)) {
         previous.messages.push(message);
         Object.assign(previous, { date, from, snippet: draft.body, count: previous.messages.length, hasAttachments: previous.hasAttachments || message.attachments.length > 0 });
       } else {
@@ -48,6 +55,14 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
     const blob = blobs.get(id);
     if (!blob) throw new Error('Attachment not found.');
     return blob;
+  }
+
+  function release(id: string) {
+    const contains = (items: Attachment[]) => items.some((file) => file.id === id);
+    if (files.some((file) => file.id === id) || [...drafts.values()].some((draft) => contains(draft.attachments)) ||
+        [...pending.values()].some(({ draft }) => contains(draft.attachments)) ||
+        [...threads.values()].some((thread) => thread.messages.some((message) => contains(message.attachments)))) return;
+    blobs.delete(id);
   }
 
   function store(file: Blob, name: string): Attachment {
@@ -101,10 +116,16 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
     async listDrafts() { return copy([...drafts.values()].reverse()); },
     async saveDraft(draft) {
       const saved = { ...copy(draft), id: draft.id ?? nextId() };
+      const old = drafts.get(saved.id);
       drafts.set(saved.id, saved);
+      for (const file of old?.attachments ?? []) release(file.id);
       return copy(saved);
     },
-    async discardDraft(id) { drafts.delete(id); },
+    async discardDraft(id) {
+      const old = drafts.get(id);
+      drafts.delete(id);
+      for (const file of old?.attachments ?? []) release(file.id);
+    },
     async send(draft) {
       const now = clock();
       refresh(now);
@@ -115,7 +136,11 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
       if (draft.attachments.reduce((sum, a) => sum + a.size, 0) > attachmentLimit) throw new Error('Attachments cannot exceed 25 MiB in total.');
       const result = { id: nextId(), undoUntil: now + settings.undoSeconds * 1000 };
       pending.set(result.id, { ...result, draft: copy(draft) });
-      if (draft.id) drafts.delete(draft.id);
+      if (draft.id) {
+        const old = drafts.get(draft.id);
+        drafts.delete(draft.id);
+        for (const file of old?.attachments ?? []) release(file.id);
+      }
       return result;
     },
     async undoSend(id) {
@@ -123,11 +148,13 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
       const entry = pending.get(id);
       if (!entry) return undefined;
       pending.delete(id);
-      if (entry.draft.id) drafts.set(entry.draft.id, entry.draft);
-      return copy(entry.draft);
+      const restored = { ...entry.draft, id: entry.draft.id ?? nextId() };
+      drafts.set(restored.id, restored);
+      return copy(restored);
     },
     async uploadAttachment(file, name) { return store(file, name); },
     async downloadAttachment(id) { return needAttachment(id); },
+    async releaseAttachment(id) { release(id); },
     async listDriveFiles() { return copy(files); },
     async attachFromDrive(id, mode) {
       const file = files.find((item) => item.id === id);
@@ -149,7 +176,8 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
     async listDomains() { return copy(domains); },
     async addDomain(name, kind) {
       name = name.trim().toLowerCase();
-      if (!email.test(`admin@${name}`) || name.includes('@')) throw new Error('Enter a valid domain.');
+      const domainLabels = name.split('.');
+      if (name.length > 253 || domainLabels.length < 2 || !domainLabels.every((label) => dnsLabel.test(label)) || !/[a-z]/i.test(domainLabels.at(-1)!)) throw new Error('Enter a valid domain.');
       if (domains.some((d) => d.name === name)) throw new Error('That domain already exists.');
       domains.push({ name, kind, status: 'Pending' });
     },

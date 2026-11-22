@@ -13,6 +13,9 @@ test('composes from an alias with a Drive copy, uploads a file and undoes send',
   await compose.getByRole('combobox', { name: 'From', exact: true }).selectOption('hello@example.com');
   await compose.getByLabel('To', { exact: true }).fill('recipient@example.com');
   await compose.getByLabel('Subject').fill('Demo message');
+  await compose.getByLabel('Subject').press('Enter');
+  await expect(compose).toBeVisible();
+  await expect(page.getByText('Message queued')).toHaveCount(0);
   await compose.getByLabel('Message body').fill('Hello from the alias.');
   await noSeriousIssues(page);
   await compose.getByRole('button', { name: 'Attach from Drive' }).click();
@@ -36,12 +39,36 @@ test('composes from an alias with a Drive copy, uploads a file and undoes send',
   await expect(compose.getByLabel('Message body')).toHaveValue('Hello from the alias.');
 });
 
+test('undo stays available inside the next composer and does not overwrite it', async ({ page }) => {
+  await page.goto('/');
+  const trigger = page.getByRole('button', { name: 'Compose', exact: true });
+  const editor = page.getByRole('dialog', { name: 'New message' });
+  await trigger.click();
+  await editor.getByLabel('To', { exact: true }).fill('recipient@example.com');
+  await editor.getByLabel('Subject').fill('First draft');
+  await editor.getByRole('button', { name: 'Send', exact: true }).click();
+  await trigger.click();
+  await editor.getByLabel('Subject').fill('Second draft');
+  await editor.getByRole('button', { name: 'Undo send' }).click();
+  await expect(editor.getByText('Send undone; saved to Drafts.')).toBeVisible();
+  await expect(editor.getByLabel('Subject')).toHaveValue('Second draft');
+  await editor.getByRole('button', { name: 'Discard draft' }).click();
+  const drafts = page.getByRole('button', { name: 'Drafts', exact: true });
+  if (!(await drafts.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
+  await drafts.click();
+  await expect(page.getByRole('button', { name: 'Open draft First draft' })).toBeVisible();
+});
+
 test('settings signature applies to reply and forwarding includes the original attachment', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByRole('searchbox')).toBeEnabled();
   await page.getByRole('button', { name: 'Account menu' }).click();
   await page.getByRole('link', { name: 'Mail settings' }).click();
   await page.getByLabel('Signature').fill('Regards, Alex');
+  const skip = page.getByRole('link', { name: 'Skip to mail' });
+  await skip.focus();
+  await skip.press('Enter');
+  await expect(page.getByLabel('Signature')).toHaveValue('Regards, Alex');
   await page.getByRole('button', { name: 'Save settings' }).click();
   await noSeriousIssues(page);
   await page.getByRole('button', { name: 'Back to mail' }).click();
@@ -53,6 +80,7 @@ test('settings signature applies to reply and forwarding includes the original a
   await expect(page.getByText('Saved floor-plan-notes.txt to demo Drive.')).toBeVisible();
   await page.getByRole('button', { name: 'Reply', exact: true }).click();
   await expect(page.getByLabel('To', { exact: true })).toHaveValue('mira@example.com');
+  await expect(page.getByRole('combobox', { name: 'From', exact: true })).toHaveValue('hello@example.com');
   await expect(page.getByLabel('Message body')).toHaveValue(/Regards, Alex/);
   await page.getByRole('button', { name: 'Discard draft' }).click();
   await page.getByRole('button', { name: 'Forward', exact: true }).click();

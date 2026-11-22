@@ -2,6 +2,8 @@
   import '@fontsource-variable/ibm-plex-sans';
   import 'suite-shell/styles.css';
   import '$lib/mail.css';
+  import { replaceState } from '$app/navigation';
+  import { page } from '$app/state';
   import { TopBar } from 'suite-shell';
   import { Archive, File, Inbox, Mail, OctagonAlert, Paperclip, Pencil, Plus, RefreshCw, Shield, Search, Send, Star, Tag, Trash2 } from '@lucide/svelte';
   import { onDestroy, onMount, tick } from 'svelte';
@@ -42,6 +44,7 @@
   let openingCompose = false;
   let queued = $state<PendingSend[]>([]);
   const sendTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const undoing = new Set<string>();
   let labelDialog: HTMLDialogElement;
   let headingHost: HTMLElement;
   let lastOpen: HTMLButtonElement | undefined;
@@ -72,33 +75,41 @@
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) busy = false; }
   }
-  onMount(() => { void refresh(); syncHash(); });
+  onMount(() => { void refresh(); if (location.hash) syncHash(); });
   onDestroy(() => { for (const timer of sendTimers.values()) clearTimeout(timer); });
 
   async function openSettings() {
     try {
-      [settings, identities] = await Promise.all([api.getSettings(), api.listIdentities()]);
+      const [value, available] = await Promise.all([api.getSettings(), api.listIdentities()]);
+      if (location.hash !== '#mail-settings') return;
+      settings = value; identities = available;
       navOpen = false;
       admin = false;
       await focusHeading();
     } catch (cause) { showError(cause); }
   }
   function syncHash() {
-    if (location.hash === '#mail-settings' && !settings) void openSettings();
-    else if (settings && location.hash !== '#mail-settings') { settings = undefined; void focusHeading(); }
+    if (location.hash === '#mail-settings') { if (!settings) void openSettings(); }
+    else if (location.hash === '#mail-admin') {
+      settings = undefined; admin = true; navOpen = false; error = ''; void focusHeading();
+    } else if (location.hash === '#mail' || !location.hash) void navigate('inbox');
   }
-  function closeSettings() { location.hash = 'mail'; }
-  async function setAdmin(next: boolean) {
-    if (settings) { settings = undefined; location.hash = 'mail'; }
-    admin = next; navOpen = false; error = '';
-    await focusHeading();
+  function returnToMail() {
+    settings = undefined; admin = false;
+    replaceState('#mail', page.state);
+    void focusHeading();
   }
   async function compose(event?: { mode: 'reply' | 'forward'; message: Message; threadId: string }, saved?: Draft) {
     if (openingCompose || draft) return;
-    openingCompose = true; error = ''; navOpen = false;
+    error = ''; navOpen = false;
+    if (saved && identities.length) {
+      draft = { ...saved, attachments: saved.attachments.map((item) => ({ ...item })) };
+      return;
+    }
+    openingCompose = true;
     try {
-      const preferences = await api.getSettings();
-      identities = await api.listIdentities();
+      const [preferences, available] = await Promise.all([api.getSettings(), api.listIdentities()]);
+      identities = available;
       if (saved) { draft = { ...saved, attachments: saved.attachments.map((item) => ({ ...item })) }; return; }
       const message = event?.message;
       const reply = event?.mode === 'reply';
@@ -107,7 +118,10 @@
       const signature = preferences.signature ? `\n\n${preferences.signature}` : '';
       const quote = message ? `\n\n${reply ? `On ${shortDate.format(new Date(message.date))}, ${message.from.name} wrote:` : `Forwarded message from ${message.from.name} <${message.from.email}>`}\n${message.text.split('\n').map((line) => `> ${line}`).join('\n')}` : '';
       const to = message && reply ? [identities.some((address) => address.email === message.from.email) ? message.to[0]?.email : message.from.email].filter((address): address is string => !!address) : [];
-      draft = { from: preferences.defaultFrom, to, cc: [], bcc: [], subject, body: signature + quote, replyToThreadId: reply ? event.threadId : undefined, attachments: message && !reply ? message.attachments.map((file) => ({ ...file })) : [] };
+      const messageIdentity = message && [...message.to, ...(message.cc ?? []), message.from]
+        .find((address) => available.some((identity) => identity.email.toLowerCase() === address.email.toLowerCase()));
+      const from = available.find((identity) => identity.email.toLowerCase() === messageIdentity?.email.toLowerCase())?.email ?? preferences.defaultFrom;
+      draft = { from, to, cc: [], bcc: [], subject, body: signature + quote, replyToThreadId: reply ? event.threadId : undefined, attachments: message && !reply ? message.attachments.map((file) => ({ ...file })) : [] };
     } catch (cause) { showError(cause); }
     finally { openingCompose = false; }
   }
@@ -129,17 +143,21 @@
     catch (cause) { showError(cause); }
   }
   async function undo(send: PendingSend) {
-    if (draft || openingCompose) { status = 'Close the active composer before reopening a queued message.'; return; }
+    if (undoing.has(send.id)) return;
+    undoing.add(send.id);
     try {
       const restored = await api.undoSend(send.id);
       const timer = sendTimers.get(send.id);
       if (timer !== undefined) clearTimeout(timer);
       sendTimers.delete(send.id);
       queued = queued.filter((item) => item.id !== send.id);
-      if (restored) { status = 'Send undone.'; await compose(undefined, restored); }
-      else { status = 'The undo window has ended.'; await refreshOpenThread(); }
+      if (restored) {
+        if (draft || openingCompose) status = 'Send undone; saved to Drafts.';
+        else { status = 'Send undone.'; await compose(undefined, restored); }
+      } else { status = 'The undo window has ended.'; await refreshOpenThread(); }
       await refresh();
     } catch (cause) { showError(cause); }
+    finally { undoing.delete(send.id); }
   }
 
   async function focusHeading() { await tick(); headingHost.querySelector<HTMLElement>('[data-view-heading]')?.focus(); }
@@ -148,8 +166,8 @@
     else navCollapsed = !navCollapsed;
   }
   async function navigate(next: View, id?: string) {
-    if (settings) { settings = undefined; location.hash = 'mail'; }
-    navOpen = false; admin = false; view = next; labelId = id; thread = undefined; lastOpen = undefined; error = ''; selected = [];
+    if (location.hash === '#mail-settings' || location.hash === '#mail-admin') replaceState('#mail', page.state);
+    navOpen = false; settings = undefined; admin = false; view = next; labelId = id; thread = undefined; lastOpen = undefined; error = ''; selected = [];
     await refresh(); await focusHeading();
   }
   function submitSearch(event: SubmitEvent) {
@@ -213,7 +231,7 @@
 
 <svelte:window onhashchange={syncHash} onkeydown={(event) => { if (event.key === 'Escape') navOpen = false; }} />
 <svelte:head><title>Riaklo Mail</title><meta name="description" content="Riaklo Mail demo inbox" /></svelte:head>
-<a class="skip" href="#mail-content">Skip to mail</a>
+<a class="skip" href="#mail-content" onclick={(event) => { event.preventDefault(); headingHost.focus(); }}>Skip to mail</a>
 <TopBar productName="Riaklo Mail" productHref="#mail" productIcon="mail" currentAppId="mail" {apps} {account} accountHref="#mail-settings" onMenuClick={toggleNav} menuControls="mail-nav" settingsLabel="Mail settings" settingsHref={busy ? undefined : '#mail-settings'}>
   {#snippet search()}
     <form class="search" role="search" onsubmit={submitSearch}>
@@ -237,14 +255,14 @@
         <li><button aria-current={view === 'label' && labelId === label.id ? 'page' : undefined} onclick={() => navigate('label', label.id)}><i class={`dot color-${index % 4}`}></i><span>{label.name}</span></button></li>
       {/each}
     </ul>
-    <ul class="admin-entry"><li><button aria-current={admin ? 'page' : undefined} onclick={() => setAdmin(true)}><Shield size={20} /> <span>Mail admin</span></button></li></ul>
+    <ul class="admin-entry"><li><button aria-current={admin ? 'page' : undefined} onclick={() => location.hash = 'mail-admin'}><Shield size={20} /> <span>Mail admin</span></button></li></ul>
   </nav>
   <main id="mail-content" class="card" bind:this={headingHost} tabindex="-1" aria-busy={busy}>
     {#if error}<p role="alert" class="notice warning">{error}</p>{/if}
     {#if admin}
-      <MailAdmin {api} onBack={() => setAdmin(false)} />
+      <MailAdmin {api} onBack={returnToMail} />
     {:else if settings}
-      <MailSettings value={settings} {identities} onBack={closeSettings} onSave={api.updateSettings} />
+      <MailSettings value={settings} {identities} onBack={returnToMail} onSave={api.updateSettings} />
     {:else if thread}
       {#key thread.id}
         <ThreadView {thread} {labels} onBack={closeThread} onUpdate={(change) => { if (thread) void update([thread.id], change); }} onDownload={download} onSaveToDrive={saveToDrive} onCompose={(mode, message) => { if (thread) void compose({ mode, message, threadId: thread.id }); }} />
@@ -293,13 +311,17 @@
   </main>
 </div>
 <div class="status" class:sr-only={!status} aria-live="polite">{status}{#if status}<button class="icon" aria-label="Dismiss notification" onclick={() => status = ''}>×</button>{/if}</div>
-{#if queued.length}
-  <div class="send-notices" aria-label="Queued messages">
-    {#each queued as send (send.id)}<div class="send-notice"><span role="status">Message queued</span><button class="pill" onclick={() => undo(send)}>Undo send</button></div>{/each}
-  </div>
-{/if}
+{#snippet undoNotices()}
+  {#if queued.length}
+    <div class="send-notices" aria-label="Queued messages">
+      {#each queued as send (send.id)}<div class="send-notice"><span role="status">Message queued</span><button type="button" class="pill" onclick={() => undo(send)}>Undo send</button></div>{/each}
+    </div>
+  {/if}
+{/snippet}
 {#if draft}
-  <Compose initial={draft} {identities} {api} onClose={() => { draft = undefined; void refresh(); }} onSent={sent} onStatus={(message) => status = message} />
+  <Compose initial={draft} {identities} {api} {undoNotices} undoStatus={status === 'Send undone; saved to Drafts.' ? status : ''} onClose={() => { draft = undefined; void refresh(); }} onSent={sent} onStatus={(message) => status = message} />
+{:else}
+  {@render undoNotices()}
 {/if}
 <dialog bind:this={labelDialog} class="modal" aria-labelledby="label-heading">
   <form onsubmit={createLabel}>

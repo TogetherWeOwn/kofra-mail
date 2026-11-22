@@ -1,9 +1,10 @@
 <script lang="ts">
   import { HardDrive, Paperclip, Trash2, X } from '@lucide/svelte';
-  import { onMount } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
   import type { Attachment, Draft, DriveFile, Identity, MailApi, PendingSend } from '@kofra/mail-core';
 
-  let { initial, identities, api, onClose, onSent, onStatus }: {
+  let { initial, identities, api, undoNotices, undoStatus, onClose, onSent, onStatus }: {
+    undoNotices: Snippet; undoStatus: string;
     initial: Draft; identities: Identity[]; api: MailApi; onClose: () => void;
     onSent: (sent: PendingSend) => void; onStatus: (message: string) => void;
   } = $props();
@@ -41,12 +42,15 @@
   async function discard() {
     if (pending) return;
     pending = true; error = '';
-    try { if (form.id) await api.discardDraft(form.id); onStatus('Draft discarded.'); finish(); }
+    try {
+      if (form.id) await api.discardDraft(form.id);
+      await Promise.all(form.attachments.map((file) => api.releaseAttachment(file.id)));
+      onStatus('Draft discarded.'); finish();
+    }
     catch (cause) { error = errorMessage(cause); }
     finally { pending = false; }
   }
-  async function send(event: SubmitEvent) {
-    event.preventDefault();
+  async function send() {
     if (pending) return;
     pending = true; error = '';
     try { onSent(await api.send(draft())); finish(); }
@@ -56,6 +60,10 @@
   function attach(files: Attachment[]) {
     if ([...form.attachments, ...files].reduce((total, file) => total + file.size, 0) > 25 * 1024 * 1024) throw new Error('Attachments cannot exceed 25 MiB in total.');
     form.attachments.push(...files);
+  }
+  function remove(file: Attachment) {
+    form.attachments = form.attachments.filter((item) => item.id !== file.id);
+    void api.releaseAttachment(file.id).catch((cause) => error = errorMessage(cause));
   }
   async function upload(event: Event & { currentTarget: HTMLInputElement }) {
     const input = event.currentTarget;
@@ -89,7 +97,7 @@
 </script>
 
 <dialog class="modal compose" aria-labelledby="compose-title" bind:this={modal} oncancel={(event) => { event.preventDefault(); void save(); }}>
-  <form onsubmit={send}>
+  <form onsubmit={(event) => event.preventDefault()}>
     <header class="compose-head"><h2 id="compose-title">New message</h2><button class="icon" type="button" aria-label="Close and save draft" disabled={pending} onclick={save}><X size={19} /></button></header>
     <div class="compose-fields">
       <label class="compose-field">From<select bind:value={form.from}>{#each identities as identity (identity.email)}<option value={identity.email}>{identity.name} &lt;{identity.email}&gt;</option>{/each}</select></label>
@@ -104,13 +112,17 @@
     {#if form.attachments.length}
       <ul class="compose-files" aria-label="Attached files">
         {#each form.attachments as file (file.id)}
-          <li><Paperclip size={15} /><span>{file.name}{file.link ? ' (Drive link)' : ''}</span><button type="button" class="icon" aria-label={`Remove ${file.name}`} onclick={() => form.attachments = form.attachments.filter((item) => item.id !== file.id)}><X size={16} /></button></li>
+          <li><Paperclip size={15} /><span>{file.name}{file.link ? ' (Drive link)' : ''}</span><button type="button" class="icon" aria-label={`Remove ${file.name}`} disabled={pending} onclick={() => remove(file)}><X size={16} /></button></li>
         {/each}
       </ul>
     {/if}
     {#if error}<p class="notice warning form-error" role="alert">{error}</p>{/if}
+    <div class="compose-undo">
+      {@render undoNotices()}
+      {#if undoStatus}<p role="status">{undoStatus}</p>{/if}
+    </div>
     <footer class="compose-actions">
-      <button class="pill primary" disabled={pending}>Send</button>
+      <button class="pill primary" type="button" disabled={pending} onclick={send}>Send</button>
       <label class="file-picker icon" title="Upload attachments"><Paperclip size={20} /><input type="file" multiple aria-label="Upload attachments" disabled={pending} onchange={upload} /></label>
       <button class="icon" type="button" aria-label="Attach from Drive" disabled={pending} onclick={openPicker}><HardDrive size={20} /></button>
       <span class="toolbar-spacer"></span><button class="pill" type="button" disabled={pending} onclick={save}>Save draft</button>
@@ -129,4 +141,8 @@
   </ul>
   {#if driveError}<p class="notice warning" role="alert">{driveError}</p>{/if}
   <div class="dialog-actions"><button type="button" class="pill" disabled={!selected || pending} onclick={() => addDrive('link')}>Insert link</button><button type="button" class="pill primary" disabled={!selected || pending} onclick={() => addDrive('copy')}>Attach copy</button></div>
+  <div class="compose-undo">
+    {@render undoNotices()}
+    {#if undoStatus}<p role="status">{undoStatus}</p>{/if}
+  </div>
 </dialog>

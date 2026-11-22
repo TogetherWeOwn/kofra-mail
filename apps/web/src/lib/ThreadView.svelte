@@ -41,7 +41,7 @@
       <details class="message" open={i === thread.messages.length - 1}>
         <summary class="message-head">
           <span class="avatar large" aria-hidden="true">{message.from.name.split(' ').slice(0, 2).map((word) => word[0]).join('')}</span>
-          <span class="message-address"><strong>{message.from.name}</strong> <span class="muted address">&lt;{message.from.email}&gt;</span><span class="muted to">to {message.to.map((address) => address.name).join(', ')}</span></span>
+          <span class="message-address"><strong>{message.from.name}</strong> <span class="muted address">&lt;{message.from.email}&gt;</span><span class="muted to">{#if message.to.length}To {message.to.map((address) => address.email).join(', ')}{/if}{#if message.cc?.length}<span class="to">Cc {message.cc.map((address) => address.email).join(', ')}</span>{/if}{#if message.bcc?.length}<span class="to">Bcc {message.bcc.map((address) => address.email).join(', ')}</span>{/if}</span></span>
           <time datetime={message.date}>{date.format(new Date(message.date))}</time>
         </summary>
         <div class="message-body">
