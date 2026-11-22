@@ -1,6 +1,7 @@
 import type { Attachment, Conversation, DirectoryUser, Domain, Draft, Group, Label, MailApi, MailboxId, PendingSend, Settings } from './index.ts';
 import { attachments, driveFiles, identities, labels, seed } from './fixtures.ts';
 import { matchesQuery } from './search.ts';
+import { secureHttpsLink } from './index.ts';
 
 const day = 86_400_000;
 const folders = { inbox: 'Inbox', sent: 'Sent', drafts: 'Drafts', archive: 'Archive', spam: 'Spam', trash: 'Trash' } satisfies Record<MailboxId, string>;
@@ -110,6 +111,7 @@ export function createFakeMailApi(clock: () => number = Date.now): MailApi {
       if (!identities.some((a) => a.email === draft.from)) throw new Error('Choose an available From address.');
       const recipients = [...draft.to, ...draft.cc, ...draft.bcc];
       if (recipients.length < 1 || recipients.length > 50 || recipients.some((a) => !email.test(a))) throw new Error('Enter 1–50 valid recipient addresses.');
+      if (draft.attachments.some((a) => a.link !== undefined && !secureHttpsLink(a.link))) throw new Error('Invalid Drive attachment link.');
       if (draft.attachments.reduce((sum, a) => sum + a.size, 0) > attachmentLimit) throw new Error('Attachments cannot exceed 25 MiB in total.');
       const result = { id: nextId(), undoUntil: now + settings.undoSeconds * 1000 };
       pending.set(result.id, { ...result, draft: copy(draft) });

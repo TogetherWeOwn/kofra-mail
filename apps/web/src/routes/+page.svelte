@@ -35,7 +35,7 @@
   let lastOpen: HTMLButtonElement | undefined;
   let request = 0;
   const heading = $derived(view === 'label' ? labels.find((label) => label.id === labelId)?.name ?? 'Label' : view === 'search' ? 'Search results' : links.find((item) => item.key === view)?.text ?? 'Inbox');
-  const shortDate = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  const shortDate = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' });
   const initials = (name: string) => name.split(' ').slice(0, 2).map((word) => word[0]).join('');
   const account = { name: 'Alex Morgan', email: 'alex@example.com', initials: 'AM' };
 
@@ -180,13 +180,14 @@
       {#if busy}<p class="empty">Loading conversations…</p>
       {:else if !rows.length}<p class="empty">{view === 'search' ? 'No conversations match your search.' : 'No conversations here.'}</p>
       {:else}
-        <span hidden id="unread-conversation">Unread conversation</span>
+        <span hidden id="unread-conversation">Unread conversation.</span>
+        <span hidden id="has-attachments">Has attachments.</span>
         <ul class="mail-list" aria-label={heading}>
           {#each rows as row, index (row.id)}
             <li class="mail-row" class:unread={row.unread} class:chosen={selected.includes(row.id)}>
               <input type="checkbox" class="row-check" aria-label={`Select ${row.subject}`} checked={selected.includes(row.id)} onchange={() => toggleSelect(row.id)} />
               <button class="icon star" aria-label={`${row.starred ? 'Unstar' : 'Star'} ${row.subject}`} aria-pressed={row.starred} onclick={() => update([row.id], { starred: !row.starred })}><Star size={17} fill={row.starred ? 'currentColor' : 'none'} /></button>
-              <button class="open-mail" id={`open-${row.id}`} aria-describedby={row.unread ? 'unread-conversation' : undefined} onclick={(event) => open(row.id, event.currentTarget)}>
+              <button class="open-mail" id={`open-${row.id}`} aria-describedby={[row.unread ? 'unread-conversation' : '', row.hasAttachments ? 'has-attachments' : ''].filter(Boolean).join(' ') || undefined} onclick={(event) => open(row.id, event.currentTarget)}>
                 <span class={`avatar row-avatar color-${index % 4}`} aria-hidden="true">{initials(row.from.name)}</span>
                 <span class="sender">{row.from.name}{#if row.count > 1} <small>{row.count}</small>{/if}</span>
                 <span class="snippet">{#each labels.filter((label) => row.labelIds.includes(label.id)) as label (label.id)}<span class="label-chip"><Tag size={11} />{label.name}</span>{/each}<span class="subject">{row.subject}</span><span class="preview"><span class="desktop"> – </span>{row.snippet}</span></span>

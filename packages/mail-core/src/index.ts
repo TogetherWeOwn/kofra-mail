@@ -3,6 +3,13 @@ export type Mailbox = { id: MailboxId; name: string; unread: number };
 export type Address = { name: string; email: string };
 export type Identity = Address & { primary: boolean };
 export type Attachment = { id: string; name: string; size: number; type: string; link?: string };
+
+/** Reject URLs that could navigate somewhere other than a credential-free HTTPS page. */
+export function secureHttpsLink(link: string): string | undefined {
+  if (!/^https:\/\/[^/\\]/i.test(link)) return undefined;
+  const url = URL.parse(link);
+  return url && url.protocol === 'https:' && !url.username && !url.password ? url.href : undefined;
+}
 export type Label = { id: string; name: string };
 export type Message = {
   id: string; from: Address; to: Address[]; date: string; subject: string;

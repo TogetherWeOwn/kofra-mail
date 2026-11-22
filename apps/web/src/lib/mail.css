@@ -67,7 +67,7 @@ nav ul button b { font-size: .82rem; }
 .toolbar input { margin: 0 12px 0 7px; }
 .toolbar-spacer { flex: 1; }
 .tally { font-size: .87rem; white-space: nowrap; }
-.list-heading:not(.sr-only) { padding: 15px 20px 8px; }
+.list-heading:not(.sr-only) { padding: 15px 20px 8px; overflow-wrap: anywhere; }
 .empty, .expiry { padding: 12px 20px; }
 .filters { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 20px 14px; }
 .mail-row { display: flex; align-items: center; padding: 0 10px; min-height: 45px; border-bottom: 1px solid var(--line); background: var(--bg); }

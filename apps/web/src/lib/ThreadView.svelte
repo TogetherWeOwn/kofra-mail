@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Attachment, Conversation, Label, ThreadUpdate } from '@kofra/mail-core';
+  import { secureHttpsLink, type Attachment, type Conversation, type Label, type ThreadUpdate } from '@kofra/mail-core';
   import { Archive, ArrowLeft, Download, HardDrive, Inbox, OctagonAlert, Paperclip, Tag, Trash2 } from '@lucide/svelte';
 
   let { thread, labels, onBack, onUpdate, onDownload, onSaveToDrive }: {
@@ -8,7 +8,7 @@
     onSaveToDrive: (file: Attachment) => void;
   } = $props();
   let showLabels = $state(false);
-  const date = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' });
+  const date = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' });
 </script>
 
 <section aria-label="Conversation" class="conversation">
@@ -50,7 +50,10 @@
             <ul class="files" aria-label="Attachments">
               {#each message.attachments as file (file.id)}
                 <li><Paperclip size={20} /><span><strong>{file.name}</strong><small>{file.size.toLocaleString()} bytes</small></span>
-                  {#if file.link}<a class="icon" href={file.link} target="_blank" rel="noopener noreferrer" aria-label={`Open Drive link for ${file.name}`}><HardDrive size={18} /></a>
+                  {#if file.link !== undefined}
+                    {@const url = secureHttpsLink(file.link)}
+                    {#if url}<a class="icon" href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open Drive link for ${file.name}`}><HardDrive size={18} /></a>
+                    {:else}<small>Link unavailable</small>{/if}
                   {:else}
                     <button class="icon" aria-label={`Download ${file.name}`} onclick={() => onDownload(file)}><Download size={18} /></button>
                     <button class="icon" aria-label={`Save ${file.name} to Drive`} onclick={() => onSaveToDrive(file)}><HardDrive size={18} /></button>

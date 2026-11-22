@@ -9,7 +9,7 @@ async function mailbox(page: Page, name: string) {
 async function accessible(page: Page) {
   const result = await new AxeBuilder({ page }).analyze();
   expect(result.violations.filter((v) => v.impact === 'critical' || v.impact === 'serious')).toEqual([]);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
 }
 
 test('reads a conversation, archives it and restores it from trash', async ({ page }) => {
@@ -24,12 +24,28 @@ test('reads a conversation, archives it and restores it from trash', async ({ pa
   await expect(page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ })).toHaveCount(0);
   await mailbox(page, 'All mail');
   await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
+  await page.getByRole('button', { name: 'Move to Inbox' }).click();
+  await mailbox(page, 'Inbox');
+  await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
   await page.getByRole('button', { name: 'Delete', exact: true }).click();
   await mailbox(page, 'Trash');
   await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
   await page.getByRole('button', { name: 'Move to Inbox' }).click();
   await mailbox(page, 'Inbox');
   await expect(page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ })).toBeVisible();
+});
+
+test('a long unbroken label fits the actual viewport', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('searchbox')).toBeEnabled();
+  const create = page.getByRole('button', { name: 'Create label' });
+  if (!(await create.isVisible())) await page.getByRole('button', { name: 'Toggle mail navigation' }).click();
+  await create.click();
+  const longName = 'W'.repeat(72);
+  await page.getByLabel('Label name').fill(longName);
+  await page.getByRole('button', { name: 'Create', exact: true }).click();
+  await expect(page.getByRole('heading', { name: longName })).toBeVisible();
+  await accessible(page);
 });
 
 test('searches and can star the result', async ({ page }) => {
