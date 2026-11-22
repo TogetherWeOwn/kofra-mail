@@ -1,0 +1,8 @@
+node_modules/
+.svelte-kit/
+.wrangler/
+playwright-report/
+test-results/
+.env*
+.dev.vars*
+!.env.example
