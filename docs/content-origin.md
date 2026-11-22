@@ -96,14 +96,18 @@ Every step must pass. Any failure answers 404 with an empty body, and the reason
 
 ### 2.5 Revocation summary
 
-| Event | Effect on outstanding URLs |
-|---|---|
-| Time passes | Dead after at most 5 minutes |
-| Password change or reset, factor change, "sign out everywhere" (the credential epoch rises) | Dead within 60 s (step 4) |
-| Message deleted, expired or purged | Dead at once (step 5) |
-| Mailbox given to another member | Dead at once (step 4, directory owner) |
-| Key removed | Dead at once (step 1) |
-| Ordinary sign-out of one session | URLs already minted live out their at most 5 minutes. They exist only in that session's page, which the sign-out has closed |
+"Dead" means the verifier refuses the URL. Every response is `no-store` (section 3.1), so the browser keeps no copy it could show without asking the verifier again.
+
+| Event | `body`, `cid`, `att` | `img` |
+|---|---|---|
+| Time passes | Dead after at most 5 minutes | Dead at the body token's `exp`, at most 5 minutes |
+| Password change or reset, factor change, "sign out everywhere" (the credential epoch rises) | Dead within 60 s (step 4) | Lives until its `exp` |
+| Message deleted, expired or purged | Dead at once (step 5) | Lives until its `exp` |
+| Mailbox given to another member | Dead at once (step 4, directory owner) | Lives until its `exp` |
+| Key removed | Dead at once (step 1) | Dead at once (step 1) |
+| Ordinary sign-out of one session | URLs already minted live out their at most 5 minutes. They exist only in that session's page, which the sign-out has closed | The same |
+
+An `img` URL skips steps 4 and 5 because it carries no mailbox data: it lets its holder fetch one public image URL through the proxy, and the image comes from the sender's server, not from the mailbox. Its life is never longer than the body token it was minted from.
 
 ## 3. Responses
 
@@ -120,7 +124,7 @@ Cache-Control: private, no-store
 - **`frame-ancestors`** stops other sites from framing a leaked URL.
 - **Scripts:** there is no `script-src`, so `default-src 'none'` forbids scripts even if the sanitiser misses one.
 - **`img-src`** names the content host explicitly. Under `sandbox` the document's origin is opaque, so `'self'` is not relied on.
-- **Image proxy responses** use `Cache-Control: private, max-age=300` instead.
+- **`no-store` applies to every response,** including `cid` and image proxy responses. A browser cache entry could otherwise be reused after the token expired or was revoked; with `no-store`, every use of a signed URL passes the verifier. Caching of remote images happens only behind the verifier (section 5, rule 6).
 
 ### 3.2 `body`
 
@@ -203,7 +207,9 @@ Cache-Control: private, no-store
    - The body is streamed and cut off at `remoteImageBytes` (5 MiB); a larger image fails.
    - Outgoing headers are rebuilt from scratch: the normalised `Content-Type`, `Content-Length` when known, and the security headers of section 3.1. No upstream header is passed through.
 5. **Failures:** anything else answers 404 with an empty body, so the browser shows a broken image.
-6. **Caching:** shared caching of the upstream fetch is allowed (a day). Senders then see fewer opens; they never see who opened.
+6. **Caching, behind the verifier only:** the Worker may keep the upstream image in its own fetch cache, keyed by the remote URL, for up to a day. Senders then see fewer opens; they never see who opened.
+   - The Worker consults that cache only after the token passed every verification step, so a cached image is never served for an expired, tampered or revoked token.
+   - Its response to the browser is still `Cache-Control: private, no-store` (section 3.1). No shared or browser cache stores the signed response.
 7. **Logging:** never the token, never the remote URL. Only the purpose, status, byte count and the first 8 characters of `SHA-256(token)`.
 
 **What users should know:** proxying still tells a sender that someone opened the message, and when. That is why images stay blocked until the user asks. The UI says so next to "Show images".
@@ -236,7 +242,9 @@ Cache-Control: private, no-store
 4. **Proxy:**
    - Refusals: IP literals, private and own-zone names, a fourth redirect, a redirect to a refused host, SVG, a mislabelled HTML body, more than 5 MiB, and over 10 s.
    - It never forwards a cookie or `Referer`, checked with a local upstream fixture.
-5. **Headers:** every response has the section 3.1 headers, and downloads are `application/octet-stream` with `attachment`.
+5. **Headers and caching:**
+   - Every response, including `cid` and `img`, has the section 3.1 headers, `Cache-Control: private, no-store` included, and downloads are `application/octet-stream` with `attachment`.
+   - An `img` URL whose image is in the fetch cache answers 404 once its token has expired or its MAC is flipped, and the cache is not read for it.
 6. **Logs:** no token or remote URL appears in captured logs.
 
 **Stop rule:** no live domain, DNS, certificate or secret is created by the lane. Choosing and attaching the content domain is an operator step after review. If the sanitiser cannot meet the corpus with `HTMLRewriter` alone, stop and report the failing vectors instead of adding a dependency.

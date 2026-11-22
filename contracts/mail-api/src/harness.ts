@@ -29,6 +29,26 @@ export interface TestMessage {
   attachments?: TestAttachment[];
   /** Thread with an earlier delivered message (In-Reply-To / References). */
   inReplyTo?: Id;
+  /** The message's `Message-ID` header, bracketed; the harness makes a unique one when absent. */
+  messageId?: string;
+}
+
+/**
+ * Header fields of a sent copy's stored MIME: lower-case names, unfolded
+ * values. The stored copy carries the same `In-Reply-To`, `References` and
+ * address headers as the provider request.
+ */
+export type SentHeaders = Record<string, string>;
+
+/** Drive fault injection, for implementations whose Drive is a local stand-in. */
+export interface DriveFaults {
+  /**
+   * The next `saveAttachmentToDrive` commits its file at Drive and then fails
+   * with 503 `unavailable`, as if the reply was lost before Mail recorded it.
+   */
+  loseNextSaveReply(): Promise<void>;
+  /** Files Drive holds for `member`. */
+  savedFiles(): Promise<number>;
 }
 
 /**
@@ -45,7 +65,11 @@ export interface ConformanceHarness {
   advance(ms: number): Promise<void>;
   /** Origin that `getBodyUrl` and `getAttachmentUrl` must answer on. */
   contentOrigin: string;
+  /** The stored header fields of a sent copy in `member`'s mailbox (`Message.sent`); `not_found` otherwise. */
+  sentHeaders(messageId: Id): Promise<SentHeaders>;
   /** A pick id the Drive picker would issue to `member` for one file, or undefined when `features.drive` is false. */
   drivePick?(): Promise<string>;
+  /** Present when `features.drive` is on and Drive can be faulted locally. */
+  driveFaults?: DriveFaults;
   close?(): Promise<void>;
 }

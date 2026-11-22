@@ -22,6 +22,7 @@ export const ERROR_STATUS = {
   idempotency_key_reused: 422,
   invalid_sender: 422,
   invalid_recipients: 422,
+  invalid_header: 422,
   too_many_recipients: 422,
   too_many_attachments: 422,
   message_too_large: 422,
@@ -39,14 +40,22 @@ export type MailErrorCode = keyof typeof ERROR_STATUS;
 
 export const ERROR_CODES = Object.keys(ERROR_STATUS) as MailErrorCode[];
 
-/** A field-level problem inside `invalid_request`; `field` is a JSON Pointer into the request body. */
+/** A field-level problem inside `invalid_request` or `invalid_header`; `field` is a JSON Pointer into the request body. */
 export interface FieldError {
   field: string;
   code: 'required' | 'invalid' | 'too_long' | 'too_many' | 'not_allowed';
 }
 
+/**
+ * The default problem `type` prefix: a stable, non-dereferenceable URI, so a
+ * fake, a local backend and every deployment emit the same type without
+ * naming a real host. A deployment that publishes error pages passes its own
+ * documentation base to `problem` instead.
+ */
+export const PROBLEM_TYPE_PREFIX = 'urn:kofra-mail:problem:';
+
 export interface Problem {
-  /** `https://kofra.app/docs/errors/<code>`; clients switch on `code`, never on `type` or `title`. */
+  /** `<prefix><code>`, by default `urn:kofra-mail:problem:<code>`; clients switch on `code`, never on `type` or `title`. */
   type: string;
   title: string;
   status: number;
@@ -63,9 +72,12 @@ export interface Problem {
   maxAgeSeconds?: number;
 }
 
-export function problem(code: MailErrorCode, extra: Omit<Partial<Problem>, 'code' | 'status' | 'type'> = {}): Problem {
+/** `typePrefix` is `PROBLEM_TYPE_PREFIX` or a deployment-configured documentation base ending in `/`. */
+export function problem(
+  code: MailErrorCode, extra: Omit<Partial<Problem>, 'code' | 'status' | 'type'> = {}, typePrefix: string = PROBLEM_TYPE_PREFIX,
+): Problem {
   return {
-    type: `https://kofra.app/docs/errors/${code}`,
+    type: `${typePrefix}${code}`,
     title: extra.title ?? code.replaceAll('_', ' '),
     status: ERROR_STATUS[code],
     code,

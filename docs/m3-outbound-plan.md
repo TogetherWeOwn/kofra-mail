@@ -41,7 +41,7 @@ These steps wait for a publish that covers their own commit:
 | `sendDraft` answers 202 | A restore cannot bring back the draft and lose an accepted send. The undo window absorbs the latency |
 | `undoSend` answers 2xx | A restore cannot bring back a `pending` send the user undid, which would then go out |
 | Release, before enqueue (step 4a) | A restore cannot bring back a draft whose message went out, or drop its sent copy |
-| Mark, before `send()` | A restore after `send()` always finds the recipients `attempting`, so the next claim counts them as ambiguous |
+| Mark, before `send()` | A restore after `send()` always finds the recipients `attempting` under the lease that bounds the call (section 2.4, step 5), so the next claim waits that lease out and counts them as ambiguous |
 | Any transition to a terminal state (`sent`, `partial`, `failed`, `cancelled`) is reported or acted on | A restore cannot rewind a finished send and send it again, or revive a send the user saw fail |
 | Releasing the send's object holders | A restored, not-yet-terminal send never points at deleted objects |
 
@@ -64,8 +64,9 @@ Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `
 | `pending`, `now ≥ undoUntil` | starts release (section 2.4) |
 | `releasing` | resumes release from the committed step |
 | `queued` with an unpublished release commit | runs release step 4a, then enqueues |
-| `queued`, `sending`, every recipient terminal | runs the finish rule |
-| `queued`, `sending` | enqueues if no live lease holds the send and `now ≥ next_attempt_at` |
+| `queued`, `sending`, an internal recipient not yet handed off | runs the internal handoff (release step 6) |
+| `queued`, `sending`, every recipient terminal (internal ones included) | runs the finish rule |
+| `queued`, `sending`, an external recipient not terminal | enqueues if no live lease holds the send and `now ≥ next_attempt_at` |
 | `delayed`, `now ≥ delayedUntil` | sets `queued` and enqueues |
 | terminal or `cancelled` with `finish_pending` | resumes the finish rule (section 2.4) |
 | anything else | nothing; the row waits for its `due_at` |
@@ -76,9 +77,11 @@ Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `
 
 ### 2.3 Writes from the API
 
+**Order of checks** (contract section 5): authentication, access, re-authentication, rate limits and header presence (`Idempotency-Key`, `If-Match`) run first. A committed idempotency key then replays **before** the draft's existence or revision is checked, so a retry of a `sendDraft` whose response was lost returns the send although the draft is gone. Only on a key miss do the existence (404) and `If-Match` (412) checks run.
+
 **`sendDraft`** runs in one Durable Object transaction, then waits for the barrier:
 1. Validate the draft (contract section 8.3).
-2. Insert the `sends` row as `pending`. It points at the immutable stored draft revision and its attachment holders.
+2. Insert the `sends` row as `pending`. It points at the immutable stored draft revision and its attachment holders, and records the submitting account user, which release and every claim compare with the mailbox's owner.
 3. Delete the draft row. Steps 2 and 3 are one journal event, so a restore replays both or neither.
 4. Create the `send_drive` row at `undoUntil`.
 5. Store the idempotency result.
@@ -92,13 +95,19 @@ Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `
 
 **Release** (run by the drive handler), in order:
 1. **Commit:** `pending` → `releasing`. The commit fixes the message's `Date` and derives the MIME boundary and our `Message-ID` from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change. If M3-0 shows the provider replaces `Message-ID`, the index records the delivered id for threading; the stored bytes keep ours.
-2. **Re-check send-as and limits.** An alias may have been removed during the undo window. A send that now fails the checks becomes `failed` with reason `invalid_sender` or `message_too_large` (finish rule).
+2. **Re-check the owner, send-as and limits, and resolve internal recipients.** An alias may have been removed, or the mailbox given to another member, during the undo window. A send whose mailbox no longer has the submitting owner, or whose `from` is no longer an active identity, becomes `failed` with reason `invalid_sender`; one over a limit becomes `failed` with `message_too_large` (finish rule). A directory point lookup marks each recipient whose address belongs to a mailbox of this workspace as **internal**, with that mailbox's id.
 3. **Store the sent copy:** build the MIME of the sent copy, register its holder with the sweeper, and PUT it to object storage (holder before PUT, as on the inbound path). The stored MIME never contains a `Bcc` header; Bcc recipients live only in the `sends` row and the sender's index.
-4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows (`pending`, one per external recipient). Set `releasing` → `queued`.
+4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows, `pending`, one per recipient: `external`, or `internal` with its mailbox id. Set `releasing` → `queued`.
 4a. **Barrier:** publish up to this commit. If the publish fails, stop; the drive timer resumes here.
-5. **Enqueue:** `await SEND.send({ ws, mb, sendId })`.
+5. **Enqueue**, only if an external recipient is not terminal: `await SEND.send({ ws, mb, sendId })`.
+6. **Internal handoff,** for each internal recipient mailbox with a row still `pending` (M3-8). It runs in the drive handler, never in the consumer, and needs no quota and no `send()`:
+   1. Register the delivery's own holder, `(internal, sendId, recipient mailbox)`, on the sent copy's raw object with the sweeper.
+   2. `INSERT OR IGNORE` the inbound outbox delivery row with the deterministic id `internal:<sendId>:<recipient mailbox id>`, `source = 'internal'`, the raw key and that holder, and wait until the write is acknowledged. A repeat inserts nothing, and the inbound pipeline also deduplicates deliveries by id. Several recipient addresses that reach one mailbox share its single delivery.
+   3. Commit that mailbox's ledger rows as `sent` (journalled; the finish rule publishes them before they are reported).
 
-Every step is idempotent: the content-addressed PUT, the holder registration, `INSERT OR IGNORE` of ledger rows. A crash leaves the drive row, which resumes from the committed state, so a crash can cause a second queue message, never zero.
+   A crash or a failed write between these steps leaves the rows `pending` and the drive row re-drives them, with the drive backoff. Our own outage never fails an internal recipient; a handoff still pending 24 hours after release raises the stall alert.
+
+Every step is idempotent: the content-addressed PUT, the holder registrations, `INSERT OR IGNORE` of ledger rows and of outbox deliveries. A crash leaves the drive row, which resumes from the committed state, so a crash can cause a second queue message, never zero, and never a second internal delivery.
 
 **Consumer** (`mail-send` Worker), in order:
 1. **Claim:** RPC `claimSend(sendId)`, one Durable Object transaction:
@@ -108,26 +117,36 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
      - another live lease holds the send;
      - the release commit is not yet published;
      - the send is `delayed` with `now < delayedUntil`;
-     - `now < next_attempt_at`.
+     - `now < next_attempt_at`;
+     - a recipient is `attempting` under a lease that has not expired, whatever its fence. That includes a lease from before a restore: its consumer may still hold a dispatch authorization until that expiry (step 4).
      The consumer acknowledges without throwing, so queue retries are never spent on waiting; the drive row re-drives. For a live lease, the claim moves `send_drive` to that lease's expiry.
-   - **On every claim** it repeats the send-as check (`from` is still an active identity of the mailbox) and checks that the mailbox still has the same owner. A `delayed` send can wait hours, so release-time checks are not enough. A failed check ends the send `failed` with `invalid_sender` (finish rule).
+   - **Only external recipients are claimed.** Internal recipients are handed off by the drive handler (release step 6) and never reach `send()`.
+   - **On every claim** it repeats the send-as check (`from` is still an active identity of the mailbox) and checks that the mailbox still has the submitting owner. A `delayed` send can wait hours, so release-time checks are not enough. A failed check ends the send `failed` with `invalid_sender` (finish rule). Step 4 repeats both checks just before dispatch.
    - **Otherwise:**
      - It increments the send's `attempt` counter and takes a lease of 5 minutes with **fence = (recovery epoch, attempt)**.
      - It moves `send_drive` to the lease expiry.
-     - It returns the send request plus the recipients to send to: those still `pending`, and those `attempting` under an expired lease or an older epoch. Each recipient of the second kind is an **ambiguous event** (section 2.6).
+     - It returns the send request plus the external recipients to send to: those still `pending`, and those `attempting` under a lease that has expired, whatever its epoch. Each recipient of the second kind is an **ambiguous event** (section 2.6).
    - **Crash-loop cap:** a claim whose lease expires with no report at all (no `recordResult`, `delaySend` or `abandonClaim`) while it left recipients `attempting` counts as an unfinished attempt. A lease that expires before Mark proves `send()` never ran, and does not count. The next claim releases that lease's quota reservations, because they belong to recipients that were never `attempting` under it.
    - **When a cap or the deadline is reached** while some recipients are still protected by the one-lease grace period (below), the claim withholds sending ("not now") and moves `send_drive` to the end of the grace period. The handler then applies the cap or the deadline. After 5 unfinished attempts in a row, the send's non-terminal recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
-2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). A reservation is all or nothing for the claim, and is keyed by (`sendId`, recipient, quota day, fence). It is provisional: it expires by itself 2 minutes after the claim's lease expiry unless the consumer confirms it after Mark answers `ok`. A late or stale reservation therefore frees itself. If the confirmation finds the reservation already expired, it reserves again under the same key before `send()`. If the quota is now exhausted, the consumer calls `delaySend` (Mark's recipients return to `pending`), and never sends unreserved.
+2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). A reservation is all or nothing for the claim, and is keyed by (`sendId`, recipient, quota day, fence). It is provisional: it expires by itself 2 minutes after the claim's lease expiry unless the consumer confirms it (step 3a). A late or stale reservation therefore frees itself. If the confirmation finds the reservation already expired, it reserves again under the same key. If the quota is now exhausted, the consumer calls `delaySend` (Mark's recipients return to `pending`), and never sends unreserved.
      - Every attempt that may call `send()` holds its own reservation, so a retry after an ambiguous result is charged again, as it should be.
      - Only the current fence can release a reservation, through `abandonClaim`, `delaySend` or a rate-limit result under that fence. A stale consumer therefore never frees a newer attempt's charge.
      - An ambiguous or accepted result keeps its reservation. If the quota is exhausted, RPC `delaySend(sendId, until, fence)` sets `delayed` and `delayedUntil`, moves `send_drive` to `until`, returns the recipients to `pending` and ends the lease. Then acknowledge.
-3. **Mark:** set the claimed recipients to `attempting` under the fence, and wait for the barrier before step 4. After the publish, Mark re-checks in the Durable Object that the fence is still current and the lease still live.
-   - **If both hold,** it renews the lease for 5 minutes from then, moves `send_drive` to the new lease expiry, and answers `ok`.
+3. **Mark:** in one commit, set the claimed recipients to `attempting` under the fence, extend the lease to 5 minutes from now (`lease_until`), and move `send_drive` to it. Wait for the barrier, so the published state holds `attempting` together with this `lease_until`. No later step extends this lease, so the published `lease_until` bounds every dispatch under the fence. After the publish, Mark re-checks in the Durable Object that the fence is still current and the lease still live.
+   - **If both hold,** it answers `ok`.
    - **Otherwise** it answers `stale`. It also returns its recipients to `pending`, unless a newer claim already took them; `send()` was never called under this fence. The attempt does not count toward the crash-loop cap. Mark answers `stale` for a stale fence or a terminal send; the consumer then acknowledges and never calls `send()`.
-4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all.
+3a. **Confirm quota:** confirm the step 2 reservation, re-reserving or calling `delaySend` as step 2 describes. This and the directory lookups of step 4 are the only remote waits after Mark, and all of them finish before the dispatch authorization. The consumer also builds the complete `send()` request here.
+4. **Authorize:** RPC `authorizeDispatch(sendId, fence)`. It grants at most one authorization per fence, for one `send()` call.
+   - The Durable Object first runs the directory point lookups: the mailbox's owner, and whether `from` is an active identity.
+   - Then, in one synchronous step with no await, it checks: the mailbox is not `restoring`; the recovery epoch and `attempt` equal the fence; no authorization was granted under this fence yet; the lease is live; the send is not terminal or `cancelled`; the owner is the submitting user and `from` is active; and every recipient of the request is still `attempting` under this fence.
+   - **If all hold,** it records on the send that this fence was authorized (a local write; it does not wait for a publish, because the published `lease_until` already bounds the call) and answers `ok` with `remainingMs = min(10 s, lease_until − now)`.
+   - **Any other answer is `stale`**, and the consumer acknowledges and never calls `send()`. With the current fence and no authorization granted under it, the recipients return to `pending` (`send()` cannot have run). Otherwise they stay `attempting`, and the next claim, after `lease_until`, counts them as ambiguous. **A failed owner or send-as check** ends the send `failed` with `invalid_sender` instead (finish rule).
+5. **Send:** the consumer reads its own clock `t0` just before calling step 4, and its dispatch deadline is `t0 + remainingMs`. Because `t0` precedes the Durable Object's check, the deadline is never later than `lease_until`, without comparing clocks across machines. Immediately after the answer, with no await between the check and the call, it calls `env.EMAIL.send(…)` only if `Date.now() < deadline`; otherwise it calls `abandonClaim` and sends nothing. A message has at most 50 recipients, so one call covers them all.
+   - **What fencing guarantees:** no `send()` call under a fence *starts* after that fence's authorization deadline, and no deadline is later than the `lease_until` that Mark published. A newer claim takes the same recipients only once that lease has expired, including after a restore, which keeps the published `lease_until` (section 2.5). So a stale consumer never starts a call after a newer attempt was authorized.
+   - **What it cannot guarantee:** the provider has no fencing token and no idempotency key. A call that started in time may still be delivered after a newer attempt's call, and a timed-out call may still deliver. Every such case is an ambiguous event (section 2.6), counted and capped at one extra copy each. An owner change or alias removal that commits after step 4's directory lookups can still be followed by the one call that starts within that authorization's 10 seconds.
    - On a retry to a subset (after a partial failure), each recipient stays in the field it was in (To, Cc or Bcc).
    - If M3-0 shows that `send()` accepts envelope recipients separately from the visible To and Cc lists, the retry keeps the original lists visible. Otherwise the retried copy shows only the retried recipients, which is a recorded limitation.
-5. **Record:** RPC `recordResult(sendId, fence, result)`. It never changes a recipient that is already terminal.
+6. **Record:** RPC `recordResult(sendId, fence, result)`. It never changes a recipient that is already terminal.
    - **The error classes** come from the M3-0 error-code receipt:
      - *Accepted:* `sent` (with `messageId`) or `suppressed`.
      - *Rejected for good* (for example an invalid address): `failed` with a reason.
@@ -143,17 +162,17 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
      - Each hop that still finds the mailbox restoring re-enqueues itself the same way and acknowledges.
      - After 50 hops it is dropped with a metric; the restored send's drive row then re-drives it, within one extra copy.
      - A record-only message never calls `send()`.
-   - **Errors before `send()`** (the quota object's RPC, Mark, building the request): the consumer calls `abandonClaim(sendId, fence, retryAfter)`.
+   - **Errors before `send()`** (the quota object's RPC, Mark, building the request, `authorizeDispatch`, a missed dispatch deadline): the consumer calls `abandonClaim(sendId, fence, retryAfter)`.
      - With the current fence it returns the claimed recipients to `pending`, ends the lease, and sets `next_attempt_at` and `send_drive` to `retryAfter`, clamped to between 1 minute and 1 hour. It does not count toward any cap.
      - With a stale fence `abandonClaim` and `delaySend` do nothing.
-   - **A terminal or `cancelled` send counts as stale for every fence.** Mark, `delaySend`, `abandonClaim` and `recordResult` against it change no recipient, lease or timer, and never recreate `send_drive`. Finish rule step 1 also ends any lease, so a consumer that outlived its lease cannot reopen a finished send. The caps and the deadline never fail a recipient that is `attempting` under a lease that expired less than one lease period ago; such a recipient is treated as ambiguous first, so a late but confirmed `sent` is still recorded.
+   - **A terminal or `cancelled` send counts as stale for every fence.** Mark, `authorizeDispatch`, `delaySend`, `abandonClaim` and `recordResult` against it change no recipient, lease or timer, and never recreate `send_drive`. Finish rule step 1 also ends any lease, so a consumer that outlived its lease cannot reopen a finished send. The caps and the deadline never fail a recipient that is `attempting` under a lease that expired less than one lease period ago; such a recipient is treated as ambiguous first, so a late but confirmed `sent` is still recorded.
    - **A stale-fence record that leaves every recipient terminal** runs finish rule step 1 itself; the drive handler does the rest.
-6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed` (finish rule), and the sent copy's `send.state` follows.
+7. **Finish:** when every recipient is terminal, internal recipients included, the send becomes `sent`, `partial` or `failed` (finish rule), and the sent copy's `send.state` follows.
 
-**The finish rule** applies to every terminal transition: `recordResult`, release step 2, the claim's `invalid_sender`, the caps, the deadline, and `undoSend` (`cancelled`).
+**The finish rule** applies to every terminal transition: `recordResult`, release step 2, the internal handoff, the claim's or the authorization's `invalid_sender`, the caps, the deadline, and `undoSend` (`cancelled`). Apart from `cancelled` and the release-time failure (which come before any ledger row exists), the finish predicate is that every ledger row, internal and external, is terminal; an internal row is terminal only once its outbox delivery and that delivery's holder exist.
 1. Commit the terminal state with `finish_pending`, end any lease, and move `send_drive` to now.
 2. Publish (section 2.1) before reporting the state or acting on it.
-3. Release the send's object holders (for `cancelled`, only those the restored draft no longer uses), and the quota reservations of recipients that ended without an accepted or ambiguous `send()`.
+3. Release the send's object holders (for `cancelled`, only those the restored draft no longer uses), and the quota reservations of recipients that ended without an accepted or ambiguous `send()`. Each internal delivery keeps the raw object through its own holder, which the inbound pipeline releases after the recipient mailbox has indexed the message.
 4. Clear `finish_pending` and delete `send_drive`, in one transaction.
 
 A crash or failed publish anywhere leaves `finish_pending` and the drive row, and the handler resumes at step 2. Every step is idempotent.
@@ -166,19 +185,20 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 
 ### 2.5 Restores
 
-- **Fencing:** a restore raises the mailbox's recovery epoch first, so every lease and fence from before it is stale (section 2.4, consumer step 5).
+- **Fencing:** a restore raises the mailbox's recovery epoch first, so every lease and fence from before it is stale: it can record only confirmed deliveries (section 2.4, consumer step 6), and `authorizeDispatch` refuses it. An authorization handed out before the restore stays bounded by the `lease_until` that Mark published, which the restored state keeps.
 - **Epilogue:** in the transaction that finishes the restore, every restored send that is not finished gets its `send_drive` row upserted:
   - at `undoUntil` for `pending`;
   - at `delayedUntil` for `delayed`;
   - at now for everything else, including terminal sends with `finish_pending`. Their queue messages may already be acknowledged.
-- **Attempting recipients:** recipients restored as `attempting` stay `attempting`; the next claim treats them as ambiguous (older epoch).
+- **Attempting recipients:** recipients restored as `attempting` stay `attempting`, with their published `lease_until`. The next claim waits until that expiry and then treats them as ambiguous; it never sends to them while an authorization from before the restore could still be used.
+- **Internal recipients:** rows restored as `pending` are handed off again; the deterministic outbox id makes the repeat a no-op.
 - **No direct enqueue:** the epilogue never enqueues directly; the drive rows do. A crash during or after the epilogue therefore still re-drives every send.
 
 ### 2.6 Duplicate policy
 
 `send()` has no idempotency key. This is a deliberate change from the earlier design rule that a retry sends only to recipients still `pending`.
 - **A recipient receives a message at least once.** A lost message is the worse failure for personal mail.
-- **At most one extra copy per ambiguous event, and at most 3 ambiguous provider errors per send.** An ambiguous event is any point where `send()` may have delivered without a recorded result: a consumer crash or a restore between `send()` and its published result, or an ambiguous provider error. A crash after Mark and before `send()` causes no extra copy, but is counted the same way, because the claim cannot tell it from a crash after `send()`. A crash before Mark is not an ambiguous event. Terminal results are published before they are acknowledged, and a terminal recipient is never changed, so a finished send is never repeated.
+- **At most one extra copy per ambiguous event, and at most 3 ambiguous provider errors per send.** An ambiguous event is any point where `send()` may have delivered without a recorded result: a consumer crash or a restore between `send()` and its published result, an ambiguous provider error, or a restore or lease expiry after Mark (the claim cannot tell whether an authorized call started). A crash after Mark and before `send()` causes no extra copy, but is counted the same way, because the claim cannot tell it from a crash after `send()`. A crash before Mark is not an ambiguous event. Terminal results are published before they are acknowledged, and a terminal recipient is never changed, so a finished send is never repeated.
 - Each occurrence raises the metric `send_ambiguous_retry`, so we measure how often it happens before considering anything stronger.
 
 ## 3. Packages
@@ -236,10 +256,10 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 - **Drafts:** each revision is an immutable stored object, with a holder registered before its PUT. `If-Match` is checked against the stored revision.
 - **Uploads:** streamed to `att/<sha256>/<gen>` with the holder registered first. An `upload_expiry` timer runs 24 h after creation and is cancelled while a draft refers to the upload.
 - **Forwarded parts:** a draft's `message` attachment reference registers the draft as a holder of that part's object (or of the source raw object for small parts), so Trash expiry of the source cannot remove it before the draft is sent or deleted.
-- **Idempotency:** the `idempotency(scope, key, fingerprint, status, body, created_at)` table stores the fingerprint of contract section 5. Only 2xx results are stored, in the same transaction as the effect; pre-checks (`If-Match`, re-authentication, rate limits) run before the record. Rows expire after 24 h.
+- **Idempotency:** the `idempotency(scope, key, fingerprint, status, body, created_at)` table stores the fingerprint of contract section 5. Only 2xx results are stored, in the same transaction as the effect. The order is contract section 5's: access, re-authentication, rate limits and the presence of required headers run before the lookup; a committed key replays before any existence or `If-Match` check; existence (404) and `If-Match` (412) run only on a key miss. Rows expire after 24 h.
 - **Journal:** draft changes are journalled within the 60-second recovery point.
 
-**Acceptance:** conformance cases 11, 12 and 15 pass against the backend over HTTP in local workerd. Two tabs saving the same draft: one wins, the other gets `revision_mismatch`.
+**Acceptance:** conformance cases 11, 12, 15, 21 and 23 pass against the backend over HTTP in local workerd. Two tabs saving the same draft: one wins, the other gets `revision_mismatch`. A replayed key whose resource is gone (a deleted draft) or whose `If-Match` is no longer current still returns the stored result.
 
 **Stop rule:** no change to the sweeper's holder rules.
 
@@ -248,7 +268,9 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 **Change:** section 2, the `pending` → `queued` steps: `sends` and the ledger insert, the `send_drive` timer and its handler, the finish rule; `sendDraft`, `undoSend`, `listSends`, `getSend` and release.
 
 **Acceptance:**
-- Conformance cases 13 and 14 pass against the backend.
+- Conformance cases 13, 14 and 22 pass against the backend.
+- **Lost response:** `sendDraft` commits and its response is dropped; the same-key retry, with the same `If-Match`, returns the send (202, its current state), never 404 or 412, and no second send exists. The same holds for `undoSend` after the restored draft was edited.
+- **Owner change or alias removal during the undo window:** the send ends `failed` with `invalid_sender`, with no queue message, no `EMAIL` call and no sent copy.
 - **Two sends in one undo window; undo one:** only the other is released.
 - **Crash injection** after each release step (the state commit, the PUT, the index commit, `queue.send`): there is always exactly one sent copy and at least one queue message.
 - **Restore matrix:** restore during each send state (`pending`, `releasing`, `queued`, `delayed`, `sending`, `sent`, `cancelled`), right after `sendDraft` answered, right after `undoSend` answered, and between `send()` returning and its result being published. After each restore:
@@ -268,13 +290,16 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 - UTF-8 headers as RFC 2047 encoded words;
 - the text part in quoted-printable or base64, whichever is smaller, so it is never larger than base64 (the client's `attachmentBudget` relies on this);
 - `multipart/mixed` with a `text/plain` part and base64 attachments;
-- `In-Reply-To`, and `References` trimmed to the first id and the last 10;
+- `In-Reply-To` and `References` from `threadingHeaders` (contract section 8.3): the first id and the last 10, trimmed further by bytes so the unfolded value fits `headerValueBytes`;
+- the request's own headers: only `In-Reply-To`, `References` and `Reply-To`, each within `headerValueBytes`. Everything else comes from the structured fields;
 - the encoded size, which is the server's `message_too_large` check.
 
 **Acceptance:**
 - Golden-file tests.
 - Parsing the output back with PostalMime gives the same addresses, subject, text and attachment bytes.
-- CR or LF in any name, subject or address is rejected before building, never stripped silently.
+- CR, LF or another control character in any name, subject or address is refused with `invalid_header` before building, never stripped silently. The builder also refuses one as a programming error, in case a draft bypassed the save check.
+- A reply in a thread of 12 legal 200-byte `Message-ID`s: `References` fits 2,048 bytes and keeps the first and newest ids (golden file). An id longer than 2,048 bytes is never sent.
+- The built request sets no header outside the three above, and never `Bcc`, `Sender`, `From`, `Return-Path` or `Reply-To` from user input; a test lists its header names and counts them (at most 3).
 - 50 recipients, 32 attachments and the measured limit are each accepted, and one more of each is refused.
 
 ### M3-5 Consumer, ledger and DLQ (Opus)
@@ -313,6 +338,14 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
   - A record-only message during a long restore re-enqueues itself without dead-lettering.
   - The send's object holders are released only after the terminal state is published.
 
+- **Dispatch fencing,** with a controllable clock in the Durable Object and the consumer, and the fake `EMAIL` counting calls per recipient and fence:
+  - The quota confirmation stalls past the lease expiry: `authorizeDispatch` answers `stale`, no `EMAIL` call happens under the old fence, and the next claim sends once.
+  - A restore starts while the quota confirmation stalls: `authorizeDispatch` answers `stale` and no `EMAIL` call happens under the old fence. The restored recipients are claimed only after the old published `lease_until`.
+  - A restore between `authorizeDispatch` and `send()`: the old call starts before its deadline; the post-restore claim sends only after the old `lease_until` and counts the recipients as ambiguous; each recipient gets at most 2 calls.
+  - The mailbox changes owner, or the alias is removed, while the quota confirmation stalls: the send ends `failed` with `invalid_sender`, with no `EMAIL` call.
+  - The consumer stalls after `authorizeDispatch` past its deadline: no `EMAIL` call, `abandonClaim`, and the send goes out on the next attempt.
+  - Across all of these, no `EMAIL` call starts after its authorization deadline or under a fence whose `lease_until` has passed.
+
 **Stop rule:** if a confirmed `send()` result cannot be recorded reliably (directly or by a record-only message), stop and report. Do not add sleeps or retries around `send()`.
 
 ### M3-6 Quota gate (Sol, Opus review)
@@ -344,7 +377,7 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 
 ### M3-8 Internal delivery (Opus)
 
-**Change:** a recipient in the same workspace (a directory point lookup) gets the sent copy through the inbound outbox. That is a delivery row per recipient mailbox, referring to the sent raw object, with its own holder. It makes no `send()` call and uses no quota.
+**Change:** a recipient in the same workspace (a directory point lookup at release) gets the sent copy through the inbound outbox, by release step 6. That is one delivery row per recipient mailbox, with the deterministic id `internal:<sendId>:<recipient mailbox id>`, referring to the sent raw object, with its own holder registered before the insert. The recipient's ledger rows are journalled and become `sent` only after the insert is acknowledged, and the send finishes only when they are. It makes no `send()` call and uses no quota.
 - **Migration:** a `source` column on `deliveries`, with values `inbound` and `internal`.
 - **Trust:** the mailbox trusts an internal message's sender only from that column, which only the send path writes. It never trusts a header in the MIME.
 
@@ -353,6 +386,9 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 - An internal To recipient and an internal Bcc recipient each receive a copy with no Bcc addresses in it (the delivered MIME is the stored sent copy, which never has a `Bcc` header).
 - An inbound message carrying any "internal" header is still scored as inbound.
 - Mixed internal and external recipients each reach a terminal state.
+- **Crash after release step 4a and before the outbox insert,** for an internal-only send and for a mixed send whose external recipients are already terminal: the send does not finish, the drive row re-drives the handoff, each recipient mailbox gets exactly one delivery, and the sender's raw holder is released only after every internal row is `sent`. The raw object exists throughout.
+- **Crash after the outbox insert and before the ledger commit, and a restore in the same gap:** the handoff repeats, the insert is a no-op, and the recipient sees one message.
+- **The outbox write failing for 30 minutes:** the rows stay `pending`, nothing fails, and the handoff completes after recovery.
 
 ### M3-9 Suppression (Sol)
 
@@ -416,16 +452,18 @@ The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at le
 
 1. **Send-as:**
    - `from` cannot be spoofed through a display name, an encoded word or a header.
-   - A removed alias cannot send after the undo window, including a `delayed` send's later attempts.
+   - A removed alias or a mailbox given to another member cannot send after the undo window, including a `delayed` send's later attempts; `authorizeDispatch` re-checks both.
    - The allow-list and the app check agree.
-2. **Header injection:** CR or LF is rejected in every name, address, subject and file name. The recipient count cannot grow through a header.
+2. **Header injection:** a control character is refused with `invalid_header` in every name, address and subject (and with `invalid_request` in file and link names). The recipient count cannot grow through a header. Threading headers stay within `headerValueBytes`.
 3. **Cross-mailbox references:**
    - `inReplyTo`, `forwardOf`, `message` attachment parts and uploads resolve only inside the session's mailbox.
    - Idempotency keys are scoped per mailbox.
 4. **Durability:**
    - No path loses a send between `pending` and a terminal state.
    - Every holder is registered before its PUT and released only after its index row is gone.
-   - Fencing stops a stale consumer from recording.
+   - Fencing stops a stale consumer from recording a failure or a retry.
+   - **Dispatch fencing:** every remote wait after Mark finishes before `authorizeDispatch`; no `send()` starts after its authorization deadline; no deadline is later than the published `lease_until`; a claim never sends to a recipient `attempting` under an unexpired lease of any epoch.
+   - **Internal handoffs:** a send finishes only after each internal delivery row and its holder exist; the sender's holders are released only then.
 5. **Quota and cost:** one mailbox cannot exhaust the account's daily quota beyond the gate, and the monthly ceiling cannot be passed by concurrency.
 6. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
 7. **Secrets and privacy:**

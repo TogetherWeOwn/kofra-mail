@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS as limits, MailApiError, ROUTES, VIEWS, problem } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, problem, threadingHeaders } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
   DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
-  Message, Operation, Page, Principal, Send, Settings, TestMessage, ThreadSummary, Upload, View,
+  Message, Operation, Page, Principal, Send, Settings, TestMessage, ThreadingHeaders, ThreadSummary, Upload, View,
 } from '@kofra/mail-contract';
 
 const second = 1000;
@@ -49,19 +49,25 @@ function mimeFilename(name: string): string {
   return `filename*=UTF-8''${encoded}`;
 }
 
+// The sent copy's header fields (lower-case names, unfolded values). Bcc addresses are envelope recipients, never headers.
+function sentHeaderFields(draft: Pick<Draft, 'to' | 'cc' | 'subject'>, from: Address, threading: ThreadingHeaders, messageId: string, date: string): Record<string, string> {
+  return {
+    from: mimeAddress(from), subject: mimeHeaderText(draft.subject).replaceAll('\r\n', ''),
+    date: new Date(date).toUTCString().replace('GMT', '+0000'), 'message-id': messageId, 'mime-version': '1.0',
+    ...(draft.to.length && { to: draft.to.map(mimeAddress).join(', ') }),
+    ...(draft.cc.length && { cc: draft.cc.map(mimeAddress).join(', ') }),
+    ...(threading.inReplyTo !== undefined && { 'in-reply-to': threading.inReplyTo }),
+    ...(threading.references !== undefined && { references: threading.references }),
+  };
+}
+const headerName = (name: string) => name.replace(/(^|-)([a-z])/g, (_, dash: string, letter: string) => dash + letter.toUpperCase());
+
 // Count a representative encoded MIME message without materializing the body or file bytes.
-function outboundMimeBytes(draft: Draft, from: Address, references: Id[]): number {
-  const lines = [
-    `From: ${mimeAddress(from)}`, `Subject: ${mimeHeaderText(draft.subject)}`,
-    'Date: Sun, 22 Nov 2026 12:00:00 +0000', 'Message-ID: <demo-00000000@mail.example>', 'MIME-Version: 1.0',
-  ];
-  if (draft.to.length) lines.push(`To: ${draft.to.map(mimeAddress).join(',\r\n ')}`);
-  if (draft.cc.length) lines.push(`Cc: ${draft.cc.map(mimeAddress).join(',\r\n ')}`);
-  // Bcc addresses are envelope recipients, not MIME headers.
-  if (references.length) {
-    const ids = references.map((id) => `<${id}@mail.example>`);
-    lines.push(`In-Reply-To: ${ids.at(-1)}`, `References: ${ids.join('\r\n ')}`);
-  }
+function outboundMimeBytes(draft: Draft, from: Address, threading: ThreadingHeaders): number {
+  const fields = sentHeaderFields(draft, from, threading, '<demo-00000000@mail.example>', '2026-11-22T12:00:00Z');
+  // Unfolded values are a lower bound on the folded size; the address lists fold at each comma.
+  const lines = Object.entries(fields).map(([name, value]) => `${headerName(name)}: ${
+    name === 'to' || name === 'cc' ? value.replaceAll(', ', ',\r\n ') : name === 'subject' ? mimeHeaderText(draft.subject) : value}`);
   let size = bytes(`${lines.join('\r\n')}\r\n`);
   const files = draft.attachments.filter((attachment) => attachment.kind !== 'link');
   const links = draft.attachments.flatMap((attachment) => attachment.kind === 'link' ? [`${attachment.name}: ${attachment.url}`] : []);
@@ -92,6 +98,7 @@ function fail(code: MailErrorCode, extra?: ProblemExtra): never { throw new Mail
 function invalid(field: string, code: FieldError['code'] = 'invalid'): never {
   fail('invalid_request', { errors: [{ field, code }] });
 }
+function badHeader(field: string): never { fail('invalid_header', { errors: [{ field, code: 'invalid' }] }); }
 function need<T>(value: T | undefined): T { if (value === undefined) fail('not_found'); return value; }
 function fields(input: unknown, allowed: readonly string[], field = ''): void {
   if (!input || typeof input !== 'object' || Array.isArray(input)) invalid(field);
@@ -125,12 +132,18 @@ function validEmail(email: string): boolean {
 interface StoredMessage {
   message: Message;
   indexedText: string;
-  references: Id[];
+  /** The `Message-ID` header, bracketed. */
+  messageIdHeader: string;
+  /** The `References` chain, bracketed ids, oldest first. */
+  references: string[];
+  /** Sent copies only: the stored MIME header fields. */
+  headers?: Record<string, string>;
   expires?: number;
 }
 interface StoredSend {
   send: Send;
-  pending?: { draft: Draft; size: number; from: Address; references: Id[] };
+  /** `ownerUserId` is the mailbox owner who submitted the send; release re-checks it. */
+  pending?: { draft: Draft; size: number; from: Address; references: string[]; ownerUserId: Id };
 }
 interface Replay {
   fingerprint: string;
@@ -158,12 +171,14 @@ interface Mailbox {
   labels: Map<Id, Label>;
   drafts: Map<Id, Draft>;
   /** Parent Message-ID chain copied when a draft's `inReplyTo` is first set. */
-  replyRefs: Map<Id, Id[]>;
+  replyRefs: Map<Id, string[]>;
   sends: Map<Id, StoredSend>;
   uploads: Map<Id, Upload>;
   keys: ReplayScope;
   training: Map<string, { spam: number; ham: number }>;
+  /** Stand-in for the user's Drive: its files, and the operation ids it has deduplicated durably. */
   driveFiles: Map<Id, { name: string; size: number; type: string }>;
+  driveOperations: Map<string, Id>;
   settings: Settings;
 }
 interface Cursor { binding: string; position: readonly [string, string] }
@@ -279,12 +294,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const picks = new Map<string, { mailboxId: Id; expires: number }>();
   const driveFileText = 'Demo Drive file';
   const driveFile = { name: 'demo.txt', type: 'text/plain', size: bytes(driveFileText), digest: createHash('sha256').update(driveFileText).digest('hex') };
+  let loseNextDriveSaveReply = false;
 
   function newMailbox(workspace: Workspace, primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
     const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
     workspace.boxes.set(directory.id, {
       workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), replyRefs: new Map(), sends: new Map(),
-      uploads: new Map(), keys: replayScope(), training: new Map(), driveFiles: new Map(),
+      uploads: new Map(), keys: replayScope(), training: new Map(), driveFiles: new Map(), driveOperations: new Map(),
       settings: { signature: '', undoSeconds: 10, defaultFrom: primaryAddress, replyFromReceivedAddress: true },
     });
     return directory;
@@ -322,7 +338,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const byThread = (a: Cursor['position'], b: Cursor['position']) => ascending(b, a);
 
   async function replay<T>(keys: ReplayScope, opts: Idempotent | undefined, op: Operation, args: unknown[],
-    fingerprintBody: unknown | (() => Promise<unknown>), run: () => T, onReplay?: (value: T) => T): Promise<T> {
+    fingerprintBody: unknown | (() => Promise<unknown>), run: (fingerprint: string) => T, onReplay?: (value: T) => T): Promise<T> {
     const key = opts?.idempotencyKey;
     if (key === undefined) fail('precondition_required');
     if (typeof key !== 'string' || key.length > limits.idempotencyKeyChars || !/^[A-Za-z0-9_-]+$/.test(key)) invalid('/idempotencyKey');
@@ -341,7 +357,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     try {
       const fingerprint = await getFingerprint();
       // Mutate and record the success synchronously; no caller sees one without the other.
-      const value = run();
+      const value = run(fingerprint);
       keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
       return value;
     } finally {
@@ -407,6 +423,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     const from = sender(box, input.from, false).email;
     checkCounts(input);
     boundedText(input.subject, limits.subjectBytes, '/subject');
+    if (hasHeaderControl(input.subject)) badHeader('/subject');
     boundedText(input.body, limits.bodyBytes, '/body');
     const { subject, body, inReplyTo, forwardOf } = input;
     for (const field of ['inReplyTo', 'forwardOf'] as const) {
@@ -417,7 +434,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       fields(value, ['name', 'email']);
       const { name, email } = value;
       if (typeof email !== 'string') invalid(`/${field}/${i}/email`);
+      if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
       if (name !== undefined) boundedText(name, limits.displayNameBytes, `/${field}/${i}/name`);
+      if (name !== undefined && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
       return { email, ...(name !== undefined && { name }) };
     });
     const attachments = input.attachments.map((ref, i): DraftAttachment => {
@@ -438,9 +457,10 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         }
         case 'link': {
           fields(ref, ['kind', 'url', 'name']);
-          const url = typeof ref.url === 'string' ? URL.parse(ref.url) : null;
+          // URL parsing drops tabs and newlines silently, so check the raw text first.
+          const url = typeof ref.url === 'string' && !/\p{Cc}/u.test(ref.url) ? URL.parse(ref.url) : null;
           if (url?.protocol !== 'https:' || url.username || url.password) invalid(`${field}/url`);
-          if (typeof ref.name !== 'string') invalid(`${field}/name`);
+          if (typeof ref.name !== 'string' || /\p{Cc}/u.test(ref.name)) invalid(`${field}/name`);
           return { kind: 'link', url: ref.url, name: ref.name };
         }
         default: return invalid(`${field}/kind`);
@@ -473,16 +493,19 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     return file;
   }
 
-  function append(box: Mailbox, linked: Id | undefined, value: Omit<Message, 'id' | 'threadId' | 'textTruncated'>, references?: Id[]): Message {
+  function append(box: Mailbox, linked: Id | undefined, value: Omit<Message, 'id' | 'threadId' | 'textTruncated'>,
+    header: { messageId?: string; references?: string[]; fields?: (messageId: string) => Record<string, string> } = {}): Message {
     const previous = linked === undefined ? undefined : box.messages.get(linked);
     const previousThread = previous && box.threads.get(previous.message.threadId);
     const threadId = previous && previousThread && previousThread.length < limits.threadMessages && subjectKey(previous.message.subject) === subjectKey(value.subject)
       ? previous.message.threadId : id();
     const text = prefix(value.text, limits.messageTextBytes);
     const message: Message = { ...copy(value), id: id(), threadId, text, textTruncated: text !== value.text };
+    const messageIdHeader = header.messageId ?? `<${message.id}@mail.example>`;
     const stored: StoredMessage = {
-      message, indexedText: prefix(value.text, limits.searchBodyBytes),
-      references: references ?? (previous ? [...previous.references, previous.message.id] : []),
+      message, indexedText: prefix(value.text, limits.searchBodyBytes), messageIdHeader,
+      references: header.references ?? (previous ? [...previous.references, previous.messageIdHeader] : []),
+      ...(header.fields && { headers: header.fields(messageIdHeader) }),
     };
     const thread = box.threads.get(threadId) ?? [];
     thread.push(stored);
@@ -491,12 +514,12 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     bump(box);
     return message;
   }
-  function replyReferences(box: Mailbox, messageId: Id | undefined): Id[] {
+  // The parent's chain plus its own id. Count-trimmed for storage; `threadingHeaders` trims by bytes at send.
+  function replyReferences(box: Mailbox, messageId: Id | undefined): string[] {
     const parent = messageId === undefined ? undefined : box.messages.get(messageId);
     if (!parent) return [];
-    const chain = [...parent.references, parent.message.id];
+    const chain = [...parent.references, parent.messageIdHeader];
     return chain.length > 11 ? [chain[0], ...chain.slice(-10)] : chain;
-    // Fixture IDs are short enough that 11 bracketed IDs always fit headerValueBytes.
   }
   function expire(box: Mailbox): void {
     for (const [threadId, rows] of box.threads) {
@@ -520,7 +543,18 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   function release(box: Mailbox, stored: StoredSend): void {
     const { send, pending } = stored;
     if (!pending) return;
-    const { draft, size, from, references } = pending;
+    const { draft, size, from, references, ownerUserId } = pending;
+    // Release re-checks the submitter and the sender: a reassigned mailbox or a removed identity never sends.
+    const stillActive = identities(box).some((identity) => identity.email === from.email && identity.sendAs === 'active');
+    if (box.directory.ownerUserId !== ownerUserId || !stillActive) {
+      send.state = 'failed';
+      send.undoRemainingMs = 0;
+      for (const recipient of send.recipients) Object.assign(recipient, { state: 'failed', reason: 'invalid_sender' });
+      delete stored.pending;
+      releaseDraftUploads(box, draft, true);
+      bump(box);
+      return;
+    }
     const date = send.undoUntil;
     const own = receivingAddresses(box);
     const toSelf = send.recipients.some(({ email }) => own.has(email.toLowerCase()));
@@ -531,7 +565,10 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       hasHtml: false, remoteImages: false, size,
       attachments: draft.attachments.flatMap((a, i) => a.kind === 'link' ? [] : [{ part: i + 1, name: a.name, type: a.type, size: a.size, inline: false }]),
       verdict: { level: 'none', reasons: [] }, send: { id: send.id, state: 'sent' },
-    }, references);
+    }, {
+      messageId: `<${send.id}@mail.example>`, references,
+      fields: (messageId) => sentHeaderFields(draft, from, threadingHeaders(references, limits), messageId, date),
+    });
     send.messageId = message.id;
     send.state = 'sent';
     send.undoRemainingMs = 0;
@@ -706,10 +743,20 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(box.keys, opts, 'saveAttachmentToDrive', [messageId, number], null, () => {
+        return replay(box.keys, opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
           const { name, size, type } = part(box, messageId, number);
-          const driveFileId = id();
-          box.driveFiles.set(driveFileId, { name, size, type });
+          // A stable operation id that Drive deduplicates durably: a retry after a lost reply returns the same file.
+          const operation = createHash('sha256').update(`${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
+          let driveFileId = box.driveOperations.get(operation);
+          if (driveFileId === undefined) {
+            driveFileId = id();
+            box.driveFiles.set(driveFileId, { name, size, type });
+            box.driveOperations.set(operation, driveFileId);
+          }
+          if (loseNextDriveSaveReply) {
+            loseNextDriveSaveReply = false;
+            fail('unavailable', { retryAfterSeconds: 1 });
+          }
           return { driveFileId, name };
         });
       },
@@ -804,11 +851,19 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           const draft = need(box.drafts.get(draftId));
           checkRevision(draft, opts);
           checkCounts(draft);
+          // Drafts are checked at save; the send re-checks before anything is built.
+          if (hasHeaderControl(draft.subject)) badHeader('/subject');
+          for (const field of ['to', 'cc', 'bcc'] as const) {
+            for (const [i, { email, name }] of draft[field].entries()) {
+              if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
+              if (name !== undefined && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
+            }
+          }
           const all = [...draft.to, ...draft.cc, ...draft.bcc];
           if (!all.length || all.some(({ email }) => !validEmail(email))) fail('invalid_recipients');
           const from = address(sender(box, draft.from, true));
           const references = box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo);
-          const size = outboundMimeBytes(draft, from, references);
+          const size = outboundMimeBytes(draft, from, threadingHeaders(references, limits));
           if (size > limits.outboundMessageBytes) fail('message_too_large', { limit: limits.outboundMessageBytes });
           const undoRemainingMs = box.settings.undoSeconds * second;
           const send: Send = {
@@ -817,7 +872,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           };
           box.drafts.delete(draftId);
           box.replyRefs.delete(draftId);
-          box.sends.set(send.id, { send, pending: { draft, size, from, references } });
+          box.sends.set(send.id, { send, pending: { draft, size, from, references, ownerUserId: box.directory.ownerUserId } });
           bump(box);
           return copy(send);
         }, ({ id }) => sendResult(need(box.sends.get(id)).send));
@@ -990,16 +1045,24 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         date, receivedAt: date, folder: 'inbox', unread: true, starred: false, labelIds: [], sent: false,
         hasHtml: input.html !== undefined, remoteImages: input.html !== undefined && (input.remoteImages ?? false), attachments,
         size: bytes(input.text) + bytes(input.html ?? '') + attachments.reduce((sum, a) => sum + a.size, 0), verdict: { level: 'none', reasons: [] },
-      });
+      }, { ...(input.messageId !== undefined && { messageId: input.messageId }) });
       return { threadId: message.threadId, messageId: message.id };
     },
     async advance(ms) { advance(ms); },
+    async sentHeaders(messageId) {
+      const box = need(ownerBox(local, 'member'));
+      return copy(need(box.messages.get(messageId)?.headers));
+    },
     ...(drive && {
       async drivePick() {
         const box = need(ownerBox(local, 'member'));
         const token = randomUUID();
         picks.set(token, { mailboxId: box.directory.id, expires: now + 5 * 60 * second });
         return token;
+      },
+      driveFaults: {
+        async loseNextSaveReply() { loseNextDriveSaveReply = true; },
+        async savedFiles() { return need(ownerBox(local, 'member')).driveFiles.size; },
       },
     }),
   };

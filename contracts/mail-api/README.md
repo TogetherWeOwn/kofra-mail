@@ -17,7 +17,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 
 1. **One port, three implementations.** `MailService` is the only interface. The in-memory fake implements it for the demo and tests. The backend serves it at `/api/v1` on the mail app host. A thin browser client implements it over HTTP. The conformance suite runs against the fake in CI. It also runs against the backend over HTTP once the backend serves the API.
 2. **The session names the mailbox.** User URLs never carry a mailbox or workspace id. The server resolves the session's account user to exactly one mailbox, so a request cannot address another user's mailbox. Admin routes act only on the session's workspace.
-3. **JMAP's data model, plain REST transport.** Ids are opaque. Reads return a mailbox `state`, and every write returns the new one. Folders, labels and keywords follow Gmail and JMAP. A JMAP endpoint can be added later without changing the data.
+3. **JMAP's data model, plain REST transport.** Ids are opaque. Mailbox listings, `getThread`, `getSession` and `updateThreads` carry the mailbox `state` (section 5 lists them); every change is pushed as the new `state` (section 9). Folders, labels and keywords follow Gmail and JMAP. A JMAP endpoint can be added later without changing the data.
 4. **Writes are retry-safe by construction.** Batch updates use set semantics, never toggles. Creates, sends and undo require an `Idempotency-Key`. Draft writes require `If-Match`, so two tabs cannot silently overwrite each other.
 5. **The app origin never renders message content.** Formatted bodies, inline images, remote images and attachment downloads come from signed, short-lived URLs on a separate content domain ([content-origin.md](../../docs/content-origin.md)). The API never returns message HTML.
 6. **Drive is reached only through per-action grants.** Mail never lists a user's Drive. "Attach from Drive" opens a Drive-hosted picker that returns a `pickId` for the chosen files only. The M2 fake's `listDriveFiles` is a demo stand-in and is not part of this contract.
@@ -80,6 +80,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
 - **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After`. This answer also means the operation may already have taken effect (for example a `sendDraft` committed but not yet confirmed durable), so the client retries with the same key until it gets another answer.
 - **Only successful (2xx) results are stored.** Any 4xx other than `idempotency_in_progress`, and any 5xx, had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
+- **One exception, `saveAttachmentToDrive`:** its effect is in Drive, which cannot commit together with Mail's record. A 5xx or a lost response may follow a file Drive already stored, so the server passes Drive a stable operation id, `SHA-256(mailbox id, key, fingerprint)`, and Drive deduplicates it durably for at least `idempotencyRetentionSeconds` and returns the original file for it. A same-key retry therefore returns the first file and never creates a second one (section 8.5).
 
 **`If-Match`:**
 - Drafts carry a `revision`. `replaceDraft` and `sendDraft` require `If-Match: <revision>`; `deleteDraft` accepts it.
@@ -90,19 +91,22 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - `updateThreads`, `updateSettings`, `renameLabel` and `updateMailbox` set values, so repeating them has the same effect.
 - `DELETE` answers 204 whether or not the resource still exists in the session's scope.
 
-**`state`:** every mailbox read returns `state`, and `updateThreads` returns the new `state`. Other writes return the resource they changed; every change is announced by the live-update push of the new `state` (section 9).
+**`state`:** exactly the routes with `state: true` in `ROUTES` carry the mailbox `state` as a top-level field: `getSession`, `listViews`, `listThreads`, `getThread`, `listLabels`, `listDrafts`, `listSends` and `updateThreads`. Every value read at the same moment is the same, and any change to the mailbox moves it.
+- No other response carries a mailbox `state`, and there is no state header. A `Send`'s own `state` field is its send state, not the mailbox state.
+- Other writes return the resource they changed (or 204). The client associates a bare resource with a mailbox state by reading one of the routes above, or from the live-update push of the new `state` (section 9).
 
 ## 6. Errors
 
 Errors are RFC 9457 `application/problem+json`, in the same shape as the Kofra API:
 
 ```json
-{ "type": "https://kofra.app/docs/errors/revision_mismatch", "title": "Draft changed elsewhere", "status": 412,
+{ "type": "urn:kofra-mail:problem:revision_mismatch", "title": "Draft changed elsewhere", "status": 412,
   "code": "revision_mismatch", "requestId": "01J…" }
 ```
 
+- **`type`** is `urn:kofra-mail:problem:<code>` (`PROBLEM_TYPE_PREFIX`), a stable URI that names no host. A deployment that publishes error pages may configure a documentation base instead, giving `<base><code>`.
 - **Switch on `code`.** Clients never use `title` or `detail` for logic. `ERROR_STATUS` in `src/errors.ts` fixes the status of every code.
-- **Field errors:** `invalid_request` carries `errors: [{ field, code }]`, where `field` is a JSON Pointer such as `/to/3/email`.
+- **Field errors:** `invalid_request` and `invalid_header` carry `errors: [{ field, code }]`, where `field` is a JSON Pointer such as `/to/3/email`.
 - **Limits:** `limit` carries the exceeded bound.
 - **Retries:** 429, 503 and 409 `idempotency_in_progress` carry `Retry-After` and `retryAfterSeconds`, a non-negative integer number of seconds.
 - **During a restore:** while a mailbox is being restored, its routes answer 503 `mailbox_restoring`. Deliveries meanwhile wait in the queue.
@@ -212,6 +216,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
 - Recipient and attachment counts may not exceed the send limits.
 - Address syntax is not checked, because drafts may be incomplete.
+- **Header text:** a subject, display name or address that contains a control character other than tab (CR and LF included) answers 422 `invalid_header`, with the field in `errors`. It is never stripped. `hasHeaderControl` in `src/headers.ts` is the rule. Link names and URLs with control characters answer 400 `invalid_request`; file names are checked when uploaded (section 8.4).
 - `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. When `inReplyTo` is first set, the server copies the parent's `Message-ID` and `References` into the draft, so the reply keeps its threading headers even if the parent later expires. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
 
 **Attachment references:**
@@ -226,7 +231,13 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `from` is an identity with `sendAs: 'active'` (`invalid_sender`);
 - file attachments ≤ `attachmentsPerMessage` (`too_many_attachments`);
 - encoded size ≤ `outboundMessageBytes` (`message_too_large`, with `limit`);
-- the subject fits `subjectBytes`, and threading headers are trimmed to fit `headerValueBytes`. References keep the first id and the last 10.
+- header text, again (`invalid_header`), and the subject fits `subjectBytes` (`invalid_request`).
+
+**Threading headers are trimmed, never refused** (`threadingHeaders` in `src/headers.ts`):
+- `In-Reply-To` is the parent's `Message-ID`.
+- `References` keeps the parent's id, then the first id, then the most recent ids, newest first, at most 10 after the first, while its unfolded value fits `headerValueBytes` (2,048). With long legal ids it keeps fewer than 11.
+- An id that alone exceeds `headerValueBytes` is never sent.
+- The provider request sets at most three headers of its own (`In-Reply-To`, `References`, `Reply-To`), each within `headerValueBytes`, well under the platform's limit on custom headers. Every other header comes from the request's structured fields.
 
 **If the checks pass:**
 - The draft becomes a `pending` send and leaves the draft list.
@@ -236,6 +247,8 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - It succeeds while the send is still `pending`. It returns the draft under its original id, with a new revision, and the send becomes `cancelled`.
 - The server releases a send no earlier than `undoUntil`. After release, undo answers 409 `send_not_pending`.
 - A retried undo with the same key returns the same draft.
+
+**At release** the server checks again that the mailbox has the owner who sent it and that `from` is still an active identity. If either changed during the undo window, the send ends `failed`, each recipient `failed` with reason `invalid_sender`; nothing is sent and no sent copy is written.
 
 **After release:**
 - The sent copy appears in this mailbox (`sent: true`, folder `archive`, or `inbox` when sent to oneself) with `send.state`. Bcc recipients are kept only in the sender's index, never in any stored or delivered MIME.
@@ -264,6 +277,9 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 - `copy` returns uploads. `link` returns link attachments for workspace members.
 
 **`saveAttachmentToDrive`:** uploads the attachment to the user's Drive with a `drive.upload` token for that one action.
+- The upload carries the operation id of section 5. Drive must store it with the file, durably, and answer a repeat of the same operation id with the original file instead of a new one.
+- **`features.drive` stays off until Drive offers that.** Without it, a lost reply after Drive stored the file would let a retry create a second file.
+- Mail writes its in-progress marker before the Drive call. A retry after a crash, a 5xx or a lost reply calls Drive again with the same operation id, then stores the returned file as the result.
 
 ### 8.6 Admin
 
@@ -298,7 +314,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 | Inbound message | 25 MiB | Cloudflare Email Service |
 | Outbound message (encoded) | 5 MiB until measured; the documented values are 5 and 25 MiB | Email Service docs disagree; the outbound size test sets it |
 | Recipients / file attachments per message | 50 / 32 | Email Service |
-| Custom header value | 2,048 bytes | Email Service |
+| Custom header value | 2,048 bytes, unfolded; References is trimmed to fit | Email Service |
 | Upload | 25 MiB per file | matches inbound |
 | Subject / body / signature | 998 / 1 MiB / 10 KiB UTF-8 bytes | RFC 5322 line length; contract bounds |
 | Label name / labels per message / per mailbox | 72 characters / 64 / 1,000 | contract bounds; the per-message limit is the mailbox journal's |
@@ -321,7 +337,9 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 
 The suite checks `MailService`, which has no headers. The HTTP client's own tests check the wire: `Retry-After` equals `retryAfterSeconds`, `X-Request-Id` and `Cache-Control: no-store` are present, problem bodies have `application/problem+json`, and `X-CSRF-Token`, `Idempotency-Key` and `If-Match` are sent as `ROUTES` requires.
 
-The harness (`src/harness.ts`) provides sessions for six principals in two workspaces, inbound delivery, a clock and the content origin. Each case gets a fresh harness. Content URLs follow the format of [content-origin.md](../../docs/content-origin.md) section 2.1, so the suite decodes their claims (it does not verify the MAC; tampering and expiry are the content Worker's own acceptance tests). Cases:
+Every call's result is also checked for `state`: present on exactly the routes with `state: true`, and absent elsewhere (a `Send`'s own send state excepted).
+
+The harness (`src/harness.ts`) provides sessions for six principals in two workspaces, inbound delivery (with an optional `Message-ID`), a clock, the content origin, the stored header fields of a sent copy (`sentHeaders`), and, where Drive is a local stand-in, Drive fault injection (`driveFaults`). Each case gets a fresh harness. Content URLs follow the format of [content-origin.md](../../docs/content-origin.md) section 2.1, so the suite decodes their claims (it does not verify the MAC; tampering and expiry are the content Worker's own acceptance tests). Cases:
 
 1. **Session:** `getSession` has the member's mailbox, `role: 'member'`, a non-empty `csrfToken` and every `LIMITS` key. The primary address is an identity with `primary: true`. `newAdmin` gets a session with no `mailbox`, gets `forbidden` on `listThreads`, and can call `listMembers` and `createMailbox` for itself.
 2. **JSON:** every result of every call in this suite equals its own `JSON.parse(JSON.stringify(…))`, and has no `null` except `nextCursor`.
@@ -402,7 +420,13 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - The 31st alias answers `limit_reached`.
     - After `deleteAlias`, the identity is gone.
     - After `updateMailbox` moves mailbox A to the invited member, `member`'s next `listThreads` answers `forbidden`.
-20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`.
+20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`. With `driveFaults`: a `saveAttachmentToDrive` whose reply is lost after Drive stored the file answers `unavailable`; the same-key retry returns one file, Drive holds exactly one new file, and a new key makes a second.
+21. **Header text and threading:**
+    - CR, LF or NUL in a subject, display name or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged.
+    - A reply in a thread of 12 messages with legal 200-byte `Message-ID`s: the sent copy's `In-Reply-To` is the parent, and its `References` fits `headerValueBytes`, starts with the first id, ends with the parent, keeps chain order and holds 10 ids.
+    - The sent copy has no `Bcc` header and no Bcc address.
+22. **Owner change before release:** a send made just before an admin moves the mailbox to another member ends `failed` with `invalid_sender` for each recipient, with no sent copy.
+23. **State:** the routes with `state: true` report the same value at the same moment; a delivery, a label, a thread update, a draft and a send each move it.
 
 ## 12. Moving the M2 UI to this contract
 

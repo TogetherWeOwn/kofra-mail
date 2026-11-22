@@ -21,24 +21,31 @@ export interface RouteSpec {
   body: 'json' | 'bytes' | 'none';
   /** Query parameters accepted; any other parameter answers 400 `unknown_field`. */
   query: readonly string[];
+  /**
+   * The response body carries the mailbox `state` it was read or written at,
+   * as a top-level `state` field. No other response carries one (a `Send`'s
+   * own `state` is its send state); clients learn later states from the
+   * live-update push.
+   */
+  state: boolean;
 }
 
-type R = Omit<RouteSpec, 'idempotency' | 'ifMatch' | 'access' | 'reauth' | 'body' | 'query'> & Partial<RouteSpec>;
-const route = (r: R): RouteSpec => ({ idempotency: 'none', ifMatch: 'none', access: 'member', reauth: false, body: r.method === 'GET' || r.method === 'DELETE' ? 'none' : 'json', query: [], ...r });
+type R = Omit<RouteSpec, 'idempotency' | 'ifMatch' | 'access' | 'reauth' | 'body' | 'query' | 'state'> & Partial<RouteSpec>;
+const route = (r: R): RouteSpec => ({ idempotency: 'none', ifMatch: 'none', access: 'member', reauth: false, body: r.method === 'GET' || r.method === 'DELETE' ? 'none' : 'json', query: [], state: false, ...r });
 const paged = ['cursor', 'limit'] as const;
 
 export const ROUTES = {
-  getSession: route({ method: 'GET', path: '/session', success: 200 }),
+  getSession: route({ method: 'GET', path: '/session', success: 200, state: true }),
 
-  listViews: route({ method: 'GET', path: '/views', success: 200 }),
-  listThreads: route({ method: 'GET', path: '/threads', success: 200, query: ['view', 'labelId', 'q', 'tz', ...paged] }),
-  getThread: route({ method: 'GET', path: '/threads/{threadId}', success: 200 }),
-  updateThreads: route({ method: 'POST', path: '/threads/update', success: 200 }),
+  listViews: route({ method: 'GET', path: '/views', success: 200, state: true }),
+  listThreads: route({ method: 'GET', path: '/threads', success: 200, query: ['view', 'labelId', 'q', 'tz', ...paged], state: true }),
+  getThread: route({ method: 'GET', path: '/threads/{threadId}', success: 200, state: true }),
+  updateThreads: route({ method: 'POST', path: '/threads/update', success: 200, state: true }),
   getBodyUrl: route({ method: 'POST', path: '/messages/{messageId}/body-url', success: 200 }),
   getAttachmentUrl: route({ method: 'POST', path: '/messages/{messageId}/attachments/{part}/url', success: 200, body: 'none' }),
   saveAttachmentToDrive: route({ method: 'POST', path: '/messages/{messageId}/attachments/{part}/save-to-drive', success: 201, idempotency: 'required', body: 'none' }),
 
-  listLabels: route({ method: 'GET', path: '/labels', success: 200 }),
+  listLabels: route({ method: 'GET', path: '/labels', success: 200, state: true }),
   createLabel: route({ method: 'POST', path: '/labels', success: 201, idempotency: 'required' }),
   renameLabel: route({ method: 'PATCH', path: '/labels/{labelId}', success: 200 }),
   deleteLabel: route({ method: 'DELETE', path: '/labels/{labelId}', success: 204 }),
@@ -47,13 +54,13 @@ export const ROUTES = {
   getSettings: route({ method: 'GET', path: '/settings', success: 200 }),
   updateSettings: route({ method: 'PATCH', path: '/settings', success: 200 }),
 
-  listDrafts: route({ method: 'GET', path: '/drafts', success: 200, query: paged }),
+  listDrafts: route({ method: 'GET', path: '/drafts', success: 200, query: paged, state: true }),
   getDraft: route({ method: 'GET', path: '/drafts/{draftId}', success: 200 }),
   createDraft: route({ method: 'POST', path: '/drafts', success: 201, idempotency: 'required' }),
   replaceDraft: route({ method: 'PUT', path: '/drafts/{draftId}', success: 200, ifMatch: 'required' }),
   deleteDraft: route({ method: 'DELETE', path: '/drafts/{draftId}', success: 204, ifMatch: 'optional' }),
   sendDraft: route({ method: 'POST', path: '/drafts/{draftId}/send', success: 202, idempotency: 'required', ifMatch: 'required', body: 'none' }),
-  listSends: route({ method: 'GET', path: '/sends', success: 200, query: ['active', ...paged] }),
+  listSends: route({ method: 'GET', path: '/sends', success: 200, query: ['active', ...paged], state: true }),
   getSend: route({ method: 'GET', path: '/sends/{sendId}', success: 200 }),
   undoSend: route({ method: 'POST', path: '/sends/{sendId}/undo', success: 200, idempotency: 'required', body: 'none' }),
 

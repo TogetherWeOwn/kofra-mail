@@ -17,7 +17,10 @@ export interface Limits {
   attachmentsPerMessage: number;
   /** One uploaded file. */
   uploadBytes: number;
-  /** One custom header value we set (In-Reply-To, References, Reply-To). */
+  /**
+   * UTF-8 bytes of one header value we set (In-Reply-To, References, Reply-To),
+   * unfolded. `threadingHeaders` trims References to it.
+   */
   headerValueBytes: number;
   /** UTF-8 bytes of a subject. */
   subjectBytes: number;

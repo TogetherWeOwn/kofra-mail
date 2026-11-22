@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ERROR_CODES, ERROR_STATUS, ROUTES } from './index.ts';
+import { ERROR_CODES, ERROR_STATUS, PROBLEM_TYPE_PREFIX, problem, ROUTES } from './index.ts';
 
 const routes = Object.entries(ROUTES);
 
@@ -46,4 +46,15 @@ test('all catalogue statuses are HTTP errors', () => {
     const status = ERROR_STATUS[code];
     assert.ok(Number.isInteger(status) && status >= 400 && status < 600, code);
   }
+});
+
+test('problem types are a stable URN by default, or a configured documentation base', () => {
+  assert.equal(problem('not_found').type, `${PROBLEM_TYPE_PREFIX}not_found`);
+  assert.match(PROBLEM_TYPE_PREFIX, /^urn:/);
+  assert.equal(problem('not_found', {}, 'https://docs.example.com/mail/errors/').type, 'https://docs.example.com/mail/errors/not_found');
+});
+
+test('only mailbox reads and the thread update carry the mailbox state', () => {
+  const stateful = routes.filter(([, route]) => route.state).map(([name]) => name).sort();
+  assert.deepEqual(stateful, ['getSession', 'getThread', 'listDrafts', 'listLabels', 'listSends', 'listThreads', 'listViews', 'updateThreads']);
 });

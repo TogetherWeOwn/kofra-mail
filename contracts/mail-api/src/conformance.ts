@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { ERROR_STATUS, isMailApiError } from './errors.ts';
 import type { MailErrorCode, Problem } from './errors.ts';
+import { hasHeaderControl, threadingHeaders } from './headers.ts';
 import { attachmentBudget, LIMITS } from './limits.ts';
 import { ROUTES } from './routes.ts';
 import type { ConformanceHarness, TestMessage } from './harness.ts';
@@ -63,8 +64,14 @@ function checked(service: MailService): MailService {
     get(target, property: keyof MailService) {
       const method = target[property];
       return (...args: unknown[]) => (Reflect.apply(method, target, args) as Promise<unknown>).then((result) => {
-        if (ROUTES[property].success === 204) assert.equal(result, undefined);
+        const route = ROUTES[property];
+        if (route.success === 204) assert.equal(result, undefined);
         else assert.notEqual(result, undefined, `${property} must return a JSON body`);
+        // Exactly the routes marked `state` carry the mailbox state; a Send's own `state` is its send state.
+        if (route.state) assert.equal(typeof (result as { state?: unknown }).state, 'string', `${property} must carry state`);
+        else if (result !== undefined && property !== 'sendDraft' && property !== 'getSend') {
+          assert.ok(!Object.hasOwn(result as object, 'state'), `${property} must not carry state`);
+        }
         return json(result);
       });
     },
@@ -93,8 +100,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
             as: (principal) => checked(harness.as(principal)),
             deliver: async (...args) => json(await harness.deliver(...args)),
             advance: async (ms) => json(await harness.advance(ms)),
+            sentHeaders: async (messageId) => json(await harness.sentHeaders(messageId)),
             contentOrigin: harness.contentOrigin,
             ...(harness.drivePick && { drivePick: async () => json(await harness.drivePick!()) }),
+            ...(harness.driveFaults && { driveFaults: harness.driveFaults }),
           };
           await body(h, h.as('member'));
         } finally {
@@ -720,6 +729,131 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         attachments: [{ kind: 'upload', uploadId: attachment.uploadId }],
       }), key('draft'));
       assert.deepEqual(draft.attachments, attachments);
+
+      // A lost reply after Drive stored the file: the same-key retry returns that file and creates no second one.
+      if (!h.driveFaults) return;
+      const { messageId } = await h.deliver(message('Save me', { attachments: [file] }));
+      const { messages: [delivered] } = await mail.getThread((await mail.listThreads({ view: 'inbox', q: 'subject:"save me"' })).items[0].id);
+      assert.equal(delivered.id, messageId);
+      const [{ part }] = delivered.attachments;
+      const before = await h.driveFaults.savedFiles();
+      await h.driveFaults.loseNextSaveReply();
+      const lost = await rejects(mail.saveAttachmentToDrive(messageId, part, key('save')), 'unavailable');
+      assert.ok(Number.isInteger(lost.retryAfterSeconds));
+      const saved = await mail.saveAttachmentToDrive(messageId, part, key('save'));
+      assert.equal(saved.name, file.name);
+      assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('save')), saved);
+      assert.equal(await h.driveFaults.savedFiles(), before + 1);
+      const another = await mail.saveAttachmentToDrive(messageId, part, key('save-again'));
+      assert.notEqual(another.driveFileId, saved.driveFileId);
+      assert.equal(await h.driveFaults.savedFiles(), before + 2);
+    });
+
+    run('21. header text is refused, and threading headers fit the header byte limit', async (h, mail) => {
+      const session = await mail.getSession();
+      const { limits } = session;
+      const mailbox = requiredMailbox(session);
+      const input = draftInput(mailbox.primaryAddress);
+      const bad: [Partial<DraftInput>, string][] = [
+        [{ subject: 'Hello\r\nBcc: victim@example.net' }, '/subject'],
+        [{ subject: 'Line\nfeed' }, '/subject'],
+        [{ to: [{ name: 'Casey\r\nBcc: victim@example.net', email: 'casey@example.net' }] }, '/to/0/name'],
+        [{ cc: [{ email: 'casey@example.net\r\nBcc: victim@example.net' }] }, '/cc/0/email'],
+        [{ bcc: [{ name: 'Null\u0000name', email: 'casey@example.net' }] }, '/bcc/0/name'],
+      ];
+      for (const [i, [patch, field]] of bad.entries()) {
+        const refused = await rejects(mail.createDraft({ ...input, ...patch }, key(`bad-${i}`)), 'invalid_header');
+        assert.deepEqual(refused.errors, [{ field, code: 'invalid' }]);
+      }
+      const draft = await mail.createDraft(input, key('good'));
+      await rejects(mail.replaceDraft(draft.id, { ...input, subject: 'Edited\r\nX-Injected: 1' }, { ifMatch: draft.revision }), 'invalid_header');
+      assert.deepEqual(await mail.getDraft(draft.id), draft);
+      assert.ok(!hasHeaderControl('Tab\tseparated'));
+
+      // A thread of 12 messages, each with a legal 200-byte Message-ID: 11 of them would exceed headerValueBytes.
+      const idBytes = 200;
+      const longId = (n: number) => {
+        const tail = `.${n}@example.net>`;
+        return `<${'m'.repeat(idBytes - 1 - tail.length)}${tail}`;
+      };
+      const chain: string[] = [];
+      let parent: { threadId: string; messageId: string } | undefined;
+      for (let n = 1; n <= 12; n++) {
+        chain.push(longId(n));
+        assert.equal(Buffer.byteLength(chain.at(-1)!), idBytes);
+        parent = await h.deliver(message(n === 1 ? 'Long thread' : 'Re: Long thread', {
+          messageId: chain.at(-1), ...(parent && { inReplyTo: parent.messageId }),
+        }));
+      }
+      assert.ok(parent);
+      const reply = await mail.createDraft(draftInput(mailbox.primaryAddress, {
+        subject: 'Re: Long thread', inReplyTo: parent.messageId, bcc: [{ email: 'hidden@example.net' }],
+      }), key('reply'));
+      const send = await mail.sendDraft(reply.id, { ...key('send-reply'), ifMatch: reply.revision });
+      await h.advance((await mail.getSettings()).undoSeconds * second);
+      const sent = await mail.getSend(send.id);
+      assert.ok(sent.messageId);
+      const headers = await h.sentHeaders(sent.messageId);
+      assert.equal(headers['in-reply-to'], chain.at(-1));
+      const references = headers.references.split(' ');
+      assert.ok(Buffer.byteLength(headers.references) <= limits.headerValueBytes);
+      assert.equal(references[0], chain[0]);
+      assert.equal(references.at(-1), chain.at(-1));
+      const positions = references.map((id) => chain.indexOf(id));
+      assert.ok(positions.every((p, i) => p >= 0 && (i === 0 || p > positions[i - 1])), 'References keeps chain order');
+      // The parent, the first id, then the newest ids while they fit: 10 ids of 200 bytes and 9 spaces.
+      assert.equal(references.length, Math.min(11, Math.floor((limits.headerValueBytes + 1) / (idBytes + 1))));
+      assert.deepEqual(threadingHeaders(chain, limits), { inReplyTo: chain.at(-1), references: headers.references });
+      assert.ok(!Object.hasOwn(headers, 'bcc'), 'no stored MIME carries Bcc');
+      assert.ok(!JSON.stringify(headers).includes('hidden@example.net'));
+      for (const name of ['from', 'to', 'subject', 'date', 'message-id']) assert.ok(headers[name], name);
+    });
+
+    run('22. a pending send never goes out after the mailbox changes owner', async (h, mail) => {
+      const session = await mail.getSession();
+      const mailbox = requiredMailbox(session);
+      const { undoSeconds } = await mail.getSettings();
+      const draft = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Before reassignment' }), key('draft'));
+      const send = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+      const newOwner = h.as('newAdmin');
+      const { user } = await newOwner.getSession();
+      await h.as('admin').updateMailbox(mailbox.id, { ownerUserId: user.id });
+      await rejects(mail.getSend(send.id), 'forbidden');
+      await h.advance(undoSeconds * second);
+      const failed = await newOwner.getSend(send.id);
+      assert.equal(failed.state, 'failed');
+      assert.equal(failed.messageId, undefined);
+      assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'invalid_sender' }]);
+      const copies = await newOwner.listThreads({ view: 'sent', q: 'subject:"before reassignment"' });
+      assert.deepEqual(copies.items, []);
+    });
+
+    run('23. mailbox reads carry one state, and every change moves it', async (h, mail) => {
+      const reads = async () => [
+        (await mail.getSession()).state, (await mail.listViews()).state, (await mail.listThreads({ view: 'all' })).state,
+        (await mail.listLabels()).state, (await mail.listDrafts({})).state, (await mail.listSends({})).state,
+      ];
+      const settled = async () => {
+        const states = await reads();
+        assert.equal(new Set(states).size, 1, 'every mailbox read reports the same state');
+        return states[0];
+      };
+      const initial = await settled();
+      const { threadId } = await h.deliver(message('State'));
+      const delivered = await settled();
+      assert.notEqual(delivered, initial);
+      assert.equal((await mail.getThread(threadId)).state, delivered);
+      await mail.createLabel({ name: 'State label' }, key('label'));
+      const labelled = await settled();
+      assert.notEqual(labelled, delivered);
+      const { state } = await mail.updateThreads({ ids: [threadId], set: { starred: true } });
+      assert.notEqual(state, labelled);
+      assert.equal(await settled(), state);
+      const draft = await mail.createDraft(draftInput(requiredMailbox(await mail.getSession()).primaryAddress), key('draft'));
+      const drafted = await settled();
+      assert.notEqual(drafted, state);
+      await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+      assert.notEqual(await settled(), drafted);
     });
   });
 }
