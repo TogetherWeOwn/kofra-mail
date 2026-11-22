@@ -6,7 +6,8 @@ export interface ResolvedRecipient {
 // Preserve the directory's stable ID verbatim (including hyphens). Never normalize
 // it into a different workspace's bucket. S3 bucket names cap at 63 characters.
 export function workspaceMailBucket(workspaceId: string): string {
-  if (!workspaceId || workspaceId.length > 58 || /[^a-z0-9-]/.test(workspaceId) || workspaceId.endsWith('-')) {
+  if (!workspaceId || workspaceId.length > 58 || /[^a-z0-9-]/.test(workspaceId) || workspaceId.endsWith('-')
+    || workspaceId.includes('--') || workspaceId.endsWith('-s3alias')) {
     throw new Error('Invalid workspace storage ID');
   }
   return `mail-${workspaceId}`;

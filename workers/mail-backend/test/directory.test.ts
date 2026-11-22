@@ -70,12 +70,15 @@ test('propagates database unavailability rather than returning a miss', async ()
   await assert.rejects(lookupRecipient({ withSession: () => ({ prepare }) }, 'billing@example.test'), /no such table/);
 });
 
+const reservedWorkspaceIds = ['w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal'];
+
 test('derives a distinct valid storage bucket for each workspace without changing its ID', () => {
   const bucket = workspaceMailBucket;
   assert.equal(bucket('w1'), 'mail-w1');
   assert.equal(bucket('w2'), 'mail-w2');
   assert.equal(bucket('a'.repeat(58)).length, 63);
-  for (const invalid of ['', 'W1', '../w1', 'w1-', 'a'.repeat(59)]) {
+  assert.equal(bucket('w1-s3alias-archive'), 'mail-w1-s3alias-archive');
+  for (const invalid of ['', 'W1', '../w1', 'w1-', 'a'.repeat(59), ...reservedWorkspaceIds]) {
     assert.throws(() => bucket(invalid), /Invalid workspace storage ID/);
   }
 });
@@ -90,7 +93,7 @@ for (const [table, sql] of [
     if (table === 'addresses') {
       await db.prepare("INSERT INTO mailboxes VALUES ('m3',?,'u3','target@ulid.test')").bind(valid).run();
     }
-    for (const invalid of [valid.toUpperCase(), `${valid}-`]) {
+    for (const invalid of [valid.toUpperCase(), `${valid}-`, ...reservedWorkspaceIds]) {
       await assert.rejects(db.prepare(sql).bind(invalid).run(), /CHECK constraint failed: length\(workspace_id\)/);
     }
     assert.equal((await db.prepare(sql).bind(valid).run()).meta.changes, 1);
