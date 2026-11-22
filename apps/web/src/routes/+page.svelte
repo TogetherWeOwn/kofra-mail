@@ -82,7 +82,7 @@
       if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.defaultPrevented) return;
       if (!(event.target instanceof Element) || !event.target.closest('a[href="#mail"]')) return;
       event.preventDefault();
-      if (location.hash !== '#mail') pushState('#mail', page.state);
+      if ((settings || admin) && location.hash !== '#mail') pushState('#mail', page.state);
       void navigate('inbox');
     };
     document.addEventListener('click', followMailLink, true);

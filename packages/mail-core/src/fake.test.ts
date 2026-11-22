@@ -98,10 +98,15 @@ test('undo restores the exact draft before the deadline, but not at the deadline
   assert.deepEqual(await api.listDrafts(), [restored]);
   assert.equal(await (await api.downloadAttachment(restored.attachments[0].id)).text(), 'restored attachment bytes');
   assert.equal(await api.undoSend(first.id), undefined);
-  const next = await api.send(draft);
+  const next = await api.send(restored);
+  assert.deepEqual(await api.listDrafts(), []);
+  assert.equal(await (await api.downloadAttachment(file.id)).text(), 'restored attachment bytes');
   now = next.undoUntil;
   assert.equal(await api.undoSend(next.id), undefined);
-  assert.equal((await api.listThreads({ mailboxId: 'sent' })).length, 1);
+  const [sent] = await api.listThreads({ mailboxId: 'sent' });
+  assert.equal(sent?.id, next.id);
+  const [sentFile] = (await api.getThread(sent.id))!.messages[0].attachments;
+  assert.equal(await (await api.downloadAttachment(sentFile.id)).text(), 'restored attachment bytes');
 });
 
 test('uses the normalized subject to thread replies and retains Cc and Bcc on the sent copy', async () => {

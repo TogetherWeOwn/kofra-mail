@@ -4,6 +4,9 @@ import { expect, test } from '@playwright/test';
 test('adds demo domains, users, aliases and moderated groups', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByRole('searchbox')).toBeEnabled();
+  const historySize = await page.evaluate(() => history.length);
+  await page.getByRole('link', { name: 'Riaklo Mail' }).click();
+  expect(await page.evaluate(() => history.length)).toBe(historySize);
   const admin = page.getByRole('button', { name: 'Mail admin', exact: true });
   if (!(await admin.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await admin.click();
