@@ -160,7 +160,7 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 
 **Deadline:** the send keeps a **provider-wait total**: for each rate-limit or ambiguous result recorded under the current fence, the time from that report to its `next_attempt_at`. At 72 hours of provider-wait, the remaining recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
 - Only time the provider caused counts. Quota waits (`delayed`, including the provider's daily-quota error) never count either: they end at a known reset, and the monthly gate can delay a send by weeks with the operator's approval. An outage of our own services (a mailbox not ready or restoring, the queue or the consumer down, crashes) never fails a send.
-- **Our own stalls alert instead of failing:** a send that has not reached `send()` within 24 hours of release, or whose leases expired before Mark 5 times in a row, raises an operator alert, once per day.
+- **Our own stalls alert instead of failing:** a send that has not reached `send()` within 24 hours of release (not counting time in `delayed`, which M3-6 alerts on separately), or whose leases expired before Mark 5 times in a row, raises an operator alert, once per day.
 - A send that has not reached `send()` within 24 hours of release raises an operator alert instead.
 
 **Dead-letter queue:** a dead-lettered `send` message only posts a redacted alert to the alert Worker over its service binding, and is acknowledged after the alert answers 2xx. It never changes the send, because the drive row re-drives it. `failed` comes only from recorded failures, the crash-loop cap, the ambiguous-error cap or the deadline.

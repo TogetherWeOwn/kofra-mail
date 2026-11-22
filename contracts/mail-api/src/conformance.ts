@@ -406,7 +406,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       for (const result of concurrentUploads) {
         if (result.status !== 'rejected') continue;
         const busy = await rejects(Promise.reject(result.reason), 'idempotency_in_progress');
-        assert.ok((busy.retryAfterSeconds ?? 0) >= 1, 'idempotency_in_progress carries retryAfterSeconds');
+        assert.ok(Number.isInteger(busy.retryAfterSeconds) && busy.retryAfterSeconds! >= 0, 'idempotency_in_progress carries an integer retryAfterSeconds');
       }
       for (const other of committed) assert.deepEqual(other, committed[0]);
       const uploaded = committed[0];

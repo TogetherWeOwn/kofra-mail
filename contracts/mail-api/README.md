@@ -104,7 +104,7 @@ Errors are RFC 9457 `application/problem+json`, in the same shape as the Kofra A
 - **Switch on `code`.** Clients never use `title` or `detail` for logic. `ERROR_STATUS` in `src/errors.ts` fixes the status of every code.
 - **Field errors:** `invalid_request` carries `errors: [{ field, code }]`, where `field` is a JSON Pointer such as `/to/3/email`.
 - **Limits:** `limit` carries the exceeded bound.
-- **Retries:** 429, 503 and 409 `idempotency_in_progress` carry `Retry-After` and `retryAfterSeconds`.
+- **Retries:** 429, 503 and 409 `idempotency_in_progress` carry `Retry-After` and `retryAfterSeconds`, a non-negative integer number of seconds.
 - **During a restore:** while a mailbox is being restored, its routes answer 503 `mailbox_restoring`. Deliveries meanwhile wait in the queue.
 - **Not yet available:** a feature whose dependency is not live (for example Drive before its per-action tokens) answers 501 `feature_unavailable`, and `Session.features` reports it as off.
 - **No content in errors:** `detail` never contains message content, other mailboxes' addresses or secrets.
