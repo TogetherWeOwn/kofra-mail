@@ -56,13 +56,15 @@ Cost: about four journal writes per send.
 
 Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `sendDraft` until its cleanup is finished. There are no other send timer kinds.
 - **Other steps only move it.** Every step below sets the row's `due_at` with an upsert on that one row; none inserts a second row or deletes it. Only the end of cleanup deletes it, unconditionally, because the send is terminal and finished.
-- **The handler re-arms before acting.** In one transaction it moves its own row to now + backoff (5 minutes, doubling to at most 1 hour), then acts on the send's state:
+- **The handler re-arms before acting.** In one transaction it moves its own row to now + backoff, then acts on the send's state. The backoff is 5 minutes, doubling to at most 1 hour, from a `drive_backoff` field on the `sends` row. Any progress (a claim, a report, a state change) resets the field.
 
 | State | The handler |
 |---|---|
 | `pending`, `now ≥ undoUntil` | starts release (section 2.4) |
 | `releasing` | resumes release from the committed step |
-| `queued`, `sending` | enqueues if the release commit is published, no live lease holds the send and `now ≥ next_attempt_at` |
+| `queued` with an unpublished release commit | runs release step 4a, then enqueues |
+| `queued`, `sending`, every recipient terminal | runs the finish rule |
+| `queued`, `sending` | enqueues if no live lease holds the send and `now ≥ next_attempt_at` |
 | `delayed`, `now ≥ delayedUntil` | sets `queued` and enqueues |
 | terminal or `cancelled` with `finish_pending` | resumes the finish rule (section 2.4) |
 | anything else | nothing; the row waits for its `due_at` |
@@ -99,7 +101,7 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
 
 **Consumer** (`mail-send` Worker), in order:
 1. **Claim:** RPC `claimSend(sendId)`, one Durable Object transaction:
-   - It refuses a `cancelled` or terminal send (the consumer acknowledges).
+   - It refuses a `cancelled` or terminal send (the consumer acknowledges). A send whose recipients are all terminal is finished by the finish rule, never claimed with an empty recipient set.
    - **Not now:**
      - the mailbox is `restoring` or not ready;
      - another live lease holds the send;
@@ -112,8 +114,8 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
      - It increments the send's `attempt` counter and takes a lease of 5 minutes with **fence = (recovery epoch, attempt)**.
      - It moves `send_drive` to the lease expiry.
      - It returns the send request plus the recipients to send to: those still `pending`, and those `attempting` under an expired lease or an older epoch. Each recipient of the second kind is an **ambiguous event** (section 2.6).
-   - **Crash-loop cap:** a claim whose lease expires with no report at all (no `recordResult`, `delaySend` or `abandonClaim`) counts as an unfinished attempt. After 5 unfinished attempts in a row, the send's non-terminal recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
-2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). If the quota is exhausted, RPC `delaySend(sendId, until, fence)` sets `delayed` and `delayedUntil`, moves `send_drive` to `until`, returns the recipients to `pending` and ends the lease. Then acknowledge.
+   - **Crash-loop cap:** a claim whose lease expires with no report at all (no `recordResult`, `delaySend` or `abandonClaim`) while it left recipients `attempting` counts as an unfinished attempt. A lease that expires before Mark proves `send()` never ran, and does not count. After 5 unfinished attempts in a row, the send's non-terminal recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
+2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). A reservation is keyed by (`sendId`, recipient, quota day), so re-reserving the same recipient is a no-op. `abandonClaim` and a rate-limit result release the claim's reservations; an ambiguous result keeps them. If the quota is exhausted, RPC `delaySend(sendId, until, fence)` sets `delayed` and `delayedUntil`, moves `send_drive` to `until`, returns the recipients to `pending` and ends the lease. Then acknowledge.
 3. **Mark:** set the claimed recipients to `attempting` under the fence.
 4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all.
    - On a retry to a subset (after a partial failure), each recipient stays in the field it was in (To, Cc or Bcc).
@@ -137,18 +139,20 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
    - **Errors before `send()`** (the quota object's RPC, Mark, building the request): the consumer calls `abandonClaim(sendId, fence, retryAfter)`.
      - With the current fence it returns the claimed recipients to `pending`, ends the lease, and sets `next_attempt_at` and `send_drive` to `retryAfter`, clamped to between 1 minute and 1 hour. It does not count toward any cap.
      - With a stale fence `abandonClaim` and `delaySend` do nothing.
+   - **A terminal or `cancelled` send counts as stale for every fence.** Mark, `delaySend`, `abandonClaim` and `recordResult` against it change no recipient, lease or timer, and never recreate `send_drive`. Finish rule step 1 also ends any lease, so a consumer that outlived its lease cannot reopen a finished send.
+   - **A stale-fence record that leaves every recipient terminal** runs finish rule step 1 itself; the drive handler does the rest.
 6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed` (finish rule), and the sent copy's `send.state` follows.
 
 **The finish rule** applies to every terminal transition: `recordResult`, release step 2, the claim's `invalid_sender`, the caps, the deadline, and `undoSend` (`cancelled`).
-1. Commit the terminal state with `finish_pending`, and move `send_drive` to now.
+1. Commit the terminal state with `finish_pending`, end any lease, and move `send_drive` to now.
 2. Publish (section 2.1) before reporting the state or acting on it.
 3. Release the send's object holders. For `cancelled`, release only those the restored draft no longer uses.
 4. Clear `finish_pending` and delete `send_drive`, in one transaction.
 
 A crash or failed publish anywhere leaves `finish_pending` and the drive row, and the handler resumes at step 2. Every step is idempotent.
 
-**Deadline:** a send whose first `send()` call was more than 72 hours ago, not counting time in `delayed`, ends its remaining recipients `failed` with `delivery_error` (finish rule), and an alert fires.
-- Time before the first `send()` does not count, so an outage of our own services never fails a send.
+**Deadline:** a send whose first `send()` call was more than 72 hours ago ends its remaining recipients `failed` with `delivery_error` (finish rule), and an alert fires.
+- The clock does not run before the first `send()`, while the send is `delayed`, while the mailbox is restoring, or while the last report was `abandonClaim`. So an outage of our own services never fails a send; only time in which the provider kept failing counts.
 - A send that has not reached `send()` within 24 hours of release raises an operator alert instead.
 
 **Dead-letter queue:** a dead-lettered `send` message only posts a redacted alert to the alert Worker over its service binding, and is acknowledged after the alert answers 2xx. It never changes the send, because the drive row re-drives it. `failed` comes only from recorded failures, the crash-loop cap, the ambiguous-error cap or the deadline.
@@ -167,7 +171,7 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 
 `send()` has no idempotency key. This is a deliberate change from the earlier design rule that a retry sends only to recipients still `pending`.
 - **A recipient receives a message at least once.** A lost message is the worse failure for personal mail.
-- **At most one extra copy per ambiguous event, and at most 3 ambiguous provider errors per send.** An ambiguous event is any point where `send()` may have delivered without a recorded result: a consumer crash or a restore between `send()` and its published result, or an ambiguous provider error. A crash before `send()` causes no extra copy, but is counted the same way, because the claim cannot tell the two apart. Terminal results are published before they are acknowledged, and a terminal recipient is never changed, so a finished send is never repeated.
+- **At most one extra copy per ambiguous event, and at most 3 ambiguous provider errors per send.** An ambiguous event is any point where `send()` may have delivered without a recorded result: a consumer crash or a restore between `send()` and its published result, or an ambiguous provider error. A crash after Mark and before `send()` causes no extra copy, but is counted the same way, because the claim cannot tell it from a crash after `send()`. A crash before Mark is not an ambiguous event. Terminal results are published before they are acknowledged, and a terminal recipient is never changed, so a finished send is never repeated.
 - Each occurrence raises the metric `send_ambiguous_retry`, so we measure how often it happens before considering anything stronger.
 
 ## 3. Packages
@@ -287,6 +291,9 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
   - The quota object or Mark failing for 30 minutes: `abandonClaim` keeps every recipient `pending`, no cap is reached, and the sends go out after recovery.
   - A rate-limit backoff shorter than the lease: the lease ends with the report, and the backoff timer re-drives.
   - Every terminal path releases the send's holders and deletes its timers.
+  - The deadline or `invalid_sender` ends a send while an earlier consumer is past its lease: that consumer's `delaySend`, `abandonClaim`, Mark and `recordResult` change nothing, and the send stays terminal.
+  - After a restore, record-only messages that make every recipient terminal finish the send, with no empty claim and no false alert.
+  - Mark failing for 30 minutes leaks no quota reservation; other mailboxes are not delayed.
   - A stale fence cannot record `failed`, a retry or an ambiguous outcome.
   - A crash after `send()` and before recording resends at most once more and never loses a recipient. The test counts calls per recipient.
   - A partial failure gives `partial` with per-recipient reasons.
