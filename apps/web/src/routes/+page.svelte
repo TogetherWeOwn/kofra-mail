@@ -14,7 +14,11 @@
   import { createFakeMailApi } from '@kofra/mail-core/fake';
   import ThreadView from '$lib/ThreadView.svelte';
 
-  const api = createFakeMailApi();
+  import type { PageProps } from './$types';
+
+  let { data }: PageProps = $props();
+  function setupApi() { return createFakeMailApi(Date.now, { contentOrigin: data.contentOrigin }); }
+  const api = setupApi();
   const links = [
     { key: 'inbox', text: 'Inbox', icon: Inbox }, { key: 'starred', text: 'Starred', icon: Star },
     { key: 'sent', text: 'Sent', icon: Send }, { key: 'drafts', text: 'Drafts', icon: File },
@@ -279,7 +283,7 @@
       <MailSettings value={settings} {identities} onBack={returnToMail} onSave={api.updateSettings} />
     {:else if thread}
       {#key thread.id}
-        <ThreadView {thread} {labels} onBack={closeThread} onUpdate={(change) => { if (thread) void update([thread.id], change); }} onDownload={download} onSaveToDrive={saveToDrive} onCompose={(mode, message) => { if (thread) void compose({ mode, message, threadId: thread.id }); }} />
+        <ThreadView {thread} {labels} {api} contentOrigin={data.contentOrigin} onBack={closeThread} onUpdate={(change) => { if (thread) void update([thread.id], change); }} onDownload={download} onSaveToDrive={saveToDrive} onCompose={(mode, message) => { if (thread) void compose({ mode, message, threadId: thread.id }); }} />
       {/key}
     {:else if view === 'drafts'}
       <h1 class="list-heading" tabindex="-1" data-view-heading>Drafts</h1>

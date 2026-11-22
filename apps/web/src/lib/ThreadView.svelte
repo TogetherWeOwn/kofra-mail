@@ -1,14 +1,20 @@
 <script lang="ts">
-  import { secureHttpsLink, type Attachment, type Conversation, type Label, type ThreadUpdate } from '@kofra/mail-core';
+  import { secureHttpsLink, type Attachment, type Conversation, type Label, type MailApi, type ThreadUpdate } from '@kofra/mail-core';
   import { Archive, ArrowLeft, Download, Forward, HardDrive, Inbox, OctagonAlert, Paperclip, Reply, Tag, Trash2 } from '@lucide/svelte';
 
-  let { thread, labels, onBack, onUpdate, onDownload, onSaveToDrive, onCompose }: {
+  import { SvelteMap } from 'svelte/reactivity';
+  import MessageContent from './MessageContent.svelte';
+
+  let { thread, labels, api, contentOrigin, onBack, onUpdate, onDownload, onSaveToDrive, onCompose }: {
+    api: MailApi; contentOrigin?: string;
     thread: Conversation; labels: Label[]; onBack: () => void;
     onUpdate: (update: ThreadUpdate) => void; onDownload: (file: Attachment) => void;
     onSaveToDrive: (file: Attachment) => void;
     onCompose: (mode: 'reply' | 'forward', message: Conversation['messages'][number]) => void;
   } = $props();
   let showLabels = $state(false);
+  const expanded = new SvelteMap<string, boolean>();
+  const allowFormatted = $derived(thread.mailboxId !== 'spam' && thread.mailboxId !== 'trash');
   const date = new Intl.DateTimeFormat('en', { dateStyle: 'medium', timeStyle: 'short' });
 </script>
 
@@ -38,22 +44,22 @@
       <div class="notice warning"><OctagonAlert size={20} /><div><strong>Why is this message in Spam?</strong><p>It resembles messages identified as spam. Don’t open links or attachments unless you trust the sender.</p></div><button class="pill" onclick={() => onUpdate({ mailboxId: 'inbox' })}>Not spam</button></div>
     {/if}
     {#each thread.messages as message, i (message.id)}
-      <details class="message" open={i === thread.messages.length - 1}>
+      {@const open = expanded.get(message.id) ?? i === thread.messages.length - 1}
+      <details class="message" {open} ontoggle={(event) => expanded.set(message.id, event.currentTarget.open)}>
         <summary class="message-head">
           <span class="avatar large" aria-hidden="true">{message.from.name.split(' ').slice(0, 2).map((word) => word[0]).join('')}</span>
           <span class="message-address"><strong>{message.from.name}</strong> <span class="muted address">&lt;{message.from.email}&gt;</span><span class="muted to">{#if message.to.length}To {message.to.map((address) => address.email).join(', ')}{/if}{#if message.cc?.length}<span class="to">Cc {message.cc.map((address) => address.email).join(', ')}</span>{/if}{#if message.bcc?.length}<span class="to">Bcc {message.bcc.map((address) => address.email).join(', ')}</span>{/if}</span></span>
           <time datetime={message.date}>{date.format(new Date(message.date))}</time>
         </summary>
         <div class="message-body">
-          {#if message.remoteImages}<div class="notice"><span>Remote images blocked</span></div>{/if}
-          <p class="plain-message">{message.text}</p>
+          {#if open}<MessageContent {message} {api} origin={allowFormatted ? contentOrigin : undefined} />{/if}
           {#if message.attachments.length}
             <ul class="files" aria-label="Attachments">
               {#each message.attachments as file (file.id)}
                 <li><Paperclip size={20} /><span><strong>{file.name}</strong><small>{file.size.toLocaleString()} bytes</small></span>
                   {#if file.link !== undefined}
                     {@const url = secureHttpsLink(file.link)}
-                    {#if url}<a class="icon" href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open Drive link for ${file.name}`}><HardDrive size={18} /></a>
+                    {#if url && allowFormatted}<a class="icon" href={url} target="_blank" rel="noopener noreferrer" aria-label={`Open Drive link for ${file.name}`}><HardDrive size={18} /></a>
                     {:else}<small>Link unavailable</small>{/if}
                   {:else}
                     <button class="icon" aria-label={`Download ${file.name}`} onclick={() => onDownload(file)}><Download size={18} /></button>
