@@ -75,7 +75,18 @@
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) busy = false; }
   }
-  onMount(() => { void refresh(); if (location.hash) syncHash(); });
+  onMount(() => {
+    void refresh();
+    if (location.hash) syncHash();
+    const followMailLink = (event: MouseEvent) => {
+      if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.defaultPrevented) return;
+      if (!(event.target instanceof Element) || !event.target.closest('a[href="#mail"]')) return;
+      event.preventDefault();
+      void navigate('inbox');
+    };
+    document.addEventListener('click', followMailLink, true);
+    return () => document.removeEventListener('click', followMailLink, true);
+  });
   onDestroy(() => { for (const timer of sendTimers.values()) clearTimeout(timer); });
 
   async function openSettings() {
@@ -92,7 +103,9 @@
     if (location.hash === '#mail-settings') { if (!settings) void openSettings(); }
     else if (location.hash === '#mail-admin') {
       settings = undefined; admin = true; navOpen = false; error = ''; void focusHeading();
-    } else if (location.hash === '#mail' || !location.hash) void navigate('inbox');
+    } else if (settings || admin) {
+      settings = undefined; admin = false; void focusHeading();
+    }
   }
   function returnToMail() {
     settings = undefined; admin = false;
@@ -118,7 +131,7 @@
       const signature = preferences.signature ? `\n\n${preferences.signature}` : '';
       const quote = message ? `\n\n${reply ? `On ${shortDate.format(new Date(message.date))}, ${message.from.name} wrote:` : `Forwarded message from ${message.from.name} <${message.from.email}>`}\n${message.text.split('\n').map((line) => `> ${line}`).join('\n')}` : '';
       const to = message && reply ? [identities.some((address) => address.email === message.from.email) ? message.to[0]?.email : message.from.email].filter((address): address is string => !!address) : [];
-      const messageIdentity = message && [...message.to, ...(message.cc ?? []), message.from]
+      const messageIdentity = message && [message.from, ...message.to, ...(message.cc ?? [])]
         .find((address) => available.some((identity) => identity.email.toLowerCase() === address.email.toLowerCase()));
       const from = available.find((identity) => identity.email.toLowerCase() === messageIdentity?.email.toLowerCase())?.email ?? preferences.defaultFrom;
       draft = { from, to, cc: [], bcc: [], subject, body: signature + quote, replyToThreadId: reply ? event.threadId : undefined, attachments: message && !reply ? message.attachments.map((file) => ({ ...file })) : [] };

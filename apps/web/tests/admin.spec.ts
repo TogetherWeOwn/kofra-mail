@@ -32,6 +32,10 @@ test('adds demo domains, users, aliases and moderated groups', async ({ page }) 
   await expect(page.getByRole('row', { name: /Operations.*ops@example\.com.*Moderated/ })).toBeVisible();
   expect((await new AxeBuilder({ page }).analyze()).violations.filter((v) => v.impact === 'serious' || v.impact === 'critical')).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(page.viewportSize()!.width);
-  await page.getByRole('link', { name: 'Riaklo Mail' }).click();
+  const home = page.getByRole('link', { name: 'Riaklo Mail' });
+  await home.click();
+  await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
+  await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
+  await home.click();
   await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
 });

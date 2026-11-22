@@ -46,6 +46,9 @@ test('undo stays available inside the next composer and does not overwrite it', 
   await trigger.click();
   await editor.getByLabel('To', { exact: true }).fill('recipient@example.com');
   await editor.getByLabel('Subject').fill('First draft');
+  await editor.getByRole('combobox', { name: 'From', exact: true }).selectOption('hello@example.com');
+  await editor.getByLabel('Upload attachments').setInputFiles({ name: 'restored.txt', mimeType: 'text/plain', buffer: Buffer.from('restore me') });
+  await expect(editor.getByText('restored.txt')).toBeVisible();
   await editor.getByRole('button', { name: 'Send', exact: true }).click();
   await trigger.click();
   await editor.getByLabel('Subject').fill('Second draft');
@@ -56,7 +59,39 @@ test('undo stays available inside the next composer and does not overwrite it', 
   const drafts = page.getByRole('button', { name: 'Drafts', exact: true });
   if (!(await drafts.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await drafts.click();
-  await expect(page.getByRole('button', { name: 'Open draft First draft' })).toBeVisible();
+  await page.getByRole('button', { name: 'Open draft First draft' }).click();
+  await expect(editor.getByRole('combobox', { name: 'From', exact: true })).toHaveValue('hello@example.com');
+  await expect(editor.getByText('restored.txt')).toBeVisible();
+});
+
+test('replies to a sent copy from its original sender, not a copied alias', async ({ page }) => {
+  await page.clock.install();
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Compose', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'New message' });
+  await editor.getByLabel('To', { exact: true }).fill('person@example.com');
+  await editor.getByRole('button', { name: 'Cc and Bcc' }).click();
+  await editor.getByLabel('Cc', { exact: true }).fill('hello@example.com');
+  await editor.getByLabel('Subject').fill('Follow up');
+  await editor.getByRole('button', { name: 'Send', exact: true }).click();
+  await page.clock.fastForward(11_000);
+  const sent = page.getByRole('button', { name: 'Sent', exact: true });
+  if (!(await sent.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
+  await sent.click();
+  await page.getByRole('button', { name: /^Alex Morgan.*Follow up/ }).click();
+  await expect(page.getByText('Cc hello@example.com')).toBeVisible();
+  await page.getByRole('button', { name: 'Reply', exact: true }).click();
+  await expect(editor.getByRole('combobox', { name: 'From', exact: true })).toHaveValue('alex@example.com');
+});
+
+test('browser Back from settings restores the open conversation', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
+  await page.getByRole('button', { name: 'Account menu' }).click();
+  await page.getByRole('link', { name: 'Mail settings' }).click();
+  await expect(page.getByRole('heading', { name: 'Mail settings' })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
 });
 
 test('settings signature applies to reply and forwarding includes the original attachment', async ({ page }) => {
