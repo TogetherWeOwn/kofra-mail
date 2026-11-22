@@ -394,7 +394,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const committed = concurrentUploads.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
       assert.ok(committed.length >= 1);
       for (const result of concurrentUploads) {
-        if (result.status === 'rejected') await rejects(Promise.reject(result.reason), 'idempotency_in_progress');
+        if (result.status !== 'rejected') continue;
+        const busy = await rejects(Promise.reject(result.reason), 'idempotency_in_progress');
+        assert.ok((busy.retryAfterSeconds ?? 0) >= 1, 'idempotency_in_progress carries retryAfterSeconds');
       }
       for (const other of committed) assert.deepEqual(other, committed[0]);
       const uploaded = committed[0];

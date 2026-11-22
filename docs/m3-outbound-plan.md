@@ -14,7 +14,7 @@ Status: plan, version 1. It implements the send half of the [Mail API contract](
 - **The mailbox Durable Object owns all send state.** Queues carry ids only (`{ ws, mb, sendId }`); a queue message is limited to 128 KB.
 - **No content in logs or alerts:** no message content, subjects or addresses. Addresses appear only as counts or as the first 8 characters of a SHA-256.
 - **Send state is journalled, and published before it matters.** `sends` rows, ledger changes and each sent copy's index row (raw key, flags, labels, the Bcc list) are non-derived state in the mailbox journal. Normally the journal publishes drafts and settings within 60 seconds and flags within an hour, and a restore loads the latest snapshot plus the published deltas. A send moves faster than that (the shortest undo window is 5 seconds), so the send path uses a **publish barrier** (section 2.1).
-- **Restores are fenced and resume sending through timers** (section 2.4), following the inbound recovery rules: a restore raises the mailbox's recovery epoch, runs in resumable slices, and "restoring" or "not ready" never spends an attempt or ends in `failed`.
+- **Restores are fenced and resume sending through timers** (section 2.5), following the inbound recovery rules: a restore raises the mailbox's recovery epoch, runs in resumable slices, and "restoring" or "not ready" never spends an attempt or ends in `failed`.
 - **Stop rule for every package:** if a package needs a change to the inbound design decisions (storage keys, holder ordering, journal recovery boundary, recovery epoch), stop and write a design note for Opus. Do not adapt them locally.
 
 ## 2. Send state machine
@@ -52,79 +52,118 @@ An idempotent replay of `sendDraft` or `undoSend` also waits until the original 
 
 Cost: about four journal writes per send.
 
-### 2.2 Writes from the API
+### 2.2 One drive timer per send
+
+Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `sendDraft` until its cleanup is finished. There are no other send timer kinds.
+- **Other steps only move it.** Every step below sets the row's `due_at` with an upsert on that one row; none inserts a second row or deletes it. Only the end of cleanup deletes it, unconditionally, because the send is terminal and finished.
+- **The handler re-arms before acting.** In one transaction it moves its own row to now + backoff (5 minutes, doubling to at most 1 hour), then acts on the send's state:
+
+| State | The handler |
+|---|---|
+| `pending`, `now ≥ undoUntil` | starts release (section 2.4) |
+| `releasing` | resumes release from the committed step |
+| `queued`, `sending` | enqueues if the release commit is published, no live lease holds the send and `now ≥ next_attempt_at` |
+| `delayed`, `now ≥ delayedUntil` | sets `queued` and enqueues |
+| terminal or `cancelled` with `finish_pending` | resumes the finish rule (section 2.4) |
+| anything else | nothing; the row waits for its `due_at` |
+
+  It also checks the deadline (section 2.4).
+- **So a lost, duplicated or dead-lettered queue message, a crash in any step, or a failed publish is always re-driven,** and two drivers can never run for one send.
+- The alarm never enqueues a `cancelled` send, and the consumer re-checks the state before calling `send()`.
+
+### 2.3 Writes from the API
 
 **`sendDraft`** runs in one Durable Object transaction, then waits for the barrier:
 1. Validate the draft (contract section 8.3).
 2. Insert the `sends` row as `pending`. It points at the immutable stored draft revision and its attachment holders.
 3. Delete the draft row. Steps 2 and 3 are one journal event, so a restore replays both or neither.
-4. Add the timer `send_release` at `undoUntil`.
+4. Create the `send_drive` row at `undoUntil`.
 5. Store the idempotency result.
 
 **`undoSend`** runs in one transaction, only from `pending`, then waits for the barrier:
-1. Set the state to `cancelled`.
-2. Delete its own timer row. Other sends' timers are untouched.
-3. Restore the draft under its old id with a new revision (one journal event with step 1).
-4. Store the idempotency result, so a retry after a lost response returns the restored draft.
+1. Set the state to `cancelled` with `finish_pending`, and move `send_drive` to now.
+2. Restore the draft under its old id with a new revision (one journal event with step 1).
+3. Store the idempotency result, so a retry after a lost response returns the restored draft.
 
-The alarm never enqueues a `cancelled` send, and the consumer re-checks the state before calling `send()`.
+### 2.4 Release, the consumer and finishing
 
-### 2.3 Release and the consumer
-
-**Timer kinds used by a send** (all keyed by `sendId`, so each kind has at most one row per send): `send_release` (end of the undo window), `release_retry` (re-runs release), `send_retry` (re-drives the consumer: lease expiry, backoff, restore end) and `send_delayed` (quota reset). Each step deletes or replaces only its own kind.
-- **Invariant:** from release step 4 until the send is terminal, the send always has exactly one `send_retry` or `send_delayed` row.
-- **Their handlers never delete their own row.** In one transaction, before enqueueing, a handler re-arms its row to now + backoff (5 minutes, doubling to at most 1 hour) and checks the 72-hour deadline. Then it enqueues. A lost or dead-lettered queue message is therefore always re-driven.
-- **Who may change the row:** only `claimSend`, `recordResult`, `delaySend`, `abandonClaim` and the finish rule. Every delete is conditional on `due_at` being unchanged since that step read it, so an alarm handler that awaited an enqueue cannot delete a row a claim has just replaced.
-
-**Release** (alarm), in order:
-1. **Commit:** `pending` → `releasing`, plus a `release_retry` timer at +60 s. The commit fixes the message's `Date` and derives the MIME boundary and our `Message-ID` from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change. If M3-0 shows the provider replaces `Message-ID`, the index records the delivered id for threading; the stored bytes keep ours.
-2. **Re-check send-as and limits.** An alias may have been removed during the undo window. A send that now fails the checks becomes `failed` with reason `invalid_sender` or `message_too_large` (a terminal transition, so it is published first; section 2.1).
+**Release** (run by the drive handler), in order:
+1. **Commit:** `pending` → `releasing`. The commit fixes the message's `Date` and derives the MIME boundary and our `Message-ID` from `sendId`, so a rerun builds identical bytes and the content-addressed key does not change. If M3-0 shows the provider replaces `Message-ID`, the index records the delivered id for threading; the stored bytes keep ours.
+2. **Re-check send-as and limits.** An alias may have been removed during the undo window. A send that now fails the checks becomes `failed` with reason `invalid_sender` or `message_too_large` (finish rule).
 3. **Store the sent copy:** build the MIME of the sent copy, register its holder with the sweeper, and PUT it to object storage (holder before PUT, as on the inbound path). The stored MIME never contains a `Bcc` header; Bcc recipients live only in the `sends` row and the sender's index.
-4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows (`pending`, one per external recipient). Set `releasing` → `queued`, and add a `send_retry` timer at +5 minutes as the consumer's safety net.
-4a. **Barrier:** publish up to this commit. If the publish fails, stop; `release_retry` runs release again.
-5. **Enqueue:** `await SEND.send({ ws, mb, sendId })`, then delete `release_retry`.
+4. **Commit:** index the sent copy (`sent: true`) and insert the ledger rows (`pending`, one per external recipient). Set `releasing` → `queued`.
+4a. **Barrier:** publish up to this commit. If the publish fails, stop; the drive timer resumes here.
+5. **Enqueue:** `await SEND.send({ ws, mb, sendId })`.
 
-A crash at any step leaves `release_retry` (before step 4) or `send_retry` (from step 4), which re-drives from the committed state. Every step is idempotent: the content-addressed PUT, the holder registration, `INSERT OR IGNORE` of ledger rows. So a crash can cause a second queue message, never zero.
+Every step is idempotent: the content-addressed PUT, the holder registration, `INSERT OR IGNORE` of ledger rows. A crash leaves the drive row, which resumes from the committed state, so a crash can cause a second queue message, never zero.
 
 **Consumer** (`mail-send` Worker), in order:
 1. **Claim:** RPC `claimSend(sendId)`, one Durable Object transaction:
    - It refuses a `cancelled` or terminal send (the consumer acknowledges).
-   - **Not now:** the mailbox is `restoring` or not ready, another live lease holds the send, or the send's release commit is not yet published (release step 4a failed). The consumer acknowledges without throwing, so queue retries are never spent on waiting. The invariant above guarantees a timer; for a live lease, the claim re-arms `send_retry` at that lease's expiry, and an unpublished release is re-driven by `release_retry`.
-   - **On every claim** it repeats the send-as check (`from` is still an active identity of the mailbox) and checks that the mailbox still has the same owner. A `delayed` send can wait hours, so release-time checks are not enough. A failed check ends the send `failed` with `invalid_sender`.
-   - Otherwise it increments the send's `attempt` counter, takes a lease of 5 minutes with **fence = (recovery epoch, attempt)**, inserts or replaces the `send_retry` timer at the lease expiry, and returns the send request plus the recipients to send to: those still `pending`, and those `attempting` under an expired lease or an older epoch. Each recipient of the second kind is an **ambiguous event** (section 2.5).
-   - **Crash-loop cap:** a claim whose lease expires with no report at all (no `recordResult`, `delaySend` or `abandonClaim`) counts as an unfinished attempt. After 5 unfinished attempts in a row, the send's non-terminal recipients end `failed` with `delivery_error`, and an alert fires.
-   - **Errors before `send()`:** if anything fails before `send()` is called (the quota object's RPC, Mark, building the request), the consumer calls `abandonClaim(sendId, fence, retryAfter)`. That returns the claimed recipients to `pending`, ends the lease, re-arms `send_retry` and does not count toward any cap. Infrastructure faults therefore never make a send `failed`, as on the inbound path.
-2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). If the quota is exhausted: RPC `delaySend(sendId, until, fence)` sets `delayed`, replaces `send_retry` with `send_delayed`, and returns the recipients to `pending`. Then acknowledge.
+   - **Not now:**
+     - the mailbox is `restoring` or not ready;
+     - another live lease holds the send;
+     - the release commit is not yet published;
+     - the send is `delayed` with `now < delayedUntil`;
+     - `now < next_attempt_at`.
+     The consumer acknowledges without throwing, so queue retries are never spent on waiting; the drive row re-drives. For a live lease, the claim moves `send_drive` to that lease's expiry.
+   - **On every claim** it repeats the send-as check (`from` is still an active identity of the mailbox) and checks that the mailbox still has the same owner. A `delayed` send can wait hours, so release-time checks are not enough. A failed check ends the send `failed` with `invalid_sender` (finish rule).
+   - **Otherwise:**
+     - It increments the send's `attempt` counter and takes a lease of 5 minutes with **fence = (recovery epoch, attempt)**.
+     - It moves `send_drive` to the lease expiry.
+     - It returns the send request plus the recipients to send to: those still `pending`, and those `attempting` under an expired lease or an older epoch. Each recipient of the second kind is an **ambiguous event** (section 2.6).
+   - **Crash-loop cap:** a claim whose lease expires with no report at all (no `recordResult`, `delaySend` or `abandonClaim`) counts as an unfinished attempt. After 5 unfinished attempts in a row, the send's non-terminal recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
+2. **Reserve quota:** reserve the recipients in the account's quota object (M3-6). If the quota is exhausted, RPC `delaySend(sendId, until, fence)` sets `delayed` and `delayedUntil`, moves `send_drive` to `until`, returns the recipients to `pending` and ends the lease. Then acknowledge.
 3. **Mark:** set the claimed recipients to `attempting` under the fence.
-4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all. On a retry to a subset (after a partial failure), each recipient stays in the field it was in (To, Cc or Bcc). If M3-0 shows that `send()` accepts envelope recipients separately from the visible To and Cc lists, the retry keeps the original lists visible; otherwise the retried copy shows only the retried recipients, which is a recorded limitation.
+4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all.
+   - On a retry to a subset (after a partial failure), each recipient stays in the field it was in (To, Cc or Bcc).
+   - If M3-0 shows that `send()` accepts envelope recipients separately from the visible To and Cc lists, the retry keeps the original lists visible. Otherwise the retried copy shows only the retried recipients, which is a recorded limitation.
 5. **Record:** RPC `recordResult(sendId, fence, result)`. It never changes a recipient that is already terminal.
    - **The error classes** come from the M3-0 error-code receipt:
      - *Accepted:* `sent` (with `messageId`) or `suppressed`.
      - *Rejected for good* (for example an invalid address): `failed` with a reason.
-     - *Not accepted, try later* (rate limit, quota): back to `pending`, with backoff; the daily-quota error goes through `delaySend`. Not counted.
-     - *Ambiguous* (timeout, connection reset, an unknown 5xx): the message may have been delivered. Back to `pending`, the metric `send_ambiguous_retry` rises, and the send's ambiguous count goes up. The next attempt waits at least 30 minutes, so 3 ambiguous errors span at least an hour. At 3, the remaining recipients end `failed` with `delivery_error`, and an alert fires.
-   - **With the current fence** it records every class and ends the lease in the same transaction (as `delaySend` and `abandonClaim` do).
-   - **With a stale fence** (a restore or a newer claim came in between) it records only `sent` and `suppressed`, because those are confirmed provider facts. A stale consumer can therefore never send again, but its confirmed deliveries are kept.
-   - **While the mailbox is `restoring`**, the consumer enqueues a **record-only** message carrying the result (ids and provider message ids, well under 128 KB) with `delaySeconds` backoff and a hop count, and acknowledges. Each hop that still finds the mailbox restoring re-enqueues itself the same way and acknowledges. After 50 hops it is dropped with a metric: the epilogue's re-drive then covers it, within one extra copy. A record-only message never calls `send()`.
-   - Non-terminal outcomes replace `send_retry` with the backoff time.
-6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed`, and the sent copy's `send.state` follows.
+     - *Not accepted, try later* (rate limit): back to `pending`, with `next_attempt_at` at the backoff. Not counted. The daily-quota error goes through `delaySend`.
+     - *Ambiguous* (timeout, connection reset, an unknown 5xx): the message may have been delivered.
+       - The recipients go back to `pending`, the metric `send_ambiguous_retry` rises, and the send's ambiguous count goes up.
+       - `next_attempt_at` is at least 30 minutes ahead, and the claim enforces it, so 3 ambiguous errors span at least an hour.
+       - At 3, the remaining recipients end `failed` with `delivery_error` (finish rule), and an alert fires.
+   - **With the current fence** it records every class, ends the lease and moves `send_drive` to `next_attempt_at` (or to now, for finishing), in one transaction.
+   - **With a stale fence** (a restore or a newer claim came in between) it records only `sent` and `suppressed`, because those are confirmed provider facts. It changes no lease and no timer. A stale consumer can therefore never send again, but its confirmed deliveries are kept.
+   - **While the mailbox is `restoring`**, the consumer enqueues a **record-only** message and acknowledges.
+     - The message carries the result (ids and provider message ids, well under 128 KB), with `delaySeconds` backoff and a hop count.
+     - Each hop that still finds the mailbox restoring re-enqueues itself the same way and acknowledges.
+     - After 50 hops it is dropped with a metric; the restored send's drive row then re-drives it, within one extra copy.
+     - A record-only message never calls `send()`.
+   - **Errors before `send()`** (the quota object's RPC, Mark, building the request): the consumer calls `abandonClaim(sendId, fence, retryAfter)`.
+     - With the current fence it returns the claimed recipients to `pending`, ends the lease, and sets `next_attempt_at` and `send_drive` to `retryAfter`, clamped to between 1 minute and 1 hour. It does not count toward any cap.
+     - With a stale fence `abandonClaim` and `delaySend` do nothing.
+6. **Finish:** when every recipient is terminal, the send becomes `sent`, `partial` or `failed` (finish rule), and the sent copy's `send.state` follows.
 
-**The finish rule** applies to every terminal transition, wherever it happens: `recordResult`, release step 2, the claim's `invalid_sender`, the crash-loop cap, the ambiguous-error cap, the deadline, and `undoSend` (`cancelled`).
-1. Commit the terminal state.
-2. Publish (section 2.1) before reporting it or acting on it.
-3. Delete the send's timers.
-4. Release its object holders (for `cancelled`, only those the restored draft no longer uses).
+**The finish rule** applies to every terminal transition: `recordResult`, release step 2, the claim's `invalid_sender`, the caps, the deadline, and `undoSend` (`cancelled`).
+1. Commit the terminal state with `finish_pending`, and move `send_drive` to now.
+2. Publish (section 2.1) before reporting the state or acting on it.
+3. Release the send's object holders. For `cancelled`, release only those the restored draft no longer uses.
+4. Clear `finish_pending` and delete `send_drive`, in one transaction.
 
-**Deadline:** a send that has spent 72 hours outside `delayed` without reaching a terminal state ends its remaining recipients `failed` with `delivery_error`, and an alert fires. Time in `delayed` (a quota wait) does not count.
+A crash or failed publish anywhere leaves `finish_pending` and the drive row, and the handler resumes at step 2. Every step is idempotent.
 
-**Dead-letter queue:** a dead-lettered `send` message only posts a redacted alert to the alert Worker over its service binding. It is acknowledged after the alert answers 2xx. It never changes the send: the send's own timers re-drive it, and `failed` comes only from recorded failures, the crash-loop cap, the ambiguous-error cap or the deadline.
+**Deadline:** a send whose first `send()` call was more than 72 hours ago, not counting time in `delayed`, ends its remaining recipients `failed` with `delivery_error` (finish rule), and an alert fires.
+- Time before the first `send()` does not count, so an outage of our own services never fails a send.
+- A send that has not reached `send()` within 24 hours of release raises an operator alert instead.
 
-### 2.4 Restores
+**Dead-letter queue:** a dead-lettered `send` message only posts a redacted alert to the alert Worker over its service binding, and is acknowledged after the alert answers 2xx. It never changes the send, because the drive row re-drives it. `failed` comes only from recorded failures, the crash-loop cap, the ambiguous-error cap or the deadline.
 
-- **Fencing:** a restore raises the mailbox's recovery epoch first, so every lease and fence from before it is stale (section 2.3, consumer step 5).
-- **Epilogue, in the transaction that finishes the restore:** for every restored send insert a timer row: `send_release` at `undoUntil` for `pending`; `release_retry` now for `releasing`; `send_retry` now for `queued` and `sending` (their queue messages may already be acknowledged); `send_delayed` at `delayedUntil` for `delayed`. Recipients restored as `attempting` stay `attempting`; the next claim treats them as ambiguous (older epoch). The epilogue never enqueues directly: timers do, through the same idempotent path, so a crash during or after the epilogue still re-drives every send.
+### 2.5 Restores
 
-### 2.5 Duplicate policy
+- **Fencing:** a restore raises the mailbox's recovery epoch first, so every lease and fence from before it is stale (section 2.4, consumer step 5).
+- **Epilogue:** in the transaction that finishes the restore, every restored send that is not finished gets its `send_drive` row upserted:
+  - at `undoUntil` for `pending`;
+  - at `delayedUntil` for `delayed`;
+  - at now for everything else, including terminal sends with `finish_pending`. Their queue messages may already be acknowledged.
+- **Attempting recipients:** recipients restored as `attempting` stay `attempting`; the next claim treats them as ambiguous (older epoch).
+- **No direct enqueue:** the epilogue never enqueues directly; the drive rows do. A crash during or after the epilogue therefore still re-drives every send.
+
+### 2.6 Duplicate policy
 
 `send()` has no idempotency key. This is a deliberate change from the earlier design rule that a retry sends only to recipients still `pending`.
 - **A recipient receives a message at least once.** A lost message is the worse failure for personal mail.
@@ -168,7 +207,7 @@ A crash at any step leaves `release_retry` (before step 4) or `send_retry` (from
 ### M3-1 Timers (Opus)
 
 **Change:** the `timers(due_at, kind, ref)` table, primary key `(kind, ref)` and indexed on `due_at`. The alarm is always the earliest `due_at`.
-- `alarm()` runs at most 64 due rows per call, then re-arms. It covers: `send_release`, `release_retry`, `send_retry`, `send_delayed`, `journal_flush`, `daily_delta`, `weekly_snapshot`, `expiry` (Spam and Trash), `upload_expiry` and `idem_expiry`.
+- `alarm()` runs at most 64 due rows per call, then re-arms. It covers: `send_drive` (one row per send, section 2.2), `journal_flush`, `daily_delta`, `weekly_snapshot`, `expiry` (Spam and Trash), `upload_expiry` and `idem_expiry`.
 - The mailbox object's existing hourly journal-flush alarm becomes a `journal_flush` row.
 
 **Acceptance:**
@@ -195,7 +234,7 @@ A crash at any step leaves `release_retry` (before step 4) or `send_retry` (from
 
 ### M3-3 Send state machine (Opus)
 
-**Change:** section 2, the `pending` → `queued` steps: `sends` and the ledger insert; `sendDraft`, `undoSend`, `listSends`, `getSend` and release.
+**Change:** section 2, the `pending` → `queued` steps: `sends` and the ledger insert, the `send_drive` timer and its handler, the finish rule; `sendDraft`, `undoSend`, `listSends`, `getSend` and release.
 
 **Acceptance:**
 - Conformance cases 13 and 14 pass against the backend.
@@ -203,7 +242,7 @@ A crash at any step leaves `release_retry` (before step 4) or `send_retry` (from
 - **Crash injection** after each release step (the state commit, the PUT, the index commit, `queue.send`): there is always exactly one sent copy and at least one queue message.
 - **Restore matrix:** restore during each send state (`pending`, `releasing`, `queued`, `delayed`, `sending`, `sent`, `cancelled`), right after `sendDraft` answered, right after `undoSend` answered, and between `send()` returning and its result being published. After each restore:
   - every accepted send reaches a terminal state, and no undone send goes out;
-  - every recipient receives the message at least once, with one extra copy only for the ambiguous case (section 2.5);
+  - every recipient receives the message at least once, with one extra copy only for the ambiguous case (section 2.6);
   - a draft whose message went out does not reappear, and its sent copy is in Sent;
   - a crash during the epilogue still re-drives every send.
 - **Barrier:** with the journal publish failing, `sendDraft` and `undoSend` answer 409 `idempotency_in_progress` with `Retry-After`. A same-key retry after the publish recovers returns the original result. While the publish keeps failing, no queue message and no `EMAIL.send()` happen.
@@ -229,17 +268,22 @@ A crash at any step leaves `release_retry` (before step 4) or `send_retry` (from
 
 ### M3-5 Consumer, ledger and DLQ (Opus)
 
-**Change:** section 2, consumer and dead-letter queue: the `send` queue and its DLQ, `claimSend`, `recordResult` and `delaySend` with fencing, and the ledger states `pending`, `attempting`, `sent`, `failed` and `suppressed`.
+**Change:** section 2, consumer and dead-letter queue: the `send` queue and its DLQ, `claimSend`, `recordResult`, `delaySend` and `abandonClaim` with fencing, `next_attempt_at`, the caps and the deadline, and the ledger states `pending`, `attempting`, `sent`, `failed` and `suppressed`.
 
 **Acceptance:**
 - With the fake `EMAIL` binding:
   - A retry sends to `pending` recipients and to `attempting` recipients whose lease expired, never to terminal ones.
   - A crash between Mark and Send, and a crash after Send: each recipient gets the message, with at most one extra copy, and the send ends terminal.
-  - A consumer that crashes and whose queue message is redelivered within the lease: the redelivery is acknowledged, and the lease-expiry `send_retry` timer re-drives the send.
+  - A consumer that crashes and whose queue message is redelivered within the lease: the redelivery is acknowledged, and the drive row (moved to the lease expiry) re-drives the send.
   - Ambiguous provider errors: 3 of them end the remaining recipients `failed` with `delivery_error`; rate-limit errors never do.
   - The 72-hour deadline ends a stuck send, and time in `delayed` does not count toward it.
-  - Every delivery of the claim RPC fails until the message dead-letters: the `send_retry` handler re-arms and re-drives, and the send still reaches a terminal state.
-  - A `claimSend` committing while a `send_retry` handler awaits its enqueue: the handler does not delete the claim's timer.
+  - Every delivery of the claim RPC fails until the message dead-letters: the drive handler re-arms and re-drives, and the send still reaches a terminal state.
+  - A `claimSend` committing while the drive handler awaits its enqueue: the send still has exactly one drive row, at the lease expiry.
+  - After a quota wait, the send has exactly one drive row, and the claim refuses before `delayedUntil`.
+  - Stale-fence `abandonClaim` and `delaySend` change no recipient, lease or timer.
+  - A stray queue message right after an ambiguous error is refused until `next_attempt_at`.
+  - A publish failure during the finish rule, then recovery: the send ends with no drive row and its holders released.
+  - An outage of the quota object for 3 days fails no send; the 24-hour alert fires.
   - The quota object or Mark failing for 30 minutes: `abandonClaim` keeps every recipient `pending`, no cap is reached, and the sends go out after recovery.
   - A rate-limit backoff shorter than the lease: the lease ends with the report, and the backoff timer re-drives.
   - Every terminal path releases the send's holders and deletes its timers.
