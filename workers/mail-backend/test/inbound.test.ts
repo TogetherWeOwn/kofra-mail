@@ -57,7 +57,8 @@ test('outbox accepts a lowercase workspace ID and rejects IDs that cannot name a
     rawKey, authResults: null, createdAt: 100,
   };
   for (const workspaceId of [row.workspaceId.toUpperCase(), `${row.workspaceId}-`,
-    'w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal', 'w1\0extra']) {
+    'w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal',
+    's3alias', '-ol-s3', '-x-s3', '-table-s3', 'w1\0extra']) {
     await assert.rejects(outbox.insert({ ...row, workspaceId }), /CHECK constraint failed: length\(workspace_id\)/);
   }
   await outbox.insert(row);

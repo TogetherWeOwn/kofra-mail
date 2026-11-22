@@ -10,7 +10,7 @@ npm test
 
 This Worker is off unless `MAIL_BACKEND_ENABLED=on`. No deployment, domain, Email Routing rule or real S3 binding is part of the package. Tests use local workerd D1 and synthetic mail and storage fixtures.
 
-Ingress performs a primary directory point lookup, holds a reference, uploads the unchanged raw message, commits an outbox row, and waits for the queue to accept the delivery ID. Recipient lookup case-folds the local part. Only a successful directory miss permanently rejects a recipient. Group delivery is not enabled.
+Ingress performs a primary directory point lookup, holds a reference, uploads the unchanged raw message, commits an outbox row, and waits for the queue to accept the delivery ID. Recipient lookup lowercases the local part; it does not apply full Unicode case folding. Only a successful directory miss permanently rejects a recipient. Group delivery is not enabled.
 
 The object-store client takes `KOFRA_S3_ENDPOINT` from Worker configuration and `KOFRA_S3_ACCESS_KEY_ID` and `KOFRA_S3_SECRET_ACCESS_KEY` from Worker secrets. Trusted directory workspace IDs select separate `mail-<workspace_id>` buckets, in tenant 0 until storage tenancy is available. The adapter never provisions buckets or follows redirects. Ingress registers a raw digest before uploading to the assigned `raw/<sha256>/<generation>` key. PUTs sign the payload's SHA-256 hash so storage can verify the bytes. Do not put any real secret into checked-in files.
 
