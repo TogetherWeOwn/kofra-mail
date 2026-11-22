@@ -6,11 +6,12 @@ export interface ResolvedRecipient {
 // Preserve the directory's stable ID verbatim (including hyphens). Never normalize
 // it into a different workspace's bucket. S3 bucket names cap at 63 characters.
 export function workspaceMailBucket(workspaceId: string): string {
+  const bucket = `mail-${workspaceId}`;
   if (!workspaceId || workspaceId.length > 58 || /[^a-z0-9-]/.test(workspaceId) || workspaceId.endsWith('-')
-    || workspaceId.includes('--') || workspaceId.endsWith('-s3alias')) {
+    || workspaceId.includes('--') || /(?:-s3alias|--(?:ol|x|table)-s3)$/.test(bucket)) {
     throw new Error('Invalid workspace storage ID');
   }
-  return `mail-${workspaceId}`;
+  return bucket;
 }
 
 type DirectoryDatabase = {

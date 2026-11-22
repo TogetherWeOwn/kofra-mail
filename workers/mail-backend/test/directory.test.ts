@@ -70,7 +70,8 @@ test('propagates database unavailability rather than returning a miss', async ()
   await assert.rejects(lookupRecipient({ withSession: () => ({ prepare }) }, 'billing@example.test'), /no such table/);
 });
 
-const reservedWorkspaceIds = ['w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal'];
+const reservedWorkspaceIds = ['w1-s3alias', 'w1--ol-s3', 'w1--x-s3', 'w1--table-s3', 'w1--internal',
+  's3alias', '-ol-s3', '-x-s3', '-table-s3'];
 
 test('derives a distinct valid storage bucket for each workspace without changing its ID', () => {
   const bucket = workspaceMailBucket;
