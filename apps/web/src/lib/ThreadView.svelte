@@ -17,7 +17,8 @@
     {#if thread.mailboxId === 'spam' || thread.mailboxId === 'trash'}
       <button class="icon" aria-label="Move to Inbox" onclick={() => onUpdate({ mailboxId: 'inbox' })}><Inbox size={20} /></button>
     {:else}
-      <button class="icon" aria-label="Archive" onclick={() => onUpdate({ mailboxId: 'archive' })}><Archive size={20} /></button>
+      {#if thread.mailboxId === 'archive'}<button class="icon" aria-label="Move to Inbox" onclick={() => onUpdate({ mailboxId: 'inbox' })}><Inbox size={20} /></button>
+      {:else}<button class="icon" aria-label="Archive" onclick={() => onUpdate({ mailboxId: 'archive' })}><Archive size={20} /></button>{/if}
       <button class="icon" aria-label="Delete" onclick={() => onUpdate({ mailboxId: 'trash' })}><Trash2 size={20} /></button>
       <button class="icon" aria-label="Report spam" onclick={() => onUpdate({ mailboxId: 'spam' })}><OctagonAlert size={20} /></button>
     {/if}

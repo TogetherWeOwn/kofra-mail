@@ -51,7 +51,11 @@
     const ticket = ++request;
     try {
       const [nextRows, nextLabels, nextMailboxes] = await Promise.all([api.listThreads(currentFilter()), api.listLabels(), api.listMailboxes()]);
-      if (ticket === request) { rows = nextRows; labels = nextLabels; mailboxes = nextMailboxes; }
+      if (ticket === request) {
+        const visible = new Set(nextRows.map((row) => row.id));
+        selected = selected.filter((id) => visible.has(id));
+        rows = nextRows; labels = nextLabels; mailboxes = nextMailboxes;
+      }
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) busy = false; }
   }
@@ -95,9 +99,15 @@
     error = '';
     try {
       await Promise.all(ids.map((id) => api.updateThread(id, change)));
-      if (change.mailboxId) { selected = []; await closeThread(); status = `Moved to ${mailboxes.find((box) => box.id === change.mailboxId)?.name ?? 'mailbox'}.`; }
-      else if (thread && ids.includes(thread.id)) thread = await api.getThread(thread.id);
-      await refresh();
+      if (change.mailboxId) {
+        selected = [];
+        status = `Moved to ${mailboxes.find((box) => box.id === change.mailboxId)?.name ?? 'mailbox'}.`;
+        await refresh();
+        await closeThread();
+      } else {
+        if (thread && ids.includes(thread.id)) thread = await api.getThread(thread.id);
+        await refresh();
+      }
     } catch (cause) { showError(cause); }
   }
   async function createLabel(event: SubmitEvent) {
@@ -135,7 +145,7 @@
     <ul>
       {#each links as item (item.key)}
         {@const count = mailboxes.find((box) => box.id === item.key)?.unread}
-        <li><button aria-current={view === item.key ? 'page' : undefined} onclick={() => navigate(item.key)}><item.icon size={20} /><span>{item.text}</span>{#if count}<b aria-hidden="true">{count}</b>{/if}</button></li>
+        <li><button aria-current={view === item.key ? 'page' : undefined} aria-describedby={count ? `unread-${item.key}` : undefined} onclick={() => navigate(item.key)}><item.icon size={20} /><span>{item.text}</span>{#if count}<b aria-hidden="true">{count}</b>{/if}</button>{#if count}<span hidden id={`unread-${item.key}`}>{count} unread</span>{/if}</li>
       {/each}
     </ul>
     <div class="nav-labels"><h2>Labels</h2><button class="icon" aria-label="Create label" onclick={() => { newLabel = ''; error = ''; labelDialog.showModal(); }}><Plus size={18} /></button></div>
@@ -170,12 +180,13 @@
       {#if busy}<p class="empty">Loading conversations…</p>
       {:else if !rows.length}<p class="empty">{view === 'search' ? 'No conversations match your search.' : 'No conversations here.'}</p>
       {:else}
+        <span hidden id="unread-conversation">Unread conversation</span>
         <ul class="mail-list" aria-label={heading}>
           {#each rows as row, index (row.id)}
             <li class="mail-row" class:unread={row.unread} class:chosen={selected.includes(row.id)}>
               <input type="checkbox" class="row-check" aria-label={`Select ${row.subject}`} checked={selected.includes(row.id)} onchange={() => toggleSelect(row.id)} />
               <button class="icon star" aria-label={`${row.starred ? 'Unstar' : 'Star'} ${row.subject}`} aria-pressed={row.starred} onclick={() => update([row.id], { starred: !row.starred })}><Star size={17} fill={row.starred ? 'currentColor' : 'none'} /></button>
-              <button class="open-mail" id={`open-${row.id}`} onclick={(event) => open(row.id, event.currentTarget)}>
+              <button class="open-mail" id={`open-${row.id}`} aria-describedby={row.unread ? 'unread-conversation' : undefined} onclick={(event) => open(row.id, event.currentTarget)}>
                 <span class={`avatar row-avatar color-${index % 4}`} aria-hidden="true">{initials(row.from.name)}</span>
                 <span class="sender">{row.from.name}{#if row.count > 1} <small>{row.count}</small>{/if}</span>
                 <span class="snippet">{#each labels.filter((label) => row.labelIds.includes(label.id)) as label (label.id)}<span class="label-chip"><Tag size={11} />{label.name}</span>{/each}<span class="subject">{row.subject}</span><span class="preview"><span class="desktop"> – </span>{row.snippet}</span></span>

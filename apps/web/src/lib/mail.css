@@ -78,7 +78,8 @@ nav ul button b { font-size: .82rem; }
 .star[aria-pressed='true'] { color: var(--gold); }
 .open-mail { display: grid; align-items: center; text-align: left; grid-template-columns: minmax(110px, 20%) minmax(0, 1fr) auto; gap: 10px; width: 100%; min-width: 0; min-height: 44px; padding: 0 6px 0 0; border: 0; background: transparent; }
 .snippet, .sender { white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
-.sender { color: var(--body); }
+.sender { grid-column: 1; grid-row: 1; color: var(--body); }
+.snippet { grid-column: 2; grid-row: 1; }
 .sender small, .preview { color: var(--muted); }
 .unread :is(.sender, .subject, time) { color: var(--ink); font-weight: 600; }
 time { white-space: nowrap; color: var(--body); font-size: .87rem; text-align: right; }
@@ -130,7 +131,7 @@ time { white-space: nowrap; color: var(--body); font-size: .87rem; text-align: r
   .frame nav.mobile-open { display: block; position: fixed; z-index: 3; inset: 64px auto 0 0; width: min(270px, 84vw); overflow: auto; background: var(--bg); border-right: 1px solid var(--line); }
   .backdrop { display: block; position: fixed; z-index: 2; inset: 64px 0 0; border: 0; background: #0006; }
   .mail-row { position: relative; min-height: 92px; padding: 0 44px 0 12px; }
-  .mail-row .row-check, .desktop, .paperclip { display: none; }
+  .desktop, .paperclip { display: none; }
   .star { position: absolute; right: 5px; }
   .open-mail { min-height: 90px; grid-template-columns: 32px minmax(0, 1fr) auto; grid-template-rows: auto auto; gap: 2px 8px; padding: 11px 0; align-content: center; }
   .row-avatar { display: inline-grid; grid-column: 1; grid-row: 1 / span 2; align-self: start; }
