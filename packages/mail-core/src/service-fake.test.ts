@@ -4,6 +4,7 @@ import { defineConformance } from '@kofra/mail-contract/conformance';
 import { createFakeMailHarness } from './service-fake.ts';
 
 defineConformance('in-memory fake', async () => createFakeMailHarness({ contentOrigin: 'https://content.usercontent.example' }));
+defineConformance('in-memory fake, Drive off', async () => createFakeMailHarness({ contentOrigin: 'https://content.usercontent.example', drive: false }));
 
 test('a workspace cannot register a domain already used by another workspace', async () => {
   const harness = createFakeMailHarness();

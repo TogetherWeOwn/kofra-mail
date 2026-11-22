@@ -105,7 +105,7 @@ export const LIMITS = {
  * 4/3 and MIME adds CRLF after every 76 encoded characters (78/76); the body
  * is counted at the same rate (the backend never encodes it larger than
  * base64), and 16 KiB is reserved for headers and MIME structure. Files within
- * the budget always pass the server's encoded-size check; files above it may
+ * the budget pass unless the headers are unusually large; files above it may
  * still pass. The server's check at send time is authoritative.
  */
 export function attachmentBudget(limits: Pick<Limits, 'outboundMessageBytes'>, bodyBytes: number): number {

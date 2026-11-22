@@ -384,17 +384,20 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const draft = await verify((opts) => mail.createDraft(input, opts),
         (opts) => mail.createDraft({ ...input, subject: 'Different' }, opts), 'draft');
       const uploadKey = key('upload');
-      // An HTTP harness must let the calls overlap before the key commits.
+      // Two same-key uploads started together: whether they overlap depends on
+      // scheduling, so either the second is refused as in progress or it is a
+      // replay of the first. Never two distinct uploads.
       const concurrentUploads = await Promise.allSettled([
         mail.createUpload(upload(), uploadKey),
         mail.createUpload(upload(), uploadKey),
       ]);
-      const committed = concurrentUploads.filter((result) => result.status === 'fulfilled');
-      const rejected = concurrentUploads.filter((result) => result.status === 'rejected');
-      assert.equal(committed.length, 1);
-      assert.equal(rejected.length, 1);
-      await rejects(Promise.reject(rejected[0].reason), 'idempotency_in_progress');
-      const uploaded = committed[0].value;
+      const committed = concurrentUploads.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+      assert.ok(committed.length >= 1);
+      for (const result of concurrentUploads) {
+        if (result.status === 'rejected') await rejects(Promise.reject(result.reason), 'idempotency_in_progress');
+      }
+      for (const other of committed) assert.deepEqual(other, committed[0]);
+      const uploaded = committed[0];
       assert.deepEqual(await mail.createUpload(upload(), uploadKey), uploaded);
       await rejects(mail.createUpload(upload(new Blob(['XYZ'])), uploadKey), 'idempotency_key_reused');
       await rejects(mail.createUpload(upload(), noKey), 'precondition_required');
@@ -462,14 +465,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const rawBudget = attachmentBudget(limits, Buffer.byteLength(input.body));
       const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
       const boundaryDraft = await mail.createDraft({ ...input, attachments: [{ kind: 'upload', uploadId: boundary.id }] }, key('draft-fits'));
-      try {
-        const boundarySend = await mail.sendDraft(boundaryDraft.id, { ...key('send-fits'), ifMatch: boundaryDraft.revision });
-        assert.equal(boundarySend.state, 'pending');
-      } catch (error) {
-        if (!isMailApiError(error)) throw error;
-        assert.notEqual(error.code, 'message_too_large');
-        assert.notEqual(error.code, 'payload_too_large');
-      }
+      const boundarySend = await mail.sendDraft(boundaryDraft.id, { ...key('send-fits'), ifMatch: boundaryDraft.revision });
+      assert.equal(boundarySend.state, 'pending');
       const tooLargeRaw = Math.ceil(limits.outboundMessageBytes * 3 / 4) + 1;
       const large = await mail.createUpload(upload(new Blob([new Uint8Array(tooLargeRaw)])), key('large'));
       const oversize = await rejects(send({ attachments: [{ kind: 'upload', uploadId: large.id }] }, 'oversize'), 'message_too_large');

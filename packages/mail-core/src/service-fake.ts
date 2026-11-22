@@ -95,6 +95,8 @@ interface Mailbox {
   messages: Map<Id, StoredMessage>;
   labels: Map<Id, Label>;
   drafts: Map<Id, Draft>;
+  /** Parent Message-ID chain copied when a draft's `inReplyTo` is first set. */
+  replyRefs: Map<Id, Id[]>;
   sends: Map<Id, StoredSend>;
   uploads: Map<Id, Upload>;
   keys: ReplayScope;
@@ -174,7 +176,8 @@ async function sha256(blob: Blob): Promise<string> {
 }
 
 /** Test/demo fixture. Never binds a real session, delivers mail, or serves content bytes. */
-export function createFakeMailHarness(options: { contentOrigin?: string; start?: number } = {}): ConformanceHarness {
+export function createFakeMailHarness(options: { contentOrigin?: string; start?: number; drive?: boolean } = {}): ConformanceHarness {
+  const drive = options.drive ?? true;
   const contentOrigin = new URL(options.contentOrigin ?? 'https://content.usercontent.example').origin;
   const start = options.start ?? Date.parse('2026-11-22T12:00:00Z');
   let now = start;
@@ -198,7 +201,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   function newMailbox(workspace: Workspace, primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
     const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
     workspace.boxes.set(directory.id, {
-      workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), sends: new Map(),
+      workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), replyRefs: new Map(), sends: new Map(),
       uploads: new Map(), keys: replayScope(), training: new Map(), driveFiles: new Map(),
       settings: { signature: '', undoSeconds: 10, defaultFrom: primaryAddress, replyFromReceivedAddress: true },
     });
@@ -351,8 +354,12 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         default: return invalid(`${field}/kind`);
       }
     });
+    const to = cleanAddresses('to'), cc = cleanAddresses('cc'), bcc = cleanAddresses('bcc');
+    // Commit the parent's threading chain only once the whole draft is valid.
+    if (inReplyTo === undefined) box.replyRefs.delete(draftId);
+    else if (inReplyTo !== previous?.inReplyTo) box.replyRefs.set(draftId, replyReferences(box, inReplyTo));
     return {
-      id: draftId, revision: id(), updatedAt: iso(now), from, to: cleanAddresses('to'), cc: cleanAddresses('cc'), bcc: cleanAddresses('bcc'),
+      id: draftId, revision: id(), updatedAt: iso(now), from, to, cc, bcc,
       subject, body, attachments, ...(inReplyTo !== undefined && { inReplyTo }), ...(forwardOf !== undefined && { forwardOf }),
     };
   }
@@ -516,7 +523,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           user: { id: user.id, name: user.name },
           ...(box && { mailbox: { id: box.directory.id, primaryAddress: box.directory.primaryAddress } }),
           workspace: { id: workspace.id, role: admin ? 'admin' : 'member' },
-          csrfToken, authTime: iso(authTime), limits, features: { drive: true, htmlContent: true }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
+          csrfToken, authTime: iso(authTime), limits, features: { drive, htmlContent: true }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
         };
       },
       async listViews() {
@@ -606,6 +613,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
+        if (!drive) fail('feature_unavailable');
         return replay(box.keys, opts, 'saveAttachmentToDrive', [messageId, number], null, () => {
           const { name, size, type } = part(box, messageId, number);
           const driveFileId = id();
@@ -720,7 +728,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
             recipients: all.map(({ email }) => ({ email, state: 'pending' })),
           };
           box.drafts.delete(draftId);
-          box.sends.set(send.id, { send, pending: { draft, size, from, references: replyReferences(box, draft.inReplyTo) } });
+          box.sends.set(send.id, { send, pending: { draft, size, from, references: box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo) } });
           bump(box);
           return send;
         }, ({ id }) => sendResult(need(box.sends.get(id)).send));
@@ -769,6 +777,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       async importFromDrive(input, opts) {
         const box = mailbox();
+        if (!drive) fail('feature_unavailable');
         return replay(box.keys, opts, 'importFromDrive', [], input, () => {
           fields(input, ['pickId', 'mode']);
           const pick = need(picks.get(input.pickId));

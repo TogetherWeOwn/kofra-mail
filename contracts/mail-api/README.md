@@ -69,7 +69,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - Routes with `idempotency: 'required'` reject a request without the header with 428 `precondition_required`.
 - The key is 1 to 64 characters of `[A-Za-z0-9_-]`. The client makes one key per user action (a UUID) and reuses it on every retry of that action.
 - **Order of checks:**
-  1. Authentication, CSRF, `access`, re-authentication, rate limits and missing headers (428).
+  1. Authentication, CSRF, `access`, re-authentication, feature availability (501), rate limits and missing headers (428).
   2. **A committed key replays here**, before any existence or `If-Match` check: a replayed `sendDraft` succeeds although its draft is gone.
   3. A key in progress answers 409 (below).
   4. Existence (404), `If-Match` (412) and validation, then the effect.
@@ -212,7 +212,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
 - Recipient and attachment counts may not exceed the send limits.
 - Address syntax is not checked, because drafts may be incomplete.
-- `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
+- `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. When `inReplyTo` is first set, the server copies the parent's `Message-ID` and `References` into the draft, so the reply keeps its threading headers even if the parent later expires. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
 
 **Attachment references:**
 - `upload`: an unexpired upload of this mailbox.
@@ -252,7 +252,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Downloads:** `getAttachmentUrl` returns a content-origin URL valid for `contentUrlSeconds` (5 minutes). It always downloads as `application/octet-stream` with `Content-Disposition: attachment`, and is never rendered by the app.
 
-**The client's size check:** `attachmentBudget(limits, bodyBytes)` is a conservative estimate: files within it always pass. Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
+**The client's size check:** `attachmentBudget(limits, bodyBytes)` is an estimate that reserves 16 KiB for headers and MIME structure: files within it pass unless the headers are unusually large (for example 50 recipients with long encoded names and many long file names). Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
 
 ### 8.5 Drive
 
