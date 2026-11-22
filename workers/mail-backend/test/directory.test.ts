@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { URL } from 'node:url';
 import { Miniflare } from 'miniflare';
-import { lookupRecipient, workspaceMailBucket } from '../src/directory.ts';
+import { lookupRecipient, normalizeAddress, workspaceMailBucket } from '../src/directory.ts';
 
 const mf = new Miniflare({
   modules: true,
@@ -31,6 +31,32 @@ test('maps an alias domain and plus tag, normalizing NFC and folding the local p
   for (const address of ['JOSÉ+x@ALIAS.test', 'José+tag@ALIAS.Test', 'José+tag@ALIAS.Test']) {
     assert.deepEqual(await lookupRecipient(db, address), { workspaceId: 'w1', mailboxId: 'm1' }, address);
   }
+});
+
+test('normalizes the local part again when lowercasing creates a composable sequence', async () => {
+  await db.prepare("INSERT INTO addresses VALUES ('ǰ@example.test','w1','mailbox','m1','alias','allowed')").run();
+  assert.deepEqual(await lookupRecipient(db, 'J̌@example.test'), { workspaceId: 'w1', mailboxId: 'm1' });
+});
+
+test('normalizes Unicode addresses idempotently', () => {
+  for (const [address, expected] of [
+    ['J̌+tag@ÉXAMPLE.TEST', 'ǰ@éxample.test'],
+    ['İ@EXAMPLE.TEST', 'i̇@example.test'],
+    ['ΟΣ@EXAMPLE.TEST', 'ος@example.test'],
+    ['José@EXAMPLE.TEST', 'josé@example.test'],
+  ]) {
+    const normalized = normalizeAddress(address);
+    assert.equal(normalized, expected, address);
+    assert.equal(normalizeAddress(normalized), normalized, address);
+  }
+});
+
+test('resolves the exact Unicode address a directory writer normalized before storing', async () => {
+  const address = 'josÉ@example.test';
+  await db.prepare('DELETE FROM addresses WHERE address_norm = ?').bind('josé@example.test').run();
+  await db.prepare("INSERT INTO addresses VALUES (?,'w1','mailbox','m1','primary','allowed')")
+    .bind(normalizeAddress(address)).run();
+  assert.deepEqual(await lookupRecipient(db, address), { workspaceId: 'w1', mailboxId: 'm1' });
 });
 
 test('resolves a user alias to its mailbox regardless of case', async () => {

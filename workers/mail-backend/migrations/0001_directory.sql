@@ -27,7 +27,8 @@ CREATE TABLE mailboxes (
 );
 
 CREATE TABLE addresses (
-  -- SQLite lower() folds ASCII only; JavaScript folds the rest at lookup.
+  -- SQLite lower() folds ASCII only; this CHECK is an ASCII guard.
+  -- Every directory writer must store normalizeAddress() output.
   address_norm TEXT PRIMARY KEY NOT NULL CHECK (address_norm = lower(address_norm)),
   workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'
     AND workspace_id NOT GLOB '*--*' AND workspace_id NOT GLOB '*-s3alias' AND instr(workspace_id, char(0)) = 0

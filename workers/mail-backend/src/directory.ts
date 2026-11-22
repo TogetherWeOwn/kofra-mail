@@ -31,14 +31,20 @@ const LOOKUP = `
   WHERE original.name = ?1
 `;
 
-export async function lookupRecipient(db: DirectoryDatabase, envelopeTo: string): Promise<ResolvedRecipient | null> {
-  const address = envelopeTo.normalize('NFC');
+// SQLite lower() folds only ASCII. Every directory writer must store normalizeAddress() output.
+export function normalizeAddress(address: string): string {
   const at = address.lastIndexOf('@');
   if (at <= 0 || at === address.length - 1) throw new Error('Invalid envelope recipient');
   const domain = address.slice(at + 1).toLowerCase().normalize('NFC');
-  const local = address.slice(0, at).normalize('NFC').toLowerCase().split('+', 1)[0];
+  const local = address.slice(0, at).normalize('NFC').toLowerCase().normalize('NFC').split('+', 1)[0];
+  return `${local}@${domain}`;
+}
+
+export async function lookupRecipient(db: DirectoryDatabase, envelopeTo: string): Promise<ResolvedRecipient | null> {
+  const address = normalizeAddress(envelopeTo);
+  const at = address.lastIndexOf('@');
   // A stale replica miss must not cause a permanent SMTP bounce.
-  const row = await db.withSession('first-primary').prepare(LOOKUP).bind(domain, local)
+  const row = await db.withSession('first-primary').prepare(LOOKUP).bind(address.slice(at + 1), address.slice(0, at))
     .first<{ domainId: string | null; workspaceId: string; mailboxId: string | null }>();
   if (!row) return null;
   if (!row.domainId) throw new Error('Invalid directory alias configuration');
