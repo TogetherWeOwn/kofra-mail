@@ -57,7 +57,7 @@ export interface Problem {
   errors?: FieldError[];
   /** The limit that was exceeded, for `payload_too_large`, `message_too_large`, `too_many_*` and `limit_reached`. */
   limit?: number;
-  /** Mirrors `Retry-After` for 429 and 503. */
+  /** Mirrors `Retry-After` for 429, 503 and 409 `idempotency_in_progress`. */
   retryAfterSeconds?: number;
   /** For `reauth_required`: the `max_age` the client sends to the account service. */
   maxAgeSeconds?: number;
