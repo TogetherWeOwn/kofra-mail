@@ -1,6 +1,6 @@
 CREATE TABLE deliveries (
   id TEXT PRIMARY KEY NOT NULL,
-  workspace_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'),
   envelope_from TEXT NOT NULL,
   envelope_to TEXT NOT NULL,
   resolved_mailbox_ids TEXT NOT NULL CHECK (json_valid(resolved_mailbox_ids) AND json_array_length(resolved_mailbox_ids) = 1),

@@ -49,6 +49,20 @@ function fixture(input = bytes, rawSize = input.byteLength) {
   return { calls, message, ports };
 }
 
+test('outbox accepts a lowercase workspace ID and rejects IDs that cannot name a mail bucket', async () => {
+  const outbox = new Outbox(db);
+  const row = {
+    id: '01KBN8ZJ7G0000000000000003', workspaceId: '01arz3ndektsv4rrffq69g5fav',
+    mailboxId: 'box', envelopeFrom: 'sender@example.test', envelopeTo: 'box@example.test',
+    rawKey, authResults: null, createdAt: 100,
+  };
+  for (const workspaceId of [row.workspaceId.toUpperCase(), `${row.workspaceId}-`]) {
+    await assert.rejects(outbox.insert({ ...row, workspaceId }), /CHECK constraint failed: length\(workspace_id\)/);
+  }
+  await outbox.insert(row);
+  assert.equal((await outbox.get(row.id))?.workspaceId, row.workspaceId);
+});
+
 test('ships off and throws without resolving bindings or permanently rejecting', async () => {
   const { message, calls } = fixture();
   await assert.rejects(handleEmail(message, {}), /disabled/i);
