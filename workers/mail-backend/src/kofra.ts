@@ -1,24 +1,24 @@
 import { AwsClient } from 'aws4fetch';
 import { MAX_RAW_BYTES, readExact } from './bytes.ts';
+import { workspaceMailBucket } from './directory.ts';
+import { parseObjectKey } from './object-key.ts';
 
 export type KofraConfig = Partial<Record<
-  'KOFRA_S3_ENDPOINT' | 'KOFRA_S3_ACCESS_KEY_ID' | 'KOFRA_S3_SECRET_ACCESS_KEY' |
-  'KOFRA_MAIL_BUCKET' | 'KOFRA_MAIL_WORKSPACE_ID', string>>;
+  'KOFRA_S3_ENDPOINT' | 'KOFRA_S3_ACCESS_KEY_ID' | 'KOFRA_S3_SECRET_ACCESS_KEY', string>>;
 
 export function isObjectKey(key: string): boolean {
-  return /^(raw|attachments|drafts)\/[a-f0-9]{64}$/.test(key);
+  return parseObjectKey(key) !== null || /^drafts\/[a-f0-9]{64}(?![\s\S])/.test(key);
 }
 
 export function kofra(config: KofraConfig, workspaceId: string) {
   const { KOFRA_S3_ENDPOINT: endpoint, KOFRA_S3_ACCESS_KEY_ID: accessKeyId,
-    KOFRA_S3_SECRET_ACCESS_KEY: secretAccessKey, KOFRA_MAIL_BUCKET: bucket,
-    KOFRA_MAIL_WORKSPACE_ID: scope } = config;
-  if (!endpoint || !accessKeyId || !secretAccessKey || !bucket || !scope || workspaceId !== scope) {
-    throw new Error('Kofra mail object store unavailable for workspace');
-  }
+    KOFRA_S3_SECRET_ACCESS_KEY: secretAccessKey } = config;
+  if (!endpoint || !accessKeyId || !secretAccessKey) throw new Error('Kofra mail object store unavailable for workspace');
+  const bucket = workspaceMailBucket(workspaceId);
   const url = new URL(endpoint);
-  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash ||
-      !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(bucket)) throw new Error('Invalid Kofra mail object store configuration');
+  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) {
+    throw new Error('Invalid Kofra mail object store configuration');
+  }
   const s3 = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 });
   async function request(method: 'GET' | 'PUT', key: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
     if (!isObjectKey(key)) throw new Error('Invalid mail object key');

@@ -1,11 +1,12 @@
 import { MAX_RAW_BYTES, readExact, sha256 } from './bytes.ts';
 import type { ResolvedRecipient } from './directory.ts';
+import { parseObjectKey } from './object-key.ts';
 import type { NewDelivery } from './outbox.ts';
 
 export type InboundMail = Pick<ForwardableEmailMessage, 'from' | 'to' | 'rawSize' | 'raw' | 'setReject'>;
 export type InboundPorts = {
   lookup(to: string): Promise<ResolvedRecipient | null>;
-  hold(workspaceId: string, rawKey: string, deliveryId: string): Promise<void>;
+  register(workspaceId: string, digest: string, deliveryId: string): Promise<string>;
   put(workspaceId: string, rawKey: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
   insert(row: NewDelivery): Promise<void>;
   send(deliveryId: string): Promise<void>;
@@ -20,11 +21,13 @@ export async function receive(message: InboundMail, ports: InboundPorts): Promis
     return;
   }
   const bytes = await readExact(message.raw, message.rawSize, MAX_RAW_BYTES);
-  const rawKey = `raw/${await sha256(bytes)}`;
+  const digest = await sha256(bytes);
   const createdAt = ports.now();
   const id = ports.newId(createdAt);
   const { workspaceId, mailboxId } = recipient;
-  await ports.hold(workspaceId, rawKey, id);
+  const rawKey = await ports.register(workspaceId, digest, id);
+  const key = parseObjectKey(rawKey);
+  if (key?.kind !== 'raw' || key.digest !== digest) throw new Error('Invalid registered raw key');
   await ports.put(workspaceId, rawKey, bytes);
   await ports.insert({ id, workspaceId, mailboxId, envelopeFrom: message.from, envelopeTo: message.to,
     rawKey, authResults: firstCloudflareResult(bytes), createdAt });

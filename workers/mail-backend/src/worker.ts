@@ -1,4 +1,6 @@
 import { ulid } from 'ulid';
+import { mailAlert, type AlertBinding } from './alerts.ts';
+import type { ObjectKind } from './object-key.ts';
 import { deliver, dlq } from './deliver.ts';
 import { lookupRecipient } from './directory.ts';
 import { receive, type InboundMail } from './inbound.ts';
@@ -6,6 +8,7 @@ import { kofra, type KofraConfig } from './kofra.ts';
 import { Outbox } from './outbox.ts';
 
 export type ObjectReferences = {
+  register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
   hold(key: string, holder: string): Promise<void>;
   release(key: string, holder: string): Promise<void>;
 };
@@ -18,6 +21,7 @@ export type Env = KofraConfig & {
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;
   DEAD_LETTER_QUEUE_NAME: string;
+  ALERTS?: AlertBinding;
   SWEEPER: Namespace<ObjectReferences>;
   MAILBOX: Namespace<MailboxDelivery>;
 };
@@ -33,7 +37,7 @@ export async function handleEmail(message: InboundMail, env: Partial<Env>): Prom
   const outbox = new Outbox(DIRECTORY);
   await receive(message, {
     lookup: to => lookupRecipient(DIRECTORY, to),
-    hold: (workspaceId, key, id) => SWEEPER.getByName(workspaceId).hold(key, `delivery:${id}`),
+    register: (workspaceId, digest, id) => SWEEPER.getByName(workspaceId).register('raw', digest, `delivery:${id}`),
     put: (workspaceId, key, bytes) => kofra(env, workspaceId).put(key, bytes),
     insert: row => outbox.insert(row),
     send: async id => { await DELIVER.send(id); },
@@ -51,7 +55,7 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
   for (const message of batch.messages) {
     try {
       if (batch.queue === env.DEAD_LETTER_QUEUE_NAME) {
-        await dlq(message.body, async event => { console.error(event); });
+        await dlq(message.body, mailAlert(env.ALERTS));
       } else {
         await deliver(message.body, {
           outbox,
