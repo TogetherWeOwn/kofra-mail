@@ -4,8 +4,8 @@ import { ERROR_CODES, ERROR_STATUS, ROUTES } from './index.ts';
 
 const routes = Object.entries(ROUTES);
 
-test('the method and path uniquely identify a route', () => {
-  const keys = routes.map(([, { method, path }]) => `${method} ${path}`);
+test('the method and path shape uniquely identify a route', () => {
+  const keys = routes.map(([, { method, path }]) => `${method} ${path.replace(/\{[^}]+\}/g, '{}')}`);
   assert.equal(new Set(keys).size, keys.length);
 });
 

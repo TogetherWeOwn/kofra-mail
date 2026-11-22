@@ -175,10 +175,10 @@ Cache-Control: private, no-store
 
 **CSS** (in `style` attributes and `<style>` elements):
 - Removed: `@import`, `@font-face`, `expression(…)`, `behavior`, `-moz-binding`, and `url(…)` other than `data:image/…`.
-- When `ri` is true, remote `url(…)` in `background`/`background-image` is rewritten to an `img` URL, like an `<img>`.
+- When remote images are in effect (`ri` true and the verdict is not `phishing`), remote `url(…)` in `background`/`background-image` is rewritten to an `img` URL, like an `<img>`.
 - `position: fixed` and `position: sticky` become `position: static`, so a message cannot paint over its own frame's warning banner.
 
-**Version:** sanitiser output carries a `sanitizer` version number, so any later output cache is keyed by `(raw digest, ri, verdict, version)`.
+**Version and caching:** sanitiser output carries a `sanitizer` version number. Any later output cache stores **token-free** output, with each `cid` and remote-image reference left as a placeholder, keyed by `(raw digest, ri, verdict, version)`. The Worker mints the `cid` and `img` URLs into the cached output for each authorised response, from that response's own body token. A cached body therefore never carries another mailbox's or another request's tokens, expiry or revocation scope.
 
 ## 5. Remote-image proxy (`img`)
 

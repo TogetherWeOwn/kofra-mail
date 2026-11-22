@@ -41,6 +41,7 @@ These steps wait for a publish that covers their own commit:
 | `sendDraft` answers 202 | A restore cannot bring back the draft and lose an accepted send. The undo window absorbs the latency |
 | `undoSend` answers 2xx | A restore cannot bring back a `pending` send the user undid, which would then go out |
 | Release, before enqueue (step 4a) | A restore cannot bring back a draft whose message went out, or drop its sent copy |
+| Mark, before `send()` | A restore after `send()` always finds the recipients `attempting`, so the next claim counts them as ambiguous |
 | Any transition to a terminal state (`sent`, `partial`, `failed`, `cancelled`) is reported or acted on | A restore cannot rewind a finished send and send it again, or revive a send the user saw fail |
 | Releasing the send's object holders | A restored, not-yet-terminal send never points at deleted objects |
 
@@ -50,7 +51,7 @@ An idempotent replay of `sendDraft` or `undoSend` also waits until the original 
 - **Answers report remaining time at answer time:** `undoRemainingMs = max(0, undoUntil - now)` is computed when the 202 is sent, after the publish.
 - **The idempotency rows of `sendDraft` and `undoSend` are journalled** in the same event as their effect, so a retry after a restore still returns the original result.
 
-Cost: about four journal writes per send.
+Cost: about five journal writes per send, plus one per retry.
 
 ### 2.2 One drive timer per send
 
@@ -119,7 +120,7 @@ Every step is idempotent: the content-addressed PUT, the holder registration, `I
      - Every attempt that may call `send()` holds its own reservation, so a retry after an ambiguous result is charged again, as it should be.
      - Only the current fence can release a reservation, through `abandonClaim`, `delaySend` or a rate-limit result under that fence. A stale consumer therefore never frees a newer attempt's charge.
      - An ambiguous or accepted result keeps its reservation. If the quota is exhausted, RPC `delaySend(sendId, until, fence)` sets `delayed` and `delayedUntil`, moves `send_drive` to `until`, returns the recipients to `pending` and ends the lease. Then acknowledge.
-3. **Mark:** set the claimed recipients to `attempting` under the fence. Mark answers `stale` for a stale fence or a terminal send; the consumer then acknowledges and never calls `send()`.
+3. **Mark:** set the claimed recipients to `attempting` under the fence, and wait for the barrier before step 4. Mark answers `stale` for a stale fence or a terminal send; the consumer then acknowledges and never calls `send()`.
 4. **Send:** call `env.EMAIL.send(…)` once per message. A message has at most 50 recipients, so one call covers them all.
    - On a retry to a subset (after a partial failure), each recipient stays in the field it was in (To, Cc or Bcc).
    - If M3-0 shows that `send()` accepts envelope recipients separately from the visible To and Cc lists, the retry keeps the original lists visible. Otherwise the retried copy shows only the retried recipients, which is a recorded limitation.
@@ -298,6 +299,7 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
   - The deadline or `invalid_sender` ends a send while an earlier consumer is past its lease: that consumer's `delaySend`, `abandonClaim`, Mark and `recordResult` change nothing, and the send stays terminal.
   - After a restore, record-only messages that make every recipient terminal finish the send, with no empty claim and no false alert.
   - Mark failing for 30 minutes leaks no quota reservation; other mailboxes are not delayed.
+  - A restore after `send()` and before its result is published: the restored recipients are `attempting`, and the next claim counts them as ambiguous (metric and cap).
   - A stale fence cannot record `failed`, a retry or an ambiguous outcome.
   - A crash after `send()` and before recording resends at most once more and never loses a recipient. The test counts calls per recipient.
   - A partial failure gives `partial` with per-recipient reasons.

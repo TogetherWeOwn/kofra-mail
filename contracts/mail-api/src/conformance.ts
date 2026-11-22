@@ -42,7 +42,7 @@ function decodeContentUrl(url: URL) {
   const { iat, exp } = claims;
   assert.ok(typeof iat === 'number' && Number.isInteger(iat));
   assert.ok(typeof exp === 'number' && Number.isInteger(exp) && exp > iat);
-  return { purpose, claims, ttl: exp - iat };
+  return { purpose, claims, exp, ttl: exp - iat };
 }
 
 function json<T>(result: T): T {
@@ -346,6 +346,16 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(reply.threadId, target.threadId);
       assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q: 'confirmed' })), [target.threadId]);
       assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q: 'from:morgan@example.com has:attachment' })), []);
+      const { messages: [delivered] } = await mail.getThread(decoy.threadId);
+      // Move to the next 18:00 UTC, which is already the following day in Tokyo.
+      const at = Date.parse(delivered.receivedAt);
+      await h.advance((18 * 60 * 60 * second - (at % day) + day) % day);
+      const evening = await h.deliver(message('Evening in UTC'));
+      const { messages: [eveningMessage] } = await mail.getThread(evening.threadId);
+      const nextDay = new Date(Date.parse(eveningMessage.receivedAt) + day).toISOString().slice(0, 10);
+      const q = `after:${nextDay} subject:"evening in utc"`;
+      assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q, tz: 'Asia/Tokyo' })), [evening.threadId]);
+      assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q })), []);
       await rejects(mail.listThreads({ view: 'all', q: 'x'.repeat(limits.queryBytes + 1) }), 'invalid_request');
     });
 
@@ -455,7 +465,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         return mail.sendDraft(draft.id, { ...key(`send-${token}`), ifMatch: draft.revision });
       };
       await rejects(send({ to: [] }, 'empty'), 'invalid_recipients');
-      await rejects(send({ to: [{ email: 'invalid' }] }, 'invalid'), 'invalid_recipients');
+      const invalidDraft = await mail.createDraft({ ...input, to: [{ email: 'invalid' }] }, key('draft-invalid'));
+      await rejects(mail.sendDraft(invalidDraft.id, { ...key('send-invalid'), ifMatch: invalidDraft.revision }), 'invalid_recipients');
       // Count limits apply at save time too, so invalid drafts need not be creatable.
       await rejects(send({ to: Array.from({ length: limits.recipientsPerMessage + 1 }, (_, i) => ({ email: `person${i}@example.net` })) }, 'recipients'), 'too_many_recipients');
       const attachments: DraftInput['attachments'] = [];
@@ -618,6 +629,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         assert.equal(token.claims.ri, ri);
         assert.equal(token.claims.part, part);
         assert.ok(token.ttl <= limits.contentUrlSeconds);
+        assert.equal(Date.parse(content.expiresAt), token.exp * second);
         assert.ok(Date.parse(content.expiresAt) > now);
         assert.ok(Date.parse(content.expiresAt) <= Date.parse(after.receivedAt) + limits.contentUrlSeconds * second);
       }
@@ -694,6 +706,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
     run('20. Drive copy grants produce usable uploads, or Drive is unavailable', async (h, mail) => {
       const session = await mail.getSession();
       if (!session.features.drive) {
+        assert.equal(h.drivePick, undefined);
         await rejects(mail.importFromDrive({ pickId: missing, mode: 'copy' }, key('drive')), 'feature_unavailable');
         return;
       }

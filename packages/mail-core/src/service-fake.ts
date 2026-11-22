@@ -12,11 +12,73 @@ const maxAuthAge = 600;
 const copy = structuredClone;
 const iso = (ms: number) => new Date(ms).toISOString();
 const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
-// The client's 16 KiB budget allowance also covers per-part padding and final CRLFs.
-const mimeHeadersReserve = 15 * 1024;
 function base64MimeBytes(rawBytes: number): number {
   const encoded = 4 * Math.ceil(rawBytes / 3);
   return encoded + 2 * Math.ceil(encoded / 76);
+}
+
+function mimeHeaderText(text: string): string {
+  if (/^[\x20-\x7e]{0,60}$/.test(text)) return text;
+  const words: string[] = [];
+  const word = (value: string) => `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`;
+  let chunk = '';
+  let length = 0;
+  for (const character of text) {
+    const size = bytes(character);
+    // 45 raw bytes form 60 base64 characters, leaving room for the encoded-word wrapper.
+    if (length + size > 45) { words.push(word(chunk)); chunk = ''; length = 0; }
+    chunk += character;
+    length += size;
+  }
+  if (chunk) words.push(word(chunk));
+  return words.join('\r\n ');
+}
+
+const mimeQuoted = (text: string) => `"${text.replace(/["\\]/g, '\\$&')}"`;
+function mimeAddress({ name, email }: AddressInput): string {
+  if (!name) return email;
+  const phrase = mimeHeaderText(name);
+  return `${phrase === name ? mimeQuoted(phrase) : phrase} <${email}>`;
+}
+function mimeFilename(name: string): string {
+  if (/^[\x20-\x7e]{0,60}$/.test(name)) return `filename=${mimeQuoted(name)}`;
+  const encoded = Array.from(Buffer.from(name), (byte) => {
+    const char = String.fromCharCode(byte);
+    return /^[a-z0-9._-]$/i.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }).join('');
+  return `filename*=UTF-8''${encoded}`;
+}
+
+// Count a representative encoded MIME message without materializing the body or file bytes.
+function outboundMimeBytes(draft: Draft, from: Address, references: Id[]): number {
+  const lines = [
+    `From: ${mimeAddress(from)}`, `Subject: ${mimeHeaderText(draft.subject)}`,
+    'Date: Sun, 22 Nov 2026 12:00:00 +0000', 'Message-ID: <demo-00000000@mail.example>', 'MIME-Version: 1.0',
+  ];
+  if (draft.to.length) lines.push(`To: ${draft.to.map(mimeAddress).join(',\r\n ')}`);
+  if (draft.cc.length) lines.push(`Cc: ${draft.cc.map(mimeAddress).join(',\r\n ')}`);
+  // Bcc addresses are envelope recipients, not MIME headers.
+  if (references.length) {
+    const ids = references.map((id) => `<${id}@mail.example>`);
+    lines.push(`In-Reply-To: ${ids.at(-1)}`, `References: ${ids.join('\r\n ')}`);
+  }
+  let size = bytes(`${lines.join('\r\n')}\r\n`);
+  const files = draft.attachments.filter((attachment) => attachment.kind !== 'link');
+  const links = draft.attachments.flatMap((attachment) => attachment.kind === 'link' ? [`${attachment.name}: ${attachment.url}`] : []);
+  const text = [draft.body, ...links].join('\r\n');
+  const bodySize = bytes('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n') + base64MimeBytes(bytes(text));
+  if (!files.length) return size + bodySize;
+
+  const boundary = 'kofra-fake-multipart-boundary';
+  const delimiter = bytes(`--${boundary}\r\n`);
+  size += bytes(`Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`)
+    + delimiter + bodySize + bytes(`--${boundary}--\r\n`);
+  for (const file of files) {
+    size += delimiter + base64MimeBytes(file.size) + bytes(
+      `Content-Type: ${file.type}\r\nContent-Disposition: attachment;\r\n ${mimeFilename(file.name)}\r\nContent-Transfer-Encoding: base64\r\n\r\n`,
+    );
+  }
+  return size;
 }
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 const normalized = (s: string) => s.normalize('NFKC').toLowerCase();
@@ -133,11 +195,36 @@ function summarize(all: StoredMessage[], rows: StoredMessage[], view?: View): Th
   };
 }
 
-function search(query: string, labels: Map<Id, Label>): (row: StoredMessage) => boolean {
-  const terms = Array.from(normalized(query).matchAll(/(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g), ([, op = '', phrase, word]) => [op, phrase ?? word]);
+function dateBoundary(date: string, zone?: Intl.DateTimeFormat): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return NaN;
+  const midnight = Date.parse(`${date}T00:00:00Z`);
+  if (!Number.isFinite(midnight) || iso(midnight).slice(0, 10) !== date) return NaN;
+  if (!zone) return midnight;
+
+  const offsetAt = (instant: number) => {
+    const name = zone.formatToParts(instant).find(({ type }) => type === 'timeZoneName')?.value;
+    const match = /^GMT([+-])(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(name ?? '');
+    if (!match) return 0; // A zero offset is formatted as GMT.
+    const [, sign, hours, minutes, seconds = '0'] = match;
+    return (Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds)) * second * (sign === '-' ? -1 : 1);
+  };
+  // Try the offsets on both sides of midnight. Use the earlier instant on an
+  // overlap; in a gap use the pre-transition offset to move midnight forward.
+  const candidates = [-day, 0, day].map((delta) => midnight - offsetAt(midnight + delta));
+  const exact = candidates.filter((instant) => instant + offsetAt(instant) === midnight);
+  return exact.length ? Math.min(...exact) : Math.max(...candidates);
+}
+
+function search(query: string, labels: Map<Id, Label>, zone?: Intl.DateTimeFormat): (row: StoredMessage) => boolean {
+  const tokens = normalized(query).matchAll(/(before|after):(?=\s|$)|(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g);
+  const terms = Array.from(tokens, ([, emptyDate, operator, phrase, word]) => {
+    const op = emptyDate ?? operator ?? '';
+    const term = phrase ?? word ?? '';
+    return { op, term, boundary: op === 'before' || op === 'after' ? dateBoundary(term, zone) : NaN };
+  });
   const contains = (text: string, term: string) => normalized(text).includes(term);
   const addressMatches = (a: Address, term: string) => contains(`${a.name} ${a.email}`, term);
-  return ({ message: m, indexedText }) => terms.every(([op, term]) => {
+  return ({ message: m, indexedText }) => terms.every(({ op, term, boundary }) => {
     switch (op) {
       case 'from': return addressMatches(m.from, term);
       case 'to': return [...m.to, ...m.cc].some((a) => addressMatches(a, term));
@@ -145,13 +232,8 @@ function search(query: string, labels: Map<Id, Label>): (row: StoredMessage) => 
       case 'label': return m.labelIds.some((id) => normalized(labels.get(id)?.name ?? '') === term);
       case 'has': return term === 'attachment' && m.attachments.length > 0;
       case 'is': return term === 'unread' ? m.unread : term === 'starred' && m.starred;
-      case 'before':
-      case 'after': {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(term)) return false;
-        const date = Date.parse(`${term}T00:00:00Z`);
-        if (!Number.isFinite(date) || iso(date).slice(0, 10) !== term) return false;
-        return op === 'before' ? Date.parse(m.date) < date : Date.parse(m.date) >= date;
-      }
+      case 'before': return Date.parse(m.date) < boundary;
+      case 'after': return Date.parse(m.date) >= boundary;
       case 'larger': {
         const match = /^(\d+)([km])?$/.exec(term);
         return !!match && m.size > Number(match[1]) * (match[2] === 'm' ? 1024 ** 2 : match[2] === 'k' ? 1024 : 1);
@@ -279,6 +361,16 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         sendAs: source.sendAs === 'active' && d.sending === 'active' ? 'active' : 'pending',
       })));
     return [primary, ...explicit, ...implicit];
+  }
+  function receivingAddresses(box: Mailbox): Set<string> {
+    const { primaryAddress, aliases } = box.directory;
+    const addresses = [primaryAddress, ...aliases.map(({ address }) => address)];
+    const variants = [...box.workspace.domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
+      .flatMap((d) => addresses.flatMap((email) => {
+        const [localPart, domain] = email.split('@');
+        return domain === d.aliasOf ? [`${localPart}@${d.name}`] : [];
+      }));
+    return new Set([...addresses, ...variants]);
   }
   function sender(box: Mailbox, email: string, active: boolean): Identity {
     if (typeof email !== 'string') fail('invalid_sender');
@@ -430,8 +522,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     if (!pending) return;
     const { draft, size, from, references } = pending;
     const date = send.undoUntil;
-    const own = new Set(identities(box).map((identity) => identity.email));
-    const toSelf = send.recipients.some(({ email }) => own.has(email.toLowerCase()) || box.directory.aliases.some(({ address }) => address === email.toLowerCase()));
+    const own = receivingAddresses(box);
+    const toSelf = send.recipients.some(({ email }) => own.has(email.toLowerCase()));
     const message = append(box, draft.inReplyTo, {
       folder: toSelf ? 'inbox' : 'archive', sent: true, unread: false, starred: false, labelIds: [],
       from, to: draft.to.map(address), cc: draft.cc.map(address), bcc: draft.bcc.map(address), date, receivedAt: date, subject: draft.subject,
@@ -538,13 +630,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         if (!VIEWS.includes(view)) invalid('/view');
         if (labelId !== undefined) need(box.labels.get(labelId));
         if (q !== undefined) boundedText(q, limits.queryBytes, '/q');
+        let zone: Intl.DateTimeFormat | undefined;
         if (tz !== undefined) {
           if (typeof tz !== 'string' || /^[+-]/.test(tz)) invalid('/tz');
-          try { new Intl.DateTimeFormat('en', { timeZone: tz }); }
+          try { zone = new Intl.DateTimeFormat('en', { timeZone: tz, timeZoneName: 'longOffset' }); }
           catch { invalid('/tz'); }
         }
-        // The fake validates tz but evaluates date boundaries in UTC.
-        const match = search(q ?? '', box.labels);
+        const match = search(q ?? '', box.labels, zone);
         const items = [...box.threads.values()].flatMap((all) => {
           const rows = inView(all, view);
           return rows.some((row) => (labelId === undefined || row.message.labelIds.includes(labelId)) && match(row)) ? [summarize(all, rows, view)] : [];
@@ -554,7 +646,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async getThread(threadId) {
         const box = mailbox();
         const rows = need(box.threads.get(threadId));
-        return { thread: summarize(rows, rows), messages: rows.map(({ message }) => message), state: state(box) };
+        return copy({ thread: summarize(rows, rows), messages: rows.map(({ message }) => message), state: state(box) });
       },
       async updateThreads(update) {
         const box = mailbox();
@@ -715,25 +807,19 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           const all = [...draft.to, ...draft.cc, ...draft.bcc];
           if (!all.length || all.some(({ email }) => !validEmail(email))) fail('invalid_recipients');
           const from = address(sender(box, draft.from, true));
-          let bodyBytes = bytes(draft.body);
-          let encodedFileBytes = 0;
-          for (const attachment of draft.attachments) {
-            if (attachment.kind === 'link') bodyBytes += bytes(`\r\n${attachment.name}: ${attachment.url}`);
-            else encodedFileBytes += base64MimeBytes(attachment.size);
-          }
-          const size = mimeHeadersReserve + base64MimeBytes(bodyBytes) + encodedFileBytes;
+          const references = box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo);
+          const size = outboundMimeBytes(draft, from, references);
           if (size > limits.outboundMessageBytes) fail('message_too_large', { limit: limits.outboundMessageBytes });
           const undoRemainingMs = box.settings.undoSeconds * second;
           const send: Send = {
             id: id(), draftId, state: 'pending', createdAt: iso(now), undoUntil: iso(now + undoRemainingMs), undoRemainingMs,
             recipients: all.map(({ email }) => ({ email, state: 'pending' })),
           };
-          const references = box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo);
           box.drafts.delete(draftId);
           box.replyRefs.delete(draftId);
           box.sends.set(send.id, { send, pending: { draft, size, from, references } });
           bump(box);
-          return send;
+          return copy(send);
         }, ({ id }) => sendResult(need(box.sends.get(id)).send));
       },
       async listSends(query) {
@@ -764,7 +850,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         const box = mailbox();
         const { name, type, bytes: blob } = input ?? {};
         let digest: string;
-        const fingerprint = async () => [name, type, blob instanceof Blob ? (digest = await sha256(blob)) : null];
+        const fingerprint = async () => {
+          if (!(blob instanceof Blob)) return [name, type, null];
+          // An oversized body cannot match a committed upload. Don't open its stream.
+          if (blob.size > limits.uploadBytes) return [name, type, { oversized: true }];
+          digest = await sha256(blob);
+          return [name, type, digest];
+        };
         return replay(box.keys, opts, 'createUpload', [], fingerprint, () => {
           fields(input, ['name', 'type', 'bytes']);
           if (!(blob instanceof Blob)) invalid('/bytes');
@@ -902,11 +994,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       return { threadId: message.threadId, messageId: message.id };
     },
     async advance(ms) { advance(ms); },
-    async drivePick() {
-      const box = need(ownerBox(local, 'member'));
-      const token = randomUUID();
-      picks.set(token, { mailboxId: box.directory.id, expires: now + 5 * 60 * second });
-      return token;
-    },
+    ...(drive && {
+      async drivePick() {
+        const box = need(ownerBox(local, 'member'));
+        const token = randomUUID();
+        picks.set(token, { mailboxId: box.directory.id, expires: now + 5 * 60 * second });
+        return token;
+      },
+    }),
   };
 }

@@ -319,6 +319,8 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 - `packages/mail-core` runs the suite against the fake in CI;
 - the backend runs it over HTTP against local workerd once it serves `/api/v1`.
 
+The suite checks `MailService`, which has no headers. The HTTP client's own tests check the wire: `Retry-After` equals `retryAfterSeconds`, `X-Request-Id` and `Cache-Control: no-store` are present, problem bodies have `application/problem+json`, and `X-CSRF-Token`, `Idempotency-Key` and `If-Match` are sent as `ROUTES` requires.
+
 The harness (`src/harness.ts`) provides sessions for six principals in two workspaces, inbound delivery, a clock and the content origin. Each case gets a fresh harness. Content URLs follow the format of [content-origin.md](../../docs/content-origin.md) section 2.1, so the suite decodes their claims (it does not verify the MAC; tampering and expiry are the content Worker's own acceptance tests). Cases:
 
 1. **Session:** `getSession` has the member's mailbox, `role: 'member'`, a non-empty `csrfToken` and every `LIMITS` key. The primary address is an identity with `primary: true`. `newAdmin` gets a session with no `mailbox`, gets `forbidden` on `listThreads`, and can call `listMembers` and `createMailbox` for itself.
