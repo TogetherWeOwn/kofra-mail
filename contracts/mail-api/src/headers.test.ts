@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { hasHeaderControl, isSafeMessageId, LIMITS, threadingHeaders } from './index.ts';
+import { hasHeaderControl, indexedAttachmentName, isSafeMessageId, LIMITS, MESSAGE_ID_MAX, threadingHeaders } from './index.ts';
 
 const id = (n: number, bytes = 20) => {
   const tail = `.${n}@example.net>`;
@@ -45,4 +45,16 @@ test('threading headers drop ids that are not safe to repeat in a header', () =>
   // An unsafe parent is never repeated: no In-Reply-To, and References keeps only the safe ids.
   assert.deepEqual(threadingHeaders([id(1), unsafe[0]], LIMITS), { references: id(1) });
   assert.deepEqual(threadingHeaders([unsafe[0]], LIMITS), {});
+});
+
+test('an id too long for one header line is never repeated', () => {
+  assert.ok(isSafeMessageId(id(1, MESSAGE_ID_MAX)));
+  assert.ok(!isSafeMessageId(id(1, MESSAGE_ID_MAX + 1)));
+  assert.ok(`In-Reply-To: ${id(1, MESSAGE_ID_MAX)}`.length <= 998);
+});
+
+test('third-party attachment names lose controls and path separators', () => {
+  assert.equal(indexedAttachmentName('a\r\nb/c\\d.txt'), 'abcd.txt');
+  assert.equal(indexedAttachmentName('\u0000'), 'attachment');
+  assert.ok(Buffer.byteLength(indexedAttachmentName('é'.repeat(300))) <= 255);
 });

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, problem, threadingHeaders } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, problem, threadingHeaders } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
   DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
@@ -444,6 +444,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       const { name, email } = value;
       if (typeof email !== 'string') invalid(`/${field}/${i}/email`);
       if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
+      if (bytes(email) > limits.addressBytes) invalid(`/${field}/${i}/email`, 'too_long');
       if (typeof name === 'string' && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
       if (name !== undefined) boundedText(name, limits.displayNameBytes, `/${field}/${i}/name`);
       return { email, ...(name !== undefined && { name }) };
@@ -469,7 +470,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           // URL parsing drops tabs and newlines silently, so check the raw text first.
           const url = typeof ref.url === 'string' && !/\p{Cc}/u.test(ref.url) ? URL.parse(ref.url) : null;
           if (url?.protocol !== 'https:' || url.username || url.password) invalid(`${field}/url`);
+          if (bytes(ref.url) > limits.linkUrlBytes) invalid(`${field}/url`, 'too_long');
           if (typeof ref.name !== 'string' || /\p{Cc}/u.test(ref.name)) invalid(`${field}/name`);
+          if (bytes(ref.name) > limits.linkNameBytes) invalid(`${field}/name`, 'too_long');
           return { kind: 'link', url: ref.url, name: ref.name };
         }
         default: return invalid(`${field}/kind`);
@@ -1062,7 +1065,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     async deliver(input: TestMessage, principal = 'member') {
       const box = need(ownerBox(workspaceFor(principal), userIdFor(principal)));
       const date = iso(now);
-      const attachments = (input.attachments ?? []).map((a, i) => ({ part: i + 1, name: a.name, type: a.type, size: a.bytes.length, inline: a.inline ?? false }));
+      const attachments = (input.attachments ?? []).map((a, i) => ({ part: i + 1, name: indexedAttachmentName(a.name), type: a.type, size: a.bytes.length, inline: a.inline ?? false }));
       const message = append(box, input.inReplyTo, {
         from: input.from, to: input.to, cc: input.cc ?? [], subject: input.subject, text: input.text,
         date, receivedAt: date, folder: 'inbox', unread: true, starred: false, labelIds: [], sent: false,

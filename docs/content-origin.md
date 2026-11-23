@@ -181,7 +181,8 @@ Cache-Control: private, no-store
 **CSS** (in `style` attributes and `<style>` elements):
 - Removed: `@import`, `@font-face`, `expression(…)`, `behavior`, `-moz-binding`, and `url(…)` other than `data:image/…`.
 - When remote images are in effect (`ri` true and the verdict is not `phishing`), remote `url(…)` in `background`/`background-image` is rewritten to an `img` URL, like an `<img>`.
-- `position: fixed` and `position: sticky` become `position: static`, so a message cannot paint over its own frame's warning banner.
+- `position: fixed` and `position: sticky` become `position: static`.
+- **The phishing and suspicious-sender warnings are drawn by the app, above the iframe and outside it,** never inside the content document. Message CSS cannot paint outside its iframe, so no `position`, `z-index`, `transform` or negative margin can cover or hide them.
 
 **Version and caching:** sanitiser output carries a `sanitizer` version number. Any later output cache stores **token-free** output, with each `cid` and remote-image reference left as a placeholder, keyed by `(raw digest, ri, verdict, version)`. The Worker mints the `cid` and `img` URLs into the cached output for each authorised response, from that response's own body token. A cached body therefore never carries another mailbox's or another request's tokens, expiry or revocation scope.
 
@@ -240,6 +241,7 @@ Cache-Control: private, no-store
 3. **Sanitiser:**
    - A corpus of at least 150 vectors (html5sec-style plus real newsletter samples written for the tests) leaves no element, attribute, URL scheme or CSS construct outside section 4. It includes markup hidden inside `xmp`, `noembed`, `noframes`, `plaintext`, `listing`, `textarea`, `title` and `noscript`, and a phishing message whose links must all lose `href`.
    - A Playwright test loads every vector in the real iframe and sees no script execution, no network request outside the content host, and no top navigation.
+   - Overlay vectors (`position: absolute` with a large `z-index`, `transform`, negative margins) leave the app's warning banner, which is outside the iframe, fully visible and clickable.
 4. **Proxy:**
    - Refusals: IP literals, private and own-zone names, a fourth redirect, a redirect to a refused host, SVG, a mislabelled HTML body, more than 5 MiB, and over 10 s.
    - It never forwards a cookie or `Referer`, checked with a local upstream fixture.

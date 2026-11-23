@@ -30,6 +30,11 @@ export interface Limits {
   signatureBytes: number;
   /** UTF-8 bytes of a display name. */
   displayNameBytes: number;
+  /** UTF-8 bytes of one address in a draft (RFC 5321's 254 for a path). */
+  addressBytes: number;
+  /** UTF-8 bytes of a link attachment's URL and of its name. */
+  linkUrlBytes: number;
+  linkNameBytes: number;
   /** Characters (code points) of a label name, after trimming. */
   labelNameChars: number;
   labelsPerMessage: number;
@@ -81,6 +86,9 @@ export const LIMITS = {
   bodyBytes: 1 * MiB,
   signatureBytes: 10 * KiB,
   displayNameBytes: 256,
+  addressBytes: 254,
+  linkUrlBytes: 2048,
+  linkNameBytes: 255,
   labelNameChars: 72,
   labelsPerMessage: 64,
   labelsPerMailbox: 1000,

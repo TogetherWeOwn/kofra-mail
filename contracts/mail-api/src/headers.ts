@@ -15,11 +15,30 @@ export function hasHeaderControl(text: string): boolean {
 
 /**
  * A `Message-ID` we will repeat in a header: `<`, printable ASCII without
- * space, `<` or `>`, then `>`. Ids come from third-party mail, so anything
- * else (CR, NUL, space, non-ASCII, a missing bracket) is dropped, never sent.
+ * space, `<` or `>`, then `>`, at most `MESSAGE_ID_MAX` bytes. Ids come from
+ * third-party mail, so anything else (CR, NUL, space, non-ASCII, a missing
+ * bracket, an id too long for one line) is dropped, never sent.
  */
 export function isSafeMessageId(id: string): boolean {
-  return /^<[\x21-\x3b\x3d\x3f-\x7e]+>$/.test(id);
+  return id.length <= MESSAGE_ID_MAX && /^<[\x21-\x3b\x3d\x3f-\x7e]+>$/.test(id);
+}
+
+/**
+ * The longest id we repeat: `In-Reply-To: <id>` must fit one RFC 5322 line
+ * of 998 octets, since a single id cannot be folded.
+ */
+export const MESSAGE_ID_MAX = 998 - 'In-Reply-To: '.length;
+
+/**
+ * An attachment name taken from third-party mail or Drive, as the index
+ * stores it: control characters, `/` and `\` removed, at most 255 UTF-8
+ * bytes. Outbound MIME then always encodes it (RFC 2231) unless it is a
+ * plain token, so a name can never add a header or a parameter.
+ */
+export function indexedAttachmentName(name: string): string {
+  let clean = name.replace(/[\p{Cc}/\\]/gu, '');
+  while (utf8Bytes(clean) > 255) clean = [...clean].slice(0, -1).join('');
+  return clean || 'attachment';
 }
 
 /** How many of the most recent ids `References` keeps after the first one. */

@@ -215,13 +215,13 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 **Saving a draft:**
 - `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
 - Recipient and attachment counts may not exceed the send limits.
-- Address syntax is not checked, because drafts may be incomplete.
+- Address syntax is not checked, because drafts may be incomplete, but lengths are: an address over `addressBytes` (254), a link URL over `linkUrlBytes` or a link name over `linkNameBytes` answers 400 `invalid_request` (`too_long`).
 - **Header text:** a subject, display name or address (and, on admin routes, a mailbox `displayName`, which is the From name of its identities) that contains a control character other than tab (CR and LF included) answers 422 `invalid_header`, with the field in `errors`. It is never stripped. `hasHeaderControl` in `src/headers.ts` is the rule. Link names and URLs with control characters answer 400 `invalid_request`; file names are checked when uploaded (section 8.4).
 - `inReplyTo` and `forwardOf` must name messages in this mailbox when first set. When `inReplyTo` is first set, the server copies the parent's `Message-ID` and `References` into the draft, so the reply keeps its threading headers even if the parent later expires. A later `replaceDraft` that carries the same value over stays valid even after the source message expired or was deleted, like an attachment already on the draft.
 
 **Attachment references:**
 - `upload`: an unexpired upload of this mailbox.
-- `message`: an attachment part of a message in this mailbox (forwarding). The draft holds a reference on that part, so Trash expiry of the source message cannot remove it before the draft is sent or deleted.
+- `message`: an attachment part of a message in this mailbox (forwarding). Its name is the one the index stored: names from third-party mail and Drive have control characters, `/` and `\` removed when indexed (`indexedAttachmentName`), and the outbound MIME encodes every name that is not a plain token (RFC 2231). The draft holds a reference on that part, so Trash expiry of the source message cannot remove it before the draft is sent or deleted.
 - `link`: a credential-free `https:` URL; it is sent as a link in the body and does not count toward `attachmentsPerMessage`.
 - **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft whose encoded size exceeds `outboundMessageBytes` is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
 - An upload referred to by a draft does not expire.
@@ -237,7 +237,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - Message-IDs come from third-party mail. An id that is not `<`, printable ASCII without space or angle brackets, then `>` (`isSafeMessageId`) is dropped; an unsafe parent id leaves out `In-Reply-To`.
 - `In-Reply-To` is the parent's `Message-ID`.
 - `References` keeps the parent's id, then the first id, then the most recent ids, newest first, at most 10 after the first, while its unfolded value fits `headerValueBytes` (2,048). With long legal ids it keeps fewer than 11.
-- An id that alone exceeds `headerValueBytes` is never sent.
+- An id that alone exceeds `headerValueBytes`, or `MESSAGE_ID_MAX` (one RFC 5322 line), is never sent. `References` folds between ids, so every physical line fits 998 octets.
 - The provider request sets at most three headers of its own (`In-Reply-To`, `References`, `Reply-To`), each within `headerValueBytes`, well under the platform's limit on custom headers. Every other header comes from the request's structured fields.
 
 **If the checks pass:**
@@ -318,6 +318,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 | Custom header value | 2,048 bytes, unfolded; References is trimmed to fit | Email Service |
 | Upload | 25 MiB per file | matches inbound |
 | Subject / body / signature | 998 / 1 MiB / 10 KiB UTF-8 bytes | RFC 5322 line length; contract bounds |
+| Address / link URL / link name in a draft | 254 / 2,048 / 255 UTF-8 bytes | RFC 5321 path length; contract bounds |
 | Label name / labels per message / per mailbox | 72 characters / 64 / 1,000 | contract bounds; the per-message limit is the mailbox journal's |
 | Aliases per mailbox | 30 | Google Workspace's limit, so imported directories fit |
 | Thread size | 100 messages | threading rule |

@@ -803,6 +803,21 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(mail.replaceDraft(draft.id, { ...input, subject: 'Edited\r\nX-Injected: 1' }, { ifMatch: draft.revision }), 'invalid_header');
       assert.deepEqual(await mail.getDraft(draft.id), draft);
       assert.ok(!hasHeaderControl('Tab\tseparated'));
+      // Draft text is bounded at save.
+      const long = [
+        { to: [{ email: `${'a'.repeat(limits.addressBytes)}@example.net` }] },
+        { attachments: [{ kind: 'link' as const, url: `https://example.net/${'p'.repeat(limits.linkUrlBytes)}`, name: 'Link' }] },
+        { attachments: [{ kind: 'link' as const, url: 'https://example.net/doc', name: 'n'.repeat(limits.linkNameBytes + 1) }] },
+      ];
+      for (const [i, patch] of long.entries()) await rejects(mail.createDraft({ ...input, ...patch }, key(`long-${i}`)), 'invalid_request');
+      // Third-party attachment names are stored without controls or path separators, and still forward.
+      const odd = await h.deliver(message('Odd name', { attachments: [{ ...file, name: 'evil\r\nX-Injected: 1/..\\name.txt' }] }));
+      const { messages: [oddMessage] } = await mail.getThread(odd.threadId);
+      assert.ok(!/[\p{Cc}/\\]/u.test(oddMessage.attachments[0].name));
+      const forward = await mail.createDraft(draftInput(mailbox.primaryAddress, {
+        forwardOf: odd.messageId, attachments: [{ kind: 'message', messageId: odd.messageId, part: oddMessage.attachments[0].part }],
+      }), key('odd-forward'));
+      assert.equal((await mail.sendDraft(forward.id, { ...key('odd-send'), ifMatch: forward.revision })).state, 'pending');
       // The mailbox name is the From display name of every identity.
       const admin = h.as('admin');
       const named = await rejects(admin.updateMailbox(mailbox.id, { displayName: 'Mailbox\r\nBcc: victim@example.net' }), 'invalid_header');
