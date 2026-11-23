@@ -842,6 +842,13 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const quoted = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Quoted name', to: [{ name: quotedName, email: 'casey@example.net' }] }), key('quoted'));
       const quotedSend = await mail.sendDraft(quoted.id, { ...key('quoted-send'), ifMatch: quoted.revision });
       assert.deepEqual(quotedSend.recipients.map(({ email }) => email), ['casey@example.net']);
+      await h.advance((await mail.getSettings()).undoSeconds * second);
+      const quotedCopy = (await mail.getSend(quotedSend.id)).messageId;
+      assert.ok(quotedCopy);
+      // Outside quoted strings and encoded words the To header holds exactly one address: the recipient's.
+      const bare = (await h.sentHeaders(quotedCopy)).to.replace(/"(?:[^"\\]|\\.)*"/g, '').replace(/=\?[^?]+\?[BbQq]\?[^?]*\?=/g, '');
+      assert.deepEqual(bare.match(/<[^>]*>/g), ['<casey@example.net>']);
+      assert.ok(!bare.includes('victim@example.net') && !bare.includes(','), 'the name cannot add a recipient');
       assert.ok(!JSON.stringify(headers).includes('hidden@example.net'));
       for (const name of ['from', 'to', 'subject', 'date', 'message-id']) assert.ok(headers[name], name);
       for (const [name, value] of Object.entries(headers)) assert.ok(!/[\r\n]/.test(value), `${name} is unfolded`);
