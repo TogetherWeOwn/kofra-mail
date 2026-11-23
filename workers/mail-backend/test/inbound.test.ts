@@ -5,6 +5,7 @@ import { after, before, test } from 'node:test';
 import { URL } from 'node:url';
 import { Miniflare } from 'miniflare';
 import { deliver, dlq } from '../src/deliver.ts';
+import { lookupRecipient } from '../src/directory.ts';
 import { receive } from '../src/inbound.ts';
 import { Outbox } from '../src/outbox.ts';
 import { handleEmail, handleQueue, type Env } from '../src/worker.ts';
@@ -28,7 +29,7 @@ function fixture(input = bytes, rawSize = input.byteLength) {
   const message = {
     from: 'sender@example.test', to: 'box@example.test', rawSize,
     raw: new ReadableStream<Uint8Array>({ start(c) { c.enqueue(input); c.close(); } }),
-    setReject(reason: string) { assert.match(reason, /unknown recipient/i); calls.push('reject'); },
+    setReject(reason: string) { assert.equal(reason, 'Unknown recipient'); calls.push('reject'); },
   };
   const ports = {
     lookup: async (_to: string) => recipient as typeof recipient | null,
@@ -97,7 +98,7 @@ test('will not put a key whose digest differs from the registered raw digest', a
   assert.deepEqual(calls, []);
 });
 
-test('only a successful miss permanently rejects', async () => {
+test('an unknown recipient permanently rejects but a directory outage still throws', async () => {
   const miss = fixture();
   miss.ports.lookup = async () => null;
   await receive(miss.message, miss.ports);
@@ -107,6 +108,15 @@ test('only a successful miss permanently rejects', async () => {
   await assert.rejects(receive(error.message, error.ports), /directory unavailable/);
   assert.deepEqual(error.calls, []);
 });
+
+for (const to of ['+alerts@example.test', '@example.test']) {
+  test(`permanently rejects malformed recipient ${to} as unknown`, async () => {
+    const { message, ports, calls } = fixture();
+    ports.lookup = address => lookupRecipient({ withSession: () => assert.fail('Unexpected directory access') }, address);
+    await receive({ ...message, to }, ports);
+    assert.deepEqual(calls, ['reject']);
+  });
+}
 
 for (const failure of ['register', 'put', 'insert', 'send'] as const) {
   test(`throws on ${failure} failure without skipping the handoff order`, async () => {

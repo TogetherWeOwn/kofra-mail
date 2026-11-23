@@ -1,5 +1,5 @@
 import { MAX_RAW_BYTES, readExact, sha256 } from './bytes.ts';
-import type { ResolvedRecipient } from './directory.ts';
+import { InvalidEnvelopeRecipientError, type ResolvedRecipient } from './directory.ts';
 import { parseObjectKey } from './object-key.ts';
 import type { NewDelivery } from './outbox.ts';
 
@@ -15,7 +15,13 @@ export type InboundPorts = {
 };
 
 export async function receive(message: InboundMail, ports: InboundPorts): Promise<void> {
-  const recipient = await ports.lookup(message.to);
+  let recipient: ResolvedRecipient | null;
+  try {
+    recipient = await ports.lookup(message.to);
+  } catch (error) {
+    if (!(error instanceof InvalidEnvelopeRecipientError)) throw error;
+    recipient = null;
+  }
   if (recipient === null) {
     message.setReject('Unknown recipient');
     return;
