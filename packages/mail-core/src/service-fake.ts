@@ -983,7 +983,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async importFromDrive(input, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(owned(box), opts, 'importFromDrive', [], input, () => {
+        // A pick is the chooser's grant, so its replays are scoped to (mailbox, account user) too.
+        return replay(ownedByUser(box), opts, 'importFromDrive', [], input, () => {
           fields(input, ['pickId', 'mode']);
           const pick = need(picks.get(input.pickId));
           // A pick is the choosing user's grant for this mailbox; it does not pass to a later owner.

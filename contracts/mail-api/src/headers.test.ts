@@ -58,6 +58,7 @@ test('third-party attachment names lose controls and path separators', () => {
   assert.equal(indexedAttachmentName('\u0000'), 'attachment');
   assert.equal(indexedAttachmentName('invoice\u202efdp.exe'), 'invoicefdp.exe');
   assert.equal(indexedAttachmentName('a\u2066b\u2069\u200fc'), 'abc');
+  assert.equal(indexedAttachmentName('d\u061ce'), 'de');
   assert.ok(Buffer.byteLength(indexedAttachmentName('é'.repeat(300))) <= 255);
   assert.equal(indexedAttachmentName('é'.repeat(300)), 'é'.repeat(127));
   const started = performance.now();

@@ -746,6 +746,16 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       }), key('draft'));
       assert.deepEqual(draft.attachments, attachments);
 
+      // A pick, and a committed import under it, belong to the chooser: after an owner change the new owner gets neither.
+      const pick = await h.drivePick();
+      const imported = await mail.importFromDrive({ pickId: pick, mode: 'copy' }, key('chooser-import'));
+      const nextOwner = h.as('newAdmin');
+      await h.as('admin').updateMailbox(mailbox.id, { ownerUserId: (await nextOwner.getSession()).user.id });
+      await rejects(nextOwner.importFromDrive({ pickId: pick, mode: 'copy' }, key('fresh-import')), 'not_found');
+      await rejects(nextOwner.importFromDrive({ pickId: pick, mode: 'copy' }, key('chooser-import')), 'not_found');
+      await h.as('admin').updateMailbox(mailbox.id, { ownerUserId: session.user.id });
+      assert.deepEqual(await mail.importFromDrive({ pickId: pick, mode: 'copy' }, key('chooser-import')), imported);
+
       // A lost reply after Drive stored the file: the same-key retry returns that file and creates no second one.
       if (!h.driveFaults) return;
       const { messageId } = await h.deliver(message('Save me', { attachments: [file, { ...file, name: 'second.txt' }] }));

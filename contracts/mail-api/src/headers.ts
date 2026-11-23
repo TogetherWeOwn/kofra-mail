@@ -41,7 +41,7 @@ export function indexedAttachmentName(name: string): string {
   let size = 0;
   // One pass, whole code points only.
   // Bidirectional controls go too, so a name cannot display as `invoice<RLO>fdp.exe`.
-  for (const character of name.replace(/[\p{Cc}/\\\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, '')) {
+  for (const character of name.replace(/[\p{Cc}\p{Bidi_Control}/\\]/gu, '')) {
     size += utf8Bytes(character);
     if (size > 255) break;
     clean += character;
