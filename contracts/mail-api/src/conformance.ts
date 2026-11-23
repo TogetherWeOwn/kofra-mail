@@ -822,6 +822,26 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal(references.length, Math.min(11, Math.floor((limits.headerValueBytes + 1) / (idBytes + 1))));
       assert.deepEqual(threadingHeaders(chain, limits), { inReplyTo: chain.at(-1), references: headers.references });
       assert.ok(!Object.hasOwn(headers, 'bcc'), 'no stored MIME carries Bcc');
+      // Message-IDs come from third-party mail: an unsafe one is never repeated in a header.
+      const hostile = await h.deliver(message('Hostile id', { messageId: '<a@example.net>\rBcc: victim@example.net' }));
+      const answer = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Re: Hostile id', inReplyTo: hostile.messageId }), key('hostile-reply'));
+      const hostileSend = await mail.sendDraft(answer.id, { ...key('hostile-send'), ifMatch: answer.revision });
+      await h.advance((await mail.getSettings()).undoSeconds * second);
+      const hostileCopy = (await mail.getSend(hostileSend.id)).messageId;
+      assert.ok(hostileCopy);
+      const hostileHeaders = await h.sentHeaders(hostileCopy);
+      assert.ok(!Object.hasOwn(hostileHeaders, 'in-reply-to') && !Object.hasOwn(hostileHeaders, 'references'));
+      assert.ok(!JSON.stringify(hostileHeaders).includes('victim@example.net'));
+
+      // Address syntax cannot smuggle recipients, and a quoted name stays one recipient.
+      for (const [i, email] of ['casey@example.net, victim@example.net', 'Casey <victim@example.net>', 'casey@example.net>'].entries()) {
+        const smuggled = await mail.createDraft(draftInput(mailbox.primaryAddress, { to: [{ email }] }), key(`smuggle-${i}`));
+        await rejects(mail.sendDraft(smuggled.id, { ...key(`smuggle-send-${i}`), ifMatch: smuggled.revision }), 'invalid_recipients');
+      }
+      const quotedName = `Casey "the boss", Bcc <victim@example.net> ${'x'.repeat(100)}`;
+      const quoted = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Quoted name', to: [{ name: quotedName, email: 'casey@example.net' }] }), key('quoted'));
+      const quotedSend = await mail.sendDraft(quoted.id, { ...key('quoted-send'), ifMatch: quoted.revision });
+      assert.deepEqual(quotedSend.recipients.map(({ email }) => email), ['casey@example.net']);
       assert.ok(!JSON.stringify(headers).includes('hidden@example.net'));
       for (const name of ['from', 'to', 'subject', 'date', 'message-id']) assert.ok(headers[name], name);
       for (const [name, value] of Object.entries(headers)) assert.ok(!/[\r\n]/.test(value), `${name} is unfolded`);

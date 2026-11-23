@@ -755,7 +755,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         return replay(owned(box), opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
           // A stable operation id that Drive deduplicates durably. A retry asks Drive first, so a lost reply
           // returns the stored file even if the source message expired in between.
-          const operation = createHash('sha256').update(`${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
+          const operation = createHash('sha256').update(`${user.id}\n${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
           let saved = box.driveOperations.get(operation);
           if (saved === undefined) {
             const { name, size, type } = part(box, messageId, number);

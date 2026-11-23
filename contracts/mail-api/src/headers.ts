@@ -13,6 +13,15 @@ export function hasHeaderControl(text: string): boolean {
   return /[\x00-\x08\x0a-\x1f\x7f-\x9f]/.test(text);
 }
 
+/**
+ * A `Message-ID` we will repeat in a header: `<`, printable ASCII without
+ * space, `<` or `>`, then `>`. Ids come from third-party mail, so anything
+ * else (CR, NUL, space, non-ASCII, a missing bracket) is dropped, never sent.
+ */
+export function isSafeMessageId(id: string): boolean {
+  return /^<[\x21-\x3b\x3d\x3f-\x7e]+>$/.test(id);
+}
+
 /** How many of the most recent ids `References` keeps after the first one. */
 export const REFERENCES_RECENT = 10;
 
@@ -31,11 +40,15 @@ export interface ThreadingHeaders {
  *   recent ids newest first, at most `REFERENCES_RECENT` after the first,
  *   while the unfolded value fits `headerValueBytes`. The kept ids stay in
  *   chain order.
- * - An id that alone exceeds `headerValueBytes` is never sent.
+ * - An id that alone exceeds `headerValueBytes`, or that fails
+ *   `isSafeMessageId`, is never sent; an unsafe parent id leaves out
+ *   `In-Reply-To`.
  */
-export function threadingHeaders(chain: readonly string[], limits: Pick<Limits, 'headerValueBytes'>): ThreadingHeaders {
+export function threadingHeaders(input: readonly string[], limits: Pick<Limits, 'headerValueBytes'>): ThreadingHeaders {
   const max = limits.headerValueBytes;
+  const chain = input.filter(isSafeMessageId);
   if (!chain.length) return {};
+  const parentSafe = isSafeMessageId(input[input.length - 1]);
   const parent = chain.length - 1;
   const recent: number[] = [];
   for (let i = parent; i >= 1 && recent.length < REFERENCES_RECENT; i--) recent.push(i);
@@ -54,7 +67,7 @@ export function threadingHeaders(chain: readonly string[], limits: Pick<Limits, 
   }
   const references = chain.filter((_, i) => kept.has(i)).join(' ');
   return {
-    ...(utf8Bytes(chain[parent]) <= max && { inReplyTo: chain[parent] }),
+    ...(parentSafe && utf8Bytes(chain[parent]) <= max && { inReplyTo: chain[parent] }),
     ...(references && { references }),
   };
 }

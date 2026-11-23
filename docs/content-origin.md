@@ -92,7 +92,8 @@ Every step must pass. Any failure answers 404 with an empty body, and the reason
   3. Switch `current` to it.
   4. Wait at least 5 minutes plus 30 seconds of skew.
   5. Remove the old key.
-- **Emergency revocation:** remove every old key. All outstanding URLs then fail at step 1.
+- **Emergency revocation** (for example a leaked current key): one secret update to `{ "current": "<new kid>", "keys": { "<new kid>": "<new key>" } }`, which removes every other key, the current one included. All outstanding URLs then fail at step 1.
+- **Gradual deployments:** a Worker version still running beside the new one keeps minting with its old `kid`. Step 4's wait starts only when every request is served by a version that has the new `current`, and an emergency revocation is deployed to all traffic at once.
 
 ### 2.5 Revocation summary
 
@@ -153,7 +154,7 @@ Cache-Control: private, no-store
 - The part is streamed: from its own content-addressed object when one exists (parts of 256 KiB or more), otherwise decoded from the raw MIME.
 - **Headers:**
   - always `Content-Type: application/octet-stream`;
-  - `Content-Disposition: attachment; filename="<ASCII fallback>"; filename*=UTF-8''<percent-encoded name>`. The name has control characters, `/` and `\` removed and is at most 255 bytes.
+  - `Content-Disposition: attachment; filename="<ASCII fallback>"; filename*=UTF-8''<percent-encoded name>`. The name has control characters, `/` and `\` removed and is at most 255 bytes. In the ASCII fallback, `"`, `\`, `;` and every non-ASCII character are replaced by `_`, so a name from the message cannot add or end a parameter; `filename*` carries the full name, percent-encoded.
 - **It is never rendered.** Previews are not part of version 1.
 
 ## 4. Sanitiser

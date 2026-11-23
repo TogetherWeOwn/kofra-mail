@@ -80,7 +80,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
 - **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After`. This answer also means the operation may already have taken effect (for example a `sendDraft` committed but not yet confirmed durable), so the client retries with the same key until it gets another answer.
 - **Only successful (2xx) results are stored.** Any 4xx other than `idempotency_in_progress`, and any 5xx, had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
-- **One exception, `saveAttachmentToDrive`:** its effect is in Drive, which cannot commit together with Mail's record. A 5xx or a lost response may follow a file Drive already stored, so the server passes Drive a stable operation id, `SHA-256(mailbox id, key, fingerprint)`, and Drive deduplicates it durably for at least `idempotencyRetentionSeconds` and returns the original file for it. A same-key retry therefore returns the first file and never creates a second one (section 8.5).
+- **One exception, `saveAttachmentToDrive`:** its effect is in Drive, which cannot commit together with Mail's record. A 5xx or a lost response may follow a file Drive already stored, so the server passes Drive a stable operation id, `SHA-256(account user id, mailbox id, key, fingerprint)`, so a same-key request after the mailbox changes owner never maps to the previous owner's file, and Drive deduplicates it durably for at least `idempotencyRetentionSeconds` and returns the original file for it. A same-key retry therefore returns the first file and never creates a second one (section 8.5).
 
 **`If-Match`:**
 - Drafts carry a `revision`. `replaceDraft` and `sendDraft` require `If-Match: <revision>`; `deleteDraft` accepts it.
@@ -234,6 +234,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - header text, again (`invalid_header`), and the subject fits `subjectBytes` (`invalid_request`).
 
 **Threading headers are trimmed, never refused** (`threadingHeaders` in `src/headers.ts`):
+- Message-IDs come from third-party mail. An id that is not `<`, printable ASCII without space or angle brackets, then `>` (`isSafeMessageId`) is dropped; an unsafe parent id leaves out `In-Reply-To`.
 - `In-Reply-To` is the parent's `Message-ID`.
 - `References` keeps the parent's id, then the first id, then the most recent ids, newest first, at most 10 after the first, while its unfolded value fits `headerValueBytes` (2,048). With long legal ids it keeps fewer than 11.
 - An id that alone exceeds `headerValueBytes` is never sent.
@@ -425,6 +426,8 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - CR, LF or NUL in a subject, display name or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged; so does CR LF in a mailbox `displayName` on `updateMailbox`.
     - A reply in a thread of 12 messages with legal 200-byte `Message-ID`s: the sent copy's `In-Reply-To` is the parent, and its `References` fits `headerValueBytes`, starts with the first id, ends with the parent, keeps chain order and holds 10 ids.
     - The sent copy has no `Bcc` header and no Bcc address, and every value `sentHeaders` returns is unfolded, including a To list with a long encoded name.
+    - A reply to a message whose `Message-ID` carries CR and a `Bcc:` line has neither threading header.
+    - An address containing `,`, `<` or `>` answers `invalid_recipients` at send, and a long ASCII display name with `"`, `,` and `<…>` stays one recipient.
 22. **Owner change before release:** a send made just before an admin moves the mailbox to another member ends `failed` with `invalid_sender` for each recipient, with no sent copy.
 23. **State:** the routes with `state: true` report the same value at the same moment; a delivery, a label, a thread update, a draft and a send each move it.
 

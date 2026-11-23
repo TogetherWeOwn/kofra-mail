@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { hasHeaderControl, LIMITS, threadingHeaders } from './index.ts';
+import { hasHeaderControl, isSafeMessageId, LIMITS, threadingHeaders } from './index.ts';
 
 const id = (n: number, bytes = 20) => {
   const tail = `.${n}@example.net>`;
@@ -35,4 +35,14 @@ test('an id longer than the header limit is never sent', () => {
   assert.deepEqual(threadingHeaders([huge, id(2)], limits), { inReplyTo: id(2), references: id(2) });
   // When the first id does not fit beside the parent, the parent alone is kept.
   assert.deepEqual(threadingHeaders([id(1, 30), id(2, 30)], limits), { inReplyTo: id(2, 30), references: id(2, 30) });
+});
+
+test('threading headers drop ids that are not safe to repeat in a header', () => {
+  const unsafe = ['<a@example.net>\rBcc: victim@example.org', '<a@example.net>\nX: 1', '<a\u0000@example.net>', '<a b@example.net>', '<é@example.net>', 'a@example.net', '<a<b@example.net>'];
+  for (const value of unsafe) assert.ok(!isSafeMessageId(value), JSON.stringify(value));
+  assert.ok(isSafeMessageId('<a.b+c@example.net>'));
+  assert.deepEqual(threadingHeaders([id(1), ...unsafe, id(2)], LIMITS), { inReplyTo: id(2), references: `${id(1)} ${id(2)}` });
+  // An unsafe parent is never repeated: no In-Reply-To, and References keeps only the safe ids.
+  assert.deepEqual(threadingHeaders([id(1), unsafe[0]], LIMITS), { references: id(1) });
+  assert.deepEqual(threadingHeaders([unsafe[0]], LIMITS), {});
 });
