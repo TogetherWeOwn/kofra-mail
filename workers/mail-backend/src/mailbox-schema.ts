@@ -1,0 +1,40 @@
+export const MAILBOX_SCHEMA = `
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, size INTEGER NOT NULL,
+  sent_date TEXT, sender TEXT NOT NULL, recipients TEXT NOT NULL, cc TEXT NOT NULL,
+  subject TEXT NOT NULL, snippet TEXT NOT NULL, thread_id TEXT NOT NULL,
+  flags INTEGER NOT NULL, internal_date INTEGER NOT NULL, gmail_id TEXT,
+  message_id TEXT, dedupe_key TEXT NOT NULL,
+  auth TEXT NOT NULL DEFAULT 'none',
+  att_keys TEXT NOT NULL DEFAULT '[]',
+  indexed INTEGER NOT NULL DEFAULT 1 CHECK (indexed IN (0, 1, 2))
+);
+CREATE INDEX IF NOT EXISTS messages_by_header_id ON messages(message_id, internal_date DESC, id DESC);
+CREATE INDEX IF NOT EXISTS messages_by_thread ON messages(thread_id, internal_date DESC);
+CREATE INDEX IF NOT EXISTS messages_unindexed ON messages(id) WHERE indexed = 0;
+CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS fingerprints (key TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, subject_norm TEXT NOT NULL, last_date INTEGER NOT NULL, count INTEGER NOT NULL, assigned INTEGER NOT NULL,
+  subject_key TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS labels (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS message_labels (
+  message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  label_id TEXT NOT NULL REFERENCES labels(id), PRIMARY KEY (message_id, label_id)
+);
+CREATE INDEX IF NOT EXISTS messages_by_label ON message_labels(label_id, message_id);
+CREATE TABLE IF NOT EXISTS attachments (
+  message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  part INTEGER NOT NULL, name TEXT NOT NULL, mime_type TEXT NOT NULL,
+  size INTEGER NOT NULL, object_key TEXT, PRIMARY KEY (message_id, part)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, subject, addresses, body, attachment_names);
+CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, holder TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bayes (token TEXT PRIMARY KEY, ham INTEGER NOT NULL, spam INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS settings (kind TEXT NOT NULL, id TEXT NOT NULL, definition TEXT NOT NULL, PRIMARY KEY (kind, id));
+CREATE TABLE IF NOT EXISTS backup_capture (row_no INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL);
+-- chain: SHA-256 hash chain over every event through this seq, kept for published positions.
+CREATE TABLE IF NOT EXISTS journal (seq INTEGER PRIMARY KEY, event TEXT NOT NULL, chain TEXT);
+CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id = 1), modseq INTEGER NOT NULL, flushed INTEGER NOT NULL);
+INSERT OR IGNORE INTO state VALUES (1, 0, 0);
+CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL);
+`;

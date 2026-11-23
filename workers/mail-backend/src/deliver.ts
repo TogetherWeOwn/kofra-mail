@@ -2,7 +2,7 @@ import { isDeliveryId, type Outbox } from './outbox.ts';
 
 export type DeliveryPorts = {
   outbox: Pick<Outbox, 'get' | 'complete'>;
-  index(workspaceId: string, mailboxId: string, deliveryId: string): Promise<void>;
+  index(workspaceId: string, mailboxId: string, deliveryId: string): Promise<'indexed' | 'deferred' | 'rejected'>;
   release(workspaceId: string, rawKey: string, deliveryId: string): Promise<void>;
   now(): number;
 };
@@ -20,7 +20,10 @@ export async function deliver(body: unknown, ports: DeliveryPorts): Promise<void
     await ports.release(row.workspaceId, row.rawKey, row.id);
     return;
   }
-  for (const mailboxId of row.mailboxIds) await ports.index(row.workspaceId, mailboxId, row.id);
+  for (const mailboxId of row.mailboxIds) {
+    const outcome = await ports.index(row.workspaceId, mailboxId, row.id);
+    if (outcome !== 'indexed') throw new Error(`Mailbox delivery ${outcome}`);
+  }
   if (await ports.outbox.complete(row.id, ports.now())) {
     await ports.release(row.workspaceId, row.rawKey, row.id);
   }
