@@ -1,0 +1,1131 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
+import type {
+  Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
+  DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
+  Message, Operation, Page, Principal, Send, Settings, TestMessage, ThreadingHeaders, ThreadSummary, Upload, View,
+} from '@kofra/mail-contract';
+
+const second = 1000;
+const day = 86_400 * second;
+const maxAuthAge = 600;
+const copy = structuredClone;
+const iso = (ms: number) => new Date(ms).toISOString();
+const bytes = (s: string) => Buffer.byteLength(s, 'utf8');
+function base64MimeBytes(rawBytes: number): number {
+  const encoded = 4 * Math.ceil(rawBytes / 3);
+  return encoded + 2 * Math.ceil(encoded / 76);
+}
+
+function mimeHeaderText(text: string): string {
+  if (/^[\x20-\x7e]{0,60}$/.test(text)) return text;
+  const words: string[] = [];
+  const word = (value: string) => `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`;
+  let chunk = '';
+  let length = 0;
+  for (const character of text) {
+    const size = bytes(character);
+    // 45 raw bytes form 60 base64 characters, leaving room for the encoded-word wrapper.
+    if (length + size > 45) { words.push(word(chunk)); chunk = ''; length = 0; }
+    chunk += character;
+    length += size;
+  }
+  if (chunk) words.push(word(chunk));
+  return words.join('\r\n ');
+}
+
+const mimeQuoted = (text: string) => `"${text.replace(/["\\]/g, '\\$&')}"`;
+function mimeAddress({ name, email }: AddressInput): string {
+  if (!name) return email;
+  const phrase = mimeHeaderText(name);
+  return `${phrase === name ? mimeQuoted(phrase) : phrase} <${email}>`;
+}
+function mimeFilename(name: string): string {
+  if (/^[\x20-\x7e]{0,60}$/.test(name)) return `filename=${mimeQuoted(name)}`;
+  const encoded = Array.from(Buffer.from(name), (byte) => {
+    const char = String.fromCharCode(byte);
+    return /^[a-z0-9._-]$/i.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+  }).join('');
+  return `filename*=UTF-8''${encoded}`;
+}
+
+// The sent copy's header fields, lower-case names, folded as they are written. Bcc addresses are envelope recipients, never headers.
+function foldedHeaderFields(draft: Pick<Draft, 'to' | 'cc' | 'subject'>, from: Address, threading: ThreadingHeaders, messageId: string, date: string): Record<string, string> {
+  return {
+    from: mimeAddress(from), subject: mimeHeaderText(draft.subject),
+    date: new Date(date).toUTCString().replace('GMT', '+0000'), 'message-id': messageId, 'mime-version': '1.0',
+    ...(draft.to.length && { to: draft.to.map(mimeAddress).join(',\r\n ') }),
+    ...(draft.cc.length && { cc: draft.cc.map(mimeAddress).join(',\r\n ') }),
+    ...(threading.inReplyTo !== undefined && { 'in-reply-to': threading.inReplyTo }),
+    // Fold between ids so no physical line exceeds RFC 5322's 998 octets.
+    ...(threading.references !== undefined && { references: threading.references.replaceAll(' ', '\r\n ') }),
+  };
+}
+// RFC 5322 unfolding: a CRLF followed by white space is removed.
+const unfolded = (fields: Record<string, string>) => Object.fromEntries(Object.entries(fields).map(([name, value]) => [name, value.replace(/\r\n(?=[ \t])/g, '')]));
+const headerName = (name: string) => name.replace(/(^|-)([a-z])/g, (_, dash: string, letter: string) => dash + letter.toUpperCase());
+
+// Count a representative encoded MIME message without materializing the body or file bytes.
+function outboundMimeBytes(draft: Draft, from: Address, threading: ThreadingHeaders): number {
+  const fields = foldedHeaderFields(draft, from, threading, '<demo-00000000@mail.example>', '2026-11-22T12:00:00Z');
+  const lines = Object.entries(fields).map(([name, value]) => `${headerName(name)}: ${value}`);
+  let size = bytes(`${lines.join('\r\n')}\r\n`);
+  const files = draft.attachments.filter((attachment) => attachment.kind !== 'link');
+  const links = draft.attachments.flatMap((attachment) => attachment.kind === 'link' ? [`${attachment.name}: ${attachment.url}`] : []);
+  const text = [draft.body, ...links].join('\r\n');
+  const bodySize = bytes('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n') + base64MimeBytes(bytes(text));
+  if (!files.length) return size + bodySize;
+
+  const boundary = 'kofra-fake-multipart-boundary';
+  const delimiter = bytes(`--${boundary}\r\n`);
+  size += bytes(`Content-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n`)
+    + delimiter + bodySize + bytes(`--${boundary}--\r\n`);
+  for (const file of files) {
+    size += delimiter + base64MimeBytes(file.size) + bytes(
+      `Content-Type: ${file.type}\r\nContent-Disposition: attachment;\r\n ${mimeFilename(file.name)}\r\nContent-Transfer-Encoding: base64\r\n\r\n`,
+    );
+  }
+  return size;
+}
+const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+const normalized = (s: string) => s.normalize('NFKC').toLowerCase();
+const subjectKey = (s: string) => normalized(s.trim().replace(/^(?:(?:re|fwd?):\s*)+/i, ''));
+const address = ({ name = '', email }: AddressInput): Address => ({ name, email });
+const folders: readonly Folder[] = ['inbox', 'archive', 'spam', 'trash'];
+const hidden = (folder: Folder) => folder === 'spam' || folder === 'trash';
+
+type ProblemExtra = Parameters<typeof problem>[1];
+function fail(code: MailErrorCode, extra?: ProblemExtra): never { throw new MailApiError(problem(code, extra)); }
+function invalid(field: string, code: FieldError['code'] = 'invalid'): never {
+  fail('invalid_request', { errors: [{ field, code }] });
+}
+function badHeader(field: string): never { fail('invalid_header', { errors: [{ field, code: 'invalid' }] }); }
+function need<T>(value: T | undefined): T { if (value === undefined) fail('not_found'); return value; }
+function fields(input: unknown, allowed: readonly string[], field = ''): void {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) invalid(field);
+  if (Object.keys(input).some((key) => !allowed.includes(key))) fail('unknown_field');
+}
+function boundedText(value: unknown, max: number, field: string): void {
+  if (typeof value !== 'string') invalid(field);
+  if (bytes(value) > max) invalid(field, 'too_long');
+}
+function canonical(value: unknown): string {
+  return JSON.stringify(value, (_key, item: unknown) => item && typeof item === 'object' && !Array.isArray(item)
+    ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => compare(a, b))) : item);
+}
+function prefix(text: string, max: number): string {
+  if (bytes(text) <= max) return text;
+  const data = Buffer.from(text);
+  let end = max;
+  while ((data[end] & 0xc0) === 0x80) end--;
+  return data.subarray(0, end).toString('utf8');
+}
+function validDomain(name: string): boolean {
+  const labels = name.split('.');
+  return name.length <= 253 && labels.length >= 2 && labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+}
+function validEmail(email: string): boolean {
+  const [local, domain, extra] = email.split('@');
+  return extra === undefined && local.length <= 64 && email.length <= 254 && !!domain && validDomain(domain)
+    && /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local);
+}
+
+interface StoredMessage {
+  message: Message;
+  indexedText: string;
+  /** The `Message-ID` header, bracketed. */
+  messageIdHeader: string;
+  /** The `References` chain, bracketed ids, oldest first. */
+  references: string[];
+  /** Sent copies only: the stored MIME header fields. */
+  headers?: Record<string, string>;
+  expires?: number;
+}
+interface StoredSend {
+  send: Send;
+  /** `ownerUserId` is the mailbox owner who submitted the send; release re-checks it. */
+  pending?: { draft: Draft; size: number; from: Address; references: string[]; ownerUserId: Id };
+}
+interface Replay {
+  fingerprint: string;
+  expires: number;
+  value: unknown;
+}
+interface ReplayScope {
+  committed: Map<string, Replay>;
+  inProgress: Set<string>;
+  /** Keys whose action may have taken effect without a recorded result, pinned to their fingerprint. */
+  pinned: Map<string, { fingerprint: string; expires: number }>;
+  /** In-progress markers a crash left behind, with the time they lapse (and turn into pins). */
+  stranded: Map<string, number>;
+  /** Re-checks access after replay's await (the mailbox may have changed owner meanwhile). */
+  recheck?: () => void;
+}
+const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set(), pinned: new Map(), stranded: new Map() });
+interface Workspace {
+  id: Id;
+  boxes: Map<Id, Mailbox>;
+  members: Map<Id, Omit<Member, 'hasMailbox'>>;
+  domains: Map<string, Domain>;
+  keys: ReplayScope;
+}
+interface Mailbox {
+  workspace: Workspace;
+  directory: AdminMailbox;
+  version: number;
+  threads: Map<Id, StoredMessage[]>;
+  messages: Map<Id, StoredMessage>;
+  labels: Map<Id, Label>;
+  drafts: Map<Id, Draft>;
+  /** Parent Message-ID chain copied when a draft's `inReplyTo` is first set. */
+  replyRefs: Map<Id, string[]>;
+  sends: Map<Id, StoredSend>;
+  uploads: Map<Id, Upload>;
+  keys: ReplayScope;
+  /** Idempotency scopes of routes that act for the account user (Save to Drive). */
+  userKeys: Map<Id, ReplayScope>;
+  training: Map<string, { spam: number; ham: number }>;
+  /** Stand-in for the user's Drive: its files, and the operation ids it has deduplicated durably. */
+  driveFiles: Map<Id, { owner: Id; name: string; size: number; type: string }>;
+  driveOperations: Map<string, { driveFileId: Id; name: string }>;
+  settings: Settings;
+}
+interface Cursor { binding: string; position: readonly [string, string] }
+
+function qualifies(row: StoredMessage, view: View): boolean {
+  const m = row.message;
+  switch (view) {
+    case 'sent': return m.sent && !hidden(m.folder);
+    case 'starred': return m.starred && !hidden(m.folder);
+    case 'all': return !hidden(m.folder);
+    default: return m.folder === view;
+  }
+}
+function inView(rows: StoredMessage[], view: View): StoredMessage[] {
+  return view === 'archive' && rows.some(({ message }) => message.folder === 'inbox') ? [] : rows.filter((row) => qualifies(row, view));
+}
+function summarize(all: StoredMessage[], rows: StoredMessage[], view?: View): ThreadSummary {
+  const messages = rows.map(({ message }) => message);
+  const last = messages.reduce((a, b) => (compare(a.receivedAt, b.receivedAt) || compare(a.id, b.id)) < 0 ? b : a);
+  const expires = view === 'spam' || view === 'trash' ? Math.min(...rows.map((row) => row.expires ?? Infinity)) : Infinity;
+  return {
+    id: last.threadId, subject: last.subject, snippet: [...last.text.replace(/\s+/g, ' ').trim()].slice(0, 200).join(''),
+    lastDate: last.receivedAt, from: last.from, count: messages.length,
+    unread: messages.some((m) => m.unread), starred: messages.some((m) => m.starred),
+    folders: folders.filter((folder) => all.some(({ message }) => message.folder === folder)),
+    labelIds: [...new Set(messages.flatMap((m) => m.labelIds))],
+    hasAttachments: messages.some((m) => m.attachments.length > 0),
+    ...(Number.isFinite(expires) && { expiresAt: iso(expires) }),
+  };
+}
+
+function dateBoundary(date: string, zone?: Intl.DateTimeFormat): number {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return NaN;
+  const midnight = Date.parse(`${date}T00:00:00Z`);
+  if (!Number.isFinite(midnight) || iso(midnight).slice(0, 10) !== date) return NaN;
+  if (!zone) return midnight;
+
+  const offsetAt = (instant: number) => {
+    const name = zone.formatToParts(instant).find(({ type }) => type === 'timeZoneName')?.value;
+    const match = /^GMT([+-])(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(name ?? '');
+    if (!match) return 0; // A zero offset is formatted as GMT.
+    const [, sign, hours, minutes, seconds = '0'] = match;
+    return (Number(hours) * 3600 + Number(minutes) * 60 + Number(seconds)) * second * (sign === '-' ? -1 : 1);
+  };
+  // Try the offsets on both sides of midnight. Use the earlier instant on an
+  // overlap; in a gap use the pre-transition offset to move midnight forward.
+  const candidates = [-day, 0, day].map((delta) => midnight - offsetAt(midnight + delta));
+  const exact = candidates.filter((instant) => instant + offsetAt(instant) === midnight);
+  return exact.length ? Math.min(...exact) : Math.max(...candidates);
+}
+
+function search(query: string, labels: Map<Id, Label>, zone?: Intl.DateTimeFormat): (row: StoredMessage) => boolean {
+  const tokens = normalized(query).matchAll(/(before|after|larger):(?=\s|$)|(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g);
+  const terms = Array.from(tokens, ([, emptyDate, operator, phrase, word]) => {
+    const op = emptyDate ?? operator ?? '';
+    const term = phrase ?? word ?? '';
+    return { op, term, boundary: op === 'before' || op === 'after' ? dateBoundary(term, zone) : NaN };
+  });
+  const contains = (text: string, term: string) => normalized(text).includes(term);
+  const addressMatches = (a: Address, term: string) => contains(`${a.name} ${a.email}`, term);
+  return ({ message: m, indexedText }) => terms.every(({ op, term, boundary }) => {
+    switch (op) {
+      case 'from': return addressMatches(m.from, term);
+      case 'to': return [...m.to, ...m.cc].some((a) => addressMatches(a, term));
+      case 'subject': return contains(m.subject, term);
+      case 'label': return m.labelIds.some((id) => normalized(labels.get(id)?.name ?? '') === term);
+      case 'has': return term === 'attachment' && m.attachments.length > 0;
+      case 'is': return term === 'unread' ? m.unread : term === 'starred' && m.starred;
+      case 'before': return Date.parse(m.date) < boundary;
+      case 'after': return Date.parse(m.date) >= boundary;
+      case 'larger': {
+        const match = /^(\d+)([km])?$/.exec(term);
+        return !!match && m.size > Number(match[1]) * (match[2] === 'm' ? 1024 ** 2 : match[2] === 'k' ? 1024 : 1);
+      }
+      default: {
+        const literal = op ? `${op}:${term}` : term;
+        return [m.subject, indexedText, ...m.attachments.map((a) => a.name)].some((text) => contains(text, literal))
+          || [m.from, ...m.to, ...m.cc, ...(m.replyTo ?? []), ...(m.bcc ?? [])].some((a) => addressMatches(a, literal));
+      }
+    }
+  });
+}
+
+async function sha256(blob: Blob): Promise<string> {
+  const hash = createHash('sha256');
+  const reader = blob.stream().getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return hash.digest('hex');
+    hash.update(value);
+  }
+}
+
+/** Test/demo fixture. Never binds a real session, delivers mail, or serves content bytes. */
+export function createFakeMailHarness(options: { contentOrigin?: string; start?: number; drive?: boolean } = {}): ConformanceHarness {
+  const drive = options.drive ?? true;
+  const contentOrigin = new URL(options.contentOrigin ?? 'https://content.usercontent.example').origin;
+  const start = options.start ?? Date.parse('2026-11-22T12:00:00Z');
+  let now = start;
+  let sequence = 0;
+  const id = () => `demo-${(++sequence).toString(36).padStart(8, '0')}`;
+  const workspaceFixture = (id: Id, domain: string): Workspace => ({
+    id, boxes: new Map(), members: new Map(), keys: replayScope(),
+    domains: new Map([[domain, { name: domain, kind: 'primary', routing: 'active', sending: 'active' }]]),
+  });
+  const local = workspaceFixture('demo-workspace', 'example.com');
+  local.domains.set('example.net', { name: 'example.net', kind: 'alias', aliasOf: 'example.com', routing: 'active', sending: 'active' });
+  const foreign = workspaceFixture('demo-foreign-workspace', 'example.org');
+  const workspaces = [local, foreign];
+  const workspaceFor = (principal: Principal) => principal === 'foreignAdmin' ? foreign : local;
+  const userIdFor = (principal: Principal) => principal === 'staleAdmin' ? 'admin' : principal;
+  const cursors = new Map<string, Cursor>();
+  const picks = new Map<string, { mailboxId: Id; userId: Id; expires: number }>();
+  const driveFileText = 'Demo Drive file';
+  const driveFile = { name: 'demo.txt', type: 'text/plain', size: bytes(driveFileText), digest: createHash('sha256').update(driveFileText).digest('hex') };
+  let loseNextDriveSaveReply = false;
+  let crashNextDriveSave = false;
+
+  function newMailbox(workspace: Workspace, primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
+    const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
+    workspace.boxes.set(directory.id, {
+      workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), replyRefs: new Map(), sends: new Map(),
+      uploads: new Map(), keys: replayScope(), userKeys: new Map(), training: new Map(), driveFiles: new Map(), driveOperations: new Map(),
+      settings: { signature: '', undoSeconds: 10, defaultFrom: primaryAddress, replyFromReceivedAddress: true },
+    });
+    return directory;
+  }
+  for (const [user, name] of [['member', 'Member'], ['other', 'Other Member'], ['admin', 'Administrator'], ['invited', 'Invited Member'], ['newAdmin', 'New Administrator']]) {
+    const email = `${user.toLowerCase()}@example.com`;
+    const invited = user === 'invited';
+    local.members.set(user, { id: user, name, email, status: invited ? 'invited' : 'active' });
+    if (!invited && user !== 'newAdmin') newMailbox(local, email, name, user);
+  }
+  const foreignAdmin = { id: 'foreignAdmin', name: 'Foreign Administrator', email: 'admin@example.org', status: 'active' } as const;
+  foreign.members.set(foreignAdmin.id, foreignAdmin);
+  newMailbox(foreign, foreignAdmin.email, foreignAdmin.name, foreignAdmin.id);
+  const ownerBox = (workspace: Workspace, userId: Id) => [...workspace.boxes.values()].find(({ directory }) => directory.ownerUserId === userId);
+  const state = (box: Mailbox) => `${box.directory.id}-${box.version}`;
+  const bump = (box: Mailbox) => { box.version++; };
+
+  function page<T>(items: T[], scope: string, operation: Operation, query: { limit?: number; cursor?: string },
+    position: (item: T) => Cursor['position'], order: (a: Cursor['position'], b: Cursor['position']) => number): Page<T> {
+    const { cursor, limit: requested, ...queryFilters } = query;
+    const limit = requested === undefined ? limits.pageSizeDefault : requested;
+    if (!Number.isInteger(limit) || limit < 1 || limit > limits.pageSizeMax) invalid('/limit');
+    const binding = canonical([scope, operation, queryFilters, requested ?? null]);
+    const anchor = cursor === undefined ? undefined : cursors.get(cursor);
+    if (cursor !== undefined && (!anchor || anchor.binding !== binding)) fail('invalid_cursor');
+    const sorted = items.map((item) => ({ item, position: position(item) })).sort((a, b) => order(a.position, b.position));
+    const remaining = anchor ? sorted.filter((row) => order(row.position, anchor.position) > 0) : sorted;
+    const window = remaining.slice(0, limit);
+    const nextCursor = remaining.length > limit ? randomUUID() : null;
+    if (nextCursor) cursors.set(nextCursor, { binding, position: window[window.length - 1].position });
+    return { items: window.map(({ item }) => item), nextCursor };
+  }
+  const ascending = ([left, a]: Cursor['position'], [right, b]: Cursor['position']) => compare(left, right) || compare(a, b);
+  const byTime = ([left, a]: Cursor['position'], [right, b]: Cursor['position']) => compare(right, left) || compare(a, b);
+  const byThread = (a: Cursor['position'], b: Cursor['position']) => ascending(b, a);
+
+  async function replay<T>(keys: ReplayScope, opts: Idempotent | undefined, op: Operation, args: unknown[],
+    fingerprintBody: unknown | (() => Promise<unknown>), run: (fingerprint: string) => T, onReplay?: (value: T) => T): Promise<T> {
+    const key = opts?.idempotencyKey;
+    if (key === undefined) fail('precondition_required');
+    if (typeof key !== 'string' || key.length > limits.idempotencyKeyChars || !/^[A-Za-z0-9_-]+$/.test(key)) invalid('/idempotencyKey');
+    const getFingerprint = async () => canonical([
+      op, args, typeof fingerprintBody === 'function' ? await fingerprintBody() : fingerprintBody,
+    ]);
+    const existing = keys.committed.get(key);
+    if (existing) {
+      if (await getFingerprint() !== existing.fingerprint) fail('idempotency_key_reused');
+      keys.recheck?.();
+      const value = copy(existing.value as T);
+      return onReplay ? onReplay(value) : value;
+    }
+    if (keys.inProgress.has(key)) fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    const lapse = keys.stranded.get(key);
+    if (lapse !== undefined && lapse > now) fail('idempotency_in_progress', { retryAfterSeconds: Math.ceil((lapse - now) / second) });
+    // Reserve the key before fingerprinting can start reading an upload stream.
+    keys.inProgress.add(key);
+    try {
+      const fingerprint = await getFingerprint();
+      const pin = keys.pinned.get(key);
+      if (pin && pin.fingerprint !== fingerprint) fail('idempotency_key_reused');
+      // Mutate and record the success synchronously; no caller sees one without the other.
+      keys.recheck?.();
+      const value = run(fingerprint);
+      keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
+      keys.pinned.delete(key);
+      keys.stranded.delete(key);
+      return value;
+    } finally {
+      keys.inProgress.delete(key);
+    }
+  }
+
+  function identities(box: Mailbox): Identity[] {
+    const { primaryAddress, aliases, displayName: name } = box.directory;
+    const primary: Identity = { email: primaryAddress, name, primary: true, kind: 'primary', sendAs: 'active' };
+    const explicit = aliases.filter((alias) => alias.sendAs !== 'off').map(({ address: email, sendAs }): Identity => ({
+      name, email, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending',
+    }));
+    const implicit = [...box.workspace.domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
+      .flatMap((d) => [primary, ...explicit].filter((source) => source.email.endsWith(`@${d.aliasOf}`)).map((source): Identity => ({
+        name, email: `${source.email.split('@')[0]}@${d.name}`, kind: 'alias_domain', primary: false,
+        sendAs: source.sendAs === 'active' && d.sending === 'active' ? 'active' : 'pending',
+      })));
+    return [primary, ...explicit, ...implicit];
+  }
+  function receivingAddresses(box: Mailbox): Set<string> {
+    const { primaryAddress, aliases } = box.directory;
+    const addresses = [primaryAddress, ...aliases.map(({ address }) => address)];
+    const variants = [...box.workspace.domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
+      .flatMap((d) => addresses.flatMap((email) => {
+        const [localPart, domain] = email.split('@');
+        return domain === d.aliasOf ? [`${localPart}@${d.name}`] : [];
+      }));
+    return new Set([...addresses, ...variants]);
+  }
+  function sender(box: Mailbox, email: string, active: boolean): Identity {
+    if (typeof email !== 'string') fail('invalid_sender');
+    const value = identities(box).find((identity) => identity.email === email.toLowerCase() && (!active || identity.sendAs === 'active'));
+    if (!value) fail('invalid_sender');
+    return value;
+  }
+  function part(box: Mailbox, messageId: Id, number: number) {
+    return need(need(box.messages.get(messageId)).message.attachments.find((part) => part.part === number));
+  }
+  function checkRevision(draft: Draft, opts: Partial<Conditional> | undefined): void {
+    if (opts?.ifMatch !== undefined && opts.ifMatch !== draft.revision) fail('revision_mismatch');
+  }
+  function requireRevision(opts: Conditional | undefined): void {
+    if (!opts?.ifMatch) fail('precondition_required');
+  }
+  function uploadRef(file: Upload): DraftAttachment {
+    const { id: uploadId, name, type, size } = file;
+    return { kind: 'upload', uploadId, name, type, size };
+  }
+  function checkCounts(input: DraftInput): void {
+    for (const field of ['to', 'cc', 'bcc', 'attachments'] as const) {
+      if (!Array.isArray(input[field])) invalid(`/${field}`);
+    }
+    if (input.to.length + input.cc.length + input.bcc.length > limits.recipientsPerMessage) {
+      fail('too_many_recipients', { limit: limits.recipientsPerMessage });
+    }
+    if (input.attachments.filter((attachment) => attachment?.kind !== 'link').length > limits.attachmentsPerMessage) {
+      fail('too_many_attachments', { limit: limits.attachmentsPerMessage });
+    }
+  }
+  function makeDraft(box: Mailbox, draftId: Id, input: DraftInput, previous?: Draft): Draft {
+    fields(input, ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'inReplyTo', 'forwardOf', 'attachments']);
+    if (typeof input.from === 'string' && hasHeaderControl(input.from)) badHeader('/from');
+    const from = sender(box, input.from, false).email;
+    checkCounts(input);
+    // Control characters are refused on the raw text, before any length check or normalisation.
+    if (typeof input.subject === 'string' && hasHeaderControl(input.subject)) badHeader('/subject');
+    boundedText(input.subject, limits.subjectBytes, '/subject');
+    boundedText(input.body, limits.bodyBytes, '/body');
+    const { subject, body, inReplyTo, forwardOf } = input;
+    for (const field of ['inReplyTo', 'forwardOf'] as const) {
+      const ref = input[field];
+      if (ref !== undefined && ref !== previous?.[field]) need(box.messages.get(ref));
+    }
+    const cleanAddresses = (field: 'to' | 'cc' | 'bcc') => input[field].map((value, i) => {
+      fields(value, ['name', 'email']);
+      const { name, email } = value;
+      if (typeof email !== 'string') invalid(`/${field}/${i}/email`);
+      if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
+      if (bytes(email) > limits.addressBytes) invalid(`/${field}/${i}/email`, 'too_long');
+      if (typeof name === 'string' && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
+      if (name !== undefined) boundedText(name, limits.displayNameBytes, `/${field}/${i}/name`);
+      return { email, ...(name !== undefined && { name }) };
+    });
+    const attachments = input.attachments.map((ref, i): DraftAttachment => {
+      const field = `/attachments/${i}`;
+      if (!ref || typeof ref !== 'object') invalid(field);
+      switch (ref.kind) {
+        case 'upload':
+          fields(ref, ['kind', 'uploadId']);
+          return uploadRef(need(box.uploads.get(ref.uploadId)));
+        case 'message': {
+          fields(ref, ['kind', 'messageId', 'part']);
+          const { messageId, part: number } = ref;
+          // The draft can keep its own snapshot after expiry, but cannot acquire a new reference to an expired source.
+          const retained = previous?.attachments.find((a) => a.kind === 'message' && a.messageId === messageId && a.part === number);
+          if (retained?.kind === 'message') return retained;
+          const { name, type, size } = part(box, messageId, number);
+          return { kind: 'message', messageId, part: number, name, type, size };
+        }
+        case 'link': {
+          fields(ref, ['kind', 'url', 'name']);
+          // URL parsing drops tabs and newlines silently, so check the raw text first.
+          const url = typeof ref.url === 'string' && !/\p{Cc}/u.test(ref.url) ? URL.parse(ref.url) : null;
+          if (url?.protocol !== 'https:' || url.username || url.password) invalid(`${field}/url`);
+          if (bytes(ref.url) > limits.linkUrlBytes) invalid(`${field}/url`, 'too_long');
+          if (typeof ref.name !== 'string' || /\p{Cc}/u.test(ref.name)) invalid(`${field}/name`);
+          if (bytes(ref.name) > limits.linkNameBytes) invalid(`${field}/name`, 'too_long');
+          return { kind: 'link', url: ref.url, name: ref.name };
+        }
+        default: return invalid(`${field}/kind`);
+      }
+    });
+    const to = cleanAddresses('to'), cc = cleanAddresses('cc'), bcc = cleanAddresses('bcc');
+    // Commit the parent's threading chain only once the whole draft is valid.
+    if (inReplyTo === undefined) box.replyRefs.delete(draftId);
+    else if (inReplyTo !== previous?.inReplyTo) box.replyRefs.set(draftId, replyReferences(box, inReplyTo));
+    return {
+      id: draftId, revision: id(), updatedAt: iso(now), from, to, cc, bcc,
+      subject, body, attachments, ...(inReplyTo !== undefined && { inReplyTo }), ...(forwardOf !== undefined && { forwardOf }),
+    };
+  }
+  function usesUpload(box: Mailbox, uploadId: Id): boolean {
+    const refers = (draft: Draft) => draft.attachments.some((ref) => ref.kind === 'upload' && ref.uploadId === uploadId);
+    return [...box.drafts.values()].some(refers) || [...box.sends.values()].some(({ pending }) => pending && refers(pending.draft));
+  }
+  function releaseDraftUploads(box: Mailbox, draft: Draft, immediately: boolean): void {
+    for (const ref of draft.attachments) {
+      if (ref.kind !== 'upload') continue;
+      const file = box.uploads.get(ref.uploadId);
+      if (file && (immediately || Date.parse(file.expiresAt) <= now) && !usesUpload(box, file.id)) box.uploads.delete(file.id);
+    }
+  }
+  function storeUpload(box: Mailbox, name: string, type: string, size: number, sha256: string): Upload {
+    const file = { id: id(), name, type, size, sha256, expiresAt: iso(now + limits.uploadRetentionSeconds * second) };
+    box.uploads.set(file.id, file);
+    bump(box);
+    return file;
+  }
+
+  function append(box: Mailbox, linked: Id | undefined, value: Omit<Message, 'id' | 'threadId' | 'textTruncated'>,
+    header: { messageId?: string; references?: string[]; fields?: (messageId: string) => Record<string, string> } = {}): Message {
+    const previous = linked === undefined ? undefined : box.messages.get(linked);
+    const previousThread = previous && box.threads.get(previous.message.threadId);
+    const threadId = previous && previousThread && previousThread.length < limits.threadMessages && subjectKey(previous.message.subject) === subjectKey(value.subject)
+      ? previous.message.threadId : id();
+    const text = prefix(value.text, limits.messageTextBytes);
+    const message: Message = { ...copy(value), id: id(), threadId, text, textTruncated: text !== value.text };
+    const messageIdHeader = header.messageId ?? `<${message.id}@mail.example>`;
+    const stored: StoredMessage = {
+      message, indexedText: prefix(value.text, limits.searchBodyBytes), messageIdHeader,
+      references: header.references ?? (previous ? [...previous.references, previous.messageIdHeader] : []),
+      ...(header.fields && { headers: header.fields(messageIdHeader) }),
+    };
+    const thread = box.threads.get(threadId) ?? [];
+    thread.push(stored);
+    box.threads.set(threadId, thread);
+    box.messages.set(message.id, stored);
+    bump(box);
+    return message;
+  }
+  // The parent's chain plus its own id. Count-trimmed for storage; `threadingHeaders` trims by bytes at send.
+  function replyReferences(box: Mailbox, messageId: Id | undefined): string[] {
+    const parent = messageId === undefined ? undefined : box.messages.get(messageId);
+    if (!parent) return [];
+    // Stored bounded and safe: the first and the last 10 safe ids. An unsafe parent id is never stored;
+    // an empty marker takes its place, so threadingHeaders omits In-Reply-To instead of naming an ancestor.
+    const parentSafe = isSafeMessageId(parent.messageIdHeader);
+    const safe = [...parent.references.filter(isSafeMessageId), ...(parentSafe ? [parent.messageIdHeader] : [])];
+    const kept = safe.length > 11 ? [safe[0], ...safe.slice(-10)] : safe;
+    return parentSafe ? kept : [...kept, ''];
+  }
+  function expire(box: Mailbox): void {
+    for (const [threadId, rows] of box.threads) {
+      const kept = rows.filter((row) => {
+        if (row.expires === undefined || row.expires > now) return true;
+        box.messages.delete(row.message.id);
+        return false;
+      });
+      if (kept.length === rows.length) continue;
+      if (kept.length) box.threads.set(threadId, kept);
+      else box.threads.delete(threadId);
+      bump(box);
+    }
+    for (const [uploadId, file] of box.uploads) {
+      if (Date.parse(file.expiresAt) <= now && !usesUpload(box, uploadId)) {
+        box.uploads.delete(uploadId);
+        bump(box);
+      }
+    }
+  }
+  function release(box: Mailbox, stored: StoredSend): void {
+    const { send, pending } = stored;
+    if (!pending) return;
+    const { draft, size, from, references, ownerUserId } = pending;
+    // Release re-checks the submitter and the sender: a reassigned mailbox or a removed identity never sends.
+    const stillActive = identities(box).some((identity) => identity.email === from.email && identity.sendAs === 'active');
+    if (box.directory.ownerUserId !== ownerUserId || !stillActive) {
+      send.state = 'failed';
+      send.undoRemainingMs = 0;
+      for (const recipient of send.recipients) Object.assign(recipient, { state: 'failed', reason: 'invalid_sender' });
+      delete stored.pending;
+      releaseDraftUploads(box, draft, true);
+      bump(box);
+      return;
+    }
+    const date = send.undoUntil;
+    const own = receivingAddresses(box);
+    const toSelf = send.recipients.some(({ email }) => own.has(email.toLowerCase()));
+    const message = append(box, draft.inReplyTo, {
+      folder: toSelf ? 'inbox' : 'archive', sent: true, unread: false, starred: false, labelIds: [],
+      from, to: draft.to.map(address), cc: draft.cc.map(address), bcc: draft.bcc.map(address), date, receivedAt: date, subject: draft.subject,
+      text: [draft.body, ...draft.attachments.flatMap((a) => a.kind === 'link' ? [`${a.name}: ${a.url}`] : [])].join('\n'),
+      hasHtml: false, remoteImages: false, size,
+      attachments: draft.attachments.flatMap((a, i) => a.kind === 'link' ? [] : [{ part: i + 1, name: a.name, type: a.type, size: a.size, inline: false }]),
+      verdict: { level: 'none', reasons: [] }, send: { id: send.id, state: 'sent' },
+    }, {
+      messageId: `<${send.id}@mail.example>`, references,
+      fields: (messageId) => unfolded(foldedHeaderFields(draft, from, threadingHeaders(references, limits), messageId, date)),
+    });
+    send.messageId = message.id;
+    send.state = 'sent';
+    send.undoRemainingMs = 0;
+    for (const recipient of send.recipients) recipient.state = 'sent';
+    delete stored.pending;
+    releaseDraftUploads(box, draft, true);
+  }
+  function advance(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) throw new RangeError('The fake clock can only move forward.');
+    const end = now + ms;
+    const boxes = workspaces.flatMap((workspace) => [...workspace.boxes.values()]);
+    const due = boxes.flatMap((box) => [...box.sends.values()].flatMap((entry) =>
+      entry.pending && Date.parse(entry.send.undoUntil) <= end ? [{ box, entry, at: Date.parse(entry.send.undoUntil) }] : []));
+    for (const { box, entry, at } of due.sort((a, b) => a.at - b.at)) {
+      now = at;
+      expire(box);
+      release(box, entry);
+    }
+    now = end;
+    for (const box of boxes) expire(box);
+    for (const { committed, pinned, stranded } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
+      for (const [key, entry] of committed) if (entry.expires <= now) committed.delete(key);
+      for (const [key, entry] of pinned) if (entry.expires <= now) pinned.delete(key);
+      for (const [key, lapse] of stranded) if (lapse <= now) stranded.delete(key);
+    }
+    for (const [pick, entry] of picks) if (entry.expires <= now) picks.delete(pick);
+  }
+
+  function contentUrl(box: Mailbox, msg: Id, target: { purpose: 'body'; ri: boolean } | { purpose: 'att'; part: number }) {
+    const { purpose, ...claims } = target;
+    const iat = Math.floor(now / second);
+    const exp = iat + limits.contentUrlSeconds;
+    const payload = Buffer.from(JSON.stringify({
+      v: 1, ws: box.workspace.id, mb: box.directory.id, msg, ...claims, sub: box.directory.ownerUserId, ep: 1, iat, exp,
+    })).toString('base64url');
+    // This fake does not sign tokens; the key id and MAC are format-only placeholders.
+    return { url: `${contentOrigin}/v1/${purpose}/demo.${payload}.ZmFrZQ`, expiresAt: iso(exp * second) };
+  }
+  function labelName(box: Mailbox, value: string, except?: Id): string {
+    if (typeof value !== 'string') invalid('/name');
+    const name = value.trim();
+    if (!name) invalid('/name', 'required');
+    if ([...name].length > limits.labelNameChars) invalid('/name', 'too_long');
+    if ([...box.labels.values()].some((label) => label.id !== except && label.name.toLowerCase() === name.toLowerCase())) fail('label_exists');
+    return name;
+  }
+  function directoryAddress(workspace: Workspace, value: string, field: string): string {
+    if (typeof value !== 'string') invalid(field);
+    if (hasHeaderControl(value)) badHeader(field);
+    const email = value.trim().toLowerCase();
+    if (!validEmail(email)) invalid(field);
+    const domain = workspace.domains.get(email.split('@')[1]);
+    if (!domain || domain.kind === 'alias') fail('domain_not_in_workspace');
+    if ([...workspace.boxes.values()].some(({ directory }) => directory.primaryAddress === email || directory.aliases.some((a) => a.address === email))) fail('address_taken');
+    return email;
+  }
+  function availableOwner(workspace: Workspace, userId: Id): void {
+    need(workspace.members.get(userId));
+    if (ownerBox(workspace, userId)) invalid('/ownerUserId', 'not_allowed');
+  }
+  function displayName(name: string): string {
+    // The mailbox name is every identity's From display name.
+    if (typeof name === 'string' && hasHeaderControl(name)) badHeader('/displayName');
+    boundedText(name, limits.displayNameBytes, '/displayName');
+    if (!name.trim()) invalid('/displayName', 'required');
+    return name.trim();
+  }
+
+  function bind(principal: Principal): MailService {
+    const admin = principal !== 'member' && principal !== 'other';
+    const workspace = workspaceFor(principal);
+    const { boxes, domains, members, keys: workspaceKeys } = workspace;
+    const user = need(members.get(userIdFor(principal)));
+    const authTime = principal === 'staleAdmin' ? start - 11 * 60 * second : start;
+    const csrfToken = randomUUID();
+    const resolveMailbox = () => ownerBox(workspace, user.id);
+    const mailbox = () => {
+      const box = resolveMailbox();
+      if (!box) fail('forbidden');
+      return box;
+    };
+    // The mailbox's idempotency scope, re-checking that this session still owns it when replay resumes.
+    const recheck = (box: Mailbox) => () => { if (resolveMailbox() !== box) fail('forbidden'); };
+    const owned = (box: Mailbox): ReplayScope => ({ ...box.keys, recheck: recheck(box) });
+    // Save to Drive acts in the user's own Drive, so its keys are scoped to (mailbox, account user).
+    const ownedByUser = (box: Mailbox): ReplayScope => {
+      let keys = box.userKeys.get(user.id);
+      if (!keys) box.userKeys.set(user.id, keys = replayScope());
+      return { ...keys, recheck: recheck(box) };
+    };
+    const service: MailService = {
+      async getSession() {
+        const box = resolveMailbox();
+        return {
+          user: { id: user.id, name: user.name },
+          ...(box && { mailbox: { id: box.directory.id, primaryAddress: box.directory.primaryAddress } }),
+          workspace: { id: workspace.id, role: admin ? 'admin' : 'member' },
+          csrfToken, authTime: iso(authTime), limits, features: { drive, htmlContent: true }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
+        };
+      },
+      async listViews() {
+        const box = mailbox();
+        return { items: VIEWS.map((view) => ({ view, unreadThreads: [...box.threads.values()].filter((rows) => inView(rows, view).some(({ message }) => message.unread)).length })),
+          drafts: box.drafts.size, state: state(box) };
+      },
+      async listThreads(query) {
+        const box = mailbox();
+        fields(query, ROUTES.listThreads.query);
+        const { view, labelId, q, tz } = query;
+        if (!VIEWS.includes(view)) invalid('/view');
+        if (labelId !== undefined) need(box.labels.get(labelId));
+        if (q !== undefined) boundedText(q, limits.queryBytes, '/q');
+        let zone: Intl.DateTimeFormat | undefined;
+        if (tz !== undefined) {
+          if (typeof tz !== 'string' || /^[+-]/.test(tz)) invalid('/tz');
+          try { zone = new Intl.DateTimeFormat('en', { timeZone: tz, timeZoneName: 'longOffset' }); }
+          catch { invalid('/tz'); }
+        }
+        const match = search(q ?? '', box.labels, zone);
+        const items = [...box.threads.values()].flatMap((all) => {
+          const rows = inView(all, view);
+          return rows.some((row) => (labelId === undefined || row.message.labelIds.includes(labelId)) && match(row)) ? [summarize(all, rows, view)] : [];
+        });
+        return { ...page(items, box.directory.id, 'listThreads', query, (item) => [item.lastDate, item.id], byThread), state: state(box) };
+      },
+      async getThread(threadId) {
+        const box = mailbox();
+        const rows = need(box.threads.get(threadId));
+        return copy({ thread: summarize(rows, rows), messages: rows.map(({ message }) => message), state: state(box) });
+      },
+      async updateThreads(update) {
+        const box = mailbox();
+        fields(update, ['ids', 'set']);
+        const { ids, set } = update;
+        fields(set, ['folder', 'unread', 'starred', 'addLabelIds', 'removeLabelIds'], '/set');
+        if (!Array.isArray(ids)) invalid('/ids');
+        if (ids.length > limits.batchThreads) invalid('/ids', 'too_many');
+        if (set.folder !== undefined && !folders.includes(set.folder)) invalid('/set/folder');
+        for (const field of ['unread', 'starred'] as const) {
+          if (set[field] !== undefined && typeof set[field] !== 'boolean') invalid(`/set/${field}`);
+        }
+        const rows = [...new Set(ids)].flatMap((threadId) => need(box.threads.get(threadId)));
+        for (const [field, labels] of [['addLabelIds', set.addLabelIds], ['removeLabelIds', set.removeLabelIds]] as const) {
+          if (labels !== undefined && !Array.isArray(labels)) invalid(`/set/${field}`);
+          for (const [i, label] of (labels ?? []).entries()) if (!box.labels.has(label)) invalid(`/set/${field}/${i}`);
+        }
+        const changes = rows.map((row) => {
+          const m = row.message;
+          const next = [...new Set([...m.labelIds, ...(set.addLabelIds ?? [])])].filter((label) => !set.removeLabelIds?.includes(label));
+          if (next.length > limits.labelsPerMessage) fail('limit_reached', { limit: limits.labelsPerMessage });
+          return { row, next };
+        });
+        let changed = false;
+        for (const { row, next } of changes) {
+          const m = row.message;
+          if (set.folder !== undefined && set.folder !== m.folder) {
+            if (set.folder === 'spam' || m.folder === 'spam') {
+              const sample = box.training.get(m.from.email) ?? { spam: 0, ham: 0 };
+              sample[set.folder === 'spam' ? 'spam' : 'ham']++;
+              box.training.set(m.from.email, sample);
+            }
+            m.folder = set.folder;
+            if (hidden(m.folder)) row.expires = now + limits.spamTrashRetentionDays * day;
+            else delete row.expires;
+            changed = true;
+          }
+          if (set.unread !== undefined && set.unread !== m.unread) { m.unread = set.unread; changed = true; }
+          if (set.starred !== undefined && set.starred !== m.starred) { m.starred = set.starred; changed = true; }
+          if (next.length !== m.labelIds.length || next.some((label, i) => label !== m.labelIds[i])) { m.labelIds = next; changed = true; }
+        }
+        if (changed) bump(box);
+        return { state: state(box) };
+      },
+      async getBodyUrl(messageId, input) {
+        const box = mailbox();
+        fields(input, ['remoteImages']);
+        if (typeof input.remoteImages !== 'boolean') invalid('/remoteImages');
+        need(box.messages.get(messageId));
+        return contentUrl(box, messageId, { purpose: 'body', ri: input.remoteImages });
+      },
+      async getAttachmentUrl(messageId, number) {
+        const box = mailbox();
+        part(box, messageId, number);
+        return contentUrl(box, messageId, { purpose: 'att', part: number });
+      },
+      async saveAttachmentToDrive(messageId, number, opts) {
+        const box = mailbox();
+        if (!drive) fail('feature_unavailable');
+        const scope = ownedByUser(box);
+        return replay(scope, opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
+          // A stable operation id that Drive deduplicates durably. A retry asks Drive first, so a lost reply
+          // returns the stored file even if the source message expired in between.
+          const operation = createHash('sha256').update(`${user.id}\n${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
+          let saved = box.driveOperations.get(operation);
+          if (saved === undefined) {
+            const { name, size, type } = part(box, messageId, number);
+            saved = { driveFileId: id(), name };
+            box.driveFiles.set(saved.driveFileId, { owner: user.id, name, size, type });
+            box.driveOperations.set(operation, saved);
+          }
+          if (crashNextDriveSave) {
+            crashNextDriveSave = false;
+            // Mail crashed after Drive stored the file: only the in-progress marker, with its fingerprint, remains.
+            // It lapses after 5 minutes into the pin, never into nothing.
+            scope.stranded.set(opts.idempotencyKey, now + 5 * 60 * second);
+            scope.pinned.set(opts.idempotencyKey, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second });
+            fail('unavailable', { retryAfterSeconds: 1 });
+          }
+          if (loseNextDriveSaveReply) {
+            loseNextDriveSaveReply = false;
+            // Drive may have the file: the key stays bound to this action until it is retried or expires.
+            scope.pinned.set(opts.idempotencyKey, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second });
+            fail('unavailable', { retryAfterSeconds: 1 });
+          }
+          return { ...saved };
+        });
+      },
+      async listLabels() { const box = mailbox(); return { items: [...box.labels.values()], state: state(box) }; },
+      async createLabel(input, opts) {
+        const box = mailbox();
+        return replay(owned(box), opts, 'createLabel', [], input, () => {
+          fields(input, ['name']);
+          const name = labelName(box, input.name);
+          if (box.labels.size >= limits.labelsPerMailbox) fail('limit_reached', { limit: limits.labelsPerMailbox });
+          const label = { id: id(), name };
+          box.labels.set(label.id, label);
+          bump(box);
+          return label;
+        });
+      },
+      async renameLabel(labelId, input) {
+        const box = mailbox();
+        fields(input, ['name']);
+        const label = need(box.labels.get(labelId));
+        const name = labelName(box, input.name, labelId);
+        if (name === label.name) return label;
+        const renamed = { ...label, name };
+        box.labels.set(labelId, renamed);
+        bump(box);
+        return renamed;
+      },
+      async deleteLabel(labelId) {
+        const box = mailbox();
+        if (box.labels.delete(labelId)) {
+          for (const { message } of box.messages.values()) message.labelIds = message.labelIds.filter((label) => label !== labelId);
+          bump(box);
+        }
+      },
+      async listIdentities() { return { items: identities(mailbox()) }; },
+      async getSettings() { return mailbox().settings; },
+      async updateSettings(patch) {
+        const box = mailbox();
+        fields(patch, ['signature', 'undoSeconds', 'defaultFrom', 'replyFromReceivedAddress']);
+        const { signature, undoSeconds, defaultFrom, replyFromReceivedAddress } = patch;
+        if (signature !== undefined) boundedText(signature, limits.signatureBytes, '/signature');
+        if (undoSeconds !== undefined && !limits.undoSecondsOptions.includes(undoSeconds)) invalid('/undoSeconds');
+        if (replyFromReceivedAddress !== undefined && typeof replyFromReceivedAddress !== 'boolean') invalid('/replyFromReceivedAddress');
+        const settings = {
+          signature: signature ?? box.settings.signature, undoSeconds: undoSeconds ?? box.settings.undoSeconds,
+          defaultFrom: defaultFrom === undefined ? box.settings.defaultFrom : sender(box, defaultFrom, true).email,
+          replyFromReceivedAddress: replyFromReceivedAddress ?? box.settings.replyFromReceivedAddress,
+        };
+        if (canonical(settings) !== canonical(box.settings)) { box.settings = settings; bump(box); }
+        return settings;
+      },
+      async listDrafts(query) {
+        const box = mailbox();
+        fields(query, ROUTES.listDrafts.query);
+        return { ...page([...box.drafts.values()], box.directory.id, 'listDrafts', query, (d) => [d.updatedAt, d.id], byTime), state: state(box) };
+      },
+      async getDraft(draftId) { return need(mailbox().drafts.get(draftId)); },
+      async createDraft(input, opts) {
+        const box = mailbox();
+        return replay(owned(box), opts, 'createDraft', [], input, () => {
+          const draft = makeDraft(box, id(), input);
+          box.drafts.set(draft.id, draft);
+          bump(box);
+          return draft;
+        });
+      },
+      async replaceDraft(draftId, input, opts) {
+        const box = mailbox();
+        requireRevision(opts);
+        const previous = need(box.drafts.get(draftId));
+        checkRevision(previous, opts);
+        const draft = makeDraft(box, draftId, input, previous);
+        box.drafts.set(draftId, draft);
+        releaseDraftUploads(box, previous, false);
+        bump(box);
+        return draft;
+      },
+      async deleteDraft(draftId, opts) {
+        const box = mailbox();
+        const draft = box.drafts.get(draftId);
+        if (!draft) return;
+        checkRevision(draft, opts);
+        box.drafts.delete(draftId);
+        box.replyRefs.delete(draftId);
+        releaseDraftUploads(box, draft, true);
+        bump(box);
+      },
+      async sendDraft(draftId, opts) {
+        const box = mailbox();
+        requireRevision(opts);
+        return replay(owned(box), opts, 'sendDraft', [draftId], null, () => {
+          const draft = need(box.drafts.get(draftId));
+          checkRevision(draft, opts);
+          checkCounts(draft);
+          // Drafts are checked at save; the send re-checks before anything is built.
+          if (hasHeaderControl(draft.subject)) badHeader('/subject');
+          for (const field of ['to', 'cc', 'bcc'] as const) {
+            for (const [i, { email, name }] of draft[field].entries()) {
+              if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
+              if (name !== undefined && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
+            }
+          }
+          const all = [...draft.to, ...draft.cc, ...draft.bcc];
+          if (!all.length || all.some(({ email }) => !validEmail(email))) fail('invalid_recipients');
+          const from = address(sender(box, draft.from, true));
+          const references = box.replyRefs.get(draft.id) ?? replyReferences(box, draft.inReplyTo);
+          const size = outboundMimeBytes(draft, from, threadingHeaders(references, limits));
+          if (size > limits.outboundMessageBytes) fail('message_too_large', { limit: limits.outboundMessageBytes });
+          const undoRemainingMs = box.settings.undoSeconds * second;
+          const send: Send = {
+            id: id(), draftId, state: 'pending', createdAt: iso(now), undoUntil: iso(now + undoRemainingMs), undoRemainingMs,
+            recipients: all.map(({ email }) => ({ email, state: 'pending' })),
+          };
+          box.drafts.delete(draftId);
+          box.replyRefs.delete(draftId);
+          // The authenticated submitter, never the directory's current owner.
+          box.sends.set(send.id, { send, pending: { draft, size, from, references, ownerUserId: user.id } });
+          bump(box);
+          return copy(send);
+        }, ({ id }) => sendResult(need(box.sends.get(id)).send));
+      },
+      async listSends(query) {
+        const box = mailbox();
+        fields(query, ROUTES.listSends.query);
+        if (query.active !== undefined && typeof query.active !== 'boolean') invalid('/active');
+        const active = (send: Send) => ['pending', 'sending', 'delayed'].includes(send.state);
+        const sends = [...box.sends.values()].map(({ send }) => send).filter((send) => !query.active || active(send));
+        return { ...page(sends.map(sendResult), box.directory.id, 'listSends', query, (send) => [send.createdAt, send.id], byTime), state: state(box) };
+      },
+      async getSend(sendId) { return sendResult(need(mailbox().sends.get(sendId)).send); },
+      async undoSend(sendId, opts) {
+        const box = mailbox();
+        return replay(owned(box), opts, 'undoSend', [sendId], null, () => {
+          const entry = need(box.sends.get(sendId));
+          if (!entry.pending) fail('send_not_pending');
+          const draft = { ...entry.pending.draft, revision: id(), updatedAt: iso(now) };
+          box.drafts.set(draft.id, draft);
+          if (draft.inReplyTo !== undefined) box.replyRefs.set(draft.id, entry.pending.references);
+          entry.send.state = 'cancelled';
+          entry.send.undoRemainingMs = 0;
+          delete entry.pending;
+          bump(box);
+          return draft;
+        });
+      },
+      async createUpload(input, opts) {
+        const box = mailbox();
+        const { name, type, bytes: blob } = input ?? {};
+        let digest: string;
+        const fingerprint = async () => {
+          if (!(blob instanceof Blob)) return [name, type, null];
+          // An oversized body cannot match a committed upload. Don't open its stream.
+          if (blob.size > limits.uploadBytes) return [name, type, { oversized: true }];
+          digest = await sha256(blob);
+          return [name, type, digest];
+        };
+        return replay(owned(box), opts, 'createUpload', [], fingerprint, () => {
+          fields(input, ['name', 'type', 'bytes']);
+          if (!(blob instanceof Blob)) invalid('/bytes');
+          if (blob.size > limits.uploadBytes) fail('payload_too_large', { limit: limits.uploadBytes });
+          boundedText(name, 255, '/name');
+          if (!name || /[\\/\p{Cc}]/u.test(name)) invalid('/name');
+          if (typeof type !== 'string') invalid('/type');
+          return storeUpload(box, name, type, blob.size, digest);
+        });
+      },
+      async deleteUpload(uploadId) {
+        const box = mailbox();
+        if (!usesUpload(box, uploadId) && box.uploads.delete(uploadId)) bump(box);
+      },
+      async importFromDrive(input, opts) {
+        const box = mailbox();
+        if (!drive) fail('feature_unavailable');
+        // A pick is the chooser's grant, so its replays are scoped to (mailbox, account user) too.
+        return replay(ownedByUser(box), opts, 'importFromDrive', [], input, () => {
+          fields(input, ['pickId', 'mode']);
+          const pick = need(picks.get(input.pickId));
+          // A pick is the choosing user's grant for this mailbox; it does not pass to a later owner.
+          if (pick.mailboxId !== box.directory.id || pick.userId !== user.id) fail('not_found');
+          if (input.mode === 'link') return { attachments: [{ kind: 'link', url: 'https://example.com/drive/demo', name: driveFile.name }] };
+          if (input.mode !== 'copy') invalid('/mode');
+          return { attachments: [uploadRef(storeUpload(box, driveFile.name, driveFile.type, driveFile.size, driveFile.digest))] };
+        });
+      },
+      async listDomains() { return { items: [...domains.values()].sort((a, b) => compare(a.name, b.name)) }; },
+      async addDomain(input, opts) {
+        return replay(workspaceKeys, opts, 'addDomain', [], input, () => {
+          fields(input, ['name', 'kind', 'aliasOf']);
+          if (typeof input.name !== 'string') invalid('/name');
+          if (input.aliasOf !== undefined && typeof input.aliasOf !== 'string') invalid('/aliasOf');
+          const name = input.name.trim().toLowerCase();
+          if (!validDomain(name)) invalid('/name');
+          // Inbound delivery must resolve a domain to a single workspace.
+          if (workspaces.some((candidate) => candidate.domains.has(name))) fail('domain_exists');
+          const { kind } = input;
+          const aliasOf = input.aliasOf?.trim().toLowerCase();
+          if (kind === 'alias') {
+            const target = aliasOf === undefined ? undefined : domains.get(aliasOf);
+            if (!target || target.kind === 'alias') invalid('/aliasOf');
+          } else if (kind !== 'secondary' || aliasOf !== undefined) invalid(kind !== 'secondary' ? '/kind' : '/aliasOf');
+          const domain: Domain = { name, kind, routing: 'pending', sending: 'pending', ...(aliasOf !== undefined && { aliasOf }) };
+          domains.set(name, domain);
+          return domain;
+        });
+      },
+      async listMailboxes(query) {
+        fields(query, ROUTES.listMailboxes.query);
+        return page([...boxes.values()].map(({ directory }) => directory), workspace.id, 'listMailboxes', query, (d) => [d.primaryAddress, d.id], ascending);
+      },
+      async createMailbox(input, opts) {
+        return replay(workspaceKeys, opts, 'createMailbox', [], input, () => {
+          fields(input, ['primaryAddress', 'displayName', 'ownerUserId']);
+          const primary = directoryAddress(workspace, input.primaryAddress, '/primaryAddress');
+          availableOwner(workspace, input.ownerUserId);
+          return newMailbox(workspace, primary, displayName(input.displayName), input.ownerUserId);
+        });
+      },
+      async updateMailbox(mailboxId, patch) {
+        fields(patch, ['displayName', 'ownerUserId']);
+        const box = need(boxes.get(mailboxId));
+        const name = patch.displayName === undefined ? box.directory.displayName : displayName(patch.displayName);
+        const owner = patch.ownerUserId ?? box.directory.ownerUserId;
+        if (owner !== box.directory.ownerUserId) availableOwner(workspace, owner);
+        if (owner !== box.directory.ownerUserId || name !== box.directory.displayName) {
+          box.directory.ownerUserId = owner;
+          box.directory.displayName = name;
+          bump(box);
+        }
+        return box.directory;
+      },
+      async createAlias(input, opts) {
+        return replay(workspaceKeys, opts, 'createAlias', [], input, () => {
+          fields(input, ['mailboxId', 'address', 'sendAs']);
+          const box = need(boxes.get(input.mailboxId));
+          const email = directoryAddress(workspace, input.address, '/address');
+          if (typeof input.sendAs !== 'boolean') invalid('/sendAs');
+          if (box.directory.aliases.length >= limits.aliasesPerMailbox) fail('limit_reached', { limit: limits.aliasesPerMailbox });
+          const alias: Alias = { address: email, mailboxId: input.mailboxId, sendAs: input.sendAs ? 'pending' : 'off' };
+          box.directory.aliases.push(alias);
+          bump(box);
+          return alias;
+        });
+      },
+      async deleteAlias(value) {
+        const email = value.trim().toLowerCase();
+        for (const box of boxes.values()) {
+          const index = box.directory.aliases.findIndex((alias) => alias.address === email);
+          if (index !== -1) { box.directory.aliases.splice(index, 1); bump(box); break; }
+        }
+      },
+      async listMembers(query) {
+        fields(query, ROUTES.listMembers.query);
+        const items = [...members.values()].map((m): Member => ({ ...m, hasMailbox: ownerBox(workspace, m.id) !== undefined }));
+        return page(items, workspace.id, 'listMembers', query, (m) => [m.name, m.id], ascending);
+      },
+    };
+    // All callers get detached snapshots; access checks precede route validation and replay.
+    return new Proxy(service, {
+      get(target, op: Operation) {
+        if (!Object.hasOwn(ROUTES, op)) return undefined;
+        return async (...input: unknown[]) => {
+          const route = ROUTES[op];
+          if (route.access === 'admin') {
+            if (!admin) fail('forbidden');
+            if (route.reauth && now - authTime > maxAuthAge * second) fail('reauth_required', { maxAgeSeconds: maxAuthAge });
+          } else if (op !== 'getSession') mailbox();
+          return copy(await Reflect.apply(target[op], target, copy(input)));
+        };
+      },
+    });
+  }
+  function sendResult(send: Send): Send {
+    return { ...send, undoRemainingMs: send.state === 'pending' ? Math.max(0, Date.parse(send.undoUntil) - now) : 0 };
+  }
+
+  const sessions = {
+    member: bind('member'), other: bind('other'), admin: bind('admin'), staleAdmin: bind('staleAdmin'),
+    newAdmin: bind('newAdmin'), foreignAdmin: bind('foreignAdmin'),
+  };
+  return {
+    as: (principal) => sessions[principal],
+    contentOrigin,
+    async deliver(input: TestMessage, principal = 'member') {
+      const box = need(ownerBox(workspaceFor(principal), userIdFor(principal)));
+      const date = iso(now);
+      const attachments = (input.attachments ?? []).map((a, i) => ({ part: i + 1, name: indexedAttachmentName(a.name), type: a.type, size: a.bytes.length, inline: a.inline ?? false }));
+      const message = append(box, input.inReplyTo, {
+        from: input.from, to: input.to, cc: input.cc ?? [], subject: input.subject, text: input.text,
+        date, receivedAt: date, folder: 'inbox', unread: true, starred: false, labelIds: [], sent: false,
+        hasHtml: input.html !== undefined, remoteImages: input.html !== undefined && (input.remoteImages ?? false), attachments,
+        size: bytes(input.text) + bytes(input.html ?? '') + attachments.reduce((sum, a) => sum + a.size, 0), verdict: { level: 'none', reasons: [] },
+      }, { ...(input.messageId !== undefined && { messageId: input.messageId }) });
+      return { threadId: message.threadId, messageId: message.id };
+    },
+    async advance(ms) { advance(ms); },
+    async credentialEpoch() { return 1; },
+    async sentHeaders(messageId) {
+      const box = need(ownerBox(local, 'member'));
+      return copy(need(box.messages.get(messageId)?.headers));
+    },
+    ...(drive && {
+      async drivePick() {
+        const box = need(ownerBox(local, 'member'));
+        const token = randomUUID();
+        picks.set(token, { mailboxId: box.directory.id, userId: box.directory.ownerUserId, expires: now + 5 * 60 * second });
+        return token;
+      },
+      driveFaults: {
+        async loseNextSaveReply() { loseNextDriveSaveReply = true; },
+        async crashNextSaveAfterDrive() { crashNextDriveSave = true; },
+        // Files in member's own Drive, wherever they were saved from.
+        async savedFiles() {
+          return workspaces.flatMap((workspace) => [...workspace.boxes.values()])
+            .reduce((count, box) => count + [...box.driveFiles.values()].filter(({ owner }) => owner === 'member').length, 0);
+        },
+      },
+    }),
+  };
+}
