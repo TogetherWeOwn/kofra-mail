@@ -11,7 +11,7 @@ This package holds the wire contract between the Riaklo Mail web app and its bac
 | `src/limits.ts` | `LIMITS` and `attachmentBudget` |
 | `src/harness.ts`, `src/conformance.ts` | The conformance harness and the suite every implementation must pass |
 
-Related design notes are in [`docs/content-origin.md`](../../docs/content-origin.md), which covers formatted bodies, attachments and the image proxy, and [`docs/m3-outbound-plan.md`](../../docs/m3-outbound-plan.md), which covers the send path.
+Related design notes are in [`docs/content-origin.md`](../../docs/content-origin.md), which covers formatted bodies, attachments and the image proxy. The send-path build plan is a separate draft with open review items (pull request #11).
 
 ## 1. Decisions
 
@@ -76,6 +76,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
   Answers from steps 1, 3 and 4 are never stored.
 - **In progress:** before the operation's first await (for example an upload's streaming PUT), the server writes the key with an in-progress marker. A failed operation deletes the marker; a marker left by a crash expires after 5 minutes.
 - The server keeps a key for `idempotencyRetentionSeconds` (24 h), scoped to the mailbox (or the workspace, for admin routes), together with a fingerprint of the operation, path parameters and body. The record commits in the same transaction as the operation's effect.
+- **Scope exceptions:** `saveAttachmentToDrive` and `importFromDrive` act for the account user (in their Drive, or under their pick), so their keys are scoped to the mailbox **and the account user** (section 8.5). After the mailbox changes owner, the new owner's same key is a new action, never a replay of the previous owner's result.
 - **A replay** returns the stored status and body, with `Idempotency-Replayed: true`. One exception: a replayed `sendDraft` returns the send's current state (`getSend`), so a stale `pending` and `undoRemainingMs` are never shown after release.
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
 - **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After`. This answer also means the operation may already have taken effect (for example a `sendDraft` committed but not yet confirmed durable), so the client retries with the same key until it gets another answer.

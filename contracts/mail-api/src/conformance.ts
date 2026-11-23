@@ -754,7 +754,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(nextOwner.importFromDrive({ pickId: pick, mode: 'copy' }, key('fresh-import')), 'not_found');
       await rejects(nextOwner.importFromDrive({ pickId: pick, mode: 'copy' }, key('chooser-import')), 'not_found');
       await h.as('admin').updateMailbox(mailbox.id, { ownerUserId: session.user.id });
+      // Past the pick's lifetime (5 minutes) the chooser's committed replay still succeeds; a fresh key does not.
+      await h.advance(5 * 60 * second + second);
       assert.deepEqual(await mail.importFromDrive({ pickId: pick, mode: 'copy' }, key('chooser-import')), imported);
+      await rejects(mail.importFromDrive({ pickId: pick, mode: 'copy' }, key('expired-pick')), 'not_found');
 
       // A lost reply after Drive stored the file: the same-key retry returns that file and creates no second one.
       if (!h.driveFaults) return;
