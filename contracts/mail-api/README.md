@@ -80,7 +80,7 @@ Related design notes are in [`docs/content-origin.md`](../../docs/content-origin
 - **The same key with a different fingerprint** answers 422 `idempotency_key_reused`.
 - **A replay while the first request is still running** answers 409 `idempotency_in_progress` with `Retry-After`. This answer also means the operation may already have taken effect (for example a `sendDraft` committed but not yet confirmed durable), so the client retries with the same key until it gets another answer.
 - **Only successful (2xx) results are stored.** Any 4xx other than `idempotency_in_progress`, and any 5xx, had no effect, so a retry with the same key runs again; after fixing the request the client may reuse the key or make a new one.
-- **One exception, `saveAttachmentToDrive`:** its effect is in Drive, which cannot commit together with Mail's record. A 5xx or a lost response may follow a file Drive already stored, so the server passes Drive a stable operation id, `SHA-256(account user id, mailbox id, key, fingerprint)`, so a same-key request after the mailbox changes owner never maps to the previous owner's file, and Drive deduplicates it durably for at least `idempotencyRetentionSeconds` and returns the original file for it. A same-key retry therefore returns the first file and never creates a second one (section 8.5).
+- **One exception, `saveAttachmentToDrive`:** its effect is in Drive, which cannot commit together with Mail's record. A 5xx or a lost response may follow a file Drive already stored, so the server passes Drive a stable operation id, `SHA-256(account user id, mailbox id, key, fingerprint)`, so a same-key request after the mailbox changes owner never maps to the previous owner's file, and Drive deduplicates it durably for at least `idempotencyRetentionSeconds` and returns the original file for it. A same-key retry therefore returns the first file and never creates a second one (section 8.5). Because the effect is in the user's own Drive, this route's keys are scoped to the mailbox **and the account user**: after the mailbox changes owner, the new owner's same key is a new action, never a replay of the previous owner's file.
 
 **`If-Match`:**
 - Drafts carry a `revision`. `replaceDraft` and `sendDraft` require `If-Match: <revision>`; `deleteDraft` accepts it.
@@ -226,7 +226,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft whose encoded size exceeds `outboundMessageBytes` is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
 - An upload referred to by a draft does not expire.
 
-**`sendDraft` checks** (each a 422 code):
+**`sendDraft` checks** (each a 422 code, except the subject length, 400 `invalid_request`):
 - 1 to `recipientsPerMessage` recipients, all syntactically valid (`invalid_recipients`, `too_many_recipients`);
 - `from` is an identity with `sendAs: 'active'` (`invalid_sender`);
 - file attachments ≤ `attachmentsPerMessage` (`too_many_attachments`);
@@ -338,7 +338,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 
 The suite checks `MailService`, which has no headers. The HTTP client's own tests check the wire: `Retry-After` equals `retryAfterSeconds`, `X-Request-Id` and `Cache-Control: no-store` are present, problem bodies have `application/problem+json`, and `X-CSRF-Token`, `Idempotency-Key` and `If-Match` are sent as `ROUTES` requires.
 
-Every call's result is also checked for `state`: present on exactly the routes with `state: true`, and absent elsewhere (a `Send`'s own send state excepted).
+Every failure's `type` is checked against the harness's `problemTypePrefix` (default `PROBLEM_TYPE_PREFIX`), and content URLs must carry an integer `ep` (equal to `credentialEpoch` when the harness provides it). Every call's result is also checked for `state`: present on exactly the routes with `state: true`, and absent elsewhere (a `Send`'s own send state excepted).
 
 The harness (`src/harness.ts`) provides sessions for six principals in two workspaces, inbound delivery (with an optional `Message-ID`), a clock, the content origin, the stored header fields of a sent copy (`sentHeaders`), and, where Drive is a local stand-in, Drive fault injection (`driveFaults`). Each case gets a fresh harness. Content URLs follow the format of [content-origin.md](../../docs/content-origin.md) section 2.1, so the suite decodes their claims (it does not verify the MAC; tampering and expiry are the content Worker's own acceptance tests). Cases:
 
@@ -421,9 +421,9 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - The 31st alias answers `limit_reached`.
     - After `deleteAlias`, the identity is gone.
     - After `updateMailbox` moves mailbox A to the invited member, `member`'s next `listThreads` answers `forbidden`.
-20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`. With `driveFaults`: a `saveAttachmentToDrive` whose reply is lost after Drive stored the file answers `unavailable`; after the source then expires from Trash, the same-key retry still returns that file, Drive holds exactly one new file, and a new key answers `not_found`.
+20. **Drive** (only if `features.drive`): `importFromDrive` with `harness.drivePick()` in `copy` mode returns upload attachments usable in a draft. Otherwise it answers `feature_unavailable`. With `driveFaults`: a `saveAttachmentToDrive` whose reply is lost after Drive stored the file answers `unavailable`; after the source then expires from Trash, the same-key retry still returns that file, Drive holds exactly one new file, and a new key answers `not_found`. After a successful save, a same-key save by the mailbox's next owner makes a different file, and the original owner's replay returns the original.
 21. **Header text and threading:**
-    - CR, LF or NUL in a subject, display name or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged; so does CR LF in a mailbox `displayName` on `updateMailbox`.
+    - CR, LF or NUL in a subject, display name, `from` or address answers `invalid_header` with the field, on `createDraft` and `replaceDraft`, and the draft is unchanged, even when the text is also too long; so do CR LF in a mailbox `displayName` and a trailing LF in an alias address. Controls are checked on the raw text, before trimming or length checks.
     - A reply in a thread of 12 messages with legal 200-byte `Message-ID`s: the sent copy's `In-Reply-To` is the parent, and its `References` fits `headerValueBytes`, starts with the first id, ends with the parent, keeps chain order and holds 10 ids.
     - The sent copy has no `Bcc` header and no Bcc address, and every value `sentHeaders` returns is unfolded, including a To list with a long encoded name.
     - A reply to a message whose `Message-ID` carries CR and a `Bcc:` line has neither threading header.

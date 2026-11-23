@@ -57,7 +57,8 @@ function foldedHeaderFields(draft: Pick<Draft, 'to' | 'cc' | 'subject'>, from: A
     ...(draft.to.length && { to: draft.to.map(mimeAddress).join(',\r\n ') }),
     ...(draft.cc.length && { cc: draft.cc.map(mimeAddress).join(',\r\n ') }),
     ...(threading.inReplyTo !== undefined && { 'in-reply-to': threading.inReplyTo }),
-    ...(threading.references !== undefined && { references: threading.references }),
+    // Fold between ids so no physical line exceeds RFC 5322's 998 octets.
+    ...(threading.references !== undefined && { references: threading.references.replaceAll(' ', '\r\n ') }),
   };
 }
 // RFC 5322 unfolding: a CRLF followed by white space is removed.
@@ -177,6 +178,8 @@ interface Mailbox {
   sends: Map<Id, StoredSend>;
   uploads: Map<Id, Upload>;
   keys: ReplayScope;
+  /** Idempotency scopes of routes that act for the account user (Save to Drive). */
+  userKeys: Map<Id, ReplayScope>;
   training: Map<string, { spam: number; ham: number }>;
   /** Stand-in for the user's Drive: its files, and the operation ids it has deduplicated durably. */
   driveFiles: Map<Id, { name: string; size: number; type: string }>;
@@ -302,7 +305,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
     workspace.boxes.set(directory.id, {
       workspace, directory, version: 0, threads: new Map(), messages: new Map(), labels: new Map(), drafts: new Map(), replyRefs: new Map(), sends: new Map(),
-      uploads: new Map(), keys: replayScope(), training: new Map(), driveFiles: new Map(), driveOperations: new Map(),
+      uploads: new Map(), keys: replayScope(), userKeys: new Map(), training: new Map(), driveFiles: new Map(), driveOperations: new Map(),
       settings: { signature: '', undoSeconds: 10, defaultFrom: primaryAddress, replyFromReceivedAddress: true },
     });
     return directory;
@@ -427,8 +430,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     if (typeof input.from === 'string' && hasHeaderControl(input.from)) badHeader('/from');
     const from = sender(box, input.from, false).email;
     checkCounts(input);
+    // Control characters are refused on the raw text, before any length check or normalisation.
+    if (typeof input.subject === 'string' && hasHeaderControl(input.subject)) badHeader('/subject');
     boundedText(input.subject, limits.subjectBytes, '/subject');
-    if (hasHeaderControl(input.subject)) badHeader('/subject');
     boundedText(input.body, limits.bodyBytes, '/body');
     const { subject, body, inReplyTo, forwardOf } = input;
     for (const field of ['inReplyTo', 'forwardOf'] as const) {
@@ -440,8 +444,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       const { name, email } = value;
       if (typeof email !== 'string') invalid(`/${field}/${i}/email`);
       if (hasHeaderControl(email)) badHeader(`/${field}/${i}/email`);
+      if (typeof name === 'string' && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
       if (name !== undefined) boundedText(name, limits.displayNameBytes, `/${field}/${i}/name`);
-      if (name !== undefined && hasHeaderControl(name)) badHeader(`/${field}/${i}/name`);
       return { email, ...(name !== undefined && { name }) };
     });
     const attachments = input.attachments.map((ref, i): DraftAttachment => {
@@ -594,7 +598,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     }
     now = end;
     for (const box of boxes) expire(box);
-    for (const { committed } of [...workspaces.map((workspace) => workspace.keys), ...boxes.map((box) => box.keys)]) {
+    for (const { committed } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
       for (const [key, entry] of committed) if (entry.expires <= now) committed.delete(key);
     }
     for (const [pick, entry] of picks) if (entry.expires <= now) picks.delete(pick);
@@ -620,6 +624,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   }
   function directoryAddress(workspace: Workspace, value: string, field: string): string {
     if (typeof value !== 'string') invalid(field);
+    if (hasHeaderControl(value)) badHeader(field);
     const email = value.trim().toLowerCase();
     if (!validEmail(email)) invalid(field);
     const domain = workspace.domains.get(email.split('@')[1]);
@@ -632,9 +637,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     if (ownerBox(workspace, userId)) invalid('/ownerUserId', 'not_allowed');
   }
   function displayName(name: string): string {
-    boundedText(name, limits.displayNameBytes, '/displayName');
     // The mailbox name is every identity's From display name.
-    if (hasHeaderControl(name)) badHeader('/displayName');
+    if (typeof name === 'string' && hasHeaderControl(name)) badHeader('/displayName');
+    boundedText(name, limits.displayNameBytes, '/displayName');
     if (!name.trim()) invalid('/displayName', 'required');
     return name.trim();
   }
@@ -653,7 +658,14 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       return box;
     };
     // The mailbox's idempotency scope, re-checking that this session still owns it when replay resumes.
-    const owned = (box: Mailbox): ReplayScope => ({ ...box.keys, recheck: () => { if (resolveMailbox() !== box) fail('forbidden'); } });
+    const recheck = (box: Mailbox) => () => { if (resolveMailbox() !== box) fail('forbidden'); };
+    const owned = (box: Mailbox): ReplayScope => ({ ...box.keys, recheck: recheck(box) });
+    // Save to Drive acts in the user's own Drive, so its keys are scoped to (mailbox, account user).
+    const ownedByUser = (box: Mailbox): ReplayScope => {
+      let keys = box.userKeys.get(user.id);
+      if (!keys) box.userKeys.set(user.id, keys = replayScope());
+      return { ...keys, recheck: recheck(box) };
+    };
     const service: MailService = {
       async getSession() {
         const box = resolveMailbox();
@@ -752,7 +764,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(owned(box), opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
+        return replay(ownedByUser(box), opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
           // A stable operation id that Drive deduplicates durably. A retry asks Drive first, so a lost reply
           // returns the stored file even if the source message expired in between.
           const operation = createHash('sha256').update(`${user.id}\n${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
@@ -1060,6 +1072,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       return { threadId: message.threadId, messageId: message.id };
     },
     async advance(ms) { advance(ms); },
+    async credentialEpoch() { return 1; },
     async sentHeaders(messageId) {
       const box = need(ownerBox(local, 'member'));
       return copy(need(box.messages.get(messageId)?.headers));

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { ERROR_STATUS, isMailApiError } from './errors.ts';
+import { ERROR_STATUS, isMailApiError, PROBLEM_TYPE_PREFIX } from './errors.ts';
 import type { MailErrorCode, Problem } from './errors.ts';
 import { hasHeaderControl, threadingHeaders } from './headers.ts';
 import { attachmentBudget, LIMITS } from './limits.ts';
@@ -78,12 +78,16 @@ function checked(service: MailService): MailService {
   });
 }
 
+// The current case's problem type prefix; cases run one at a time.
+let problemTypePrefix = PROBLEM_TYPE_PREFIX;
+
 async function rejects(promise: Promise<unknown>, code: MailErrorCode): Promise<Problem> {
   let result!: Problem;
   await assert.rejects(promise, (error: unknown) => {
     assert.ok(isMailApiError(error), 'expected a MailApiError');
     assert.equal(error.code, code);
     assert.equal(error.status, ERROR_STATUS[code]);
+    assert.equal(error.problem.type, `${problemTypePrefix}${code}`);
     result = json(error.problem);
     return true;
   });
@@ -95,6 +99,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
     function run(title: string, body: (h: ConformanceHarness, mail: MailService) => Promise<void>): void {
       test(title, async () => {
         const harness = await makeHarness();
+        problemTypePrefix = harness.problemTypePrefix ?? PROBLEM_TYPE_PREFIX;
         try {
           const h: ConformanceHarness = {
             as: (principal) => checked(harness.as(principal)),
@@ -102,6 +107,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
             advance: async (ms) => json(await harness.advance(ms)),
             sentHeaders: async (messageId) => json(await harness.sentHeaders(messageId)),
             contentOrigin: harness.contentOrigin,
+            ...(harness.credentialEpoch && { credentialEpoch: harness.credentialEpoch }),
             ...(harness.drivePick && { drivePick: async () => json(await harness.drivePick!()) }),
             ...(harness.driveFaults && { driveFaults: harness.driveFaults }),
           };
@@ -639,6 +645,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         assert.equal(token.claims.mb, mailbox.id);
         assert.equal(token.claims.msg, msg);
         assert.equal(token.claims.sub, user.id);
+        assert.ok(Number.isInteger(token.claims.ep), 'the credential epoch claim is present');
+        if (h.credentialEpoch) assert.equal(token.claims.ep, await h.credentialEpoch('member'));
         assert.equal(token.claims.ri, ri);
         assert.equal(token.claims.part, part);
         assert.ok(token.ttl <= limits.contentUrlSeconds);
@@ -740,6 +748,17 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const { messages: [delivered] } = await mail.getThread((await mail.listThreads({ view: 'inbox', q: 'subject:"save me"' })).items[0].id);
       assert.equal(delivered.id, messageId);
       const [{ part }] = delivered.attachments;
+
+      // Keys are scoped to the account user: after an owner change the same key is the new owner's own action.
+      const ownerSave = await mail.saveAttachmentToDrive(messageId, part, key('owner-save'));
+      const newOwner = h.as('newAdmin');
+      const admin = h.as('admin');
+      await admin.updateMailbox(mailbox.id, { ownerUserId: (await newOwner.getSession()).user.id });
+      const theirs = await newOwner.saveAttachmentToDrive(messageId, part, key('owner-save'));
+      assert.notEqual(theirs.driveFileId, ownerSave.driveFileId);
+      await admin.updateMailbox(mailbox.id, { ownerUserId: session.user.id });
+      assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('owner-save')), ownerSave);
+
       const before = await h.driveFaults.savedFiles();
       // The source sits in Trash and expires between the lost reply and the retry.
       const { limits } = session;
@@ -758,6 +777,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       // A new key is a new action, and the expired source can no longer be saved.
       await rejects(mail.saveAttachmentToDrive(messageId, part, key('save-again')), 'not_found');
       assert.equal(await h.driveFaults.savedFiles(), before + 1);
+
     });
 
     run('21. header text is refused, and threading headers fit the header byte limit', async (h, mail) => {
@@ -772,6 +792,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         [{ cc: [{ email: 'casey@example.net\r\nBcc: victim@example.net' }] }, '/cc/0/email'],
         [{ bcc: [{ name: 'Null\u0000name', email: 'casey@example.net' }] }, '/bcc/0/name'],
         [{ from: `${mailbox.primaryAddress}\n` }, '/from'],
+        // A control character is refused even when the text is also too long.
+        [{ subject: `${'x'.repeat(limits.subjectBytes)}\r` }, '/subject'],
       ];
       for (const [i, [patch, field]] of bad.entries()) {
         const refused = await rejects(mail.createDraft({ ...input, ...patch }, key(`bad-${i}`)), 'invalid_header');
@@ -785,6 +807,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const admin = h.as('admin');
       const named = await rejects(admin.updateMailbox(mailbox.id, { displayName: 'Mailbox\r\nBcc: victim@example.net' }), 'invalid_header');
       assert.deepEqual(named.errors, [{ field: '/displayName', code: 'invalid' }]);
+      const aliased = await rejects(admin.createAlias({ mailboxId: mailbox.id, address: `trailing@${mailbox.primaryAddress.split('@')[1]}\n`, sendAs: false }, key('lf-alias')), 'invalid_header');
+      assert.deepEqual(aliased.errors, [{ field: '/address', code: 'invalid' }]);
 
       // A thread of 12 messages, each with a legal 200-byte Message-ID: 11 of them would exceed headerValueBytes.
       const idBytes = 200;

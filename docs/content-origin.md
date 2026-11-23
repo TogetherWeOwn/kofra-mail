@@ -205,7 +205,7 @@ Cache-Control: private, no-store
 4. **The response:**
    - status 200 only;
    - `Content-Type` must be `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/avif`, `image/bmp` or `image/x-icon`, and the first bytes must match that type. **SVG is refused.**
-   - The body is streamed and cut off at `remoteImageBytes` (5 MiB); a larger image fails.
+   - The body is read into memory, at most `remoteImageBytes` (5 MiB), **before** the response starts: an image that turns out larger, or a fetch that times out, still answers 404 with an empty body, and nothing is cached. A response with no declared length is handled the same way.
    - Outgoing headers are rebuilt from scratch: the normalised `Content-Type`, `Content-Length` when known, and the security headers of section 3.1. No upstream header is passed through.
 5. **Failures:** anything else answers 404 with an empty body, so the browser shows a broken image.
 6. **Caching, behind the verifier only:** the Worker may keep the upstream image in its own fetch cache, keyed by the remote URL, for up to a day. Senders then see fewer opens; they never see who opened.
@@ -243,6 +243,7 @@ Cache-Control: private, no-store
 4. **Proxy:**
    - Refusals: IP literals, private and own-zone names, a fourth redirect, a redirect to a refused host, SVG, a mislabelled HTML body, more than 5 MiB, and over 10 s.
    - It never forwards a cookie or `Referer`, checked with a local upstream fixture.
+   - An upstream body with no `Content-Length` that grows past 5 MiB answers 404, and nothing is cached.
 5. **Headers and caching:**
    - Every response, including `cid` and `img`, has the section 3.1 headers, `Cache-Control: private, no-store` included, and downloads are `application/octet-stream` with `attachment`.
    - An `img` URL whose image is in the fetch cache answers 404 once its token has expired or its MAC is flipped, and the cache is not read for it.

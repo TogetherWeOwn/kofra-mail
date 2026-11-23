@@ -71,5 +71,9 @@ export interface ConformanceHarness {
   drivePick?(): Promise<string>;
   /** Present when `features.drive` is on and Drive can be faulted locally. */
   driveFaults?: DriveFaults;
+  /** The problem `type` prefix this deployment is configured with; `PROBLEM_TYPE_PREFIX` when absent. */
+  problemTypePrefix?: string;
+  /** The account service's current credential epoch for a principal, when the harness can read it. */
+  credentialEpoch?(principal: Principal): Promise<number>;
   close?(): Promise<void>;
 }
