@@ -107,7 +107,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
             advance: async (ms) => json(await harness.advance(ms)),
             sentHeaders: async (messageId) => json(await harness.sentHeaders(messageId)),
             contentOrigin: harness.contentOrigin,
-            ...(harness.credentialEpoch && { credentialEpoch: harness.credentialEpoch }),
+            ...(harness.credentialEpoch && { credentialEpoch: (principal) => harness.credentialEpoch!(principal) }),
             ...(harness.drivePick && { drivePick: async () => json(await harness.drivePick!()) }),
             ...(harness.driveFaults && { driveFaults: harness.driveFaults }),
           };
@@ -754,8 +754,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const newOwner = h.as('newAdmin');
       const admin = h.as('admin');
       await admin.updateMailbox(mailbox.id, { ownerUserId: (await newOwner.getSession()).user.id });
+      const memberFiles = await h.driveFaults.savedFiles();
       const theirs = await newOwner.saveAttachmentToDrive(messageId, part, key('owner-save'));
       assert.notEqual(theirs.driveFileId, ownerSave.driveFileId);
+      assert.equal(await h.driveFaults.savedFiles(), memberFiles, "the new owner's file is in their own Drive");
       await admin.updateMailbox(mailbox.id, { ownerUserId: session.user.id });
       assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('owner-save')), ownerSave);
 

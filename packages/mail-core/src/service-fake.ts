@@ -182,7 +182,7 @@ interface Mailbox {
   userKeys: Map<Id, ReplayScope>;
   training: Map<string, { spam: number; ham: number }>;
   /** Stand-in for the user's Drive: its files, and the operation ids it has deduplicated durably. */
-  driveFiles: Map<Id, { name: string; size: number; type: string }>;
+  driveFiles: Map<Id, { owner: Id; name: string; size: number; type: string }>;
   driveOperations: Map<string, { driveFileId: Id; name: string }>;
   settings: Settings;
 }
@@ -775,7 +775,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           if (saved === undefined) {
             const { name, size, type } = part(box, messageId, number);
             saved = { driveFileId: id(), name };
-            box.driveFiles.set(saved.driveFileId, { name, size, type });
+            box.driveFiles.set(saved.driveFileId, { owner: user.id, name, size, type });
             box.driveOperations.set(operation, saved);
           }
           if (loseNextDriveSaveReply) {
@@ -1089,7 +1089,11 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       driveFaults: {
         async loseNextSaveReply() { loseNextDriveSaveReply = true; },
-        async savedFiles() { return need(ownerBox(local, 'member')).driveFiles.size; },
+        // Files in member's own Drive, wherever they were saved from.
+        async savedFiles() {
+          return workspaces.flatMap((workspace) => [...workspace.boxes.values()])
+            .reduce((count, box) => count + [...box.driveFiles.values()].filter(({ owner }) => owner === 'member').length, 0);
+        },
       },
     }),
   };
