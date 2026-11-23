@@ -1,0 +1,55 @@
+import { MAX_RAW_BYTES, readExact, sha256 } from './bytes.ts';
+import { InvalidEnvelopeRecipientError, type ResolvedRecipient } from './directory.ts';
+import { parseObjectKey } from './object-key.ts';
+import type { NewDelivery } from './outbox.ts';
+
+export type InboundMail = Pick<ForwardableEmailMessage, 'from' | 'to' | 'rawSize' | 'raw' | 'setReject'>;
+export type InboundPorts = {
+  lookup(to: string): Promise<ResolvedRecipient | null>;
+  register(workspaceId: string, digest: string, deliveryId: string): Promise<string>;
+  put(workspaceId: string, rawKey: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
+  insert(row: NewDelivery): Promise<void>;
+  send(deliveryId: string): Promise<void>;
+  newId(now: number): string;
+  now(): number;
+};
+
+export async function receive(message: InboundMail, ports: InboundPorts): Promise<void> {
+  let recipient: ResolvedRecipient | null;
+  try {
+    recipient = await ports.lookup(message.to);
+  } catch (error) {
+    if (!(error instanceof InvalidEnvelopeRecipientError)) throw error;
+    recipient = null;
+  }
+  if (recipient === null) {
+    message.setReject('Unknown recipient');
+    return;
+  }
+  const bytes = await readExact(message.raw, message.rawSize, MAX_RAW_BYTES);
+  const digest = await sha256(bytes);
+  const createdAt = ports.now();
+  const id = ports.newId(createdAt);
+  const { workspaceId, mailboxId } = recipient;
+  const rawKey = await ports.register(workspaceId, digest, id);
+  const key = parseObjectKey(rawKey);
+  if (key?.kind !== 'raw' || key.digest !== digest) throw new Error('Invalid registered raw key');
+  await ports.put(workspaceId, rawKey, bytes);
+  await ports.insert({ id, workspaceId, mailboxId, envelopeFrom: message.from, envelopeTo: message.to,
+    rawKey, authResults: firstCloudflareResult(bytes), createdAt });
+  await ports.send(id);
+}
+
+function firstCloudflareResult(bytes: Uint8Array): string | null {
+  // Headers.get() can combine duplicate fields. Read only the first field in wire order.
+  // An incomplete header block is treated as unauthenticated; never trust a later field.
+  const prefix = new TextDecoder().decode(bytes.subarray(0, 64 * 1024));
+  const boundary = /\r?\n\r?\n/.exec(prefix);
+  if (!boundary) return null;
+  const lines = prefix.slice(0, boundary.index).split(/\r?\n/);
+  const first = lines.findIndex(line => /^authentication-results:/i.test(line));
+  if (first < 0) return null;
+  let value = lines[first].slice('authentication-results:'.length).trim();
+  for (let i = first + 1; i < lines.length && /^[\t ]/.test(lines[i]); i++) value += ` ${lines[i].trim()}`;
+  return /^mx\.cloudflare\.net[\t ]*;/i.test(value) && new TextEncoder().encode(value).length <= 2048 ? value : null;
+}

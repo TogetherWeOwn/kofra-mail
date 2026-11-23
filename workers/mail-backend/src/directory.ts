@@ -31,13 +31,17 @@ const LOOKUP = `
   WHERE original.name = ?1
 `;
 
+export class InvalidEnvelopeRecipientError extends Error {
+  constructor() { super('Invalid envelope recipient'); }
+}
+
 // SQLite lower() folds only ASCII. Every directory writer must store normalizeAddress() output.
 export function normalizeAddress(address: string): string {
   const at = address.lastIndexOf('@');
-  if (at <= 0 || at === address.length - 1) throw new Error('Invalid envelope recipient');
+  if (at <= 0 || at === address.length - 1) throw new InvalidEnvelopeRecipientError();
   const domain = address.slice(at + 1).toLowerCase().normalize('NFC');
   const local = address.slice(0, at).normalize('NFC').toLowerCase().normalize('NFC').split('+', 1)[0];
-  if (!local) throw new Error('Invalid envelope recipient');
+  if (!local) throw new InvalidEnvelopeRecipientError();
   return `${local}@${domain}`;
 }
 
