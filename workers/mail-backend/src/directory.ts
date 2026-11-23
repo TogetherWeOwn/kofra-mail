@@ -1,0 +1,54 @@
+export interface ResolvedRecipient {
+  workspaceId: string;
+  mailboxId: string;
+}
+
+// Preserve the directory's stable ID verbatim (including hyphens). Never normalize
+// it into a different workspace's bucket. S3 bucket names cap at 63 characters.
+export function workspaceMailBucket(workspaceId: string): string {
+  const bucket = `mail-${workspaceId}`;
+  if (!workspaceId || workspaceId.length > 58 || /[^a-z0-9-]/.test(workspaceId) || workspaceId.endsWith('-')
+    || workspaceId.includes('--') || /(?:-s3alias|--(?:ol|x|table)-s3)$/.test(bucket)) {
+    throw new Error('Invalid workspace storage ID');
+  }
+  return bucket;
+}
+
+type DirectoryDatabase = {
+  withSession(constraint: 'first-primary'): Pick<D1DatabaseSession, 'prepare'>;
+};
+
+const LOOKUP = `
+  SELECT destination.id AS domainId, original.workspace_id AS workspaceId, a.target_id AS mailboxId
+  FROM domains AS original
+  LEFT JOIN domains AS destination
+    ON destination.workspace_id = original.workspace_id
+    AND destination.id = coalesce(original.alias_of, original.id)
+    AND destination.kind <> 'alias'
+  LEFT JOIN addresses AS a
+    ON a.address_norm = (?2 || '@' || destination.name)
+    AND a.workspace_id = destination.workspace_id
+  WHERE original.name = ?1
+`;
+
+// SQLite lower() folds only ASCII. Every directory writer must store normalizeAddress() output.
+export function normalizeAddress(address: string): string {
+  const at = address.lastIndexOf('@');
+  if (at <= 0 || at === address.length - 1) throw new Error('Invalid envelope recipient');
+  const domain = address.slice(at + 1).toLowerCase().normalize('NFC');
+  const local = address.slice(0, at).normalize('NFC').toLowerCase().normalize('NFC').split('+', 1)[0];
+  if (!local) throw new Error('Invalid envelope recipient');
+  return `${local}@${domain}`;
+}
+
+export async function lookupRecipient(db: DirectoryDatabase, envelopeTo: string): Promise<ResolvedRecipient | null> {
+  const address = normalizeAddress(envelopeTo);
+  const at = address.lastIndexOf('@');
+  // A stale replica miss must not cause a permanent SMTP bounce.
+  const row = await db.withSession('first-primary').prepare(LOOKUP).bind(address.slice(at + 1), address.slice(0, at))
+    .first<{ domainId: string | null; workspaceId: string; mailboxId: string | null }>();
+  if (!row) return null;
+  if (!row.domainId) throw new Error('Invalid directory alias configuration');
+  if (!row.mailboxId) return null;
+  return { workspaceId: row.workspaceId, mailboxId: row.mailboxId };
+}
