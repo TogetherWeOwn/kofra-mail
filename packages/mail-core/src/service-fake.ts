@@ -156,10 +156,12 @@ interface ReplayScope {
   inProgress: Set<string>;
   /** Keys whose action may have taken effect without a recorded result, pinned to their fingerprint. */
   pinned: Map<string, { fingerprint: string; expires: number }>;
+  /** In-progress markers a crash left behind, with the time they lapse (and turn into pins). */
+  stranded: Map<string, number>;
   /** Re-checks access after replay's await (the mailbox may have changed owner meanwhile). */
   recheck?: () => void;
 }
-const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set(), pinned: new Map() });
+const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set(), pinned: new Map(), stranded: new Map() });
 interface Workspace {
   id: Id;
   boxes: Map<Id, Mailbox>;
@@ -302,6 +304,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const driveFileText = 'Demo Drive file';
   const driveFile = { name: 'demo.txt', type: 'text/plain', size: bytes(driveFileText), digest: createHash('sha256').update(driveFileText).digest('hex') };
   let loseNextDriveSaveReply = false;
+  let crashNextDriveSave = false;
 
   function newMailbox(workspace: Workspace, primaryAddress: string, displayName: string, ownerUserId: Id): AdminMailbox {
     const directory: AdminMailbox = { id: id(), primaryAddress, displayName, ownerUserId, aliases: [] };
@@ -360,6 +363,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       return onReplay ? onReplay(value) : value;
     }
     if (keys.inProgress.has(key)) fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    const lapse = keys.stranded.get(key);
+    if (lapse !== undefined && lapse > now) fail('idempotency_in_progress', { retryAfterSeconds: Math.ceil((lapse - now) / second) });
     // Reserve the key before fingerprinting can start reading an upload stream.
     keys.inProgress.add(key);
     try {
@@ -371,6 +376,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       const value = run(fingerprint);
       keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
       keys.pinned.delete(key);
+      keys.stranded.delete(key);
       return value;
     } finally {
       keys.inProgress.delete(key);
@@ -610,9 +616,10 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     }
     now = end;
     for (const box of boxes) expire(box);
-    for (const { committed, pinned } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
+    for (const { committed, pinned, stranded } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
       for (const [key, entry] of committed) if (entry.expires <= now) committed.delete(key);
       for (const [key, entry] of pinned) if (entry.expires <= now) pinned.delete(key);
+      for (const [key, lapse] of stranded) if (lapse <= now) stranded.delete(key);
     }
     for (const [pick, entry] of picks) if (entry.expires <= now) picks.delete(pick);
   }
@@ -788,6 +795,14 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
             saved = { driveFileId: id(), name };
             box.driveFiles.set(saved.driveFileId, { owner: user.id, name, size, type });
             box.driveOperations.set(operation, saved);
+          }
+          if (crashNextDriveSave) {
+            crashNextDriveSave = false;
+            // Mail crashed after Drive stored the file: only the in-progress marker, with its fingerprint, remains.
+            // It lapses after 5 minutes into the pin, never into nothing.
+            scope.stranded.set(opts.idempotencyKey, now + 5 * 60 * second);
+            scope.pinned.set(opts.idempotencyKey, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second });
+            fail('unavailable', { retryAfterSeconds: 1 });
           }
           if (loseNextDriveSaveReply) {
             loseNextDriveSaveReply = false;
@@ -1103,6 +1118,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       driveFaults: {
         async loseNextSaveReply() { loseNextDriveSaveReply = true; },
+        async crashNextSaveAfterDrive() { crashNextDriveSave = true; },
         // Files in member's own Drive, wherever they were saved from.
         async savedFiles() {
           return workspaces.flatMap((workspace) => [...workspace.boxes.values()])

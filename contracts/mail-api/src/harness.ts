@@ -47,6 +47,12 @@ export interface DriveFaults {
    * with 503 `unavailable`, as if the reply was lost before Mail recorded it.
    */
   loseNextSaveReply(): Promise<void>;
+  /**
+   * The next `saveAttachmentToDrive` commits its file at Drive and then Mail
+   * crashes: no result is stored and only the in-progress marker remains. The
+   * call itself fails with 503 `unavailable`.
+   */
+  crashNextSaveAfterDrive(): Promise<void>;
   /** Files Drive holds for `member`. */
   savedFiles(): Promise<number>;
 }

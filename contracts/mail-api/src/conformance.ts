@@ -773,6 +773,20 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await admin.updateMailbox(mailbox.id, { ownerUserId: session.user.id });
       assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('owner-save')), ownerSave);
 
+      // A crash after Drive stored the file leaves only the marker: it answers in progress, then pins the key.
+      const crashFiles = await h.driveFaults.savedFiles();
+      await h.driveFaults.crashNextSaveAfterDrive();
+      await rejects(mail.saveAttachmentToDrive(messageId, part, key('crash-save')), 'unavailable');
+      assert.equal(await h.driveFaults.savedFiles(), crashFiles + 1);
+      const busy = await rejects(mail.saveAttachmentToDrive(messageId, part, key('crash-save')), 'idempotency_in_progress');
+      assert.ok(Number.isInteger(busy.retryAfterSeconds));
+      await h.advance(5 * 60 * second);
+      const crashOther = delivered.attachments.find((attachment) => attachment.part !== part)!.part;
+      await rejects(mail.saveAttachmentToDrive(messageId, crashOther, key('crash-save')), 'idempotency_key_reused');
+      const recovered = await mail.saveAttachmentToDrive(messageId, part, key('crash-save'));
+      assert.equal(recovered.name, file.name);
+      assert.equal(await h.driveFaults.savedFiles(), crashFiles + 1, 'the retry reconciled; no second file');
+
       const before = await h.driveFaults.savedFiles();
       // The source sits in Trash and expires between the lost reply and the retry.
       const { limits } = session;
@@ -783,9 +797,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(Number.isInteger(lost.retryAfterSeconds));
       assert.equal(await h.driveFaults.savedFiles(), before + 1, 'Drive stored the file before the reply was lost');
       // The key stays bound to that action: another part under it is refused, not a second file.
-      // The second part exists, so only the pin stops this save.
-      assert.ok(delivered.attachments.some((attachment) => attachment.part === part + 1));
-      await rejects(mail.saveAttachmentToDrive(messageId, part + 1, key('save')), 'idempotency_key_reused');
+      // The other part exists, so only the pin stops this save. Part numbers need not be adjacent.
+      const otherPart = delivered.attachments.find((attachment) => attachment.part !== part)?.part;
+      assert.ok(otherPart !== undefined);
+      await rejects(mail.saveAttachmentToDrive(messageId, otherPart, key('save')), 'idempotency_key_reused');
       assert.equal(await h.driveFaults.savedFiles(), before + 1);
       await h.advance(2 * 60 * 60 * second);
       await rejects(mail.getThread(delivered.threadId), 'not_found');
