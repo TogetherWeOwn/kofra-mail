@@ -355,6 +355,10 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q })), [target.threadId], q);
       }
       assert.deepEqual(ids(await mail.listThreads({ view: 'archive', q: 'subject:invoice' })), []);
+      // An invalid size matches nothing; it is not literal text.
+      await h.deliver(message('Size larger: than life'));
+      assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q: 'larger:' })), []);
+      assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q: 'larger:huge' })), []);
       const reply = await h.deliver(message('Re: Invoice', {
         inReplyTo: target.messageId, from: { name: 'Morgan', email: 'morgan@example.com' }, text: 'Ｃonfirmed',
       }));
@@ -753,11 +757,14 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const ownerSave = await mail.saveAttachmentToDrive(messageId, part, key('owner-save'));
       const newOwner = h.as('newAdmin');
       const admin = h.as('admin');
+      // So is a Drive pick: it is the choosing user's grant and does not pass to the next owner.
+      const memberPick = await h.drivePick!();
       await admin.updateMailbox(mailbox.id, { ownerUserId: (await newOwner.getSession()).user.id });
       const memberFiles = await h.driveFaults.savedFiles();
       const theirs = await newOwner.saveAttachmentToDrive(messageId, part, key('owner-save'));
       assert.notEqual(theirs.driveFileId, ownerSave.driveFileId);
       assert.equal(await h.driveFaults.savedFiles(), memberFiles, "the new owner's file is in their own Drive");
+      await rejects(newOwner.importFromDrive({ pickId: memberPick, mode: 'copy' }, key('stale-pick')), 'not_found');
       await admin.updateMailbox(mailbox.id, { ownerUserId: session.user.id });
       assert.deepEqual(await mail.saveAttachmentToDrive(messageId, part, key('owner-save')), ownerSave);
 
@@ -770,6 +777,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const lost = await rejects(mail.saveAttachmentToDrive(messageId, part, key('save')), 'unavailable');
       assert.ok(Number.isInteger(lost.retryAfterSeconds));
       assert.equal(await h.driveFaults.savedFiles(), before + 1, 'Drive stored the file before the reply was lost');
+      // The key stays bound to that action: another part under it is refused, not a second file.
+      await rejects(mail.saveAttachmentToDrive(messageId, part + 1, key('save')), 'idempotency_key_reused');
+      assert.equal(await h.driveFaults.savedFiles(), before + 1);
       await h.advance(2 * 60 * 60 * second);
       await rejects(mail.getThread(delivered.threadId), 'not_found');
       const saved = await mail.saveAttachmentToDrive(messageId, part, key('save'));

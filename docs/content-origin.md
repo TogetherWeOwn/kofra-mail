@@ -41,7 +41,7 @@ The iframe has no `allow-scripts`, no `allow-same-origin`, no `allow-top-navigat
 https://content.<content-domain>/v1/<purpose>/<kid>.<payload>.<mac>
 ```
 
-- **`purpose`** is `body`, `cid`, `att` or `img`.
+- **`purpose`** is `body`, `cid`, `att` or `img`. `lnk` is reserved for revocable file links (M3-13 of the outbound plan): it adds a link-id claim, and the verifier checks the link is live on every request.
 - **`payload`** is base64url (no padding) of compact JSON claims:
 
 | Claim | Meaning | Purposes |

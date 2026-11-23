@@ -154,10 +154,12 @@ interface Replay {
 interface ReplayScope {
   committed: Map<string, Replay>;
   inProgress: Set<string>;
+  /** Keys whose action may have taken effect without a recorded result, pinned to their fingerprint. */
+  pinned: Map<string, { fingerprint: string; expires: number }>;
   /** Re-checks access after replay's await (the mailbox may have changed owner meanwhile). */
   recheck?: () => void;
 }
-const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set() });
+const replayScope = (): ReplayScope => ({ committed: new Map(), inProgress: new Set(), pinned: new Map() });
 interface Workspace {
   id: Id;
   boxes: Map<Id, Mailbox>;
@@ -236,7 +238,7 @@ function dateBoundary(date: string, zone?: Intl.DateTimeFormat): number {
 }
 
 function search(query: string, labels: Map<Id, Label>, zone?: Intl.DateTimeFormat): (row: StoredMessage) => boolean {
-  const tokens = normalized(query).matchAll(/(before|after):(?=\s|$)|(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g);
+  const tokens = normalized(query).matchAll(/(before|after|larger):(?=\s|$)|(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g);
   const terms = Array.from(tokens, ([, emptyDate, operator, phrase, word]) => {
     const op = emptyDate ?? operator ?? '';
     const term = phrase ?? word ?? '';
@@ -296,7 +298,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   const workspaceFor = (principal: Principal) => principal === 'foreignAdmin' ? foreign : local;
   const userIdFor = (principal: Principal) => principal === 'staleAdmin' ? 'admin' : principal;
   const cursors = new Map<string, Cursor>();
-  const picks = new Map<string, { mailboxId: Id; expires: number }>();
+  const picks = new Map<string, { mailboxId: Id; userId: Id; expires: number }>();
   const driveFileText = 'Demo Drive file';
   const driveFile = { name: 'demo.txt', type: 'text/plain', size: bytes(driveFileText), digest: createHash('sha256').update(driveFileText).digest('hex') };
   let loseNextDriveSaveReply = false;
@@ -362,10 +364,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     keys.inProgress.add(key);
     try {
       const fingerprint = await getFingerprint();
+      const pin = keys.pinned.get(key);
+      if (pin && pin.fingerprint !== fingerprint) fail('idempotency_key_reused');
       // Mutate and record the success synchronously; no caller sees one without the other.
       keys.recheck?.();
       const value = run(fingerprint);
       keys.committed.set(key, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second, value: copy(value) });
+      keys.pinned.delete(key);
       return value;
     } finally {
       keys.inProgress.delete(key);
@@ -601,8 +606,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     }
     now = end;
     for (const box of boxes) expire(box);
-    for (const { committed } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
+    for (const { committed, pinned } of [...workspaces.map((workspace) => workspace.keys), ...boxes.flatMap((box) => [box.keys, ...box.userKeys.values()])]) {
       for (const [key, entry] of committed) if (entry.expires <= now) committed.delete(key);
+      for (const [key, entry] of pinned) if (entry.expires <= now) pinned.delete(key);
     }
     for (const [pick, entry] of picks) if (entry.expires <= now) picks.delete(pick);
   }
@@ -767,7 +773,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async saveAttachmentToDrive(messageId, number, opts) {
         const box = mailbox();
         if (!drive) fail('feature_unavailable');
-        return replay(ownedByUser(box), opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
+        const scope = ownedByUser(box);
+        return replay(scope, opts, 'saveAttachmentToDrive', [messageId, number], null, (fingerprint) => {
           // A stable operation id that Drive deduplicates durably. A retry asks Drive first, so a lost reply
           // returns the stored file even if the source message expired in between.
           const operation = createHash('sha256').update(`${user.id}\n${box.directory.id}\n${opts.idempotencyKey}\n${fingerprint}`).digest('hex');
@@ -780,6 +787,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           }
           if (loseNextDriveSaveReply) {
             loseNextDriveSaveReply = false;
+            // Drive may have the file: the key stays bound to this action until it is retried or expires.
+            scope.pinned.set(opts.idempotencyKey, { fingerprint, expires: now + limits.idempotencyRetentionSeconds * second });
             fail('unavailable', { retryAfterSeconds: 1 });
           }
           return { ...saved };
@@ -958,7 +967,8 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         return replay(owned(box), opts, 'importFromDrive', [], input, () => {
           fields(input, ['pickId', 'mode']);
           const pick = need(picks.get(input.pickId));
-          if (pick.mailboxId !== box.directory.id) fail('not_found');
+          // A pick is the choosing user's grant for this mailbox; it does not pass to a later owner.
+          if (pick.mailboxId !== box.directory.id || pick.userId !== user.id) fail('not_found');
           if (input.mode === 'link') return { attachments: [{ kind: 'link', url: 'https://example.com/drive/demo', name: driveFile.name }] };
           if (input.mode !== 'copy') invalid('/mode');
           return { attachments: [uploadRef(storeUpload(box, driveFile.name, driveFile.type, driveFile.size, driveFile.digest))] };
@@ -1084,7 +1094,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async drivePick() {
         const box = need(ownerBox(local, 'member'));
         const token = randomUUID();
-        picks.set(token, { mailboxId: box.directory.id, expires: now + 5 * 60 * second });
+        picks.set(token, { mailboxId: box.directory.id, userId: box.directory.ownerUserId, expires: now + 5 * 60 * second });
         return token;
       },
       driveFaults: {
