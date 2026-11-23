@@ -36,8 +36,14 @@ export const MESSAGE_ID_MAX = 998 - 'In-Reply-To: '.length;
  * plain token, so a name can never add a header or a parameter.
  */
 export function indexedAttachmentName(name: string): string {
-  let clean = name.replace(/[\p{Cc}/\\]/gu, '');
-  while (utf8Bytes(clean) > 255) clean = [...clean].slice(0, -1).join('');
+  let clean = '';
+  let size = 0;
+  // One pass, whole code points only.
+  for (const character of name.replace(/[\p{Cc}/\\]/gu, '')) {
+    size += utf8Bytes(character);
+    if (size > 255) break;
+    clean += character;
+  }
   return clean || 'attachment';
 }
 

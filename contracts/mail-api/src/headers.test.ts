@@ -57,4 +57,8 @@ test('third-party attachment names lose controls and path separators', () => {
   assert.equal(indexedAttachmentName('a\r\nb/c\\d.txt'), 'abcd.txt');
   assert.equal(indexedAttachmentName('\u0000'), 'attachment');
   assert.ok(Buffer.byteLength(indexedAttachmentName('é'.repeat(300))) <= 255);
+  assert.equal(indexedAttachmentName('é'.repeat(300)), 'é'.repeat(127));
+  const started = performance.now();
+  assert.equal(Buffer.byteLength(indexedAttachmentName('x'.repeat(1 << 20))), 255);
+  assert.ok(performance.now() - started < 1000, 'trimming is linear');
 });
