@@ -459,7 +459,8 @@ test('a client call replaces a lost alarm for a restoring mailbox', workerdTest,
   await box.dropAlarm();
   assert.equal(await box.alarmAt(), null);
   await box.expectIgnoredAlarm();
-  await box.setLabel(...scope, 'lost-alarm', 'Lost alarm').catch(() => {});
+  assert.equal(await box.setLabelError(...scope, 'lost-alarm', 'Lost alarm'), 'Mailbox not ready; retry');
+  assert.deepEqual(JSON.parse(await box.labels()), [], 'the rejected edit must not write a label');
   assert.equal((await lifecycle()).state, 'restoring');
   await Promise.race([box.waitForIgnoredAlarm(), new Promise((_, reject) =>
     setTimeout(() => reject(new Error('no alarm replaced the lost one')), 2_000))]);

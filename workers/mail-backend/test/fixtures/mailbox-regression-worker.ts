@@ -149,6 +149,17 @@ export class RegressionMailbox extends Mailbox {
     }
   }
 
+  // Return the error as data: Miniflare's direct DO stub does not preserve the thrown error.
+  async setLabelError(...args: Parameters<Mailbox['setLabel']>): Promise<string | null> {
+    try {
+      await this.setLabel(...args);
+      return null;
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      return error.message;
+    }
+  }
+
   async lifecycle() { return JSON.stringify(storedLifecycle<Lifecycle>(this.ctx.storage)); }
 
   async labels() {
