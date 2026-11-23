@@ -21,6 +21,7 @@ before(async () => {
   db = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
   const migration = await readFile(new URL('../migrations/0002_outbox.sql', import.meta.url), 'utf8');
   await db.batch(migration.split(';').filter(s => s.trim()).map(s => db.prepare(s)));
+  await db.prepare(await readFile(new URL('../migrations/0004_mailbox_replay.sql', import.meta.url), 'utf8')).run();
 });
 after(() => mf.dispose());
 
@@ -53,7 +54,7 @@ function fixture(input = bytes, rawSize = input.byteLength) {
 test('outbox accepts a lowercase workspace ID and rejects IDs that cannot name a mail bucket', async () => {
   const outbox = new Outbox(db);
   const row = {
-    id: '01KBN8ZJ7G0000000000000003', workspaceId: '01arz3ndektsv4rrffq69g5fav',
+    id: '01KBN8ZJ7G0000000000000005', workspaceId: '01arz3ndektsv4rrffq69g5fav',
     mailboxId: 'box', envelopeFrom: 'sender@example.test', envelopeTo: 'box@example.test',
     rawKey, authResults: null, createdAt: 100,
   };
@@ -167,7 +168,7 @@ test('queue failure leaves pending, then an acknowledgement marks done before re
   let released = 0;
   const ports = {
     outbox: box,
-    index: async (_workspaceId: string, _mailboxId: string, received: string) => { indexed++; assert.equal(received, id); },
+    index: async (_workspaceId: string, _mailboxId: string, received: string) => { indexed++; assert.equal(received, id); return 'indexed' as const; },
     release: async () => {
       assert.equal((await box.get(id))?.state, 'done');
       if (++released === 1) throw new Error('sweeper unavailable');
@@ -181,6 +182,22 @@ test('queue failure leaves pending, then an acknowledgement marks done before re
   await deliver(id, ports);
   assert.equal(indexed, 1);
   assert.equal(released, 2);
+});
+
+test('the indexed mailbox cursor replays a later acknowledgement at the same wall-clock timestamp', async () => {
+  const outbox = new Outbox(db);
+  const first = '01KBN8ZJ7G0000000000000002';
+  const later = '01KBN8ZJ7G0000000000000003';
+  for (const deliveryId of [first, later]) await outbox.insert({ id: deliveryId, workspaceId: 'workspace', mailboxId: 'cursor',
+    envelopeFrom: 'sender@example.test', envelopeTo: 'cursor@example.test', rawKey, authResults: null, createdAt: 100 });
+  assert.ok(await outbox.complete(first, 200));
+  const before = await outbox.deliveryCursor('workspace', 'cursor');
+  assert.equal(before, 200);
+  assert.ok(await outbox.complete(later, 200));
+  assert.deepEqual(await outbox.replayPage('workspace', 'cursor', before), [
+    { id: later, rawKey, createdAt: 100, doneAt: before + 1, authResults: null },
+  ]);
+  assert.deepEqual(await outbox.replayPage('other', 'cursor', before), []);
 });
 
 test('DLQ retries until its redacted service-binding POST receives a 2xx', async () => {

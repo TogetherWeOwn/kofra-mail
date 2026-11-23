@@ -1,0 +1,375 @@
+import { DurableObject } from 'cloudflare:workers';
+import { mailAlert, type MailboxAlertCode } from './alerts.ts';
+import { kofra } from './kofra.ts';
+import { MailboxIndex, PermanentMailError, storedLifecycle } from './mailbox-index.ts';
+import {
+  BackupConflict, FLAGS_FLUSH_MS, MailboxRecovery, PUBLISH_BUDGET_MS, readyLife, restoringLife, SETTINGS_FLUSH_MS, SNAPSHOT_INTERVAL_MS,
+  type CleanupCursor, type Lifecycle, type ReadyLife, type RestoringLife, type Scope,
+} from './mailbox-recovery.ts';
+import { MailboxWork } from './mailbox-work.ts';
+import { isDeliveryId, Outbox } from './outbox.ts';
+import { enabled, mailboxName, type Env } from './worker.ts';
+
+// `deferred`: the mailbox is not ready (first initialization or restore) and the
+// delivery must be retried later without spending a processing attempt.
+// `rejected`: the stored message can never be indexed.
+export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
+
+const RESTORE_SLICE_MS = 10_000;
+const REINDEX_BATCH = 16;
+const HELD_RECHECK_MS = 15 * 60_000;
+const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
+const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
+const RESTORE_RESTART_ALERT = 3;
+const backoff = (failures: number) => Math.min(MAX_FAILURE_BACKOFF_MS, 5_000 * 2 ** Math.min(Math.max(failures, 1) - 1, 16));
+
+export class Mailbox extends DurableObject<Env> {
+  private readonly work = new MailboxWork();
+  private readonly backups = new MailboxWork();
+  // Set when a call asked for an immediate wake-up; consumed by the alarm run.
+  private wakeRequested = false;
+
+  private verifyScope(scope: Scope): void {
+    const expected = this.env.MAILBOX.idFromName(mailboxName(scope.workspaceId, scope.mailboxId));
+    if (!this.ctx.id.equals(expected)) throw new Error('Delivery mailbox scope mismatch');
+  }
+
+  private index(workspaceId: string): MailboxIndex {
+    const refs = this.env.SWEEPER.getByName(workspaceId);
+    return new MailboxIndex(this.ctx.storage, {
+      ...kofra(this.env, workspaceId),
+      register: (kind, digest, holder) => refs.register(kind, digest, holder),
+      hold: (key, holder) => refs.hold(key, holder), release: (key, holder) => refs.release(key, holder),
+    }, this.ctx.id.toString());
+  }
+
+  private recovery(index: MailboxIndex): MailboxRecovery {
+    if (!this.env.MAIL_STATE) throw new Error('Mailbox journal binding missing');
+    return new MailboxRecovery(index, this.env.MAIL_STATE, this.ctx.id.toString());
+  }
+
+  private async armSoon(): Promise<void> {
+    // An alarm run in progress re-reads this before arming its next wake-up.
+    this.wakeRequested = true;
+    const at = await this.ctx.storage.getAlarm();
+    const now = Date.now();
+    if (at === null || at > now + 1000) await this.ctx.storage.setAlarm(now);
+  }
+
+  // Call in the work lane. A mailbox is ready only after a durable backup
+  // baseline exists for its incarnation, so no delivery is acknowledged into a
+  // state that a later restore could not reproduce.
+  private async ready(index: MailboxIndex, scope: Scope): Promise<boolean> {
+    let life = index.lifecycle<Lifecycle>();
+    if (life?.state === 'ready') return true;
+    if (life && life.state !== 'init') {
+      // The alarm lane keeps its own wake-up (and restart or failure backoff)
+      // for restoring and missing mailboxes; only replace a lost alarm, so
+      // client and delivery traffic cannot cancel that backoff.
+      if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
+      return false;
+    }
+    if (!life) {
+      life = { state: 'init', scope, incarnation: crypto.randomUUID() };
+      index.setLifecycle(life);
+    }
+    const recovery = this.recovery(index);
+    const now = Date.now();
+    let current = await recovery.read();
+    if (!current) {
+      // An absent manifest is a new mailbox only if no delivery was ever completed for it.
+      const history = await new Outbox(this.env.DIRECTORY).deliveryCursor(scope.workspaceId, scope.mailboxId);
+      if (history > 0) {
+        index.setLifecycle({ state: 'missing', scope: life.scope, incarnation: life.incarnation, since: now, failures: 0 });
+        await this.armSoon();
+        return false;
+      }
+      const etag = await recovery.create(life.incarnation);
+      if (etag) {
+        index.setLifecycle(readyLife(life.scope, life.incarnation, etag, 1, now));
+        return true;
+      }
+      current = await recovery.read();
+      if (!current) throw new Error('Mailbox backup manifest unavailable');
+    }
+    const { manifest } = current;
+    if (manifest.incarnation === life.incarnation && manifest.rev === 1 && manifest.last_seq === 0 && index.journal.revision() === 0) {
+      // Our own baseline; its reply was lost.
+      index.setLifecycle(readyLife(life.scope, life.incarnation, current.etag, 1, now));
+      return true;
+    }
+    // Backups exist but this object's state is gone: restore, never overwrite them.
+    index.setLifecycle(restoringLife(life.scope, life.incarnation, now));
+    await this.armSoon();
+    return false;
+  }
+
+  // Arms before committing. Further edits coalesce with the earliest deadline;
+  // a stream of edits must not push the first one past its recovery point.
+  private async armFor(delay: number): Promise<void> {
+    const existing = await this.ctx.storage.getAlarm();
+    const due = Date.now() + delay - PUBLISH_BUDGET_MS;
+    if (existing === null || due < existing) await this.ctx.storage.setAlarm(due);
+  }
+
+  async deliver(id: string): Promise<MailboxDeliveryResult> {
+    if (!isDeliveryId(id)) throw new Error('Invalid mailbox delivery id');
+    return this.work.run(async () => {
+      if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+      if (!this.env.MAIL_STATE) throw new Error('Mailbox journal binding missing');
+      const row = await new Outbox(this.env.DIRECTORY).get(id);
+      if (!row || row.state !== 'pending') return 'indexed';
+      const scope = { workspaceId: row.workspaceId, mailboxId: row.mailboxIds[0] };
+      this.verifyScope(scope);
+      const index = this.index(row.workspaceId);
+      if (!await this.ready(index, scope)) return 'deferred';
+      await this.armFor(FLAGS_FLUSH_MS);
+      try {
+        await index.ingest(row.id, row.rawKey, row.createdAt, row.authResults);
+      } catch (error) {
+        if (error instanceof PermanentMailError) return 'rejected';
+        throw error;
+      }
+      return 'indexed';
+    });
+  }
+
+  private async mutate<T>(workspaceId: string, mailboxId: string, delay: number, operation: (index: MailboxIndex) => T): Promise<T> {
+    const scope = { workspaceId, mailboxId };
+    this.verifyScope(scope);
+    return this.work.run(async () => {
+      if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+      if (!this.env.MAIL_STATE) throw new Error('Mailbox journal binding missing');
+      const index = this.index(workspaceId);
+      if (!await this.ready(index, scope)) throw new Error('Mailbox not ready; retry');
+      await this.armFor(delay);
+      return operation(index);
+    });
+  }
+
+  async setLabel(workspaceId: string, mailboxId: string, id: string, name: string) {
+    return this.mutate(workspaceId, mailboxId, SETTINGS_FLUSH_MS, index => index.setLabel(id, name));
+  }
+
+  async saveDraft(workspaceId: string, mailboxId: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
+    return this.mutate(workspaceId, mailboxId, SETTINGS_FLUSH_MS, index => index.saveDraft(id, bytes));
+  }
+
+  async setSetting(workspaceId: string, mailboxId: string, kind: 'filter' | 'send-as', id: string, definition: string) {
+    return this.mutate(workspaceId, mailboxId, SETTINGS_FLUSH_MS, index => index.setSetting(kind, id, definition));
+  }
+
+  async setFlags(workspaceId: string, mailboxId: string, id: string, flags: number, labels: string[]) {
+    return this.mutate(workspaceId, mailboxId, FLAGS_FLUSH_MS, index => index.setFlags(id, flags, labels));
+  }
+
+  // Starts or resumes a restore; the alarm runs it in bounded slices. `bootstrap`
+  // is the explicit operator decision to restart a mailbox whose backups are gone
+  // from the completed deliveries that are still retained.
+  async restoreFromBackup(workspaceId: string, mailboxId: string, bootstrap = false): Promise<Lifecycle['state']> {
+    if (!enabled(this.env) || this.env.MAIL_RECOVERY_ENABLED !== 'on') throw new Error('Mailbox restore is disabled');
+    const scope = { workspaceId, mailboxId };
+    this.verifyScope(scope);
+    return this.work.run(async () => {
+      const index = this.index(workspaceId);
+      let life = index.lifecycle<Lifecycle>();
+      if (!life || life.state === 'init') {
+        if (await this.ready(index, scope)) return 'ready';
+        life = index.lifecycle<Lifecycle>()!;
+      }
+      if (life.state === 'ready') throw new Error('Mailbox restore requires an empty target');
+      if (life.state === 'missing') {
+        if (!bootstrap) return 'missing';
+        index.setLifecycle(restoringLife(life.scope, life.incarnation, Date.now(), true));
+      } else if (life.state === 'restoring' && bootstrap && !life.bootstrap) {
+        // Recorded in any phase: it takes effect only if the manifest this restore
+        // depends on is confirmed missing.
+        index.setLifecycle({ ...life, bootstrap: true });
+      }
+      await this.armSoon();
+      return 'restoring';
+    });
+  }
+
+  async alarm(): Promise<void> {
+    if (!enabled(this.env)) {
+      // A returning handler clears the alarm; keep a wake-up for when the backend
+      // is enabled again, without publishing or restoring while it is off.
+      if (storedLifecycle<Lifecycle>(this.ctx.storage)) await this.ctx.storage.setAlarm(Date.now() + HELD_RECHECK_MS);
+      return;
+    }
+    await this.backups.run(async () => {
+      // Requests made before this run are being served by it.
+      this.wakeRequested = false;
+      const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+      if (!life || life.state === 'init') {
+        try { await this.checkBackupAlerts(null); }
+        catch { await this.work.run(() => this.ctx.storage.setAlarm(Date.now() + HELD_RECHECK_MS)); }
+        return;
+      }
+      this.verifyScope(life.scope);
+      const index = this.index(life.scope.workspaceId);
+      const now = Date.now();
+      // Cloudflare retries a thrown alarm only a few times; keep a durable wake-up.
+      await this.work.run(() => this.ctx.storage.setAlarm(now + SETTINGS_FLUSH_MS));
+      let next: number;
+      let failed = false;
+      try {
+        if (life.state === 'restoring') next = await this.restoreSlice(index, life);
+        else if (life.state === 'ready') next = await this.backupSlice(index, life, now);
+        else next = now + HELD_RECHECK_MS;
+      } catch {
+        failed = true;
+        next = now + this.failed(index);
+      }
+      try { next = Math.min(next, await this.checkBackupAlerts(index)); }
+      catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); }
+      await this.work.run(async () => {
+        // A change committed during this run must not wait for the next deadline.
+        const current = index.lifecycle<Lifecycle>();
+        // A failed run retries unpublished changes within the settings recovery point, not the backoff.
+        const pending = current?.state === 'ready' && index.journal.flushed() < index.journal.revision();
+        const soon = Date.now() + (failed ? SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS : 1000);
+        const requested = this.wakeRequested ? Date.now() : Infinity;
+        this.wakeRequested = false;
+        await this.ctx.storage.setAlarm(Math.min(pending ? Math.min(next, soon) : next, requested));
+      });
+    });
+  }
+
+  private async checkBackupAlerts(index: MailboxIndex | null): Promise<number> {
+    const now = Date.now();
+    const life = index?.lifecycle<Lifecycle>();
+    const stale = index && life?.state === 'ready' && (now - life.lastSnapshotAt > 2 * SNAPSHOT_INTERVAL_MS ||
+      (index.journal.flushed() < index.journal.revision() && now - life.lastPublishedAt > 2 * FLAGS_FLUSH_MS));
+    const blocked = life?.state === 'missing' || (life?.state === 'restoring' &&
+      (this.env.MAIL_RECOVERY_ENABLED !== 'on' || life.failures >= 5 || (life.restarts ?? 0) >= RESTORE_RESTART_ALERT));
+    const sql = this.ctx.storage.sql;
+    sql.exec('CREATE TABLE IF NOT EXISTS mailbox_alerts (code TEXT PRIMARY KEY, since INTEGER NOT NULL, sent_at INTEGER)');
+    const conflict = life?.state === 'ready' && !!life.conflict;
+    const conditions: Array<[MailboxAlertCode, boolean]> = [
+      ['backup_stale', !!stale], ['restore_blocked', blocked], ['backup_conflict', conflict]];
+    let next = Infinity;
+    for (const [code, active] of conditions) {
+      if (!active) {
+        sql.exec('DELETE FROM mailbox_alerts WHERE code = ?', code);
+        continue;
+      }
+      sql.exec('INSERT OR IGNORE INTO mailbox_alerts (code, since) VALUES (?, ?)', code, now);
+      const { sent_at } = sql.exec<{ sent_at: number | null }>('SELECT sent_at FROM mailbox_alerts WHERE code = ?', code).one();
+      if (sent_at !== null && now < sent_at + ALERT_COOLDOWN_MS) {
+        next = Math.min(next, sent_at + ALERT_COOLDOWN_MS);
+        continue;
+      }
+      try { await mailAlert(this.env.ALERTS)({ code, key: this.ctx.id.toString() }); }
+      catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); continue; }
+      const sentAt = Date.now();
+      sql.exec('UPDATE mailbox_alerts SET sent_at = ? WHERE code = ?', sentAt, code);
+      next = Math.min(next, sentAt + ALERT_COOLDOWN_MS);
+    }
+    return next;
+  }
+
+  private failed(index: MailboxIndex): number {
+    return index.transaction(() => {
+      const life = index.lifecycle<Lifecycle>();
+      if (!life || life.state === 'init') return MAX_FAILURE_BACKOFF_MS;
+      const failures = life.failures + 1;
+      index.setLifecycle({ ...life, failures });
+      return backoff(failures);
+    });
+  }
+
+  private async restoreSlice(index: MailboxIndex, start: RestoringLife): Promise<number> {
+    if (this.env.MAIL_RECOVERY_ENABLED !== 'on') return Date.now() + HELD_RECHECK_MS;
+    const recovery = this.recovery(index);
+    const outbox = new Outbox(this.env.DIRECTORY);
+    const { workspaceId, mailboxId } = start.scope;
+    const refs = this.env.SWEEPER.getByName(workspaceId);
+    const deadline = Date.now() + RESTORE_SLICE_MS;
+    let life: Lifecycle = start;
+    // Each step performs I/O, so the clock advances between steps.
+    while (life.state === 'restoring' && Date.now() < deadline) {
+      const restarts = life.restarts ?? 0;
+      life = await recovery.restoreStep(life, {
+        now: Date.now,
+        fence: async () => null,
+        replayPage: after => outbox.replayPage(workspaceId, mailboxId, after),
+        release: (key, holder) => refs.release(key, holder),
+      });
+      // A restart means the manifest vanished under this restore. Each restart
+      // counts against restore_blocked and backs off, so a manifest that keeps
+      // disappearing cannot spin fence and baseline writes in a silent loop.
+      if (life.state === 'restoring' && (life.restarts ?? 0) > restarts) return Date.now() + backoff(life.restarts ?? 1);
+    }
+    return Date.now() + (life.state === 'restoring' ? 0 : 1000);
+  }
+
+  private async backupSlice(index: MailboxIndex, life: ReadyLife, now: number): Promise<number> {
+    const outbox = new Outbox(this.env.DIRECTORY);
+    const { workspaceId, mailboxId } = life.scope;
+    const recovery = this.recovery(index);
+    let published: Awaited<ReturnType<MailboxRecovery['publish']>>;
+    try {
+      published = await recovery.publish(life, now, () => this.work.run(async () => {
+        // Every done row at or below the cursor is present in the capture.
+        const deliveryCursor = await outbox.deliveryCursor(workspaceId, mailboxId);
+        return { deliveryCursor, seq: index.captureSnapshot() };
+      }));
+    } catch (error) {
+      // Never write over a manifest this state cannot have produced; raise an alert.
+      if (error instanceof BackupConflict) {
+        const stored = index.lifecycle<Lifecycle>();
+        if (stored?.state === 'ready') index.setLifecycle({ ...stored, conflict: error.message });
+      }
+      throw error;
+    }
+    let current = published.life;
+    let cleanupPending = false;
+    let cleanupRetry = false;
+    try {
+      let prior = await this.ctx.storage.get<CleanupCursor>('backupCleanup');
+      // Artifacts are superseded only by a snapshot switch (or a recreated
+      // manifest), so scan after one and while a scan is unfinished, not every run.
+      const switched = current.upload === null && (life.upload !== null || current.lastSnapshotAt !== life.lastSnapshotAt);
+      if (switched && !prior) {
+        // Record the obligation first, so a failed first scan is retried on the next run.
+        prior = { incarnation: current.incarnation, snapshot: null, snapshots: '', deltas: '' };
+        await this.ctx.storage.put('backupCleanup', prior);
+      }
+      const next = prior ? await recovery.cleanup(current, prior) : null;
+      if (next) {
+        await this.ctx.storage.put('backupCleanup', next);
+        cleanupPending = true;
+      } else if (prior) await this.ctx.storage.delete('backupCleanup');
+    } catch {
+      // Publication already succeeded; retry the scan soon rather than at the next switch.
+      cleanupRetry = true;
+    }
+    // Search and message text of restored messages are rebuilt in the background.
+    // The cursor keeps one message that cannot be fetched yet from starving the rest.
+    // Reindex failures back off on their own clock and never delay publication.
+    const reindexDue = (current.reindexRetryAt ?? 0) <= Date.now();
+    const pending = reindexDue ? index.unindexed(current.reindexAfter, REINDEX_BATCH) : [];
+    let reindexError: unknown = null;
+    for (const message of pending) {
+      try { await index.reindex(message.id, message.rawKey); } catch (error) { reindexError ??= error; }
+    }
+    const reindexFailures = reindexError ? (current.reindexFailures ?? 0) + 1 : reindexDue ? 0 : current.reindexFailures ?? 0;
+    const reindexRetryAt = reindexError ? Date.now() + backoff(reindexFailures) : reindexDue ? 0 : current.reindexRetryAt ?? 0;
+    const reindexAfter = !reindexDue ? current.reindexAfter : pending.length === REINDEX_BATCH ? pending[pending.length - 1].id : '';
+    const failures = published.snapshotError ? current.failures : 0;
+    if (reindexAfter !== current.reindexAfter || failures !== current.failures ||
+        reindexFailures !== (current.reindexFailures ?? 0) || reindexRetryAt !== (current.reindexRetryAt ?? 0)) {
+      current = { ...current, reindexAfter, failures, reindexFailures, reindexRetryAt };
+      index.setLifecycle(current);
+    }
+    const soon = Date.now() + 1000;
+    const reindexAt = reindexRetryAt ? Math.max(reindexRetryAt, soon) : Infinity;
+    // Deltas were still published; retry only the snapshot, with backoff.
+    if (published.snapshotError) return Math.min(Date.now() + backoff(current.failures), reindexAt);
+    const next = Math.min(Math.max(current.nextSnapshotAt, soon), reindexAt, cleanupRetry ? Date.now() + 60_000 : Infinity);
+    const more = published.more || cleanupPending || (reindexDue && !reindexError && pending.length > 0);
+    return more ? soon : next;
+  }
+}

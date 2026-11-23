@@ -12,19 +12,25 @@ export type ObjectReferences = {
   hold(key: string, holder: string): Promise<void>;
   release(key: string, holder: string): Promise<void>;
 };
-export type MailboxDelivery = { deliver(id: string): Promise<void> };
+export type MailboxDelivery = { deliver(id: string): Promise<'indexed' | 'deferred' | 'rejected'> };
 type Namespace<T> = { getByName(name: string): T };
 
 export type Env = KofraConfig & {
   MAIL_BACKEND_ENABLED?: string;
+  MAIL_RECOVERY_ENABLED?: string;
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;
   DEAD_LETTER_QUEUE_NAME: string;
   ALERTS?: AlertBinding;
   SWEEPER: Namespace<ObjectReferences>;
-  MAILBOX: Namespace<MailboxDelivery>;
+  MAILBOX: Namespace<MailboxDelivery> & { idFromName(name: string): DurableObjectId };
+  MAIL_STATE: R2Bucket;
 };
+
+export function mailboxName(workspaceId: string, mailboxId: string): string {
+  return JSON.stringify([workspaceId, mailboxId]);
+}
 
 export function enabled(env: { MAIL_BACKEND_ENABLED?: string }): boolean {
   return env.MAIL_BACKEND_ENABLED === 'on';
@@ -32,8 +38,8 @@ export function enabled(env: { MAIL_BACKEND_ENABLED?: string }): boolean {
 
 export async function handleEmail(message: InboundMail, env: Partial<Env>): Promise<void> {
   if (!enabled(env)) throw new Error('Mail backend is disabled');
-  const { DIRECTORY, DELIVER, SWEEPER } = env;
-  if (!DIRECTORY || !DELIVER || !SWEEPER) throw new Error('Mail ingress bindings missing');
+  const { DIRECTORY, DELIVER, SWEEPER, MAILBOX, MAIL_STATE } = env;
+  if (!DIRECTORY || !DELIVER || !SWEEPER || !MAILBOX || !MAIL_STATE) throw new Error('Mail ingress bindings missing');
   const outbox = new Outbox(DIRECTORY);
   await receive(message, {
     lookup: to => lookupRecipient(DIRECTORY, to),
@@ -59,7 +65,7 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
       } else {
         await deliver(message.body, {
           outbox,
-          index: (workspaceId, mailboxId, id) => env.MAILBOX.getByName(JSON.stringify([workspaceId, mailboxId])).deliver(id),
+          index: (workspaceId, mailboxId, id) => env.MAILBOX.getByName(mailboxName(workspaceId, mailboxId)).deliver(id),
           release: (workspaceId, key, id) => env.SWEEPER.getByName(workspaceId).release(key, `delivery:${id}`),
           now: Date.now,
         });
