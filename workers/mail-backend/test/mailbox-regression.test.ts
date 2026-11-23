@@ -412,23 +412,36 @@ test('a manifest that keeps vanishing under an approved bootstrap backs off and 
   assert.deepEqual(JSON.parse(JSON.stringify(await box.deliveredIds())), [id]);
 });
 
-test('a bootstrap approved before a deltas-phase manifest loss restarts and completes', workerdTest, async t => {
-  const { box, db, journal, manifestKey, lifecycle } = await setup(t, readRetainedMessage);
+test('an approved bootstrap clears a committed delta after deltas-phase manifest loss', workerdTest, async t => {
+  const { box, db, journal, manifestKey, lifecycle, pending } = await setup(t, readRetainedMessage);
   await box.prepare();
+  await box.setLabel(...scope, 'partial', 'Partial');
+  await box.run();
   await retainDelivery(db);
   await box.wipe();
   assert.equal(await box.restoreFromBackup(...scope, true), 'restoring');
-  // Skip takeover's two reads and the snapshot read; delete at the deltas read.
-  await box.pauseNextIo('manifest GET', 3);
+  // Skip takeover's two reads, the snapshot read, and the first delta read.
+  await box.pauseNextIo('manifest GET', 4);
   await whilePaused(box.run(), box.waitForIo(), () => box.resumeIo(), async key => {
     assert.equal(key, manifestKey);
     const life = await lifecycle();
-    assert.ok(life.state === 'restoring' && life.phase === 'deltas');
+    assert.ok(life.state === 'restoring' && life.phase === 'deltas' && life.delta === 1);
+    assert.deepEqual(JSON.parse(await box.labels()), [{ id: 'partial', name: 'Partial' }]);
+    assert.equal((await pending()).modseq, 1);
     await journal.delete(manifestKey);
   });
-  for (let i = 0; i < 4 && (await lifecycle()).state !== 'ready'; i++) await box.run();
+  await box.pauseNextIo('manifest GET');
+  await whilePaused(box.run(), box.waitForIo(), () => box.resumeIo(), async key => {
+    assert.equal(key, manifestKey);
+    const life = await lifecycle();
+    assert.ok(life.state === 'restoring' && life.phase === 'takeover' && life.restarts === 1);
+    assert.deepEqual(JSON.parse(await box.labels()), [], 'partial restore rows must be cleared');
+    assert.deepEqual(await pending(), { modseq: 0, flushed: 0 }, 'the cursor must reset before retained deliveries are replayed');
+  });
+  for (let i = 0; i < 3 && (await lifecycle()).state !== 'ready'; i++) await box.run();
   assert.equal((await lifecycle()).state, 'ready');
   assert.ok(await journal.head(manifestKey), 'the bootstrap recreated the manifest');
+  assert.deepEqual(JSON.parse(await box.labels()), []);
   assert.deepEqual(JSON.parse(JSON.stringify(await box.deliveredIds())), [id]);
 });
 
