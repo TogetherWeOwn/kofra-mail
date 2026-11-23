@@ -87,6 +87,6 @@ export class AlarmPlumbing extends Mailbox {
 }
 
 export class UnusedSweeper extends DurableObject {}
-export { FixtureMailbox } from './mailbox-worker.ts';
+export { FixtureMailbox, FixtureSweeper } from './mailbox-worker.ts';
 
 export default {};

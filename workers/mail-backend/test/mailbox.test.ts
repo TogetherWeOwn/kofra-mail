@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { fileURLToPath, URL } from 'node:url';
 import { TextEncoder, TextDecoder } from 'node:util';
@@ -9,13 +8,17 @@ import { sha256 } from '../src/bytes.ts';
 import type { JournalEvent } from '../src/mail-journal.ts';
 import type { MailboxManifest } from '../src/mailbox-recovery.ts';
 import { Outbox } from '../src/outbox.ts';
-import type { AlarmMailbox, FixtureMailbox } from './fixtures/mailbox-worker.ts';
+import { migrateDirectory, seedDirectory } from './fixtures/directory-db.ts';
+import type { AlarmMailbox, FixtureMailbox, FixtureSweeper } from './fixtures/mailbox-worker.ts';
 
 const mime = (header = '', messageId = 'first', body = 'Evidence for tomorrow') => new TextEncoder().encode(`${header}Message-ID: <${messageId}@example.test>\r\nFrom: sender@example.test\r\nTo: reader@example.test\r\nSubject: A report\r\nContent-Type: text/plain\r\n\r\n${body}\r\n`);
 let mf: Miniflare;
 type Fixture = Pick<FixtureMailbox, 'ingest' | 'ingestError' | 'search' | 'label' | 'flags' | 'draft' | 'bayes' | 'flush' | 'replay' | 'replayError' | 'state' | 'wipe' |
   'publishBackup' | 'waitForManifest' | 'releaseManifest' | 'restoreBackup' | 'setting' | 'createBaseline' | 'publishOnce' | 'publishError' |
-  'beginRestore' | 'advanceRestore' | 'restoreStepError' | 'restoreCursor' | 'rebuildSearch' | 'failNextSnapshotPage' | 'rawGetCount' | 'seedBayes'>;
+  'beginRestore' | 'advanceRestore' | 'restoreStepError' | 'restoreCursor' | 'rebuildSearch' | 'failNextSnapshotPage' | 'rawGetCount' | 'seedBayes' |
+  'readIndexed' | 'emptyTrash'>;
+let sweep: Pick<FixtureSweeper, 'register' | 'hold' | 'release' | 'candidates' | 'deleteDue'>;
+let refNamespace: { getByName(name: string): typeof sweep };
 const state = async (box: Fixture) => JSON.parse(await box.state()) as {
   modseq: number; messages: Record<string, unknown>[]; labels: unknown[]; drafts: unknown[]; bayes: unknown[]; settings: unknown[];
 };
@@ -31,7 +34,9 @@ before(async () => {
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
   mf = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: compiled.outputFiles[0].text }],
     compatibilityDate: '2025-06-01', durableObjects: {
-      BOX: { className: 'FixtureMailbox', useSQLite: true }, MAILBOX: { className: 'AlarmMailbox', useSQLite: true },
+      BOX: { className: 'FixtureMailbox', useSQLite: true },
+      SWEEP: { className: 'FixtureSweeper', useSQLite: true },
+      MAILBOX: { className: 'AlarmMailbox', useSQLite: true },
     },
     r2Buckets: { RAW: 'raw', STATE: 'state', MAIL_STATE: 'state' }, d1Databases: ['DIRECTORY'],
     bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', KOFRA_S3_ENDPOINT: 'https://object-store.example.test',
@@ -52,20 +57,20 @@ before(async () => {
   api = await mf.getDurableObjectNamespace('BOX') as unknown as typeof api;
   alarmApi = await mf.getDurableObjectNamespace('MAILBOX') as unknown as typeof alarmApi;
   raw = await mf.getR2Bucket('RAW');
+  refNamespace = await mf.getDurableObjectNamespace('SWEEP') as unknown as typeof refNamespace;
+  sweep = refNamespace.getByName('workspace');
   journal = await mf.getR2Bucket('STATE');
   db = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
-  for (const name of ['0001_directory.sql', '0002_outbox.sql']) {
-    const migration = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
-    const statements = migration.split(/;\s*\n(?=\s*(?:CREATE |$))/).filter(s => s.trim());
-    await db.batch(statements.map(s => db.prepare(s)));
-  }
-  await db.prepare("INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES ('orchestrated', 'fixture', 'u1', 'reader@example.test')").run();
+  await migrateDirectory(db);
+  await seedDirectory(db, 'fixture', ['orchestrated']);
+  await db.prepare("INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES ('draft-deadline', 'workspace', 'user-draft-deadline', 'draft-deadline@other.test')").run();
 });
 after(async () => { await mf?.dispose(); });
 
 async function upload(bytes = mime()) {
-  const key = `raw/${await sha256(bytes)}/${ids[0]}`;
+  const key = await sweep.register('raw', await sha256(bytes), 'fixture:upload');
   await raw.put(key, bytes);
+  await sweep.release(key, 'fixture:upload');
   return key;
 }
 
@@ -443,6 +448,110 @@ test('cannot replay a journal segment across a gap', async () => {
   const empty = api.getByName('gap-empty');
   assert.match(await empty.replayError(last), /journal gap/i);
   assert.deepEqual((await state(empty)).labels, []);
+});
+
+test('two mailboxes share raw MIME and an attachment; one empties Trash and the other reads both', async () => {
+  const attachmentBytes = 256 * 1024;
+  const content = Buffer.alloc(attachmentBytes, 37).toString('base64').match(/.{1,76}/g)?.join('\r\n');
+  const wire = new TextEncoder().encode([
+    'Message-ID: <shared@example.test>', 'Subject: Shared report', 'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary=split', '', '--split', 'Content-Type: text/plain', '', 'Shareable',
+    '--split', 'Content-Type: application/octet-stream', 'Content-Disposition: attachment; filename=share.bin',
+    'Content-Transfer-Encoding: base64', '', content, '--split--', '',
+  ].join('\r\n'));
+  const key = await upload(wire);
+  const a = api.getByName('shared-a');
+  const b = api.getByName('shared-b');
+  await a.ingest(ids[0], key);
+  // Even an equal delivery identifier must not alias the per-mailbox holders.
+  await b.ingest(ids[0], key);
+  const surviving = await b.readIndexed(ids[0]);
+  assert.deepEqual(surviving, [wire.byteLength, attachmentBytes]);
+  await a.label('trash', 'Trash');
+  await a.flags(ids[0], 0, ['trash']);
+  assert.equal(await a.emptyTrash(), 1);
+  assert.deepEqual(await a.readIndexed(ids[0]), []);
+  await a.ingest(ids[0], key);
+  assert.deepEqual(await a.readIndexed(ids[0]), []);
+  assert.deepEqual(await b.readIndexed(ids[0]), surviving);
+  const grace = 35 * 24 * 60 * 60 * 1000;
+  assert.ok(!(await sweep.candidates(100 + grace)).includes(key));
+  await b.label('trash', 'Trash');
+  await b.flags(ids[0], 0, ['trash']);
+  assert.equal(await b.emptyTrash(), 1);
+  assert.ok(!(await sweep.candidates(100 + grace - 1)).includes(key));
+  const candidates = await sweep.candidates(100 + grace);
+  assert.ok(candidates.includes(key));
+  const digest = await sha256(new Uint8Array(attachmentBytes).fill(37));
+  assert.ok(candidates.some(candidate => candidate.startsWith(`att/${digest}/`)));
+});
+
+test('restore replays a purge without leaving a reconstructed raw holder', async () => {
+  const box = api.getByName('purged-recovery');
+  const key = await upload(mime('Received: restore-purge.example.test\r\n'));
+  const due = 100 + 35 * 24 * 60 * 60 * 1000;
+  await box.ingest(ids[0], key);
+  await box.label('trash', 'Trash');
+  await box.flags(ids[0], 0, ['trash']);
+  await box.emptyTrash();
+  const segment = await box.flush('purged-recovery');
+  assert.ok(segment);
+  assert.ok((await sweep.candidates(due)).includes(key));
+  await box.wipe();
+  await box.replay(segment);
+  assert.deepEqual(await box.readIndexed(ids[0]), []);
+  assert.ok((await sweep.candidates(due)).includes(key));
+});
+
+test('a lost holder-release reply can be retried without changing the grace cutoff', async () => {
+  const holder = `delivery:${ids[0]}`;
+  const key = await sweep.register('raw', '5'.repeat(64), holder);
+  const grace = 35 * 24 * 60 * 60 * 1000;
+  await sweep.hold(key, holder, 100);
+  await sweep.hold(key, holder, 150);
+  assert.ok(!(await sweep.candidates(150 + grace)).includes(key));
+  await sweep.release(key, holder, 200);
+  await sweep.release(key, holder, 250);
+  assert.ok(!(await sweep.candidates(200 + grace - 1)).includes(key));
+  assert.ok((await sweep.candidates(200 + grace)).includes(key));
+  await sweep.hold(key, holder, 200 + grace);
+  assert.ok(!(await sweep.candidates(200 + grace)).includes(key));
+});
+
+test('a late ambiguous DELETE cannot touch a same-digest re-registration', async () => {
+  const ledger = refNamespace.getByName('ambiguous');
+  const bytes = mime();
+  const digest = await sha256(bytes);
+  const oldKey = await ledger.register('raw', digest, 'old', 100);
+  assert.equal(await ledger.register('raw', digest, 'deduped', 100), oldKey);
+  await raw.put(oldKey, bytes);
+  await ledger.release(oldKey, 'old', 200);
+  await ledger.release(oldKey, 'deduped', 200);
+  const due = 200 + 35 * 24 * 60 * 60 * 1000;
+  assert.equal(await ledger.deleteDue(due, oldKey, 503), JSON.stringify([oldKey]));
+  const replacement = await ledger.register('raw', digest, 'replacement', due);
+  assert.notEqual(replacement, oldKey);
+  assert.ok(replacement.startsWith(`raw/${digest}/`));
+  await raw.put(replacement, bytes);
+  // The previous DELETE took effect after the caller had already seen a failure.
+  await raw.delete(oldKey);
+  assert.equal(await raw.head(oldKey), null);
+  assert.equal(await sha256(new Uint8Array(await (await raw.get(replacement))!.arrayBuffer())), digest);
+});
+
+test('retired generations are re-deleted with backoff until 204 or 404', async () => {
+  for (const status of [204, 404]) {
+    const ledger = refNamespace.getByName(`delete-${status}`);
+    const key = await ledger.register('att', '8'.repeat(64), 'old', 100);
+    await ledger.release(key, 'old', 100);
+    const due = 100 + 35 * 24 * 60 * 60 * 1000;
+    assert.equal(await ledger.deleteDue(due - 1, key, 503), '[]');
+    assert.equal(await ledger.deleteDue(due, key, 503), JSON.stringify([key]));
+    assert.equal(await ledger.deleteDue(due + 1, key, 500), '[]');
+    assert.equal(await ledger.deleteDue(due + 60_000, key, 500), JSON.stringify([key]));
+    assert.equal(await ledger.deleteDue(due + 180_000, key, status), JSON.stringify([key]));
+    assert.equal(await ledger.deleteDue(due + 86_400_000, key, status), '[]');
+  }
 });
 
 test('indexes a meeting invitation containing a calendar part', async () => {

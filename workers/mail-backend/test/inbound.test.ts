@@ -1,14 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
-import { URL } from 'node:url';
 import { Miniflare } from 'miniflare';
 import { deliver, dlq } from '../src/deliver.ts';
 import { lookupRecipient } from '../src/directory.ts';
 import { receive } from '../src/inbound.ts';
 import { Outbox } from '../src/outbox.ts';
 import { handleEmail, handleQueue, type Env } from '../src/worker.ts';
+import { migrateDirectory, seedDirectory } from './fixtures/directory-db.ts';
 
 const bytes = new TextEncoder().encode('Authentication-Results: mx.cloudflare.net; dmarc=fail\r\nAuthentication-Results: mx.cloudflare.net; dmarc=pass\r\n\r\nhello\n');
 const digest = createHash('sha256').update(bytes).digest('hex');
@@ -19,9 +18,8 @@ const mf = new Miniflare({ modules: true, script: 'export default {};', d1Databa
 let db: D1Database;
 before(async () => {
   db = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
-  const migration = await readFile(new URL('../migrations/0002_outbox.sql', import.meta.url), 'utf8');
-  await db.batch(migration.split(';').filter(s => s.trim()).map(s => db.prepare(s)));
-  await db.prepare(await readFile(new URL('../migrations/0004_mailbox_replay.sql', import.meta.url), 'utf8')).run();
+  await migrateDirectory(db);
+  await seedDirectory(db, 'workspace', ['box', 'cursor']);
 });
 after(() => mf.dispose());
 
@@ -166,6 +164,7 @@ test('queue failure leaves pending, then an acknowledgement marks done before re
   const box = new Outbox(db);
   let indexed = 0;
   let released = 0;
+  let current = 200;
   const ports = {
     outbox: box,
     index: async (_workspaceId: string, _mailboxId: string, received: string) => { indexed++; assert.equal(received, id); return 'indexed' as const; },
@@ -173,13 +172,18 @@ test('queue failure leaves pending, then an acknowledgement marks done before re
       assert.equal((await box.get(id))?.state, 'done');
       if (++released === 1) throw new Error('sweeper unavailable');
     },
-    now: () => 200,
+    now: () => current,
   };
-  await assert.rejects(deliver(id, { ...ports, index: async () => { throw new Error('DO unavailable'); } }), /DO unavailable/);
-  assert.equal((await box.get(id))?.state, 'pending');
-  await assert.rejects(deliver(id, ports), /sweeper unavailable/);
+  await deliver(id, { ...ports, index: async () => { throw new Error('DO unavailable'); } }, 'first');
+  const pending = await box.get(id);
+  assert.equal(pending?.state, 'pending');
+  assert.equal(pending.attempts, 0);
+  assert.equal(pending.retries, 1);
+  assert.equal(released, 0);
+  current = pending.nextAttemptAt;
+  await assert.rejects(deliver(id, ports, 'retry'), /sweeper unavailable/);
   assert.equal((await box.get(id))?.state, 'done');
-  await deliver(id, ports);
+  await deliver(id, ports, 'retry');
   assert.equal(indexed, 1);
   assert.equal(released, 2);
 });
@@ -190,36 +194,38 @@ test('the indexed mailbox cursor replays a later acknowledgement at the same wal
   const later = '01KBN8ZJ7G0000000000000003';
   for (const deliveryId of [first, later]) await outbox.insert({ id: deliveryId, workspaceId: 'workspace', mailboxId: 'cursor',
     envelopeFrom: 'sender@example.test', envelopeTo: 'cursor@example.test', rawKey, authResults: null, createdAt: 100 });
-  assert.ok(await outbox.complete(first, 200));
+  const firstClaim = await outbox.claim(first, 200, 'first');
+  assert.ok(firstClaim);
+  assert.ok(await outbox.complete(first, firstClaim.lease, 200, 'first'));
   const before = await outbox.deliveryCursor('workspace', 'cursor');
   assert.equal(before, 200);
-  assert.ok(await outbox.complete(later, 200));
+  const laterClaim = await outbox.claim(later, 200, 'later');
+  assert.ok(laterClaim);
+  assert.ok(await outbox.complete(later, laterClaim.lease, 200, 'later'));
   assert.deepEqual(await outbox.replayPage('workspace', 'cursor', before), [
     { id: later, rawKey, createdAt: 100, doneAt: before + 1, authResults: null },
   ]);
   assert.deepEqual(await outbox.replayPage('other', 'cursor', before), []);
 });
 
-test('DLQ retries until its redacted service-binding POST receives a 2xx', async () => {
+test('DLQ records its redacted alert obligation in D1 before acknowledging, without posting', async () => {
   const calls: unknown[] = [];
   let acks = 0;
   let retries = 0;
-  const batch = { queue: 'dlq', messages: [{ body: { envelopeFrom: 'private@example.test' },
+  const batch = { queue: 'dlq', messages: [{ id: 'queue-message-1', body: { envelopeFrom: 'private@example.test' },
     ack: () => { acks++; }, retry: () => { retries++; } }] } as unknown as MessageBatch<unknown>;
   const env = {
     MAIL_BACKEND_ENABLED: 'on', DIRECTORY: db, DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq',
     ALERTS: { fetch: async (url: string, init: RequestInit) => {
-      calls.push([new URL(url).pathname, init.method, JSON.parse(String(init.body))]);
-      return new Response(null, { status: calls.length === 1 ? 503 : 204 });
+      calls.push([new URL(url).pathname, init.method]);
+      return new Response(null, { status: 204 });
     } },
   } as Env;
   await handleQueue(batch, env);
-  assert.deepEqual([acks, retries], [0, 1]);
-  await handleQueue(batch, env);
-  assert.deepEqual([acks, retries], [1, 1]);
-  assert.deepEqual(calls, Array.from({ length: 2 }, () => ['/v1/alert', 'POST', {
-    source: 'mail:delivery_dlq', key: 'invalid-delivery', title: 'Mail delivery dead-lettered',
-  }]));
+  assert.deepEqual([acks, retries], [1, 0]);
+  assert.deepEqual(calls, []);
+  const row = await db.prepare("SELECT key, source, sent_at AS sentAt FROM mail_alerts WHERE key LIKE 'delivery_dlq:%'").first();
+  assert.deepEqual(row, { key: 'delivery_dlq:invalid:queue-message-1', source: 'mail:delivery_dlq', sentAt: null });
 });
 
 test('DLQ emits a redacted signal even for malformed input', async () => {

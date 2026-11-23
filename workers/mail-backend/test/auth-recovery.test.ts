@@ -11,24 +11,30 @@ async function startIndex(t: TestContext) {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/index-plumbing.ts', import.meta.url))],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
   const runtime = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: bundle.outputFiles[0].text }],
-    compatibilityDate: '2025-06-01', durableObjects: { BOX: { className: 'IndexPlumbing', useSQLite: true } },
+    compatibilityDate: '2025-06-01', durableObjects: { BOX: { className: 'IndexPlumbing', useSQLite: true }, SWEEP: { className: 'FixtureSweeper', useSQLite: true } },
     r2Buckets: ['RAW', 'STATE'] });
   t.after(() => runtime.dispose());
   const boxes = await runtime.getDurableObjectNamespace('BOX') as unknown as { getByName(name: string): IndexPlumbing };
   const raw = await runtime.getR2Bucket('RAW');
   const state = await runtime.getR2Bucket('STATE');
-  return { boxes, raw, state };
+  return { runtime, boxes, raw, state };
 }
 
 test('stores the authentication verdict in the message, journal and snapshot and preserves it on restore', async t => {
-  const { boxes, raw, state } = await startIndex(t);
+  const { runtime, boxes, raw, state } = await startIndex(t);
   const source = boxes.getByName('source');
   const restored = boxes.getByName('target');
   const id = '01KBN8ZJ7G0000000000000000';
   const results = 'mx.example; dmarc=pass header.from=example.test';
   const bytes = new TextEncoder().encode(`From: sender@example.test\r\nAuthentication-Results: ${results}\r\n\r\nbody`);
-  const key = `raw/${await sha256(bytes)}/${id}`;
+  // Register the generation with the fixture sweeper, as ingress does, so restore can hold it.
+  const sweeps = await runtime.getDurableObjectNamespace('SWEEP') as unknown as {
+    getByName(name: string): { register(kind: 'raw', digest: string, holder: string): Promise<string>; release(key: string, holder: string): Promise<void> };
+  };
+  const ledger = sweeps.getByName('workspace');
+  const key = await ledger.register('raw', await sha256(bytes), 'fixture:upload');
   await raw.put(key, bytes);
+  await ledger.release(key, 'fixture:upload');
   assert.equal(await source.indexRaw(id, key, results), 'indexed');
   assert.equal(JSON.parse(await source.state()).messages[0].auth, 'pass');
   const events = JSON.parse(await source.journalEvents()) as Array<{ type: string; auth?: string }>;

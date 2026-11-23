@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { kofra } from '../src/kofra.ts';
+import { ObjectInvalidError, ObjectMissingError } from '../src/object-errors.ts';
 
 const config = {
   KOFRA_S3_ENDPOINT: 'https://storage.example.test',
@@ -81,6 +82,50 @@ test('Kofra separates workspaces even for the same raw key', async t => {
   await kofra(config, 'workspace').put(key, bytes);
   await kofra(config, 'other').put(key, bytes);
   assert.deepEqual(paths, [`/mail-workspace/${key}`, `/mail-other/${key}`]);
+});
+
+test('classifies GET failures as missing, invalid, or transient', async t => {
+  const cases = [
+    ['NoSuchKey', () => new Response('<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code></Error>', { status: 404 }), ObjectMissingError],
+    ['NoSuchBucket', () => new Response('<Error><Code>NoSuchBucket</Code></Error>', { status: 404 }), Error],
+    ['empty 404', () => new Response(null, { status: 404 }), Error],
+    ['declared empty object', () => new Response(null, { headers: { 'content-length': '0' } }), ObjectInvalidError],
+    ['declared over 25 MiB', () => new Response(null, { headers: { 'content-length': String(25 * 1024 * 1024 + 1) } }), ObjectInvalidError],
+    ['missing content-length', () => new Response(bytes), Error],
+  ] as const;
+  const fetch = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 500 }));
+  const store = kofra(config, 'workspace');
+  for (const [label, response, errorType] of cases) {
+    fetch.mock.mockImplementationOnce(async () => response());
+    await assert.rejects(store.get(key), error => {
+      assert.equal(Object.getPrototypeOf(error), errorType.prototype, label);
+      return true;
+    });
+  }
+});
+
+test('only 204 and a verified NoSuchKey 404 confirm a signed generation DELETE', async t => {
+  let status = 204;
+  let body: string | null = null;
+  const fake = t.mock.method(globalThis, 'fetch', async (request: Request) => {
+    assert.equal(request.method, 'DELETE');
+    assert.equal(request.url, `https://storage.example.test/mail-workspace/${key}`);
+    assert.equal(request.redirect, 'manual');
+    return new Response(body, { status });
+  });
+  const store = kofra(config, 'workspace');
+  await store.deleteGeneration(key);
+  status = 404;
+  body = '<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code></Error>';
+  await store.deleteGeneration(key);
+  body = '<Error><Code>NoSuchBucket</Code></Error>';
+  await assert.rejects(store.deleteGeneration(key), /failed \(404\)/);
+  body = null;
+  await assert.rejects(store.deleteGeneration(key), /failed \(404\)/);
+  status = 200;
+  await assert.rejects(store.deleteGeneration(key), /failed \(200\)/);
+  await assert.rejects(store.deleteGeneration(`drafts/${'a'.repeat(64)}`), /Invalid mail generation/);
+  assert.equal(fake.mock.callCount(), 5);
 });
 
 test('Kofra rejects unqualified raw keys, invalid workspace IDs and arbitrary paths', async t => {

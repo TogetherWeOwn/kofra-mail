@@ -1,0 +1,34 @@
+{
+  // Local emulation only. This file has no real resources or routes.
+  "name": "mail-backend-local",
+  "main": "src/entry.ts",
+  "compatibility_date": "2025-06-01",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "MAIL_BACKEND_ENABLED": "off",
+    "MAIL_RECOVERY_ENABLED": "off",
+    "MAIL_SWEEP_ENABLED": "off",
+    "DELIVERY_QUEUE_NAME": "mail-local-deliver",
+    "DEAD_LETTER_QUEUE_NAME": "mail-local-dlq"
+  },
+  "d1_databases": [{
+    "binding": "DIRECTORY",
+    "database_name": "mail-local-directory",
+    "database_id": "00000000-0000-0000-0000-000000000000"
+  }],
+  "r2_buckets": [{ "binding": "MAIL_STATE", "bucket_name": "mail-local-state" }],
+  "durable_objects": { "bindings": [
+    { "name": "MAILBOX", "class_name": "Mailbox" },
+    { "name": "SWEEPER", "class_name": "Sweeper" }
+  ] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox", "Sweeper"] }],
+  "queues": {
+    "producers": [{ "binding": "DELIVER", "queue": "mail-local-deliver" }],
+    "consumers": [
+      { "queue": "mail-local-deliver", "max_batch_size": 1, "max_retries": 3, "dead_letter_queue": "mail-local-dlq" },
+      { "queue": "mail-local-dlq", "max_batch_size": 10, "retry_delay": 300, "max_retries": 10 }
+    ]
+  },
+  "triggers": { "crons": ["* * * * *"] }
+}
