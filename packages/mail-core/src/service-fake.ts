@@ -535,10 +535,12 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   function replyReferences(box: Mailbox, messageId: Id | undefined): string[] {
     const parent = messageId === undefined ? undefined : box.messages.get(messageId);
     if (!parent) return [];
-    // Copied bounded: only safe ids, the first and the last 10, so a hostile References header cannot bloat the draft.
-    // The parent's own id stays last even when unsafe, so threadingHeaders can omit In-Reply-To rather than name an ancestor.
-    const chain = [...parent.references.filter(isSafeMessageId), parent.messageIdHeader];
-    return chain.length > 11 ? [chain[0], ...chain.slice(-10)] : chain;
+    // Stored bounded and safe: the first and the last 10 safe ids. An unsafe parent id is never stored;
+    // an empty marker takes its place, so threadingHeaders omits In-Reply-To instead of naming an ancestor.
+    const parentSafe = isSafeMessageId(parent.messageIdHeader);
+    const safe = [...parent.references.filter(isSafeMessageId), ...(parentSafe ? [parent.messageIdHeader] : [])];
+    const kept = safe.length > 11 ? [safe[0], ...safe.slice(-10)] : safe;
+    return parentSafe ? kept : [...kept, ''];
   }
   function expire(box: Mailbox): void {
     for (const [threadId, rows] of box.threads) {

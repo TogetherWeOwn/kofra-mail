@@ -882,6 +882,21 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(hostileCopy);
       const hostileHeaders = await h.sentHeaders(hostileCopy);
       assert.ok(!Object.hasOwn(hostileHeaders, 'in-reply-to') && !Object.hasOwn(hostileHeaders, 'references'));
+      // A hostile id deep in a thread neither names an ancestor as the parent nor costs a safe ancestor its place.
+      const thread: string[] = [];
+      let previous: { messageId: string } | undefined;
+      for (let n = 1; n <= 12; n++) {
+        const id = n === 12 ? '<x@example.net>\r\nBcc: victim@example.net' : `<deep.${n}@example.net>`;
+        if (n < 12) thread.push(id);
+        previous = await h.deliver(message(n === 1 ? 'Deep thread' : 'Re: Deep thread', { messageId: id, ...(previous && { inReplyTo: previous.messageId }) }));
+      }
+      assert.ok(previous);
+      const deep = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: 'Re: Deep thread', inReplyTo: previous.messageId }), key('deep-reply'));
+      const deepSend = await mail.sendDraft(deep.id, { ...key('deep-send'), ifMatch: deep.revision });
+      await h.advance((await mail.getSettings()).undoSeconds * second);
+      const deepHeaders = await h.sentHeaders((await mail.getSend(deepSend.id)).messageId!);
+      assert.ok(!Object.hasOwn(deepHeaders, 'in-reply-to'), 'an unsafe parent is never replaced by an ancestor');
+      assert.deepEqual(deepHeaders.references.split(' '), [thread[0], ...thread.slice(-10)]);
       assert.ok(!JSON.stringify(hostileHeaders).includes('victim@example.net'));
 
       // Address syntax cannot smuggle recipients, and a quoted name stays one recipient.
