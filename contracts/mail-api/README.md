@@ -281,7 +281,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 **`saveAttachmentToDrive`:** uploads the attachment to the user's Drive with a `drive.upload` token for that one action.
 - The upload carries the operation id of section 5. Drive must store it with the file, durably, and answer a repeat of the same operation id with the original file instead of a new one.
 - **`features.drive` stays off until Drive offers that.** Without it, a lost reply after Drive stored the file would let a retry create a second file.
-- Mail writes its in-progress marker before the Drive call. A retry after a crash, a 5xx or a lost reply first asks Drive for the operation id's file, before reading the attachment again, so it succeeds even if the source message expired in between; only an unknown operation id reads the attachment and uploads it. Mail then stores the returned file as the result.
+- Mail writes its in-progress marker, **with the request's fingerprint**, before the Drive call. For this route the marker never simply expires: if no result is stored, it becomes the pin above when its 5 minutes run out, so a crash after Drive stored the file still binds the key to that fingerprint for `idempotencyRetentionSeconds`. A retry after a crash, a 5xx or a lost reply first asks Drive for the operation id's file, before reading the attachment again, so it succeeds even if the source message expired in between; only an unknown operation id reads the attachment and uploads it. Mail then stores the returned file as the result.
 
 ### 8.6 Admin
 

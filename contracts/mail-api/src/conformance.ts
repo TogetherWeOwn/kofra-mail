@@ -748,13 +748,18 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
 
       // A lost reply after Drive stored the file: the same-key retry returns that file and creates no second one.
       if (!h.driveFaults) return;
-      const { messageId } = await h.deliver(message('Save me', { attachments: [file] }));
+      const { messageId } = await h.deliver(message('Save me', { attachments: [file, { ...file, name: 'second.txt' }] }));
       const { messages: [delivered] } = await mail.getThread((await mail.listThreads({ view: 'inbox', q: 'subject:"save me"' })).items[0].id);
       assert.equal(delivered.id, messageId);
       const [{ part }] = delivered.attachments;
 
       // Keys are scoped to the account user: after an owner change the same key is the new owner's own action.
       const ownerSave = await mail.saveAttachmentToDrive(messageId, part, key('owner-save'));
+      // A separate action on the same available attachment is a second file.
+      const filesBefore = await h.driveFaults.savedFiles();
+      const separate = await mail.saveAttachmentToDrive(messageId, part, key('separate-save'));
+      assert.notEqual(separate.driveFileId, ownerSave.driveFileId);
+      assert.equal(await h.driveFaults.savedFiles(), filesBefore + 1);
       const newOwner = h.as('newAdmin');
       const admin = h.as('admin');
       // So is a Drive pick: it is the choosing user's grant and does not pass to the next owner.
@@ -778,6 +783,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.ok(Number.isInteger(lost.retryAfterSeconds));
       assert.equal(await h.driveFaults.savedFiles(), before + 1, 'Drive stored the file before the reply was lost');
       // The key stays bound to that action: another part under it is refused, not a second file.
+      // The second part exists, so only the pin stops this save.
+      assert.ok(delivered.attachments.some((attachment) => attachment.part === part + 1));
       await rejects(mail.saveAttachmentToDrive(messageId, part + 1, key('save')), 'idempotency_key_reused');
       assert.equal(await h.driveFaults.savedFiles(), before + 1);
       await h.advance(2 * 60 * 60 * second);
