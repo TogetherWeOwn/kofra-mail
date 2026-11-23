@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { test, type TestContext } from 'node:test';
 import { fileURLToPath, URL } from 'node:url';
 import { TextEncoder } from 'node:util';
@@ -9,6 +8,7 @@ import { Miniflare, Response, type Request } from 'miniflare';
 import type { JournalEvent, JournalRow } from '../src/mail-journal.ts';
 import type { Lifecycle, MailboxManifest } from '../src/mailbox-recovery.ts';
 import { mailboxName } from '../src/worker.ts';
+import { migrateDirectory, seedDirectory } from './fixtures/directory-db.ts';
 import type { RegressionMailbox } from './fixtures/mailbox-regression-worker.ts';
 
 const scope = ['workspace', 'mailbox'] as const;
@@ -48,10 +48,8 @@ async function setup(t: TestContext, getRaw?: (path: string) => Response | Promi
   });
   t.after(() => runtime.dispose());
   const db = await runtime.getD1Database('DIRECTORY');
-  for (const file of ['0001_directory.sql', '0002_outbox.sql']) {
-    const sql = await readFile(new URL(`../migrations/${file}`, import.meta.url), 'utf8');
-    await db.batch(sql.split(/;\s*\n(?=\s*(?:CREATE |$))/).filter(s => s.trim()).map(s => db.prepare(s)));
-  }
+  await migrateDirectory(db);
+  await seedDirectory(db, scope[0], [scope[1]]);
   const boxes = await runtime.getDurableObjectNamespace('MAILBOX');
   const objectId = boxes.idFromName(mailboxName(...scope));
   const box = boxes.get(objectId) as unknown as RegressionMailbox;

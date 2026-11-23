@@ -7,7 +7,8 @@ import {
   type CleanupCursor, type Lifecycle, type ReadyLife, type RestoringLife, type Scope,
 } from './mailbox-recovery.ts';
 import { MailboxWork } from './mailbox-work.ts';
-import { isDeliveryId, Outbox } from './outbox.ts';
+import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
+import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
 
 // `deferred`: the mailbox is not ready (first initialization or restore) and the
@@ -15,8 +16,6 @@ import { enabled, mailboxName, type Env } from './worker.ts';
 // `rejected`: the stored message can never be indexed.
 export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
-const RESTORE_SLICE_MS = 10_000;
-const REINDEX_BATCH = 16;
 const HELD_RECHECK_MS = 15 * 60_000;
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
 const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
@@ -26,6 +25,9 @@ const backoff = (failures: number) => Math.min(MAX_FAILURE_BACKOFF_MS, 5_000 * 2
 export class Mailbox extends DurableObject<Env> {
   private readonly work = new MailboxWork();
   private readonly backups = new MailboxWork();
+  // Wall-clock budget of one restore run and messages rebuilt per backup run.
+  protected restoreSliceMs = 10_000;
+  protected reindexBatch = 16;
   // Set when a call asked for an immediate wake-up; consumed by the alarm run.
   private wakeRequested = false;
 
@@ -77,15 +79,22 @@ export class Mailbox extends DurableObject<Env> {
     const now = Date.now();
     let current = await recovery.read();
     if (!current) {
-      // An absent manifest is a new mailbox only if no delivery was ever completed for it.
-      const history = await new Outbox(this.env.DIRECTORY).deliveryCursor(scope.workspaceId, scope.mailboxId);
-      if (history > 0) {
+      // An absent manifest is a new mailbox only if it never had a baseline and no
+      // delivery was ever completed for it; otherwise its backups were lost.
+      const outbox = new Outbox(this.env.DIRECTORY);
+      const established = await outbox.backupInitialized(scope.workspaceId, scope.mailboxId) ||
+        await outbox.deliveryCursor(scope.workspaceId, scope.mailboxId) > 0;
+      if (established) {
+        // Rows the lost backups covered are again the only replay record.
+        await outbox.resetBackupWatermark(scope.workspaceId, scope.mailboxId);
         index.setLifecycle({ state: 'missing', scope: life.scope, incarnation: life.incarnation, since: now, failures: 0 });
         await this.armSoon();
         return false;
       }
       const etag = await recovery.create(life.incarnation);
       if (etag) {
+        // Recorded outside this object and the manifest before any write is acknowledged.
+        await new Outbox(this.env.DIRECTORY).markBackedUp(scope.workspaceId, scope.mailboxId);
         index.setLifecycle(readyLife(life.scope, life.incarnation, etag, 1, now));
         return true;
       }
@@ -95,10 +104,14 @@ export class Mailbox extends DurableObject<Env> {
     const { manifest } = current;
     if (manifest.incarnation === life.incarnation && manifest.rev === 1 && manifest.last_seq === 0 && index.journal.revision() === 0) {
       // Our own baseline; its reply was lost.
+      await new Outbox(this.env.DIRECTORY).markBackedUp(scope.workspaceId, scope.mailboxId);
       index.setLifecycle(readyLife(life.scope, life.incarnation, current.etag, 1, now));
       return true;
     }
     // Backups exist but this object's state is gone: restore, never overwrite them.
+    // Pruning stays frozen for the whole restore window; the manifest the restore
+    // depends on could still disappear before takeover. Publication re-advances it.
+    await new Outbox(this.env.DIRECTORY).resetBackupWatermark(scope.workspaceId, scope.mailboxId);
     index.setLifecycle(restoringLife(life.scope, life.incarnation, now));
     await this.armSoon();
     return false;
@@ -246,9 +259,10 @@ export class Mailbox extends DurableObject<Env> {
       (this.env.MAIL_RECOVERY_ENABLED !== 'on' || life.failures >= 5 || (life.restarts ?? 0) >= RESTORE_RESTART_ALERT));
     const sql = this.ctx.storage.sql;
     sql.exec('CREATE TABLE IF NOT EXISTS mailbox_alerts (code TEXT PRIMARY KEY, since INTEGER NOT NULL, sent_at INTEGER)');
+    const skipped = life?.state === 'ready' && (life.restoreSkipped ?? 0) > 0;
     const conflict = life?.state === 'ready' && !!life.conflict;
     const conditions: Array<[MailboxAlertCode, boolean]> = [
-      ['backup_stale', !!stale], ['restore_blocked', blocked], ['backup_conflict', conflict]];
+      ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict]];
     let next = Infinity;
     for (const [code, active] of conditions) {
       if (!active) {
@@ -265,6 +279,8 @@ export class Mailbox extends DurableObject<Env> {
       catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); continue; }
       const sentAt = Date.now();
       sql.exec('UPDATE mailbox_alerts SET sent_at = ? WHERE code = ?', sentAt, code);
+      // A skipped-delivery report is sent once per restore.
+      if (code === 'restore_skipped' && index && life?.state === 'ready') index.setLifecycle({ ...life, restoreSkipped: 0 });
       next = Math.min(next, sentAt + ALERT_COOLDOWN_MS);
     }
     return next;
@@ -286,14 +302,15 @@ export class Mailbox extends DurableObject<Env> {
     const outbox = new Outbox(this.env.DIRECTORY);
     const { workspaceId, mailboxId } = start.scope;
     const refs = this.env.SWEEPER.getByName(workspaceId);
-    const deadline = Date.now() + RESTORE_SLICE_MS;
+    const deadline = Date.now() + this.restoreSliceMs;
     let life: Lifecycle = start;
-    // Each step performs I/O, so the clock advances between steps.
-    while (life.state === 'restoring' && Date.now() < deadline) {
+    // Each step performs I/O, so the clock advances between steps. At least one step runs.
+    do {
       const restarts = life.restarts ?? 0;
       life = await recovery.restoreStep(life, {
         now: Date.now,
-        fence: async () => null,
+        // Claims taken before this point can no longer complete (stale index state).
+        fence: () => outbox.bumpRecoveryEpoch(workspaceId, mailboxId),
         replayPage: after => outbox.replayPage(workspaceId, mailboxId, after),
         release: (key, holder) => refs.release(key, holder),
       });
@@ -301,7 +318,8 @@ export class Mailbox extends DurableObject<Env> {
       // counts against restore_blocked and backs off, so a manifest that keeps
       // disappearing cannot spin fence and baseline writes in a silent loop.
       if (life.state === 'restoring' && (life.restarts ?? 0) > restarts) return Date.now() + backoff(life.restarts ?? 1);
-    }
+    } while (life.state === 'restoring' && Date.now() < deadline);
+    if (life.state === 'ready') await outbox.markBackedUp(workspaceId, mailboxId).catch(() => {});
     return Date.now() + (life.state === 'restoring' ? 0 : 1000);
   }
 
@@ -309,13 +327,19 @@ export class Mailbox extends DurableObject<Env> {
     const outbox = new Outbox(this.env.DIRECTORY);
     const { workspaceId, mailboxId } = life.scope;
     const recovery = this.recovery(index);
+    // A completion is marked done only after its index commit, so every done row
+    // at or below this cursor has its journal event at or below this revision.
+    const mark = await this.work.run(async () => {
+      const cursor = await outbox.deliveryCursor(workspaceId, mailboxId);
+      return { cursor, seq: index.journal.revision() };
+    });
     let published: Awaited<ReturnType<MailboxRecovery['publish']>>;
     try {
       published = await recovery.publish(life, now, () => this.work.run(async () => {
         // Every done row at or below the cursor is present in the capture.
         const deliveryCursor = await outbox.deliveryCursor(workspaceId, mailboxId);
         return { deliveryCursor, seq: index.captureSnapshot() };
-      }));
+      }), () => outbox.resetBackupWatermark(workspaceId, mailboxId).catch(() => {}));
     } catch (error) {
       // Never write over a manifest this state cannot have produced; raise an alert.
       if (error instanceof BackupConflict) {
@@ -323,6 +347,19 @@ export class Mailbox extends DurableObject<Env> {
         if (stored?.state === 'ready') index.setLifecycle({ ...stored, conflict: error.message });
       }
       throw error;
+    }
+    // The published backup was gone. onMissing above cleared the informational
+    // coverage before any re-establishment write; clear it again in case that
+    // reset failed, until the re-established manifest commits.
+    if (published.reestablishing) await outbox.resetBackupWatermark(workspaceId, mailboxId).catch(() => {});
+    // Only now may completed rows up to the cursor be pruned: the published
+    // backup is confirmed to cover them. A failure only delays pruning.
+    let prunedPage = false;
+    if (published.lastSeq >= mark.seq) {
+      try {
+        await outbox.markBackedUp(workspaceId, mailboxId, mark.cursor);
+        prunedPage = await outbox.pruneCovered(workspaceId, mailboxId, Date.now() - RETENTION_MS, mark.cursor) === PRUNE_PAGE;
+      } catch { /* retried on a later run */ }
     }
     let current = published.life;
     let cleanupPending = false;
@@ -350,14 +387,14 @@ export class Mailbox extends DurableObject<Env> {
     // The cursor keeps one message that cannot be fetched yet from starving the rest.
     // Reindex failures back off on their own clock and never delay publication.
     const reindexDue = (current.reindexRetryAt ?? 0) <= Date.now();
-    const pending = reindexDue ? index.unindexed(current.reindexAfter, REINDEX_BATCH) : [];
+    const pending = reindexDue ? index.unindexed(current.reindexAfter, this.reindexBatch) : [];
     let reindexError: unknown = null;
     for (const message of pending) {
       try { await index.reindex(message.id, message.rawKey); } catch (error) { reindexError ??= error; }
     }
     const reindexFailures = reindexError ? (current.reindexFailures ?? 0) + 1 : reindexDue ? 0 : current.reindexFailures ?? 0;
     const reindexRetryAt = reindexError ? Date.now() + backoff(reindexFailures) : reindexDue ? 0 : current.reindexRetryAt ?? 0;
-    const reindexAfter = !reindexDue ? current.reindexAfter : pending.length === REINDEX_BATCH ? pending[pending.length - 1].id : '';
+    const reindexAfter = !reindexDue ? current.reindexAfter : pending.length === this.reindexBatch ? pending[pending.length - 1].id : '';
     const failures = published.snapshotError ? current.failures : 0;
     if (reindexAfter !== current.reindexAfter || failures !== current.failures ||
         reindexFailures !== (current.reindexFailures ?? 0) || reindexRetryAt !== (current.reindexRetryAt ?? 0)) {
@@ -369,7 +406,7 @@ export class Mailbox extends DurableObject<Env> {
     // Deltas were still published; retry only the snapshot, with backoff.
     if (published.snapshotError) return Math.min(Date.now() + backoff(current.failures), reindexAt);
     const next = Math.min(Math.max(current.nextSnapshotAt, soon), reindexAt, cleanupRetry ? Date.now() + 60_000 : Infinity);
-    const more = published.more || cleanupPending || (reindexDue && !reindexError && pending.length > 0);
+    const more = published.more || cleanupPending || prunedPage || (reindexDue && !reindexError && pending.length > 0);
     return more ? soon : next;
   }
 }

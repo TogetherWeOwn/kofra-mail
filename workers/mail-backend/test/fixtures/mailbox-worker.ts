@@ -1,12 +1,15 @@
 import { DurableObject } from 'cloudflare:workers';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
 import { journalPrefix, replayJournal, writeDelta } from '../../src/journal-backup.ts';
+import { sha256 } from '../../src/bytes.ts';
+import { parseObjectKey, type ObjectKind } from '../../src/object-key.ts';
+import { SweepLedger } from '../../src/sweep-ledger.ts';
 import { MailboxRecovery, readyLife, restoringLife, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
 import { MailboxWork } from '../../src/mailbox-work.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import type { Env as MailboxEnv } from '../../src/worker.ts';
 
-interface Env { RAW: R2Bucket; STATE: R2Bucket; }
+interface Env { RAW: R2Bucket; STATE: R2Bucket; SWEEP: DurableObjectNamespace<FixtureSweeper>; }
 const FIXTURE_INCARNATION = '00000000-0000-4000-8000-000000000000';
 type Delivery = [id: string, rawKey: string, createdAt: number, doneAt: number];
 
@@ -31,11 +34,33 @@ export class AlarmMailbox extends Mailbox {
   }
 }
 
+export class FixtureSweeper extends DurableObject {
+  async register(kind: ObjectKind, digest: string, holder: string, now = 100) {
+    return new SweepLedger(this.ctx.storage).register(kind, digest, holder, now);
+  }
+  async deleteDue(now: number, target: string, status: number) {
+    const attempted: string[] = [];
+    try {
+      await new SweepLedger(this.ctx.storage).sweep(now, async key => {
+        if (key === target) attempted.push(key);
+        if (key !== target || ![204, 404].includes(status)) throw new Error('DELETE outcome not confirmed');
+      });
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+    return JSON.stringify(attempted);
+  }
+  async hold(key: string, holder: string, now = 100) { new SweepLedger(this.ctx.storage).hold(key, holder, now); }
+  async release(key: string, holder: string, now = 100) { new SweepLedger(this.ctx.storage).release(key, holder, now); }
+  async candidates(now: number) { return new SweepLedger(this.ctx.storage).candidates(now); }
+}
+
 export class FixtureMailbox extends DurableObject<Env> {
   private rawReads = 0;
   private snapshotFault?: { method: 'GET' | 'PUT'; page: number };
 
   private index() {
+    const refs = this.env.SWEEP.getByName('workspace');
     return new MailboxIndex(this.ctx.storage, {
       get: async key => {
         this.rawReads++;
@@ -44,9 +69,9 @@ export class FixtureMailbox extends DurableObject<Env> {
         return new Uint8Array(await object.arrayBuffer());
       },
       put: async (key, bytes) => { await this.env.RAW.put(key, bytes); },
-      register: async (kind, digest) => `${kind}/${digest}/01KBN8ZJ7G0000000000000000`,
-      hold: async () => {},
-      release: async () => {},
+      register: (kind, digest, holder) => refs.register(kind, digest, holder),
+      hold: (key, holder) => refs.hold(key, holder),
+      release: (key, holder) => refs.release(key, holder),
     }, this.ctx.id.toString());
   }
   private readonly work = new MailboxWork();
@@ -214,6 +239,18 @@ export class FixtureMailbox extends DurableObject<Env> {
     });
   }
   async wipe() { await this.ctx.storage.deleteAll(); }
+  async emptyTrash() { return this.index().emptyTrash(); }
+  async readIndexed(id: string) {
+    const lengths: number[] = [];
+    for (const key of this.index().messageObjectKeys(id)) {
+      const object = await this.env.RAW.get(key);
+      if (!object) throw new Error('Indexed object missing');
+      const bytes = new Uint8Array(await object.arrayBuffer());
+      if (parseObjectKey(key)?.digest !== await sha256(bytes)) throw new Error('Indexed object was changed');
+      lengths.push(bytes.byteLength);
+    }
+    return lengths;
+  }
 }
 
 export default {};

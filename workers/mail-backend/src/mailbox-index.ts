@@ -1,6 +1,7 @@
 import { authVerdict, AUTH_VERDICT } from './auth-verdict.ts';
 import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
+import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
 import { MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
@@ -18,6 +19,8 @@ export type MailboxObjects = {
 // The stored message can never be indexed: a digest mismatch, an unparseable
 // message or a size cap. Transport and storage failures are never permanent.
 export class PermanentMailError extends Error {}
+// The raw object is verifiably gone.
+export class MissingMailError extends PermanentMailError {}
 export class LifecycleConflict extends Error {}
 
 type MessageEvent = Extract<JournalEvent, { type: 'message' }>;
@@ -118,13 +121,32 @@ export class MailboxIndex {
 
   private async parse(key: string): Promise<ParsedMail> {
     if (!key.startsWith('raw/') || !isObjectKey(key)) throw new PermanentMailError('Invalid raw key');
-    const content = await this.objects.get(key);
+    let content: Uint8Array<ArrayBuffer>;
+    try {
+      content = await this.objects.get(key);
+    } catch (error) {
+      if (error instanceof ObjectMissingError) throw new MissingMailError('Raw message object does not exist');
+      if (error instanceof ObjectInvalidError) throw new PermanentMailError('Invalid mailbox object size');
+      throw error;
+    }
     if (content.byteLength === 0 || content.byteLength > MAX_RAW_BYTES) throw new PermanentMailError('Invalid mailbox object size');
     try {
       return await parseMail(content, key);
     } catch (error) {
       throw new PermanentMailError(error instanceof Error ? error.message : 'Unparseable message');
     }
+  }
+
+  // Restore found a completed delivery whose raw object is verifiably gone (for
+  // example, a duplicate whose object was collected). Record its receipt so the
+  // replay can continue; it was never, or can no longer be, shown.
+  skipMissing(id: string): void {
+    if (!isDeliveryId(id)) throw new Error('Invalid delivery for mailbox');
+    this.storage.transactionSync(() => {
+      if (this.received(id)) return;
+      this.apply({ type: 'receipt', id });
+      this.journal.append({ type: 'receipt', id });
+    });
   }
 
   private referenceFor(id: string): string { return `message:${this.holderScope}:${id}`; }

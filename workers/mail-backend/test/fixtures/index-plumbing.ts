@@ -1,5 +1,6 @@
 import { MailboxIndex, PermanentMailError } from '../../src/mailbox-index.ts';
 import { FixtureMailbox } from './mailbox-worker.ts';
+export { FixtureSweeper } from './mailbox-worker.ts';
 
 export class IndexPlumbing extends FixtureMailbox {
   async indexRaw(id: string, key: string, results: string | null = null) {

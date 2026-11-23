@@ -1,6 +1,6 @@
 import { deltaRange, INCARNATION, journalPrefix, readDelta, writeDelta } from './journal-backup.ts';
 import { sha256 } from './bytes.ts';
-import type { MailboxIndex, SnapshotRow } from './mailbox-index.ts';
+import { MissingMailError, type MailboxIndex, type SnapshotRow } from './mailbox-index.ts';
 import type { ReplayDelivery } from './outbox.ts';
 
 export const SETTINGS_FLUSH_MS = 60_000;
@@ -40,6 +40,8 @@ export type ReadyLife = {
   state: 'ready'; scope: Scope; incarnation: string; etag: string; rev: number;
   nextSnapshotAt: number; lastPublishedAt: number; lastSnapshotAt: number; failures: number; upload: Upload | null;
   reindexAfter: string;
+  // Completed deliveries the last restore skipped because their raw object was gone.
+  restoreSkipped?: number;
   // Background reindex backoff, separate from publication failures.
   reindexFailures?: number; reindexRetryAt?: number;
   // The manifest position a restore rebuilt from; its event is not in the local journal.
@@ -51,6 +53,8 @@ export type RestoringLife = {
   state: 'restoring'; scope: Scope; incarnation: string; startedAt: number; failures: number; bootstrap: boolean;
   phase: 'reset' | 'fence' | 'takeover' | 'snapshot' | 'deltas' | 'deliveries';
   epoch: number | null; etag: string | null; rev: number; page: number; rowNo: number; delta: number; after: number;
+  // Completed deliveries whose raw object was verifiably gone during replay.
+  skipped: number;
   baseSeq?: number; baseChain?: string | null;
   // Times this restore restarted because its manifest was confirmed missing.
   restarts?: number;
@@ -73,7 +77,7 @@ export function readyLife(scope: Scope, incarnation: string, etag: string, rev: 
 
 export function restoringLife(scope: Scope, incarnation: string, now: number, bootstrap = false): RestoringLife {
   return { state: 'restoring', scope, incarnation, startedAt: now, failures: 0, bootstrap, phase: 'reset',
-    epoch: null, etag: null, rev: 0, page: 0, rowNo: 0, delta: 0, after: 0 };
+    epoch: null, etag: null, rev: 0, page: 0, rowNo: 0, delta: 0, after: 0, skipped: 0 };
 }
 
 const uint = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
@@ -515,7 +519,8 @@ export class MailboxRecovery {
         if (!rows.length) {
           const now = ports.now();
           const ready: ReadyLife = { ...readyLife(life.scope, life.incarnation, life.etag!, life.rev, now),
-            nextSnapshotAt: now, lastSnapshotAt: life.startedAt, baseSeq: life.baseSeq, baseChain: life.baseChain };
+            nextSnapshotAt: now, lastSnapshotAt: life.startedAt, restoreSkipped: life.skipped,
+            baseSeq: life.baseSeq, baseChain: life.baseChain };
           this.index.setLifecycle(ready);
           return ready;
         }
@@ -523,11 +528,18 @@ export class MailboxRecovery {
         for (const row of rows) {
           if (!uint(row.doneAt) || row.doneAt <= after) throw new Error('Non-monotonic mailbox delivery cursor');
           // Deduplicated by receipt and by Message-ID plus body hash.
-          await this.index.ingest(row.id, row.rawKey, row.createdAt, row.authResults);
+          let skipped = life.skipped;
+          try {
+            await this.index.ingest(row.id, row.rawKey, row.createdAt, row.authResults);
+          } catch (error) {
+            if (!(error instanceof MissingMailError)) throw error;
+            this.index.skipMissing(row.id);
+            skipped++;
+          }
           after = row.doneAt;
-          save({ ...life, after });
+          life = save({ ...life, after, skipped });
         }
-        return { ...life, after };
+        return life;
       }
     }
   }

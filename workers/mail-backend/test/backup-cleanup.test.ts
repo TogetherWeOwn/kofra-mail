@@ -15,7 +15,7 @@ async function setup(t: TestContext) {
   const runtime = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: bundle.outputFiles[0].text }],
     compatibilityDate: '2025-06-01', durableObjects: {
     MAILBOX: { className: 'AlarmPlumbing', useSQLite: true }, SWEEPER: { className: 'UnusedSweeper', useSQLite: true },
-    TARGET: { className: 'FixtureMailbox', useSQLite: true },
+    TARGET: { className: 'FixtureMailbox', useSQLite: true }, SWEEP: { className: 'FixtureSweeper', useSQLite: true },
   }, bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', KOFRA_S3_ENDPOINT: 'https://s3.invalid',
     KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture' },
   r2Buckets: { MAIL_STATE: 'shared-state', STATE: 'shared-state', RAW: 'raw-fixture' }, d1Databases: ['DIRECTORY'] });
