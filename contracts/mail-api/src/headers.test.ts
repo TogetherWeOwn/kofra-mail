@@ -56,6 +56,8 @@ test('an id too long for one header line is never repeated', () => {
 test('third-party attachment names lose controls and path separators', () => {
   assert.equal(indexedAttachmentName('a\r\nb/c\\d.txt'), 'abcd.txt');
   assert.equal(indexedAttachmentName('\u0000'), 'attachment');
+  assert.equal(indexedAttachmentName('invoice\u202efdp.exe'), 'invoicefdp.exe');
+  assert.equal(indexedAttachmentName('a\u2066b\u2069\u200fc'), 'abc');
   assert.ok(Buffer.byteLength(indexedAttachmentName('é'.repeat(300))) <= 255);
   assert.equal(indexedAttachmentName('é'.repeat(300)), 'é'.repeat(127));
   const started = performance.now();

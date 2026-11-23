@@ -31,7 +31,8 @@ export const MESSAGE_ID_MAX = 998 - 'In-Reply-To: '.length;
 
 /**
  * An attachment name taken from third-party mail or Drive, as the index
- * stores it: control characters, `/` and `\` removed, at most 255 UTF-8
+ * stores it: control characters, bidirectional controls, `/` and `\`
+ * removed, at most 255 UTF-8
  * bytes. Outbound MIME then always encodes it (RFC 2231) unless it is a
  * plain token, so a name can never add a header or a parameter.
  */
@@ -39,7 +40,8 @@ export function indexedAttachmentName(name: string): string {
   let clean = '';
   let size = 0;
   // One pass, whole code points only.
-  for (const character of name.replace(/[\p{Cc}/\\]/gu, '')) {
+  // Bidirectional controls go too, so a name cannot display as `invoice<RLO>fdp.exe`.
+  for (const character of name.replace(/[\p{Cc}/\\\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, '')) {
     size += utf8Bytes(character);
     if (size > 255) break;
     clean += character;

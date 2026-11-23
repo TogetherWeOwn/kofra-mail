@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, problem, threadingHeaders } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
   DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
@@ -535,7 +535,9 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   function replyReferences(box: Mailbox, messageId: Id | undefined): string[] {
     const parent = messageId === undefined ? undefined : box.messages.get(messageId);
     if (!parent) return [];
-    const chain = [...parent.references, parent.messageIdHeader];
+    // Copied bounded: only safe ids, the first and the last 10, so a hostile References header cannot bloat the draft.
+    // The parent's own id stays last even when unsafe, so threadingHeaders can omit In-Reply-To rather than name an ancestor.
+    const chain = [...parent.references.filter(isSafeMessageId), parent.messageIdHeader];
     return chain.length > 11 ? [chain[0], ...chain.slice(-10)] : chain;
   }
   function expire(box: Mailbox): void {
