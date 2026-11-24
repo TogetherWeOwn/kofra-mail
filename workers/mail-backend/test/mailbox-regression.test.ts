@@ -101,8 +101,14 @@ test('mail API reads an M1 delivery and applies whole-thread set mutations', wor
 });
 
 test('mail API hydrates legacy indexed M1 messages from verified MIME once', workerdTest, async t => {
-  const wire = new TextEncoder().encode('From: Legacy Sender <sender@example.test>\r\nSubject: M1 message\r\n' +
-    'MIME-Version: 1.0\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n<p>Legacy</p><img src="https://example.test/image.png">');
+  const wire = new TextEncoder().encode([
+    'From: Legacy Sender <sender@example.test>', 'Subject: M1 message', 'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary=legacy', '', '--legacy',
+    'Content-Type: text/html; charset=UTF-8', '', '<p>Legacy body</p><img src="https://example.test/image.png">',
+    ...['blue', 'train.txt', 'green fields.pdf'].flatMap((name) => ['--legacy',
+      'Content-Type: application/octet-stream', `Content-Disposition: attachment; filename="${name}"`, '', 'test']),
+    '--legacy--', '',
+  ].join('\r\n'));
   const key = `raw/${sha256(wire)}/${id}`;
   let reads = 0;
   const { box, db } = await setup(t, path => {
@@ -125,9 +131,15 @@ test('mail API hydrates legacy indexed M1 messages from verified MIME once', wor
   };
   assert.deepEqual(await search('from:sender@example.test'), [id]);
   assert.deepEqual(await search('from:"legacy sender"'), []);
+  assert.deepEqual(await search('"blue train"'), [], 'a legacy phrase must not span filenames');
+  assert.deepEqual(await search('blue train'), [id], 'legacy unquoted terms can match separate filenames');
+  assert.deepEqual(await search('"legacy body" blue'), [id], 'a body phrase can combine with an unquoted filename term');
+  assert.deepEqual(await search('"green fields"'), [], 'legacy quoted filename matches wait for hydration');
   const thread = () => box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options);
   const result = await thread();
   assert.deepEqual(await search('from:"legacy sender"'), [id]);
+  assert.deepEqual(await search('"blue train"'), []);
+  assert.deepEqual(await search('"green fields"'), [id], 'a phrase can match inside a hydrated filename');
   const [first] = (result.body as { messages: { from: { name: string }; hasHtml: boolean; remoteImages: boolean }[] }).messages;
   assert.equal(first.from.name, 'Legacy Sender');
   assert.equal(first.hasHtml, true);

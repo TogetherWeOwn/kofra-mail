@@ -1,3 +1,6 @@
+// FTS5's unicode61 tokenizer drops punctuation but indexes private-use tokens.
+export const ATTACHMENT_SEARCH_BOUNDARY = String.fromCodePoint(0xE000);
+
 export const MAILBOX_SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, size INTEGER NOT NULL,

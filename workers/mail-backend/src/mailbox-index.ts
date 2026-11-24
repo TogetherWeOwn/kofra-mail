@@ -3,7 +3,7 @@ import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
-import { MAILBOX_SCHEMA } from './mailbox-schema.ts';
+import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
@@ -203,11 +203,23 @@ export class MailboxIndex {
   private insertSearchDisplay(id: string, rowid: number, parsed: ParsedMail | Prepared) {
     const display = parsed.display;
     const searchBody = display ? normalizeSearch(parsed.body) : parsed.body;
-    const names = parsed.attachments.map(a => a.name).join(' ').slice(0, 8192);
+    let names: string;
+    if (display) {
+      // Keep the existing filename-character budget; the separators add at
+      // most two extra characters per indexed attachment.
+      let remaining = 8192;
+      const bounded = parsed.attachments.flatMap(({ name }) => {
+        if (remaining <= 0) return [];
+        const clipped = name.slice(0, remaining);
+        remaining -= clipped.length + 1;
+        return [clipped];
+      });
+      names = normalizeSearch(bounded.join(` ${ATTACHMENT_SEARCH_BOUNDARY} `));
+    } else names = parsed.attachments.map(a => a.name).join(' ').slice(0, 8192);
     this.sql.exec('INSERT INTO fts(rowid, id, subject, addresses, body, attachment_names) VALUES (?, ?, ?, ?, ?, ?)',
       rowid, id, display?.searchSubject ?? parsed.subject,
       display ? `${display.searchFrom} ${display.searchTo}`.slice(0, 16_384) : `${parsed.sender} ${parsed.to} ${parsed.cc}`,
-      searchBody, display ? normalizeSearch(names) : names);
+      searchBody, names);
     if (display) this.sql.exec('INSERT OR REPLACE INTO mailbox_api_display VALUES (?, ?, ?)', id, JSON.stringify(display),
       searchBody === parsed.body ? null : parsed.body);
   }

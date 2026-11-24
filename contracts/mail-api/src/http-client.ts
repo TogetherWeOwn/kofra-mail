@@ -29,9 +29,10 @@ function unexpected(response: Response): MailApiError {
 }
 
 /** Same-origin browser adapter. The injected fetch is used by the local HTTP harness. */
-export function createHttpMailService({ baseUrl = API_PREFIX, fetch: fetcher = globalThis.fetch }: {
+export function createHttpMailService({ baseUrl = API_PREFIX, fetch: fetcher = globalThis.fetch, onProblem }: {
   baseUrl?: string;
   fetch?: typeof globalThis.fetch;
+  onProblem?: (error: MailApiError, operation: Operation) => void;
 } = {}): MailService {
   let end = baseUrl.length;
   while (end > 0 && baseUrl[end - 1] === '/') end--;
@@ -90,12 +91,10 @@ export function createHttpMailService({ baseUrl = API_PREFIX, fetch: fetcher = g
     if (response.status === 401 && csrfToken === token) csrfToken = undefined;
     const value: unknown = await response.json().catch(() => undefined);
     if (response.status !== route.success) {
-      if (isProblem(value, response.status)) {
-        const error = new MailApiError(value);
-        if (isMailApiError(error, 'csrf_failed') && csrfToken === token) csrfToken = undefined;
-        throw error;
-      }
-      throw unexpected(response);
+      const error = isProblem(value, response.status) ? new MailApiError(value) : unexpected(response);
+      if (isMailApiError(error, 'csrf_failed') && csrfToken === token) csrfToken = undefined;
+      onProblem?.(error, operation);
+      throw error;
     }
     if (!isObject(value)) throw unexpected(response);
     return value as Awaited<ReturnType<MailService[K]>>;

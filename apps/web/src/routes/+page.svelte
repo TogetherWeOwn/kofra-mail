@@ -7,7 +7,7 @@
   import { TopBar } from 'suite-shell';
   import { Archive, File, Inbox, Mail, OctagonAlert, Paperclip, Pencil, Plus, RefreshCw, Shield, Search, Send, Star, Tag, Trash2 } from '@lucide/svelte';
   import { onMount, tick } from 'svelte';
-  import { createHttpMailService, isMailApiError, type Conversation, type Draft, type Identity, type Label, type Message, type MessageAttachment, type Session, type Settings, type ThreadChange, type ThreadQuery, type ThreadSummary, type View, type ViewList } from '@kofra/mail-contract';
+  import { ROUTES, createHttpMailService, isMailApiError, type Conversation, type Draft, type Identity, type Label, type MailApiError, type MailboxPage, type Message, type MessageAttachment, type Operation, type Session, type Settings, type ThreadChange, type ThreadQuery, type ThreadSummary, type View, type ViewList } from '@kofra/mail-contract';
   import Compose, { type ComposeDraft } from '$lib/Compose.svelte';
   import MailSettings from '$lib/MailSettings.svelte';
   import MailAdmin from '$lib/MailAdmin.svelte';
@@ -17,7 +17,7 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
-  const api = createHttpMailService();
+  const api = createHttpMailService({ onProblem: handleProblem });
   const links = [
     { key: 'inbox', text: 'Inbox', icon: Inbox }, { key: 'starred', text: 'Starred', icon: Star },
     { key: 'sent', text: 'Sent', icon: Send }, { key: 'drafts', text: 'Drafts', icon: File },
@@ -59,6 +59,7 @@
   let headingHost: HTMLElement;
   let lastOpen: HTMLButtonElement | undefined;
   let request = 0;
+  let access = 0;
   let threadRequest = 0;
   let threadRefresh = 0;
   let loadedPages = 1;
@@ -78,6 +79,30 @@
     return { view: view === 'drafts' ? 'inbox' : view };
   }
   function showError(cause: unknown) { error = cause instanceof Error ? cause.message : 'This action did not complete.'; }
+  function applySession(next: Session | undefined): boolean {
+    const changed = session?.user.id !== next?.user.id || session?.workspace.id !== next?.workspace.id ||
+      session?.mailbox?.id !== next?.mailbox?.id;
+    if (changed) {
+      // Invalidate in-flight mailbox work before dropping its data from the UI.
+      access++; request++; threadRequest++;
+      thread = undefined; draft = undefined; settings = undefined; admin = false;
+      rows = []; drafts = []; selected = []; labels = []; identities = []; views = undefined;
+      cursor = null; loadedPages = 1; listState = undefined; lastOpen = undefined;
+      view = 'inbox'; labelId = undefined; searchText = ''; query = ''; navOpen = false;
+      busy = false; moreBusy = false; mutating = false; openingCompose = false; labelSaving = false;
+      error = ''; status = ''; newLabel = ''; labelError = '';
+      labelAction.clear(); driveActions.clear(); savingToDrive.clear(); labelDialog?.close();
+    }
+    session = next;
+    if (next?.workspace.role !== 'admin') admin = false;
+    return changed;
+  }
+  function handleProblem(failure: MailApiError, operation: Operation) {
+    if (failure.status === 401) applySession(undefined);
+    else if (failure.status === 403 && ROUTES[operation].access === 'member' && session?.mailbox) {
+      applySession({ ...session, mailbox: undefined });
+    }
+  }
   async function refresh(preservePages = false) {
     if (!session?.mailbox) return;
     const ticket = ++request;
@@ -86,69 +111,99 @@
     const isDrafts = view === 'drafts';
     const pageCount = preservePages ? loadedPages : 1;
     const filter = currentFilter();
-    async function threadPages() {
-      if (isDrafts) return;
-      let next = await api.listThreads(filter);
+    async function readPages<T extends { id: string }>(read: (cursor?: string) => Promise<MailboxPage<T>>) {
+      let next = await read();
       const firstState = next.state;
       let pages = 1;
       while (ticket === request && pages < pageCount && next.nextCursor) {
-        const page = await api.listThreads({ ...filter, cursor: next.nextCursor });
+        const page = await read(next.nextCursor);
         next = { ...page, items: appendUnique(next.items, page.items) };
         pages++;
       }
       return { next, pages, firstState };
     }
     try {
-      const [threadResult, nextDrafts, nextLabels, nextViews] = await Promise.all([
-        threadPages(), isDrafts ? api.listDrafts({}) : undefined,
+      const [threadResult, draftResult, nextLabels, nextViews] = await Promise.all([
+        isDrafts ? undefined : readPages((cursor) => api.listThreads({ ...filter, cursor })),
+        isDrafts ? readPages((cursor) => api.listDrafts({ cursor })) : undefined,
         api.listLabels(), api.listViews(),
       ]);
       if (ticket !== request) return;
-      const nextRows = threadResult?.next;
-      loadedPages = threadResult?.pages ?? 1;
-      listState = threadResult?.firstState ?? nextDrafts?.state;
-      rows = nextRows?.items ?? [];
-      drafts = nextDrafts?.items ?? [];
+      const result = threadResult ?? draftResult;
+      loadedPages = result?.pages ?? 1;
+      listState = result?.firstState;
+      rows = threadResult?.next.items ?? [];
+      drafts = draftResult?.next.items ?? [];
       const visible = new Set(rows.map((row) => row.id));
       selected = selected.filter((id) => visible.has(id));
       labels = nextLabels.items;
       views = nextViews;
-      cursor = (nextRows ?? nextDrafts)?.nextCursor ?? null;
+      cursor = result?.next.nextCursor ?? null;
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) busy = false; }
   }
   function appendUnique<T extends { id: string }>(current: T[], more: T[]): T[] {
     return [...new Map([...current, ...more].map((item) => [item.id, item])).values()];
   }
-  async function loadMore() {
+  async function loadMore(event: MouseEvent & { currentTarget: HTMLButtonElement }) {
     if (!cursor || busy || moreBusy) return;
     const ticket = request;
+    const button = event.currentTarget;
+    const hadFocus = document.activeElement === button;
+    const isDrafts = view === 'drafts';
+    const existingIds = new Set((isDrafts ? drafts : rows).map(({ id }) => id));
+    let focusId: string | undefined;
     moreBusy = true; error = '';
     try {
-      if (view === 'drafts') {
+      if (isDrafts) {
         const next = await api.listDrafts({ cursor });
-        if (ticket === request) { drafts = appendUnique(drafts, next.items); cursor = next.nextCursor; }
+        if (ticket !== request) return;
+        const added = next.items.find((item) => !existingIds.has(item.id));
+        if (added) focusId = `draft-${added.id}`;
+        drafts = appendUnique(drafts, next.items); cursor = next.nextCursor;
       } else {
         const next = await api.listThreads({ ...currentFilter(), cursor });
-        if (ticket === request) { rows = appendUnique(rows, next.items); cursor = next.nextCursor; loadedPages++; }
+        if (ticket !== request) return;
+        const added = next.items.find((item) => !existingIds.has(item.id));
+        if (added) focusId = `open-${added.id}`;
+        rows = appendUnique(rows, next.items); cursor = next.nextCursor;
+      }
+      loadedPages++;
+      if (!cursor && hadFocus) {
+        await tick();
+        if (ticket !== request || thread || settings || admin) return;
+        if (document.activeElement === document.body || document.activeElement === button) {
+          const target = (focusId && document.getElementById(focusId)) || headingHost.querySelector<HTMLElement>('[data-paged-list]');
+          (target || headingHost).focus();
+        }
       }
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) moreBusy = false; }
   }
   async function initialize() {
     initializing = true; error = '';
+    const scope = access;
     try {
-      session = await api.getSession();
+      const next = await api.getSession();
+      if (scope !== access) return;
+      applySession(next);
       await refresh();
       syncHash();
     } catch (cause) { showError(cause); }
     finally { initializing = false; }
   }
   async function checkForChanges() {
-    if (!canUseMail || busy || moreBusy || mutating || checkingForChanges) return;
+    if (initializing || busy || moreBusy || mutating || checkingForChanges) return;
     checkingForChanges = true;
+    const scope = access;
     const ticket = request;
     try {
+      const next = await api.getSession();
+      if (scope !== access) return;
+      const changed = applySession(next);
+      if (!next.mailbox) return;
+      if (changed) { await refresh(); return; }
+      if (ticket !== request) return;
       const latest = await api.listViews();
       if (ticket !== request) return;
       if (listState === latest.state) views = latest;
@@ -169,18 +224,19 @@
       void navigate('inbox');
     };
     document.addEventListener('click', followMailLink, true);
-    return () => { request++; threadRequest++; document.removeEventListener('click', followMailLink, true); };
+    return () => { access++; request++; threadRequest++; document.removeEventListener('click', followMailLink, true); };
   });
 
   async function openSettings() {
+    const scope = access;
     try {
       const [value, available] = await Promise.all([api.getSettings(), api.listIdentities()]);
-      if (location.hash !== '#mail-settings') return;
+      if (scope !== access || location.hash !== '#mail-settings') return;
       settings = value; identities = available.items;
       navOpen = false;
       admin = false;
       await focusHeading();
-    } catch (cause) { showError(cause); }
+    } catch (cause) { if (scope === access) showError(cause); }
   }
   function syncHash() {
     if (location.hash === '#mail-settings' && session?.mailbox) { if (!settings) void openSettings(); }
@@ -199,11 +255,18 @@
     if (openingCompose || draft || !canUseMail) return;
     error = ''; navOpen = false;
     openingCompose = true;
+    const scope = access;
     try {
       const available = await api.listIdentities();
+      if (scope !== access) return;
       identities = available.items;
-      if (draftId) { draft = await api.getDraft(draftId); return; }
+      if (draftId) {
+        const existing = await api.getDraft(draftId);
+        if (scope === access) draft = existing;
+        return;
+      }
       const preferences = await api.getSettings();
+      if (scope !== access) return;
       const active = identities.filter((identity) => identity.sendAs === 'active');
       const isOwn = (email: string) => active.some((identity) => identity.email.toLowerCase() === email.toLowerCase());
       const message = event?.message;
@@ -220,8 +283,8 @@
         inReplyTo: reply ? message?.id : undefined, forwardOf: reply ? undefined : message?.id,
         attachments: message && !reply ? message.attachments.map((file) => ({ kind: 'message', messageId: message.id, ...file })) : [],
       };
-    } catch (cause) { showError(cause); }
-    finally { openingCompose = false; }
+    } catch (cause) { if (scope === access) showError(cause); }
+    finally { if (scope === access) openingCompose = false; }
   }
   async function refreshOpenThread() {
     const id = thread?.thread.id;
@@ -257,21 +320,25 @@
     if (!filter.endsWith(':')) { query = searchText; void navigate('search'); }
     else document.getElementById('mail-search')?.focus();
   }
-  async function open(id: string, button: HTMLButtonElement, unread: boolean) {
+  async function open(id: string, button: HTMLButtonElement) {
     const ticket = ++threadRequest;
+    const listTicket = request;
     lastOpen = button; error = '';
     try {
-      if (unread) await api.updateThreads({ ids: [id], set: { unread: false } });
       const latest = await api.getThread(id);
       if (ticket !== threadRequest) return;
       thread = latest;
-      if (unread) {
-        rows = rows.map((row) => row.id === id ? { ...row, unread: false } : row);
-        if (view === 'search') void refresh(true);
-        else void refreshViewCounts(request);
-      }
       // Do not steal focus if the user began using the shell while mail loaded.
       if (document.activeElement === button || document.activeElement === document.body) await focusHeading();
+      if (ticket !== threadRequest || !latest.thread.unread) return;
+      await api.updateThreads({ ids: [id], set: { unread: false } });
+      if (listTicket !== request) return;
+      rows = rows.map((row) => row.id === id ? { ...row, unread: false } : row);
+      if (ticket === threadRequest && thread?.thread.id === id) {
+        thread = { ...thread, thread: { ...thread.thread, unread: false } };
+      }
+      if (view === 'search') void refresh(true);
+      else void refreshViewCounts(listTicket);
     } catch (cause) { if (ticket === threadRequest) showError(cause); }
   }
   async function refreshViewCounts(ticket: number) {
@@ -295,8 +362,10 @@
     if (maximum !== undefined && ids.length > maximum) { error = `Select no more than ${maximum} conversations at once.`; return; }
     error = ''; mutating = true;
     const ticket = threadRequest;
+    const scope = access;
     try {
       await api.updateThreads({ ids, set: change });
+      if (scope !== access) return;
       if (change.folder) {
         selected = [];
         status = `Moved to ${links.find((item) => item.key === change.folder)?.text ?? 'Archive'}.`;
@@ -305,42 +374,48 @@
       } else {
         await Promise.all([refresh(true), thread && ids.includes(thread.thread.id) ? refreshOpenThread() : undefined]);
       }
-    } catch (cause) { showError(cause); }
-    finally { mutating = false; }
+    } catch (cause) { if (scope === access) showError(cause); }
+    finally { if (scope === access) mutating = false; }
   }
   async function createLabel(event: SubmitEvent) {
     event.preventDefault();
-    if (labelSaving) return;
+    if (!canUseMail || labelSaving) return;
+    const scope = access;
     labelSaving = true; labelError = '';
     const input = { name: newLabel.trim() };
     try {
       const label = await api.createLabel(input, labelAction.options(input));
+      if (scope !== access) return;
       labelAction.clear(); labelDialog.close(); await navigate('label', label.id);
-    } catch (cause) { labelError = cause instanceof Error ? cause.message : 'Could not create the label.'; }
-    finally { labelSaving = false; }
+    } catch (cause) { if (scope === access) labelError = cause instanceof Error ? cause.message : 'Could not create the label.'; }
+    finally { if (scope === access) labelSaving = false; }
   }
   async function download(messageId: string, file: MessageAttachment) {
     error = '';
+    const scope = access;
     try {
       const link = await api.getAttachmentUrl(messageId, file.part);
+      if (scope !== access) return;
       const url = contentFrameUrl(link.url, data.contentOrigin);
       if (!url || !(Date.parse(link.expiresAt) > Date.now())) throw new Error('The attachment download link is unavailable.');
       const a = document.createElement('a');
       a.href = url; a.download = file.name; a.rel = 'noreferrer noopener'; a.referrerPolicy = 'no-referrer'; a.click();
-    } catch (cause) { showError(cause); }
+    } catch (cause) { if (scope === access) showError(cause); }
   }
   async function saveToDrive(messageId: string, file: MessageAttachment) {
     const key = `${messageId}:${file.part}`;
     if (!session?.features.drive || savingToDrive.has(key)) return;
     error = ''; savingToDrive.add(key);
     const action = driveActions.get(key) ?? mailAction();
+    const scope = access;
     driveActions.set(key, action);
     try {
       const saved = await api.saveAttachmentToDrive(messageId, file.part, action.options(key));
+      if (scope !== access) return;
       driveActions.delete(key);
       status = `Saved ${saved.name} to Drive.`;
-    } catch (cause) { showError(cause); }
-    finally { savingToDrive.delete(key); }
+    } catch (cause) { if (scope === access) showError(cause); }
+    finally { if (scope === access) savingToDrive.delete(key); }
   }
   function toggleSelect(id: string) { selected = selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]; }
 </script>
@@ -348,7 +423,7 @@
 <svelte:window onhashchange={syncHash} onfocus={checkForChanges} onkeydown={(event) => { if (event.key === 'Escape') navOpen = false; }} />
 <svelte:head><title>Riaklo Mail</title><meta name="description" content="Riaklo Mail inbox" /></svelte:head>
 <a class="skip" href="#mail-content" onclick={(event) => { event.preventDefault(); headingHost.focus(); }}>Skip to mail</a>
-<TopBar productName="Riaklo Mail" productHref="#mail" productIcon="mail" currentAppId="mail" {apps} {account} accountHref="#mail-settings" onMenuClick={toggleNav} menuControls="mail-nav" settingsLabel="Mail settings" settingsHref={canUseMail ? '#mail-settings' : undefined}>
+<TopBar productName="Riaklo Mail" productHref="#mail" productIcon="mail" currentAppId="mail" {apps} {account} accountHref={canUseMail ? '#mail-settings' : '#mail'} onMenuClick={toggleNav} menuControls="mail-nav" settingsLabel="Mail settings" settingsHref={canUseMail ? '#mail-settings' : undefined}>
   {#snippet search()}
     <form class="search" role="search" onsubmit={submitSearch}>
       <Search size={20} /><input id="mail-search" type="search" aria-label="Search mail" placeholder="Search mail" disabled={!canUseMail} bind:value={searchText} />
@@ -394,7 +469,7 @@
     {:else if view === 'drafts'}
       <h1 class="list-heading" tabindex="-1" data-view-heading>Drafts</h1>
       {#if busy}<p class="empty">Loading drafts…</p>
-      {:else if drafts.length}<ul class="draft-list" aria-label="Drafts">{#each drafts as item (item.id)}<li><button onclick={() => compose(undefined, item.id)}>Open draft {item.subject || '(No subject)'}</button></li>{/each}</ul>
+      {:else if drafts.length}<ul class="draft-list" aria-label="Drafts" tabindex="-1" data-paged-list>{#each drafts as item (item.id)}<li><button id={`draft-${item.id}`} onclick={() => compose(undefined, item.id)}>Open draft {item.subject || '(No subject)'}</button></li>{/each}</ul>
       {:else}<p class="empty">No drafts.</p>{/if}
     {:else}
       <div class="toolbar listbar">
@@ -417,12 +492,12 @@
       {:else}
         <span hidden id="unread-conversation">Unread conversation.</span>
         <span hidden id="has-attachments">Has attachments.</span>
-        <ul class="mail-list" aria-label={heading}>
+        <ul class="mail-list" aria-label={heading} tabindex="-1" data-paged-list>
           {#each rows as row, index (row.id)}
             <li class="mail-row" class:unread={row.unread} class:chosen={selected.includes(row.id)}>
               <input type="checkbox" class="row-check" aria-label={`Select ${row.subject}`} checked={selected.includes(row.id)} onchange={() => toggleSelect(row.id)} />
               <button class="icon star" aria-label={`${row.starred ? 'Unstar' : 'Star'} ${row.subject}`} aria-pressed={row.starred} disabled={mutating} onclick={() => update([row.id], { starred: !row.starred })}><Star size={17} fill={row.starred ? 'currentColor' : 'none'} /></button>
-              <button class="open-mail" id={`open-${row.id}`} aria-describedby={[row.unread ? 'unread-conversation' : '', row.hasAttachments ? 'has-attachments' : ''].filter(Boolean).join(' ') || undefined} onclick={(event) => open(row.id, event.currentTarget, row.unread)}>
+              <button class="open-mail" id={`open-${row.id}`} aria-describedby={[row.unread ? 'unread-conversation' : '', row.hasAttachments ? 'has-attachments' : ''].filter(Boolean).join(' ') || undefined} onclick={(event) => open(row.id, event.currentTarget)}>
                 <span class={`avatar row-avatar color-${index % 4}`} aria-hidden="true">{initials(row.from.name)}</span>
                 <span class="sender">{row.from.name || row.from.email}{#if row.count > 1} <small>{row.count}</small>{/if}</span>
                 <span class="snippet">{#each labels.filter((label) => row.labelIds.includes(label.id)) as label (label.id)}<span class="label-chip"><Tag size={11} />{label.name}</span>{/each}<span class="subject">{row.subject}</span><span class="preview"><span class="desktop"> – </span>{row.snippet}</span></span>
@@ -433,7 +508,7 @@
         </ul>
       {/if}
     {/if}
-    {#if !thread && !settings && !admin && cursor}<div class="toolbar"><button class="pill" disabled={busy || moreBusy} onclick={loadMore}>{moreBusy ? 'Loading…' : 'Load more'}</button></div>{/if}
+    {#if canUseMail && !thread && !settings && !admin && cursor}<div class="toolbar"><button class="pill" disabled={busy || moreBusy} onclick={loadMore}>{moreBusy ? 'Loading…' : 'Load more'}</button></div>{/if}
   </main>
 </div>
 <div class="status" class:sr-only={!status} aria-live="polite">{status}{#if status}<button class="icon" aria-label="Dismiss notification" onclick={() => status = ''}>×</button>{/if}</div>

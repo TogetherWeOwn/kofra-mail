@@ -4,6 +4,7 @@ import { VIEWS, type Address, type Conversation, type Folder, type Label, type M
   type ThreadSummary, type View, type ViewList } from '../../../contracts/mail-api/src/wire.ts';
 import type { JournalEvent } from './mail-journal.ts';
 import { fail, invalid, iso, isId, need, object, requireId, text } from './mailbox-api-input.ts';
+import { ATTACHMENT_SEARCH_BOUNDARY } from './mailbox-schema.ts';
 import { normalizeSearch, type MessageDisplay } from './parse-mail.ts';
 
 const FOLDERS = ['inbox', 'archive', 'spam', 'trash'] as const;
@@ -165,7 +166,10 @@ function searchWhere(sql: SqlStorage, query: string, timezone: string | undefine
   const clauses: string[] = [];
   const values: SqlStorageValue[] = [];
   const fts: string[] = [];
+  const legacyPhrases: string[] = [];
   const literals = new Set<string>();
+  const literalPhrases = new Set<string>();
+  const hasDisplay = 'EXISTS (SELECT 1 FROM mailbox_api_display WHERE id = s.id)';
   const add = (condition: string, ...params: SqlStorageValue[]) => { clauses.push(condition); values.push(...params); };
   const terms = normalizeSearch(query).matchAll(/(before|after|larger):(?=\s|$)|(?:([a-z]+):)?(?:"([^"]*)"|([^\s"]+))/g);
   for (const [, empty, op, quoted, word] of terms) {
@@ -205,17 +209,30 @@ function searchWhere(sql: SqlStorage, query: string, timezone: string | undefine
         if (literal) {
           // Quote every term; user input is never FTS syntax. For a literal
           // operator or punctuation-only input, preserve punctuation exactly.
-          if (!op && !literal.endsWith(':') && /[\p{L}\p{N}]/u.test(literal)) fts.push(`"${literal.replaceAll('"', '""')}"`);
-          else literals.add(literal);
+          if (!op && !literal.endsWith(':') && /[\p{L}\p{N}]/u.test(literal)) {
+            // A query cannot match the filename boundary, even when it explicitly includes it.
+            const columns = literal.includes(ATTACHMENT_SEARCH_BOUNDARY) ? '-attachment_names : ' : '';
+            const expression = `"${literal.replaceAll('"', '""')}"`;
+            fts.push(`${columns}${expression}`);
+            if (quoted !== undefined && !columns) legacyPhrases.push(`-attachment_names : ${expression}`);
+          } else (quoted === undefined ? literals : literalPhrases).add(literal);
         }
       }
     }
   }
   if (fts.length) add('s.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?)', fts.join(' AND '));
-  if (literals.size) add(`EXISTS (SELECT 1 FROM fts x WHERE x.rowid = s.rowid AND NOT EXISTS (
-    SELECT 1 FROM json_each(?) terms WHERE max(instr(lower(x.subject), terms.value),
-      instr(lower(x.addresses), terms.value), instr(lower(x.body), terms.value),
-      instr(lower(x.attachment_names), terms.value)) = 0))`, JSON.stringify([...literals]));
+  // M1 rows have one concatenated attachment string. Only their unquoted
+  // searches can use that column until digest-verified hydration rewrites it.
+  if (legacyPhrases.length) add(`(${hasDisplay} OR s.rowid IN (SELECT rowid FROM fts WHERE fts MATCH ?))`, legacyPhrases.join(' AND '));
+  for (const [terms, quoted] of [[literals, false], [literalPhrases, true]] as const) {
+    if (!terms.size) continue;
+    add(`EXISTS (SELECT 1 FROM fts x WHERE x.rowid = s.rowid AND NOT EXISTS (
+      SELECT 1 FROM json_each(?) terms WHERE max(instr(lower(x.subject), terms.value),
+        instr(lower(x.addresses), terms.value), instr(lower(x.body), terms.value),
+        CASE WHEN instr(terms.value, ?) = 0 ${quoted ? `AND ${hasDisplay}` : ''}
+          THEN instr(lower(x.attachment_names), terms.value) ELSE 0 END) = 0))`,
+    JSON.stringify([...terms]), ATTACHMENT_SEARCH_BOUNDARY);
+  }
   return { clauses, values };
 }
 

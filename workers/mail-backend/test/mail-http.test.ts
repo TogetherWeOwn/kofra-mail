@@ -2,9 +2,31 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { defineConformance } from '../../../contracts/mail-api/src/conformance.ts';
 import { isMailApiError } from '../../../contracts/mail-api/src/errors.ts';
+import { ATTACHMENT_SEARCH_BOUNDARY } from '../src/mailbox-schema.ts';
 import { startMailHttpFixture } from './fixtures/mail-http.ts';
 
 defineConformance('mail API over HTTP in local workerd (M2-W)', startMailHttpFixture);
+
+test('search phrases match within a filename, not across filenames', async () => {
+  const fixture = await startMailHttpFixture();
+  try {
+    const deliver = (...names: string[]) => fixture.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [],
+      subject: 'Attachments', text: 'Packing list',
+      attachments: names.map(name => ({ name, type: 'text/plain', bytes: new Uint8Array([42]) })) });
+    const split = await deliver('blue.pdf', 'train.txt');
+    const same = await deliver('BLUE-train.pdf');
+    const mail = fixture.as('member');
+    const search = async (q: string) => (await mail.listThreads({ view: 'inbox', q })).items.map(({ id }) => id).sort();
+
+    assert.deepEqual(await search('blue train'), [split.threadId, same.threadId].sort());
+    assert.deepEqual(await search('"blue train"'), [same.threadId]);
+    assert.deepEqual(await search('"blue pdf train"'), []);
+    const contiguous = await deliver('blue.pdf-train.txt');
+    assert.deepEqual(await search('"packing list" "blue pdf train"'), [contiguous.threadId]);
+    assert.deepEqual(await search(`"pdf ${ATTACHMENT_SEARCH_BOUNDARY} train"`), []);
+    assert.deepEqual(await search(ATTACHMENT_SEARCH_BOUNDARY), []);
+  } finally { await fixture.close(); }
+});
 
 test('the interactive demo mints fresh content URLs after its initial clock expires', async () => {
   const fixture = await startMailHttpFixture({ demo: true, startedAt: Date.now() - 660_000 });

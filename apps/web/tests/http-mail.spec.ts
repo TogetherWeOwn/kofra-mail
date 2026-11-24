@@ -1,12 +1,18 @@
 import { createHttpMailService, type DraftInput } from '@kofra/mail-contract';
 import { expect, test } from './fixtures/mail';
 
-test('reads the HTTP session before listing threads', async ({ page, origins }) => {
-  const service = createHttpMailService({ baseUrl: `${origins.appOrigin}/api/v1`, fetch: (input, init) => {
+function serviceAt(origin: string) {
+  return createHttpMailService({ baseUrl: `${origin}/api/v1`, fetch: (input, init) => {
     const request = new Request(input, init);
-    if (request.method !== 'GET') request.headers.set('Origin', origins.appOrigin);
+    if (request.method !== 'GET') request.headers.set('Origin', origin);
     return fetch(request);
   } });
+}
+
+const planRow = /^Mira Chen.*Floor plan revisions/;
+
+test('reads the HTTP session before listing threads', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
   const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
   await service.updateThreads({ ids: [plan.id], set: { unread: false } });
   const detailPath = `/api/v1/threads/${plan.id}`;
@@ -42,6 +48,73 @@ test('reads the HTTP session before listing threads', async ({ page, origins }) 
     .toBe(await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone));
 });
 
+test('clears the reader and mailbox controls when a real transfer races a focus check', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const session = await service.getSession();
+  const nextOwner = (await service.listMembers({})).items.find((member) => !member.hasMailbox && member.id !== session.user.id);
+  expect(nextOwner).toBeTruthy();
+  const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
+  await service.updateThreads({ ids: [plan.id], set: { unread: false } });
+  await page.goto('/');
+  await page.getByRole('button', { name: planRow }).click();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
+  const rechecked = page.waitForResponse((response) => response.url().endsWith('/api/v1/session'), { timeout: 5_000 }).catch(() => null);
+  // Execute the directory write after focus starts, just before its real /views read.
+  await page.route('**/api/v1/views', async (route) => {
+    await service.updateMailbox(session.mailbox!.id, { ownerUserId: nextOwner!.id });
+    await route.continue();
+  }, { times: 1 });
+  const denied = page.waitForResponse((response) => response.url().endsWith('/api/v1/views') && response.status() === 403);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect((await denied).status()).toBe(403);
+  expect((await service.getSession()).mailbox).toBeUndefined();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'No mailbox assigned' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeDisabled();
+  await expect(page.getByRole('searchbox')).toBeDisabled();
+  await expect(page.locator('#mail-nav').getByRole('button', { name: 'Inbox', exact: true, includeHidden: true })).toBeDisabled();
+  expect((await rechecked)?.ok()).toBe(true);
+});
+
+test('failed detail reads leave unopened mail unread on the backend', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
+  expect(plan.unread).toBe(true);
+  await page.route(`**/api/v1/threads/${plan.id}`, (route) => route.fulfill({ status: 503,
+    json: { type: 'urn:kofra-mail:problem:unavailable', title: 'Detail temporarily unavailable', code: 'unavailable', status: 503 }, }), { times: 1 });
+  await page.goto('/');
+  await page.getByRole('button', { name: planRow }).click();
+  await expect(page.getByRole('alert')).toHaveText('Detail temporarily unavailable');
+  expect((await service.getThread(plan.id)).thread.unread).toBe(true);
+});
+
+test('draft revalidation preserves all loaded pages after an external mailbox change', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const session = await service.getSession();
+  const input: DraftInput = { from: session.mailbox!.primaryAddress, to: [], cc: [], bcc: [], subject: '', body: '', attachments: [] };
+  for (const subject of ['First saved draft', 'Second saved draft']) {
+    await service.createDraft({ ...input, subject }, { idempotencyKey: crypto.randomUUID() });
+  }
+  await page.route(/\/api\/v1\/drafts(?:\?.*)?$/, (route) => {
+    const url = new URL(route.request().url());
+    url.searchParams.set('limit', '1');
+    return route.continue({ url: url.href });
+  });
+  await page.goto('/');
+  await expect(page.getByRole('searchbox')).toBeEnabled();
+  const draftsNav = page.getByRole('button', { name: 'Drafts', exact: true });
+  if (!(await draftsNav.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
+  await draftsNav.click();
+  const list = page.getByRole('list', { name: 'Drafts', exact: true });
+  await expect(list.getByRole('listitem')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Load more' }).click();
+  await expect(list.getByRole('listitem')).toHaveCount(2);
+  await service.createLabel({ name: 'External draft refresh' }, { idempotencyKey: crypto.randomUUID() });
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await expect(page.locator('#mail-nav').getByText('External draft refresh', { exact: true })).toHaveCount(1);
+  await expect(list.getByRole('listitem')).toHaveCount(2);
+});
+
 test('loads the next page using the opaque cursor for the same inbox query', async ({ page }) => {
   const requests: URL[] = [];
   await page.route('**/api/v1/threads?*', async (route) => {
@@ -52,13 +125,16 @@ test('loads the next page using the opaque cursor for the same inbox query', asy
   });
   await page.goto('/');
   await expect(page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem')).toHaveCount(1);
-  await page.getByRole('button', { name: 'Load more' }).click();
+  const more = page.getByRole('button', { name: 'Load more' });
+  await more.focus();
+  await more.press('Enter');
   await expect(page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem')).toHaveCount(2);
   expect(requests[0].searchParams.get('cursor')).toBeNull();
   expect(requests[1].searchParams.get('cursor')).toBeTruthy();
   expect(requests[1].searchParams.get('view')).toBe('inbox');
   await expect(page.getByRole('button', { name: 'Load more' })).toHaveCount(0);
   const later = page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem').nth(1).locator('button.open-mail');
+  await expect(later).toBeFocused();
   const id = await later.getAttribute('id');
   expect(id).toBeTruthy();
   const counts = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/views');
