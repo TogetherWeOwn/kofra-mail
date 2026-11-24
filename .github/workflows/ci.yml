@@ -81,6 +81,7 @@ jobs:
           package-manager-cache: false
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm ci --prefix workers/mail-backend --ignore-scripts --no-audit --no-fund
+      - run: npm exec -w @kofra/mail-web -- svelte-kit sync
       - run: npm exec -- playwright install --with-deps chromium
       - run: npm run test:e2e -w @kofra/mail-web -- --shard="$SHARD/4"
         env:
