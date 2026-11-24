@@ -101,13 +101,37 @@ export async function parseMail(raw: Uint8Array<ArrayBuffer>, rawKey: string, ma
   };
 }
 
+const remoteImageUrl = /^(?:https?:)?\/\//i;
+const space = /[\t\n\f\r ]/;
+
+function remoteSrcset(value: string): boolean {
+  // A srcset URL is one non-whitespace token; interior commas (e.g. in a
+  // data URL) belong to that URL. After it, commas separate descriptors.
+  let i = 0;
+  while (i < value.length) {
+    while (i < value.length && (value[i] === ',' || space.test(value[i]))) i++;
+    const start = i;
+    while (i < value.length && !space.test(value[i])) i++;
+    const url = value.slice(start, i);
+    if (remoteImageUrl.test(url)) return true;
+    if (url.endsWith(',')) continue;
+    let parentheses = 0;
+    while (i < value.length) {
+      const char = value[i++];
+      if (char === '(') parentheses++;
+      else if (char === ')' && parentheses) parentheses--;
+      else if (char === ',' && !parentheses) break;
+    }
+  }
+  return false;
+}
+
 function hasRemoteImages(html: string): boolean {
   let remote = false;
   const parser = new Parser({
     onopentag(name, attrs) {
       if (name !== 'img' && name !== 'source') return;
-      remote = (name === 'img' && /^(?:https?:)?\/\//i.test(attrs.src?.trimStart() ?? '')) ||
-        /(?:^|,)\s*(?:https?:)?\/\//i.test(attrs.srcset ?? '');
+      remote = (name === 'img' && remoteImageUrl.test(attrs.src?.trimStart() ?? '')) || remoteSrcset(attrs.srcset ?? '');
       if (remote) parser.pause();
     },
   }, { decodeEntities: true });

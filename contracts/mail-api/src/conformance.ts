@@ -650,6 +650,8 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       }));
       const { messages: [delivered] } = await mail.getThread(html.threadId);
       assert.equal(delivered.remoteImages, true);
+      const inline = await h.deliver(message('Inline only', { html: '<img srcset="data:image/svg+xml,https://local-payload 1x">' }));
+      assert.equal((await mail.getThread(inline.threadId)).messages[0].remoteImages, false);
       const now = Date.parse(delivered.receivedAt);
       const [{ part }] = delivered.attachments;
       const without = await mail.getBodyUrl(html.messageId, { remoteImages: false });

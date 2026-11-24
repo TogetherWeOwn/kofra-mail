@@ -62,6 +62,7 @@
   let threadRequest = 0;
   let threadRefresh = 0;
   let loadedPages = 1;
+  let listState: string | undefined;
   let checkingForChanges = false;
   const canUseMail = $derived(!!session?.mailbox && !initializing);
   const canAdmin = $derived(session?.workspace.role === 'admin');
@@ -88,13 +89,14 @@
     async function threadPages() {
       if (isDrafts) return;
       let next = await api.listThreads(filter);
+      const firstState = next.state;
       let pages = 1;
       while (ticket === request && pages < pageCount && next.nextCursor) {
         const page = await api.listThreads({ ...filter, cursor: next.nextCursor });
         next = { ...page, items: appendUnique(next.items, page.items) };
         pages++;
       }
-      return { next, pages };
+      return { next, pages, firstState };
     }
     try {
       const [threadResult, nextDrafts, nextLabels, nextViews] = await Promise.all([
@@ -104,6 +106,7 @@
       if (ticket !== request) return;
       const nextRows = threadResult?.next;
       loadedPages = threadResult?.pages ?? 1;
+      listState = threadResult?.firstState ?? nextDrafts?.state;
       rows = nextRows?.items ?? [];
       drafts = nextDrafts?.items ?? [];
       const visible = new Set(rows.map((row) => row.id));
@@ -145,10 +148,9 @@
     if (!canUseMail || busy || moreBusy || mutating || checkingForChanges) return;
     checkingForChanges = true;
     try {
-      const previous = views?.state;
       const latest = await api.listViews();
       await Promise.all([
-        previous !== latest.state ? refresh(true) : undefined,
+        listState !== latest.state ? refresh(true) : undefined,
         thread && thread.state !== latest.state ? refreshOpenThread() : undefined,
       ]);
     } catch (cause) { showError(cause); }

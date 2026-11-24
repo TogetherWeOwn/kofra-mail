@@ -1,7 +1,17 @@
 import { createHttpMailService, type DraftInput } from '@kofra/mail-contract';
 import { expect, test } from './fixtures/mail';
 
-test('reads the HTTP session before listing threads', async ({ page }) => {
+test('reads the HTTP session before listing threads', async ({ page, origins }) => {
+  const service = createHttpMailService({ baseUrl: `${origins.appOrigin}/api/v1`, fetch: (input, init) => {
+    const request = new Request(input, init);
+    if (request.method !== 'GET') request.headers.set('Origin', origins.appOrigin);
+    return fetch(request);
+  } });
+  const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
+  await service.updateThreads({ ids: [plan.id], set: { unread: false } });
+  const detailPath = `/api/v1/threads/${plan.id}`;
+  const staleDetail = await service.getThread(plan.id);
+  await page.route(`**${detailPath}`, (route) => route.fulfill({ json: { ...staleDetail, state: 'stale-thread-snapshot' } }), { times: 1 });
   const operations: string[] = [];
   page.on('request', (request) => {
     const path = new URL(request.url()).pathname;
@@ -11,6 +21,13 @@ test('reads the HTTP session before listing threads', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeEnabled();
   expect(operations[0]).toBe('/api/v1/session');
   expect(operations).toContain('/api/v1/threads');
+  await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
+  const refresh = page.waitForResponse((response) => new URL(response.url()).pathname === detailPath);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect((await refresh).ok()).toBe(true);
+  expect(operations.filter((path) => path === '/api/v1/threads')).toHaveLength(1);
+  await page.getByRole('button', { name: 'Back to list' }).click();
   const query = 'after:2026-11-22';
   const request = page.waitForRequest((request) => new URL(request.url()).searchParams.get('q') === query);
   await page.getByRole('searchbox').fill(query);
@@ -38,11 +55,16 @@ test('loads the next page using the opaque cursor for the same inbox query', asy
   const later = page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem').nth(1).locator('button.open-mail');
   const id = await later.getAttribute('id');
   expect(id).toBeTruthy();
+  const counts = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/views');
   await later.click();
   await page.getByRole('button', { name: 'Back to list' }).click();
   await expect(page.locator(`#${id}`)).toBeFocused();
   await expect(page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem')).toHaveCount(2);
   expect(requests).toHaveLength(2); // Opening an unread row does not walk the loaded pages again.
+  expect((await counts).ok()).toBe(true);
+  const revalidation = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/v1/threads');
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect((await revalidation).ok()).toBe(true); // Updated counts do not stand in for a refreshed list.
   const laterRow = page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem').nth(1);
   await laterRow.getByRole('button', { name: /^Star / }).click();
   await expect(laterRow.getByRole('button', { name: /^Unstar / })).toHaveAttribute('aria-pressed', 'true');

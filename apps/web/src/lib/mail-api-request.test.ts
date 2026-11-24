@@ -37,6 +37,16 @@ test('writes check Origin and CSRF before feature availability or body processin
   assert.equal(res.headers.get('access-control-allow-origin'), null);
 });
 
+test('same-origin writes still require the correct session CSRF token', async () => {
+  for (const token of [undefined, 'wrong-token']) {
+    const headers = new Headers({ origin: app });
+    if (token !== undefined) headers.set('x-csrf-token', token);
+    const res = await handleMailApi(request('/uploads?name=file', { method: 'POST', headers }), env);
+    assert.equal(res.status, 403);
+    assert.equal((await res.json()).code, 'csrf_failed');
+  }
+});
+
 test('unavailable local outbound operations fail with a typed problem', async () => {
   const res = await handleMailApi(request('/sends'), env);
   assert.equal(res.status, 501);

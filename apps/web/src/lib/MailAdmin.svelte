@@ -44,8 +44,12 @@
     memberCursor = next.nextCursor;
   }
   onMount(() => {
-    void Promise.all([api.listDomains().then(({ items }) => domains = items), loadMailboxes()])
-      .catch((cause) => loadError = failure(cause)).finally(() => loading = false);
+    void Promise.allSettled([api.listDomains().then(({ items }) => domains = items), loadMailboxes()])
+      .then((results) => {
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') loadError = failure(failed.reason);
+        loading = false;
+      });
   });
   async function select(value: Panel) { panel = value; await tick(); heading.focus(); }
   async function open(value: Action) {
