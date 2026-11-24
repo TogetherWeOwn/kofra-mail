@@ -74,6 +74,12 @@ test('clears the reader and mailbox controls when a real transfer races a focus 
   await expect(page.getByRole('searchbox')).toBeDisabled();
   await expect(page.locator('#mail-nav').getByRole('button', { name: 'Inbox', exact: true, includeHidden: true })).toBeDisabled();
   expect((await rechecked)?.ok()).toBe(true);
+  // Reproduce the hash left behind when the old mailbox view was cleared.
+  await page.evaluate(() => history.replaceState(history.state, '', '#mail-admin'));
+  const admin = page.getByRole('button', { name: 'Mail admin', exact: true });
+  if (!(await admin.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
+  await admin.click();
+  await expect(page.getByRole('button', { name: 'Back to mail' })).toBeVisible();
 });
 
 test('failed detail reads leave unopened mail unread on the backend', async ({ page, origins }) => {
@@ -153,7 +159,7 @@ test('loads the next page using the opaque cursor for the same inbox query', asy
   await expect(page.locator(`#${id}`)).toBeVisible();
 });
 
-test('leaves sending, uploads and the disabled Drive picker unavailable', async ({ page }) => {
+test('preserves unsaved draft during CSRF recovery, while outbound controls stay unavailable', async ({ page, origins }) => {
   await page.goto('/');
   await page.getByRole('button', { name: 'Compose', exact: true }).click();
   const editor = page.getByRole('dialog', { name: 'New message' });
@@ -162,6 +168,28 @@ test('leaves sending, uploads and the disabled Drive picker unavailable', async 
   await expect(editor.getByLabel('Upload attachments')).toBeDisabled();
   await expect(editor.getByRole('button', { name: 'Attach from Drive' })).toBeDisabled();
   await expect(page.getByRole('dialog', { name: 'Attach from Drive' })).toHaveCount(0);
+  const service = serviceAt(origins.appOrigin);
+  const before = await service.getSession();
+  const subject = 'CSRF recovery draft';
+  const text = 'This body has not been saved yet.';
+  await editor.getByLabel('Subject').fill(subject);
+  await editor.getByLabel('Message body').fill(text);
+  // Corrupt only the browser request token; the real workerd handler must reject it.
+  await page.route('**/api/v1/drafts', (route) => route.continue({
+    headers: { ...route.request().headers(), 'x-csrf-token': 'invalid-fixture-token' },
+  }), { times: 1 });
+  const denied = page.waitForResponse((response) => response.url().endsWith('/api/v1/drafts') && response.status() === 403);
+  const renewed = page.waitForResponse((response) => response.url().endsWith('/api/v1/session') && response.ok(), { timeout: 5_000 }).catch(() => null);
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  expect(await (await denied).json()).toMatchObject({ code: 'csrf_failed' });
+  expect((await service.getSession()).mailbox?.id).toBe(before.mailbox?.id);
+  await expect(editor).toBeVisible();
+  await expect(editor.getByLabel('Message body')).toHaveValue(text);
+  await expect(editor.getByRole('alert')).toContainText('Try again');
+  expect(await renewed).not.toBeNull();
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(editor).toBeHidden();
+  expect((await service.listDrafts({})).items.find((draft) => draft.subject === subject)?.body).toBe(text);
 });
 
 test('outbound, upload and undo routes return typed 501 without removing a draft', async ({ origins }) => {

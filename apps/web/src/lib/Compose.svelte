@@ -50,7 +50,9 @@
   function failure(cause: unknown) {
     conflict = isMailApiError(cause, 'revision_mismatch');
     if (conflict) error = 'This draft changed elsewhere. Copy any edits you want to keep before reloading the saved draft.';
-    else if (!m3 && form.attachments.length && isMailApiError(cause, 'not_implemented')) error = 'Draft attachments are not available yet. Remove the attachments to save this draft.';
+    else if (isMailApiError(cause) && (cause.status === 401 || cause.status === 403)) {
+      error = 'Your draft is still open. Try again when your mail session is ready.';
+    } else if (!m3 && form.attachments.length && isMailApiError(cause, 'not_implemented')) error = 'Draft attachments are not available yet. Remove the attachments to save this draft.';
     else error = cause instanceof Error ? cause.message : 'This action did not complete.';
   }
   function finish() { modal.close(); onClose(); }

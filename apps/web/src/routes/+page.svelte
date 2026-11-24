@@ -65,6 +65,7 @@
   let loadedPages = 1;
   let listState: string | undefined;
   let checkingForChanges = false;
+  let recoveringAccess = false;
   const canUseMail = $derived(!!session?.mailbox && !initializing);
   const canAdmin = $derived(session?.workspace.role === 'admin');
   const heading = $derived(view === 'label' ? labels.find((label) => label.id === labelId)?.name ?? 'Label' : view === 'search' ? 'Search results' : links.find((item) => item.key === view)?.text ?? 'Inbox');
@@ -97,11 +98,25 @@
     if (next?.workspace.role !== 'admin') admin = false;
     return changed;
   }
+  async function recoverSession() {
+    if (recoveringAccess) return;
+    recoveringAccess = true;
+    const scope = access;
+    try {
+      const next = await api.getSession();
+      if (scope === access && applySession(next) && next.mailbox) await refresh();
+    } catch {
+      // A failed auth refresh is not proof of a mailbox transfer. Leave edits
+      // mounted so the user can retry; the API still enforces authorization.
+    } finally { recoveringAccess = false; }
+  }
   function handleProblem(failure: MailApiError, operation: Operation) {
-    if (failure.status === 401) applySession(undefined);
-    else if (failure.status === 403 && ROUTES[operation].access === 'member' && session?.mailbox) {
-      applySession({ ...session, mailbox: undefined });
+    if (isMailApiError(failure, 'forbidden') && ROUTES[operation].access === 'member') {
+      if (operation === 'getSession') applySession(undefined);
+      else if (session?.mailbox) applySession({ ...session, mailbox: undefined });
+      return;
     }
+    if (operation !== 'getSession' && (failure.status === 401 || failure.status === 403)) void recoverSession();
   }
   async function refresh(preservePages = false) {
     if (!session?.mailbox) return;
@@ -245,6 +260,10 @@
     } else if (settings || admin) {
       settings = undefined; admin = false; void focusHeading();
     }
+  }
+  function openAdmin() {
+    if (location.hash === '#mail-admin') syncHash();
+    else location.hash = '#mail-admin';
   }
   function returnToMail() {
     settings = undefined; admin = false;
@@ -446,7 +465,7 @@
         <li><button aria-current={view === 'label' && labelId === label.id ? 'page' : undefined} onclick={() => navigate('label', label.id)}><i class={`dot color-${index % 4}`}></i><span>{label.name}</span></button></li>
       {/each}
     </ul>
-    {#if canAdmin}<ul class="admin-entry"><li><button aria-current={admin ? 'page' : undefined} onclick={() => location.hash = 'mail-admin'}><Shield size={20} /> <span>Mail admin</span></button></li></ul>{/if}
+    {#if canAdmin}<ul class="admin-entry"><li><button aria-current={admin ? 'page' : undefined} onclick={openAdmin}><Shield size={20} /> <span>Mail admin</span></button></li></ul>{/if}
   </nav>
   <main id="mail-content" class="card" bind:this={headingHost} tabindex="-1" aria-busy={initializing || busy}>
     {#if error}<p role="alert" class="notice warning">{error}</p>{/if}
