@@ -436,7 +436,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
 
 ## 12. Moving the M2 UI to this contract
 
-The M2 UI calls `MailApi` in `@kofra/mail-core`, an in-process port that predates this contract. The wiring lane replaces it with `MailService` and then removes `MailApi` and its fake.
+The M2 UI now calls `MailService` over HTTP; the earlier in-process `MailApi` and its fake have been removed. The separate `MailService` reference fake remains for contract tests. The local workerd run marks only the named M3-dependent cases `requires: m3`; remove that gate when the outbound implementation lands. Drive remains disabled until the account and Drive integrations are available.
 
 | `MailApi` | `MailService` | Change |
 |---|---|---|

@@ -37,6 +37,8 @@ export interface Features {
   drive: boolean;
   /** Formatted (HTML) bodies through the content origin. */
   htmlContent: boolean;
+  /** Outbound sends, undo and draft attachments. Omitted by older implementations. */
+  m3?: boolean;
 }
 
 // ---------------------------------------------------------------- views, threads, messages

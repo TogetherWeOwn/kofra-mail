@@ -17,6 +17,11 @@ export class RegressionMailbox extends Mailbox {
   private useScheduler = false;
   private scheduledDelay: number | null = null;
   private bookmark?: ReadyLife;
+  private mailApiClock?: number;
+
+  protected override mailApiNow(): number { return this.mailApiClock ?? super.mailApiNow(); }
+  async setMailApiClock(now: number) { this.mailApiClock = now; }
+  async setMailApiEnabled(on: boolean) { this.env.MAIL_LOCAL_API = on ? 'on' : 'off'; }
 
   constructor(ctx: DurableObjectState, env: Env) {
     const io: RegressionMailbox['io'] = {};

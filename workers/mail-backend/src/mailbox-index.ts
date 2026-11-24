@@ -3,10 +3,10 @@ import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
-import { MAILBOX_SCHEMA } from './mailbox-schema.ts';
+import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
-import { parseMail, type ParsedMail } from './parse-mail.ts';
+import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
 
 export type MailboxObjects = {
   get(key: string): Promise<Uint8Array<ArrayBuffer>>;
@@ -30,7 +30,8 @@ type Prepared = Omit<ParsedMail, 'attachments'> & { attachments: Array<{
 }> };
 type SnapshotTable = 'messages' | 'labels' | 'drafts' | 'bayes' | 'settings';
 export type SnapshotRow = { row_no: number; kind: string; value: string };
-type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[] };
+type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[]; expiresAt?: number | null };
+export type ApiDraftRef = { id: string; rawKey: string; holder: string; revision: string; updatedAt: number };
 const trashLabel = 'trash';
 
 const SUBJECT_KEY = /^[a-f0-9]{64}$/;
@@ -63,7 +64,7 @@ export class MailboxIndex {
   private readonly sql: SqlStorage;
   readonly journal: MailJournal;
 
-  constructor(storage: DurableObjectStorage, objects: MailboxObjects, holderScope: string) {
+  constructor(storage: DurableObjectStorage, objects: MailboxObjects, holderScope: string, private readonly mailApiEnabled = false) {
     this.storage = storage;
     this.objects = objects;
     this.holderScope = holderScope;
@@ -131,7 +132,7 @@ export class MailboxIndex {
     }
     if (content.byteLength === 0 || content.byteLength > MAX_RAW_BYTES) throw new PermanentMailError('Invalid mailbox object size');
     try {
-      return await parseMail(content, key);
+      return await parseMail(content, key, this.mailApiEnabled);
     } catch (error) {
       throw new PermanentMailError(error instanceof Error ? error.message : 'Unparseable message');
     }
@@ -199,10 +200,32 @@ export class MailboxIndex {
       subject_key = CASE WHEN subject_key = '' THEN excluded.subject_key ELSE subject_key END`, id, subjectNorm, createdAt, subjectKey);
   }
 
-  private insertDerived(id: string, rowid: number, parsed: Prepared) {
+  private insertSearchDisplay(id: string, rowid: number, parsed: ParsedMail | Prepared) {
+    const display = parsed.display;
+    const searchBody = display ? normalizeSearch(parsed.body) : parsed.body;
+    let names: string;
+    if (display) {
+      // Keep the existing filename-character budget; the separators add at
+      // most two extra characters per indexed attachment.
+      let remaining = 8192;
+      const bounded = parsed.attachments.flatMap(({ name }) => {
+        if (remaining <= 0) return [];
+        const clipped = name.slice(0, remaining);
+        remaining -= clipped.length + 1;
+        return [clipped];
+      });
+      names = normalizeSearch(bounded.join(` ${ATTACHMENT_SEARCH_BOUNDARY} `));
+    } else names = parsed.attachments.map(a => a.name).join(' ').slice(0, 8192);
     this.sql.exec('INSERT INTO fts(rowid, id, subject, addresses, body, attachment_names) VALUES (?, ?, ?, ?, ?, ?)',
-      rowid, id, parsed.subject, `${parsed.sender} ${parsed.to} ${parsed.cc}`, parsed.body,
-      parsed.attachments.map(a => a.name).join(' ').slice(0, 8192));
+      rowid, id, display?.searchSubject ?? parsed.subject,
+      display ? `${display.searchFrom} ${display.searchTo}`.slice(0, 16_384) : `${parsed.sender} ${parsed.to} ${parsed.cc}`,
+      searchBody, names);
+    if (display) this.sql.exec('INSERT OR REPLACE INTO mailbox_api_display VALUES (?, ?, ?)', id, JSON.stringify(display),
+      searchBody === parsed.body ? null : parsed.body);
+  }
+
+  private insertDerived(id: string, rowid: number, parsed: Prepared) {
+    this.insertSearchDisplay(id, rowid, parsed);
     for (const attachment of parsed.attachments) {
       this.sql.exec('INSERT OR REPLACE INTO attachments VALUES (?, ?, ?, ?, ?, ?)', id, attachment.part, attachment.name,
         attachment.mimeType, attachment.size, attachment.key);
@@ -302,9 +325,62 @@ export class MailboxIndex {
     return candidates.length;
   }
 
-  private change(event: Exclude<JournalEvent, MessageEvent>) {
-    this.storage.transactionSync(() => { this.apply(event); this.journal.append(event); });
+  async readObject(key: string): Promise<Uint8Array<ArrayBuffer>> { return this.objects.get(key); }
+
+  // M1 rows already have attachment links, so hydrate only the derived text
+  // and display projection. Do not re-register or rewrite object holders.
+  async hydrateApiDisplay(id: string, rawKey: string): Promise<void> {
+    let parsed: ParsedMail;
+    try { parsed = await this.parse(rawKey); }
+    catch (error) {
+      // A verified missing or invalid raw object cannot enrich this legacy
+      // row. Keep its existing index and let the rest of the thread load.
+      if (error instanceof PermanentMailError) return;
+      throw error;
+    }
+    if (!parsed.display) throw new Error('API mailbox display is disabled');
+    this.storage.transactionSync(() => {
+      const row = this.sql.exec<{ rowid: number }>(`SELECT m.rowid FROM messages m WHERE m.id = ? AND m.raw_key = ? AND m.indexed = 1
+        AND NOT EXISTS (SELECT 1 FROM mailbox_api_display d WHERE d.id = m.id)`, id, rawKey).toArray()[0];
+      if (!row) return;
+      this.sql.exec('DELETE FROM fts WHERE rowid = ?', row.rowid);
+      this.insertSearchDisplay(id, row.rowid, parsed);
+    });
   }
+
+  async prepareApiDraft(id: string, bytes: Uint8Array<ArrayBuffer>, updatedAt: number): Promise<ApiDraftRef> {
+    if (!bytes.byteLength || bytes.byteLength > MAX_RAW_BYTES) throw new Error('Invalid draft size');
+    const rawKey = `drafts/${await sha256(bytes)}`;
+    const holder = `draft:${crypto.randomUUID()}`;
+    await this.objects.hold(rawKey, holder);
+    try { await this.objects.put(rawKey, bytes); }
+    catch (error) { await this.releaseDraft({ rawKey, holder }); throw error; }
+    return { id, rawKey, holder, revision: crypto.randomUUID(), updatedAt };
+  }
+
+  async releaseDraft(ref: Pick<ApiDraftRef, 'rawKey' | 'holder'>): Promise<void> {
+    // These immutable draft objects are not sweep candidates. Release bookkeeping
+    // cannot turn an already committed change into an apparent API failure.
+    await this.objects.release(ref.rawKey, ref.holder).catch(() => {});
+  }
+
+  // Caller holds the work lane; membership/validation and all events commit together.
+  changeMany(events: Iterable<Exclude<JournalEvent, MessageEvent>>): void {
+    this.storage.transactionSync(() => {
+      for (const event of events) { this.apply(event); this.journal.append(event); }
+    });
+  }
+
+  pruneApiKeys(now: number): void {
+    this.storage.transactionSync(() => {
+      this.sql.exec(`DELETE FROM mailbox_api_idempotency WHERE key IN (SELECT key FROM mailbox_api_idempotency
+        WHERE expires_at <= ? ORDER BY expires_at, key LIMIT 64)`, now);
+      this.sql.exec(`DELETE FROM mailbox_api_in_progress WHERE key IN (SELECT key FROM mailbox_api_in_progress
+        WHERE expires_at <= ? ORDER BY expires_at, key LIMIT 64)`, now);
+    });
+  }
+
+  private change(event: Exclude<JournalEvent, MessageEvent>) { this.changeMany([event]); }
 
   private apply(event: Exclude<JournalEvent, MessageEvent>) {
     switch (event.type) {
@@ -315,6 +391,23 @@ export class MailboxIndex {
       case 'label':
         if (!bounded(event.id, 256) || !bounded(event.name, 512)) throw new Error('Invalid label');
         this.sql.exec('INSERT INTO labels VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name', event.id, event.name);
+        break;
+      case 'label_delete':
+        if (!bounded(event.id, 256)) throw new Error('Invalid label deletion');
+        this.sql.exec('DELETE FROM message_labels WHERE label_id = ?', event.id);
+        this.sql.exec('DELETE FROM labels WHERE id = ?', event.id);
+        break;
+      case 'api_settings':
+        if (!bounded(event.definition, 64 * 1024)) throw new Error('Invalid API settings');
+        JSON.parse(event.definition);
+        this.sql.exec('INSERT OR REPLACE INTO mailbox_api_settings VALUES (1, ?)', event.definition);
+        break;
+      case 'api_result':
+        if (!bounded(event.key, 64) || !SUBJECT_KEY.test(event.fingerprint) || !count(event.expiresAt) || !bounded(event.result, 4096)) {
+          throw new Error('Invalid API result');
+        }
+        JSON.parse(event.result);
+        this.sql.exec('INSERT OR REPLACE INTO mailbox_api_idempotency VALUES (?, ?, ?, ?)', event.key, event.fingerprint, event.expiresAt, event.result);
         break;
       case 'setting':
         if ((event.kind !== 'filter' && event.kind !== 'send-as') || !bounded(event.id, 256) || !bounded(event.definition, 8192)) {
@@ -331,6 +424,11 @@ export class MailboxIndex {
         if (!updated.rowsWritten) throw new Error('Missing message for flag change');
         this.sql.exec('DELETE FROM message_labels WHERE message_id = ?', event.id);
         for (const id of new Set(event.labels)) this.sql.exec('INSERT INTO message_labels VALUES (?, ?)', event.id, id);
+        if (event.expiresAt === null) this.sql.exec('DELETE FROM mailbox_api_expiry WHERE id = ?', event.id);
+        else if (event.expiresAt !== undefined) {
+          if (!count(event.expiresAt)) throw new Error('Invalid message expiry');
+          this.sql.exec('INSERT OR REPLACE INTO mailbox_api_expiry VALUES (?, ?)', event.id, event.expiresAt);
+        }
         break;
       }
       case 'draft':
@@ -340,6 +438,14 @@ export class MailboxIndex {
         }
         this.sql.exec('INSERT INTO drafts VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET raw_key=excluded.raw_key, holder=excluded.holder',
           event.id, event.rawKey, event.holder);
+        if (event.revision != null || event.updatedAt != null) {
+          if (!bounded(event.revision, 64) || !count(event.updatedAt)) throw new Error('Invalid API draft metadata');
+          this.sql.exec('INSERT OR REPLACE INTO mailbox_api_drafts VALUES (?, ?, ?)', event.id, event.revision, event.updatedAt);
+        }
+        break;
+      case 'draft_delete':
+        if (!bounded(event.id, 256)) throw new Error('Invalid draft deletion');
+        this.sql.exec('DELETE FROM drafts WHERE id = ?', event.id);
         break;
       case 'bayes':
         if (!bounded(event.token, 256) || !count(event.ham) || !count(event.spam)) throw new Error('Invalid Bayes counts');
@@ -396,13 +502,20 @@ export class MailboxIndex {
         INSERT INTO backup_capture(kind, value)
         SELECT 'message', json_object('id', id, 'rawKey', raw_key, 'createdAt', internal_date, 'threadId', thread_id,
           'flags', flags, 'gmailId', gmail_id, 'dedupeKey', dedupe_key, 'auth', auth, 'attKeys', json(att_keys),
+          'expiresAt', (SELECT expires_at FROM mailbox_api_expiry WHERE id = m.id),
           'labels', json((SELECT json_group_array(label_id) FROM message_labels WHERE message_id = m.id)))
         FROM messages AS m;
         INSERT INTO backup_capture(kind, value)
         SELECT 'thread', json_object('id', id, 'assigned', assigned, 'lastDate', last_date, 'count', count, 'subjectKey', subject_key)
         FROM threads WHERE count > 0;
         INSERT INTO backup_capture(kind, value)
-        SELECT 'draft', json_object('id', id, 'rawKey', raw_key, 'holder', holder) FROM drafts;
+        SELECT 'draft', json_object('id', d.id, 'rawKey', d.raw_key, 'holder', d.holder, 'revision', a.revision, 'updatedAt', a.updated_at)
+        FROM drafts d LEFT JOIN mailbox_api_drafts a ON a.id = d.id;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'api_settings', json_object('definition', definition) FROM mailbox_api_settings;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'api_result', json_object('key', key, 'fingerprint', fingerprint, 'expiresAt', expires_at, 'result', result)
+        FROM mailbox_api_idempotency;
         INSERT INTO backup_capture(kind, value)
         SELECT 'bayes', json_object('token', token, 'ham', ham, 'spam', spam) FROM bayes;
         INSERT INTO backup_capture(kind, value)
@@ -425,7 +538,8 @@ export class MailboxIndex {
   resetForRestore() {
     this.sql.exec(`DELETE FROM fts; DELETE FROM message_labels; DELETE FROM attachments; DELETE FROM messages; DELETE FROM threads;
       DELETE FROM receipts; DELETE FROM fingerprints; DELETE FROM labels; DELETE FROM drafts; DELETE FROM bayes;
-      DELETE FROM settings; DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
+      DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
+      DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
   }
 
   finishSnapshot(seq: number) {
@@ -442,7 +556,7 @@ export class MailboxIndex {
       validMessage({ ...message, type: 'message' }, true);
       if (!count(message.flags) || (message.gmailId !== null && !bounded(message.gmailId, 256))) throw new Error('Invalid snapshot message');
       this.insertRestoredMessage({ ...message, type: 'message' }, 0, message.gmailId);
-      this.apply({ type: 'flags', id: message.id, flags: message.flags, labels: message.labels });
+      this.apply({ type: 'flags', id: message.id, flags: message.flags, labels: message.labels, expiresAt: message.expiresAt });
     } else if (row.kind === 'thread') {
       const thread = value as { id: string; assigned: number; lastDate: number; count: number; subjectKey: string };
       if (!isDeliveryId(thread.id) || !count(thread.assigned) || !count(thread.lastDate) || !count(thread.count) ||
@@ -454,7 +568,8 @@ export class MailboxIndex {
     } else if (row.kind === 'receipt' || row.kind === 'fingerprint') {
       if (!bounded(value, 2048)) throw new Error('Invalid snapshot key');
       this.sql.exec(`INSERT OR IGNORE INTO ${row.kind === 'receipt' ? 'receipts' : 'fingerprints'} VALUES (?)`, value);
-    } else if (row.kind === 'label' || row.kind === 'bayes' || row.kind === 'draft' || row.kind === 'setting') {
+    } else if (row.kind === 'label' || row.kind === 'bayes' || row.kind === 'draft' || row.kind === 'setting' ||
+      row.kind === 'api_result' || row.kind === 'api_settings') {
       this.apply({ ...(value as object), type: row.kind } as Exclude<JournalEvent, MessageEvent>);
     } else throw new Error('Invalid snapshot state row');
   }

@@ -1,35 +1,37 @@
 # kofra-mail
 
-Riaklo Mail is a SvelteKit webmail app built for Cloudflare Workers. This repository currently runs a demo with example data. It does not connect to a real mailbox, and all changes reset on reload.
+Riaklo Mail is a SvelteKit webmail app built for Cloudflare Workers. The local demo seeds example messages through the inbound path and serves them from a mailbox Durable Object over HTTP. It does not connect to a live mailbox. Local data is discarded when the demo process exits.
 
 ## Run locally
 
-Use Node.js 24 and npm.
+Use Node.js 24 and npm. From the repository root:
 
 ```sh
 npm ci --ignore-scripts
-npm run dev
+npm ci --prefix workers/mail-backend --ignore-scripts
+npm exec -w @kofra/mail-web -- svelte-kit sync
+(cd apps/web && node tests/fixtures/mail-app.mjs)
+```
+
+Open the printed loopback URL and select “Floor plan revisions.” Images are blocked until you choose **Show images**. The isolated content fixture renders escaped text and one local test image; it does not proxy external requests. Add `--plain` to try the reader with no content origin configured.
+
+The app uses [`contracts/mail-api`](contracts/mail-api/README.md) over `/api/v1`. The local API uses a loopback-only session fixture; the shipped app has no session provider or enabled API. Sending, local uploads, and Drive are not available in the demo. Expired Spam and Trash are hidden from mailbox reads and content downloads; the local API does not reclaim their storage.
+
+## Verify
+
+```sh
 npm run check
 npm test
 npm run build
+npm --prefix workers/mail-backend run typecheck
+npm --prefix workers/mail-backend test
 npm exec -- playwright install chromium
 npm run test:e2e
 ```
 
-`packages/mail-core` defines the TypeScript interface consumed by `apps/web` and its in-memory implementation. The interface is not a published HTTP or JMAP contract. `npm run build` builds a Worker locally; it does not deploy.
+The backend test includes HTTP conformance in local workerd. Only cases requiring the later send and upload implementation are marked `requires: m3`; the in-memory contract test still runs those cases. `npm run build` builds a Worker locally; it does not deploy.
 
-`contracts/mail-api` is the backend wire contract (types, routes, errors, limits and a conformance suite) that the web app will move to. See also [docs/content-origin.md](docs/content-origin.md). The send-path build plan is a separate draft (pull request #11).
-
-## Formatted message demo
-
-Formatted message rendering is off by default; the app uses plain text when no content origin is configured. To try the authored fixture locally, run these in two terminals from the repository root:
-
-```sh
-node apps/web/tests/fixtures/content-server.mjs
-MAIL_DEMO_CONTENT_ORIGIN=http://localhost:4180 npm run dev -w @kofra/mail-web -- --host 127.0.0.1 --port 4179 --strictPort
-```
-
-Open `http://127.0.0.1:4179` and select “Floor plan revisions.” Images are blocked until you choose **Show images** in that message. The fixture serves static HTML and one local image; it does not process arbitrary messages or perform external requests.
+## Content isolation
 
 Use a dedicated, credential-free HTTPS site for real content, on a different registrable domain from the app and any storage or account services. The loopback HTTP exception is only for development with distinct loopback hosts. The app checks the frame origin, applies `frame-src`, and grants neither scripts nor same-origin access in the frame. It never receives message HTML as API data. The content service must sanitize HTML, authorize short-lived body URLs, prohibit direct remote image loads with its own CSP, and supply proxy URLs only after explicit opt-in. Those service features are not implemented here.
 

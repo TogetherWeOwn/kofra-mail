@@ -19,6 +19,7 @@ type Namespace<T> = { getByName(name: string): T };
 
 export type Env = KofraConfig & {
   MAIL_BACKEND_ENABLED?: string;
+  MAIL_LOCAL_API?: string;
   MAIL_RECOVERY_ENABLED?: string;
   MAIL_SWEEP_ENABLED?: string;
   DIRECTORY: D1Database;

@@ -6,10 +6,14 @@ export type JournalEvent =
   | { type: 'message'; id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
       subjectKey: string; auth: string; attKeys: string[] }
   | { type: 'receipt'; id: string }
-  | { type: 'flags'; id: string; flags: number; labels: string[] }
+  | { type: 'flags'; id: string; flags: number; labels: string[]; expiresAt?: number | null }
   | { type: 'label'; id: string; name: string }
+  | { type: 'label_delete'; id: string }
   | { type: 'setting'; kind: 'filter' | 'send-as'; id: string; definition: string }
-  | { type: 'draft'; id: string; rawKey: string; holder: string }
+  | { type: 'api_settings'; definition: string }
+  | { type: 'draft'; id: string; rawKey: string; holder: string; revision?: string; updatedAt?: number }
+  | { type: 'draft_delete'; id: string }
+  | { type: 'api_result'; key: string; fingerprint: string; expiresAt: number; result: string }
   | { type: 'bayes'; token: string; ham: number; spam: number }
   | { type: 'purge'; id: string };
 

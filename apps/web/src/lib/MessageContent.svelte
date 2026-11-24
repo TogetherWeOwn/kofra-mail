@@ -1,23 +1,26 @@
 <script lang="ts">
   import { ImageOff } from '@lucide/svelte';
   import { onDestroy, untrack } from 'svelte';
-  import type { MailApi, Message } from '@kofra/mail-core';
+  import type { MailService, Message } from '@kofra/mail-contract';
   import { contentFrameUrl } from './content-origin';
 
-  let { message, api, origin }: { message: Message; api: MailApi; origin?: string } = $props();
+  let { message, api, origin }: { message: Message; api: MailService; origin?: string } = $props();
   let src = $state<string>();
   let images = $state(false);
   let pending = $state(false);
   let unavailable = $state(false);
   // A metadata refresh can replace the whole message object without changing eligibility.
-  const allowedOrigin = $derived(message.hasHtml ? origin : undefined);
+  const formatted = $derived(message.hasHtml);
+  const allowedOrigin = $derived(formatted || message.textTruncated ? origin : undefined);
   const frameSrc = $derived(contentFrameUrl(src, allowedOrigin));
   let revision = 0;
-  onDestroy(() => { revision++; });
+  let expiry: ReturnType<typeof setTimeout> | undefined;
+  function cancel() { revision++; clearTimeout(expiry); }
+  onDestroy(cancel);
   $effect(() => {
-    if (allowedOrigin) untrack(() => { void load(false); });
+    if (allowedOrigin && formatted) untrack(() => { void load(false); });
     else {
-      revision++;
+      cancel();
       src = undefined;
       images = false;
       pending = false;
@@ -26,18 +29,22 @@
   });
 
   async function load(showImages: boolean) {
-    const current = ++revision;
+    cancel();
+    const current = revision;
     // Remove the previous frame before changing its image permission.
     src = undefined;
     images = false;
     pending = true;
     unavailable = false;
     try {
-      const url = contentFrameUrl(await api.getMessageContent(message.id, { remoteImages: showImages }), origin);
+      const link = await api.getBodyUrl(message.id, { remoteImages: showImages });
       if (current !== revision) return;
+      const url = contentFrameUrl(link.url, allowedOrigin);
+      const remaining = Date.parse(link.expiresAt) - Date.now();
+      if (!url || !(remaining > 0)) { unavailable = true; return; }
       src = url;
-      images = !!url && showImages;
-      unavailable = !url;
+      images = showImages;
+      expiry = setTimeout(() => { void load(showImages); }, Math.min(remaining, 2_147_483_647));
     } catch {
       if (current === revision) unavailable = true;
     } finally {
@@ -53,12 +60,17 @@
     {/if}
   </div>
 {/if}
-{#if unavailable}<p class="muted" role="status">Formatted message unavailable. Showing plain text.</p>{/if}
-{#if frameSrc}
-  <iframe title={`Formatted message: ${message.subject}`} src={frameSrc} sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
-  <details class="text-fallback"><summary>View plain text</summary><p class="plain-message">{message.text}</p></details>
-{:else}
+{#if unavailable}<p class="muted" role="status">{message.hasHtml ? 'Formatted message unavailable. Showing plain text.' : 'The full message is unavailable. Showing the preview.'}</p>{/if}
+{#snippet plainText()}
   <p class="plain-message">{message.text}</p>
+  {#if message.textTruncated}<p class="muted">This message preview is truncated.</p>{/if}
+{/snippet}
+{#if frameSrc}
+  <iframe title={`${message.hasHtml ? 'Formatted message' : 'Full message'}: ${message.subject}`} src={frameSrc} sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"></iframe>
+  <details class="text-fallback"><summary>{message.textTruncated ? 'View plain text preview' : 'View plain text'}</summary>{@render plainText()}</details>
+{:else}
+  {@render plainText()}
+  {#if message.textTruncated && allowedOrigin}<button class="pill" disabled={pending} onclick={() => load(false)}>Show full message</button>{/if}
 {/if}
 
 <style>

@@ -7,6 +7,7 @@ import { build } from 'esbuild';
 import { Miniflare, Response, type Request } from 'miniflare';
 import type { JournalEvent, JournalRow } from '../src/mail-journal.ts';
 import type { Lifecycle, MailboxManifest } from '../src/mailbox-recovery.ts';
+import { Outbox } from '../src/outbox.ts';
 import { mailboxName } from '../src/worker.ts';
 import { migrateDirectory, seedDirectory } from './fixtures/directory-db.ts';
 import type { RegressionMailbox } from './fixtures/mailbox-regression-worker.ts';
@@ -19,13 +20,14 @@ const rawKey = `raw/${sha256(message)}/${id}`;
 const workerdTest = { timeout: 15_000 };
 
 async function setup(t: TestContext, getRaw?: (path: string) => Response | Promise<Response>,
-  onAlert?: (source: unknown) => Promise<void>) {
+  onAlert?: (source: unknown) => Promise<void>, beforeDraftPut?: () => Promise<void>) {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/mailbox-regression-worker.ts', import.meta.url))],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
   const alerts: unknown[] = [];
+  const draftObjects = new Map<string, ArrayBuffer>();
   const runtime = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: bundle.outputFiles[0].text }],
     compatibilityDate: '2025-06-01', durableObjects: { MAILBOX: { className: 'RegressionMailbox', useSQLite: true } },
-    bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', KOFRA_S3_ENDPOINT: 'https://object-store.example.test',
+    bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on', KOFRA_S3_ENDPOINT: 'https://object-store.example.test',
       KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture' },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     serviceBindings: { ALERTS: async (request: Request) => {
@@ -37,12 +39,16 @@ async function setup(t: TestContext, getRaw?: (path: string) => Response | Promi
     outboundService: async (request: Request) => {
       const { pathname } = new URL(request.url);
       if (request.method === 'GET') {
+        const draft = draftObjects.get(pathname);
+        if (draft) return new Response(draft, { headers: { 'content-length': String(draft.byteLength) } });
         assert.ok(getRaw, 'unexpected mail object GET');
         return getRaw(pathname);
       }
       assert.equal(request.method, 'PUT');
       assert.match(pathname, /\/drafts\/[a-f0-9]{64}$/);
-      await request.arrayBuffer();
+      const bytes = await request.arrayBuffer();
+      await beforeDraftPut?.();
+      draftObjects.set(pathname, bytes);
       return new Response(null, { status: 201 });
     },
   });
@@ -65,6 +71,264 @@ async function setup(t: TestContext, getRaw?: (path: string) => Response | Promi
   const pending = async () => JSON.parse(await box.journal()) as { modseq: number; flushed: number };
   return { box, db, journal, manifest, manifestKey, alerts, lifecycle, pending };
 }
+
+test('mail API reads an M1 delivery and applies whole-thread set mutations', workerdTest, async t => {
+  const { box, db } = await setup(t, path => {
+    assert.ok(path.endsWith(rawKey));
+    return new Response(message, { headers: { 'content-length': String(message.byteLength) } });
+  });
+  const options = { canSendAs: ['member@example.test'] };
+  await box.prepare();
+  const first = await box.mailApi(...scope, 'getSession', {}, undefined, options);
+  await new Outbox(db as unknown as D1Database).insert({ id, workspaceId: scope[0], mailboxId: scope[1], rawKey,
+    envelopeFrom: 'sender@example.test', envelopeTo: 'member@example.test', createdAt: 1000, authResults: null });
+  assert.equal(await box.deliver(id), 'indexed');
+  const page = await box.mailApi(...scope, 'listThreads', { view: 'inbox', q: 'from:sender "fixture body"' }, undefined, options);
+  assert.deepEqual((page.body as { items: { id: string; unread: boolean }[] }).items.map(x => [x.id, x.unread]), [[id, true]]);
+  assert.notDeepEqual((page.body as { state: string }).state, (first.body as { state: string }).state);
+  const other = await box.mailApi('other', scope[1], 'getThread', { threadId: id }, undefined, options);
+  assert.deepEqual(other.error, { code: 'not_found' });
+  const content = await box.mailContent(...scope, id);
+  assert.match((content.body as { text: string }).text, /Fixture body/);
+  const bad = await box.mailApi(...scope, 'updateThreads', {}, { ids: [id, 'missing'], set: { folder: 'archive' } }, options);
+  assert.equal(bad.error?.code, 'not_found');
+  const unchanged = await box.mailApi(...scope, 'listThreads', { view: 'inbox', q: 'from:sender "fixture body"' }, undefined, options);
+  assert.deepEqual(unchanged.body, page.body);
+  const moved = await box.mailApi(...scope, 'updateThreads', {}, { ids: [id], set: { folder: 'archive', starred: true } }, options);
+  const starred = await box.mailApi(...scope, 'listThreads', { view: 'starred' }, undefined, options);
+  assert.equal((starred.body as { items: { id: string }[] }).items[0].id, id);
+  assert.equal((starred.body as { state: string }).state, (moved.body as { state: string }).state);
+});
+
+test('mail API hydrates legacy indexed M1 messages from verified MIME once', workerdTest, async t => {
+  const wire = new TextEncoder().encode([
+    'From: Legacy Sender <sender@example.test>', 'Subject: M1 message', 'MIME-Version: 1.0',
+    'Content-Type: multipart/mixed; boundary=legacy', '', '--legacy',
+    'Content-Type: text/html; charset=UTF-8', '', '<p>Legacy body</p><img src="https://example.test/image.png">',
+    ...['blue', 'train.txt', 'green fields.pdf'].flatMap((name) => ['--legacy',
+      'Content-Type: application/octet-stream', `Content-Disposition: attachment; filename="${name}"`, '', 'test']),
+    '--legacy--', '',
+  ].join('\r\n'));
+  const key = `raw/${sha256(wire)}/${id}`;
+  let reads = 0;
+  const { box, db } = await setup(t, path => {
+    reads++;
+    assert.ok(path.endsWith(key));
+    return new Response(wire, { headers: { 'content-length': String(wire.byteLength) } });
+  });
+  await box.prepare();
+  await box.setMailApiEnabled(false);
+  await new Outbox(db as unknown as D1Database).insert({ id, workspaceId: scope[0], mailboxId: scope[1], rawKey: key,
+    envelopeFrom: 'sender@example.test', envelopeTo: 'member@example.test', createdAt: 1000, authResults: null });
+  assert.equal(await box.deliver(id), 'indexed');
+  const options = { canSendAs: ['member@example.test'] };
+  assert.equal((await box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options)).error?.code, 'not_implemented');
+  await box.setMailApiEnabled(true);
+  const search = async (q: string) => {
+    const result = await box.mailApi(...scope, 'listThreads', { view: 'all', q }, undefined, options);
+    assert.equal(result.error, undefined);
+    return (result.body as { items: { id: string }[] }).items.map(item => item.id);
+  };
+  assert.deepEqual(await search('from:sender@example.test'), [id]);
+  assert.deepEqual(await search('from:"legacy sender"'), []);
+  assert.deepEqual(await search('"blue train"'), [], 'a legacy phrase must not span filenames');
+  assert.deepEqual(await search('blue train'), [id], 'legacy unquoted terms can match separate filenames');
+  assert.deepEqual(await search('"legacy body" blue'), [id], 'a body phrase can combine with an unquoted filename term');
+  assert.deepEqual(await search('"green fields"'), [], 'legacy quoted filename matches wait for hydration');
+  const thread = () => box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options);
+  const result = await thread();
+  assert.deepEqual(await search('from:"legacy sender"'), [id]);
+  assert.deepEqual(await search('"blue train"'), []);
+  assert.deepEqual(await search('"green fields"'), [id], 'a phrase can match inside a hydrated filename');
+  const [first] = (result.body as { messages: { from: { name: string }; hasHtml: boolean; remoteImages: boolean }[] }).messages;
+  assert.equal(first.from.name, 'Legacy Sender');
+  assert.equal(first.hasHtml, true);
+  assert.equal(first.remoteImages, true);
+  assert.equal(reads, 2);
+  assert.deepEqual((await thread()).body, result.body);
+  assert.equal(reads, 2, 'the digest-verified metadata is persisted in the derived index');
+});
+
+test('mail API keeps healthy legacy thread rows when one raw object is confirmed missing', workerdTest, async t => {
+  const replyId = `${id.slice(0, -1)}1`;
+  const first = new TextEncoder().encode('From: Healthy Sender <first@example.test>\r\nSubject: Legacy thread\r\n' +
+    'Message-ID: <legacy@example.test>\r\n\r\nFirst body');
+  const reply = new TextEncoder().encode('From: Missing Sender <reply@example.test>\r\nSubject: Re: Legacy thread\r\n' +
+    'In-Reply-To: <legacy@example.test>\r\n\r\nReply body');
+  const firstKey = `raw/${sha256(first)}/${id}`;
+  const replyKey = `raw/${sha256(reply)}/${replyId}`;
+  let replyStatus = 200;
+  const { box, db } = await setup(t, path => {
+    if (path.endsWith(replyKey) && replyStatus === 404) return new Response('<Error><Code>NoSuchKey</Code></Error>', { status: 404 });
+    if (path.endsWith(replyKey) && replyStatus === 503) return new Response(null, { status: 503 });
+    assert.ok(path.endsWith(firstKey) || path.endsWith(replyKey));
+    const source = path.endsWith(firstKey) ? first : reply;
+    return new Response(source, { headers: { 'content-length': String(source.byteLength) } });
+  });
+  await box.prepare();
+  await box.setMailApiEnabled(false);
+  const outbox = new Outbox(db as unknown as D1Database);
+  for (const [messageId, key, createdAt] of [[id, firstKey, 1000], [replyId, replyKey, 2000]] as const) {
+    await outbox.insert({ id: messageId, workspaceId: scope[0], mailboxId: scope[1], rawKey: key,
+      envelopeFrom: 'sender@example.test', envelopeTo: 'member@example.test', createdAt, authResults: null });
+    assert.equal(await box.deliver(messageId), 'indexed');
+  }
+  await box.setMailApiEnabled(true);
+  const thread = () => box.mailApi(...scope, 'getThread', { threadId: id }, undefined, { canSendAs: ['member@example.test'] });
+  replyStatus = 503;
+  assert.equal((await thread()).error?.code, 'unavailable');
+  replyStatus = 404;
+  const result = await thread();
+  assert.equal(result.error?.code, undefined);
+  const { messages } = result.body as { messages: { id: string; from: { name: string; email: string }; text: string }[] };
+  assert.deepEqual(messages.map(row => [row.id, row.from.name, row.from.email, row.text]), [
+    [id, 'Healthy Sender', 'first@example.test', 'First body\n'],
+    [replyId, '', 'reply@example.test', 'Reply body\n'],
+  ]);
+});
+
+test('mail API search folds Unicode literal operators and content keeps full plain text', workerdTest, async t => {
+  const plain = `ref:ÉTÉ ${'abcdefghij'.repeat(7000)} plain-tail`;
+  const wire = new TextEncoder().encode(`From: sender@example.test\r\nSubject: Plain fixture\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n${plain}`);
+  const key = `raw/${sha256(wire)}/${id}`;
+  const { box, db } = await setup(t, path => {
+    assert.ok(path.endsWith(key));
+    return new Response(wire, { headers: { 'content-length': String(wire.byteLength) } });
+  });
+  await box.prepare();
+  await new Outbox(db as unknown as D1Database).insert({ id, workspaceId: scope[0], mailboxId: scope[1], rawKey: key,
+    envelopeFrom: 'sender@example.test', envelopeTo: 'member@example.test', createdAt: 1000, authResults: null });
+  assert.equal(await box.deliver(id), 'indexed');
+  const options = { canSendAs: ['member@example.test'] };
+  const page = await box.mailApi(...scope, 'listThreads', { view: 'inbox', q: 'ref:été' }, undefined, options);
+  assert.deepEqual((page.body as { items: { id: string }[] }).items.map(item => item.id), [id]);
+  const thread = await box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options);
+  const [first] = (thread.body as { messages: { text: string; textTruncated: boolean }[] }).messages;
+  assert.equal(first.textTruncated, true);
+  assert.match(first.text, /^ref:ÉTÉ/);
+  assert.doesNotMatch(first.text, /plain-tail/);
+  const content = await box.mailContent(...scope, id);
+  assert.match((content.body as { text: string }).text, /plain-tail/);
+});
+
+test('mail API draft idempotency replays the original revision after replacement and deletion', workerdTest, async t => {
+  const { box } = await setup(t);
+  await box.prepare();
+  const options = { canSendAs: ['member@example.test'] };
+  const createOptions = { ...options, idempotencyKey: 'create-draft' };
+  const input = { from: options.canSendAs[0], to: [], cc: [], bcc: [], subject: 'first', body: 'Draft body', attachments: [] };
+  const first = await box.mailApi(...scope, 'createDraft', {}, input, createOptions);
+  const draft = first.body as { id: string; revision: string };
+  assert.ok(draft.revision);
+  const params = { draftId: draft.id };
+  const changed = await box.mailApi(...scope, 'replaceDraft', params, { ...input, subject: 'next' }, { ...options, ifMatch: draft.revision });
+  const next = changed.body as typeof draft;
+  assert.notEqual(next.revision, draft.revision);
+  assert.equal((await box.mailApi(...scope, 'deleteDraft', params, undefined, { ...options, ifMatch: draft.revision })).error?.code,
+    'revision_mismatch');
+  const removed = await box.mailApi(...scope, 'deleteDraft', params, undefined, { ...options, ifMatch: next.revision });
+  assert.equal(removed.error, undefined);
+  assert.equal(removed.body, undefined);
+  const replay = await box.mailApi(...scope, 'createDraft', {}, input, createOptions);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.body, first.body);
+  assert.equal((await box.mailApi(...scope, 'createDraft', {}, { ...input, subject: 'different' }, createOptions)).error?.code,
+    'idempotency_key_reused');
+});
+
+test('mail API reads and replays a maximum-size draft whose characters expand in JSON', workerdTest, async t => {
+  const { box } = await setup(t);
+  await box.prepare();
+  const options = { canSendAs: ['member@example.test'], idempotencyKey: 'escape-draft' };
+  const body = '\u0000'.repeat(1024 * 1024);
+  const input = { from: options.canSendAs[0], to: [], cc: [], bcc: [], subject: 'Escaped draft', body, attachments: [] };
+  const create = () => box.mailApi(...scope, 'createDraft', {}, input, options);
+  const first = await create();
+  assert.equal(first.error, undefined);
+  const { id } = first.body as { id: string };
+  const read = await box.mailApi(...scope, 'getDraft', { draftId: id }, undefined, options);
+  assert.equal(read.error?.code, undefined);
+  assert.equal((read.body as { body: string }).body === body, true);
+  const replay = await create();
+  assert.equal(replay.error?.code, undefined);
+  assert.equal(replay.replayed, true);
+  assert.equal((replay.body as { body: string }).body === body, true);
+  const second = await box.mailApi(...scope, 'createDraft', {}, { ...input, subject: 'Another large draft' },
+    { ...options, idempotencyKey: 'escape-draft-2' });
+  assert.equal(second.error?.code, undefined);
+  const page = await box.mailApi(...scope, 'listDrafts', { limit: '2' }, undefined, options);
+  const firstPage = page.body as { items: { id: string }[]; nextCursor: string };
+  assert.equal(firstPage.items.length, 1);
+  assert.ok(firstPage.nextCursor);
+  const next = await box.mailApi(...scope, 'listDrafts', { limit: '2', cursor: firstPage.nextCursor }, undefined, options);
+  const nextPage = next.body as typeof firstPage;
+  assert.equal(nextPage.items.length, 1);
+  assert.notEqual(nextPage.items[0].id, firstPage.items[0].id);
+  assert.equal(nextPage.nextCursor, null);
+});
+
+test('mail API reports an in-progress draft create while the first object write is paused', workerdTest, async t => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const { box } = await setup(t, undefined, undefined, async () => { entered.resolve(); await release.promise; });
+  await box.prepare();
+  const options = { canSendAs: ['member@example.test'], idempotencyKey: 'concurrent-create' };
+  const input = { from: options.canSendAs[0], to: [], cc: [], bcc: [], subject: 'first', body: 'Draft body', attachments: [] };
+  const create = () => box.mailApi(...scope, 'createDraft', {}, input, options);
+  const first = create();
+  try {
+    await Promise.race([entered.promise, first.then(() => assert.fail('Draft PUT did not reach the fixture gate'))]);
+    const blocked = await create();
+    assert.deepEqual(blocked.error, { code: 'idempotency_in_progress', retryAfterSeconds: 1 });
+  } finally { release.resolve(); }
+  const committed = await first;
+  assert.equal(committed.error, undefined);
+  const replay = await create();
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.body, committed.body);
+});
+
+test('mail API backup restores draft revisions, expired messages, and committed replay keys', workerdTest, async t => {
+  const { box, db, lifecycle, manifest } = await setup(t, readRetainedMessage);
+  await box.prepare({ snapshotDue: true });
+  await new Outbox(db as unknown as D1Database).insert({ id, workspaceId: scope[0], mailboxId: scope[1], rawKey,
+    envelopeFrom: 'sender@example.test', envelopeTo: 'member@example.test', createdAt: 1000, authResults: null });
+  assert.equal(await box.deliver(id), 'indexed');
+  const options = { canSendAs: ['member@example.test'] };
+  const call = (operation: Parameters<typeof box.mailApi>[2], params: Record<string, string>, input?: unknown, add = {}) =>
+    box.mailApi(...scope, operation, params, input, { ...options, ...add });
+  assert.equal((await call('updateThreads', {}, { ids: [id], set: { folder: 'trash' } })).error, undefined);
+  const draftInput = { from: options.canSendAs[0], to: [], cc: [], bcc: [], subject: 'Draft subject', body: 'Persist me', attachments: [], inReplyTo: id };
+  const created = await call('createDraft', {}, draftInput, { idempotencyKey: 'persist-draft' });
+  const original = created.body as { id: string; revision: string };
+  const params = { draftId: original.id };
+  assert.ok(original.revision);
+  assert.equal((await call('updateSettings', {}, { signature: 'Original' })).error, undefined);
+  await box.run();
+  assert.ok((await manifest()).value.snapshot_key, 'M2 state was snapshotted');
+  const replacement = await call('replaceDraft', params, { ...draftInput, subject: 'Revised' }, { ifMatch: original.revision });
+  assert.equal(replacement.error, undefined);
+  await box.run();
+  const published = (await manifest()).value;
+  assert.ok(published.delta_keys.length, 'Replacement is in a delta beyond the snapshot');
+  await box.wipe();
+  assert.equal(await box.restoreFromBackup(...scope), 'restoring');
+  assert.equal((await call('getDraft', params)).error?.code, 'mailbox_restoring');
+  for (let slice = 0; slice < 10 && (await lifecycle()).state !== 'ready'; slice++) await box.run();
+  assert.equal((await lifecycle()).state, 'ready');
+  await box.run(); // Restore reindexes derived MIME metadata in the ready alarm.
+  assert.deepEqual((await call('getDraft', params)).body, replacement.body);
+  assert.equal(((await call('getSettings', {})).body as { signature: string }).signature, 'Original');
+  const replay = await call('createDraft', {}, draftInput, { idempotencyKey: 'persist-draft' });
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.body, created.body);
+  const expiredAt = Date.parse(((await call('listThreads', { view: 'trash' })).body as { items: { expiresAt: string }[] }).items[0].expiresAt);
+  await box.setMailApiClock(expiredAt);
+  assert.equal((await call('getThread', { threadId: id })).error?.code, 'not_found');
+  assert.equal((await box.mailContent(...scope, id)).error?.code, 'not_found');
+  assert.equal((await call('replaceDraft', params, { ...draftInput, subject: 'Parent expired' },
+    { ifMatch: (replacement.body as typeof original).revision })).error, undefined, 'A retained reply survives parent expiry');
+});
 
 async function runScheduled(box: RegressionMailbox) {
   await box.expediteScheduledAlarm();
