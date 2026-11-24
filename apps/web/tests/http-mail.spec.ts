@@ -11,7 +11,11 @@ test('reads the HTTP session before listing threads', async ({ page, origins }) 
   await service.updateThreads({ ids: [plan.id], set: { unread: false } });
   const detailPath = `/api/v1/threads/${plan.id}`;
   const staleDetail = await service.getThread(plan.id);
+  const actualViews = await service.listViews();
+  const staleViews = { ...actualViews, state: 'stale-count-snapshot', items: actualViews.items.map((item) =>
+    item.view === 'inbox' ? { ...item, unreadThreads: 99 } : item), };
   await page.route(`**${detailPath}`, (route) => route.fulfill({ json: { ...staleDetail, state: 'stale-thread-snapshot' } }), { times: 1 });
+  await page.route('**/api/v1/views', (route) => route.fulfill({ json: staleViews }), { times: 1 });
   const operations: string[] = [];
   page.on('request', (request) => {
     const path = new URL(request.url()).pathname;
@@ -21,11 +25,13 @@ test('reads the HTTP session before listing threads', async ({ page, origins }) 
   await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeEnabled();
   expect(operations[0]).toBe('/api/v1/session');
   expect(operations).toContain('/api/v1/threads');
+  await expect(page.locator('#count-inbox')).toHaveText('99 unread');
   await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
   await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
   const refresh = page.waitForResponse((response) => new URL(response.url()).pathname === detailPath);
   await page.evaluate(() => window.dispatchEvent(new Event('focus')));
   expect((await refresh).ok()).toBe(true);
+  await expect(page.locator('#count-inbox')).toHaveText('1 unread');
   expect(operations.filter((path) => path === '/api/v1/threads')).toHaveLength(1);
   await page.getByRole('button', { name: 'Back to list' }).click();
   const query = 'after:2026-11-22';

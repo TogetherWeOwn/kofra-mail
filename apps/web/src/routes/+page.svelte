@@ -147,8 +147,11 @@
   async function checkForChanges() {
     if (!canUseMail || busy || moreBusy || mutating || checkingForChanges) return;
     checkingForChanges = true;
+    const ticket = request;
     try {
       const latest = await api.listViews();
+      if (ticket !== request) return;
+      if (listState === latest.state) views = latest;
       await Promise.all([
         listState !== latest.state ? refresh(true) : undefined,
         thread && thread.state !== latest.state ? refreshOpenThread() : undefined,
