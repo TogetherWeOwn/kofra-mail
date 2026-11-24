@@ -205,7 +205,7 @@ function searchWhere(sql: SqlStorage, query: string, timezone: string | undefine
         if (literal) {
           // Quote every term; user input is never FTS syntax. For a literal
           // operator or punctuation-only input, preserve punctuation exactly.
-          if (!op && /[\p{L}\p{N}]/u.test(literal)) fts.push(`"${literal.replaceAll('"', '""')}"`);
+          if (!op && !literal.endsWith(':') && /[\p{L}\p{N}]/u.test(literal)) fts.push(`"${literal.replaceAll('"', '""')}"`);
           else literals.add(literal);
         }
       }

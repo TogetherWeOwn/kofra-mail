@@ -60,6 +60,7 @@
   let lastOpen: HTMLButtonElement | undefined;
   let request = 0;
   let threadRequest = 0;
+  let loadedPages = 1;
   let checkingForChanges = false;
   const canUseMail = $derived(!!session?.mailbox && !initializing);
   const canAdmin = $derived(session?.workspace.role === 'admin');
@@ -71,23 +72,37 @@
 
   function currentFilter(): ThreadQuery {
     if (view === 'label') return { view: 'all', labelId };
-    if (view === 'search') return { view: 'all', q: query };
+    if (view === 'search') return { view: 'all', q: query, tz: Intl.DateTimeFormat().resolvedOptions().timeZone };
     return { view: view === 'drafts' ? 'inbox' : view };
   }
   function showError(cause: unknown) { error = cause instanceof Error ? cause.message : 'This action did not complete.'; }
-  async function refresh() {
+  async function refresh(preservePages = false) {
     if (!session?.mailbox) return;
     const ticket = ++request;
     busy = true;
     moreBusy = false;
     const isDrafts = view === 'drafts';
+    const pageCount = preservePages ? loadedPages : 1;
+    const filter = currentFilter();
+    async function threadPages() {
+      if (isDrafts) return;
+      let next = await api.listThreads(filter);
+      let pages = 1;
+      while (ticket === request && pages < pageCount && next.nextCursor) {
+        const page = await api.listThreads({ ...filter, cursor: next.nextCursor });
+        next = { ...page, items: appendUnique(next.items, page.items) };
+        pages++;
+      }
+      return { next, pages };
+    }
     try {
-      const [nextRows, nextDrafts, nextLabels, nextViews] = await Promise.all([
-        !isDrafts ? api.listThreads(currentFilter()) : undefined,
-        isDrafts ? api.listDrafts({}) : undefined,
+      const [threadResult, nextDrafts, nextLabels, nextViews] = await Promise.all([
+        threadPages(), isDrafts ? api.listDrafts({}) : undefined,
         api.listLabels(), api.listViews(),
       ]);
       if (ticket !== request) return;
+      const nextRows = threadResult?.next;
+      loadedPages = threadResult?.pages ?? 1;
       rows = nextRows?.items ?? [];
       drafts = nextDrafts?.items ?? [];
       const visible = new Set(rows.map((row) => row.id));
@@ -111,7 +126,7 @@
         if (ticket === request) { drafts = appendUnique(drafts, next.items); cursor = next.nextCursor; }
       } else {
         const next = await api.listThreads({ ...currentFilter(), cursor });
-        if (ticket === request) { rows = appendUnique(rows, next.items); cursor = next.nextCursor; }
+        if (ticket === request) { rows = appendUnique(rows, next.items); cursor = next.nextCursor; loadedPages++; }
       }
     } catch (cause) { if (ticket === request) showError(cause); }
     finally { if (ticket === request) moreBusy = false; }
@@ -239,9 +254,10 @@
       if (unread) await api.updateThreads({ ids: [id], set: { unread: false } });
       const latest = await api.getThread(id);
       if (ticket !== threadRequest) return;
+      if (unread) await refresh(true);
+      if (ticket !== threadRequest) return;
       thread = latest;
       await focusHeading();
-      if (unread) await refresh();
     } catch (cause) { if (ticket === threadRequest) showError(cause); }
   }
   async function closeThread() {
@@ -363,7 +379,7 @@
     {:else}
       <div class="toolbar listbar">
         <input type="checkbox" aria-label="Select all conversations" checked={!!rows.length && rows.every((row) => selected.includes(row.id))} disabled={!rows.length || busy || mutating} onchange={(event) => selected = event.currentTarget.checked ? rows.map((row) => row.id) : []} />
-        <button class="icon" aria-label="Refresh mail" disabled={busy} onclick={refresh}><RefreshCw size={19} /></button>
+        <button class="icon" aria-label="Refresh mail" disabled={busy} onclick={() => refresh()}><RefreshCw size={19} /></button>
         {#if selected.length}
           {#if view === 'trash' || view === 'spam'}<button class="icon" aria-label="Move selected to Inbox" disabled={mutating} onclick={() => update(selected, { folder: 'inbox' })}><Inbox size={19} /></button>
           {:else}<button class="icon" aria-label="Archive selected" disabled={mutating} onclick={() => update(selected, { folder: 'archive' })}><Archive size={19} /></button><button class="icon" aria-label="Delete selected" disabled={mutating} onclick={() => update(selected, { folder: 'trash' })}><Trash2 size={19} /></button>{/if}

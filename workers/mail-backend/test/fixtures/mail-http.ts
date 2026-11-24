@@ -43,12 +43,12 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, parent?:
   return [...header, `Content-Type: multipart/mixed; boundary="${boundary}"`, '', ...[html ?? plain, ...parts].flatMap((part) => [`--${boundary}`, part]), `--${boundary}--`, ''].join(CRLF);
 }
 
-export async function startMailHttpFixture({ demo = false }: { demo?: boolean } = {}) {
+export async function startMailHttpFixture({ demo = false, startedAt = Date.now() }: { demo?: boolean; startedAt?: number } = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
   const control = crypto.randomUUID();
-  let now = Math.floor(Date.now() / 1000) * 1000;
+  let now = Math.floor(startedAt / 1000) * 1000;
   const mf = new Miniflare({
     host: '127.0.0.1', port: 0,
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],

@@ -118,8 +118,16 @@ test('mail API hydrates legacy indexed M1 messages from verified MIME once', wor
   const options = { canSendAs: ['member@example.test'] };
   assert.equal((await box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options)).error?.code, 'not_implemented');
   await box.setMailApiEnabled(true);
+  const search = async (q: string) => {
+    const result = await box.mailApi(...scope, 'listThreads', { view: 'all', q }, undefined, options);
+    assert.equal(result.error, undefined);
+    return (result.body as { items: { id: string }[] }).items.map(item => item.id);
+  };
+  assert.deepEqual(await search('from:sender@example.test'), [id]);
+  assert.deepEqual(await search('from:"legacy sender"'), []);
   const thread = () => box.mailApi(...scope, 'getThread', { threadId: id }, undefined, options);
   const result = await thread();
+  assert.deepEqual(await search('from:"legacy sender"'), [id]);
   const [first] = (result.body as { messages: { from: { name: string }; hasHtml: boolean; remoteImages: boolean }[] }).messages;
   assert.equal(first.from.name, 'Legacy Sender');
   assert.equal(first.hasHtml, true);

@@ -6,6 +6,19 @@ import { startMailHttpFixture } from './fixtures/mail-http.ts';
 
 defineConformance('mail API over HTTP in local workerd (M2-W)', startMailHttpFixture);
 
+test('the interactive demo mints fresh content URLs after its initial clock expires', async () => {
+  const fixture = await startMailHttpFixture({ demo: true, startedAt: Date.now() - 660_000 });
+  try {
+    const mail = fixture.as('demo');
+    const plan = (await mail.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions');
+    assert.ok(plan);
+    const { messages: [message] } = await mail.getThread(plan.id);
+    const body = await mail.getBodyUrl(message.id, { remoteImages: false });
+    assert.ok(Date.parse(body.expiresAt) > Date.now());
+    assert.equal((await fetch(body.url)).status, 200);
+  } finally { await fixture.close(); }
+});
+
 test('directory creates replay by key and reject changed payloads before field validation', async () => {
   const fixture = await startMailHttpFixture();
   try {

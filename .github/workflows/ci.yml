@@ -45,7 +45,7 @@ jobs:
           "$RUNNER_TEMP/zizmor" --offline --no-config --no-ignores .github/workflows
 
   web:
-    name: web (types, unit, Workers build, Playwright + axe)
+    name: web (types, unit, Workers build)
     runs-on: ubuntu-latest
     timeout-minutes: 12
     env:
@@ -62,9 +62,29 @@ jobs:
       - run: npm run check
       - run: npm test
       - run: npm run build
+
+  mail-browser:
+    name: Playwright + axe (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.3'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm ci --prefix workers/mail-backend --ignore-scripts --no-audit --no-fund
       - run: npm exec -- playwright install --with-deps chromium
-      - run: npm run test:e2e
+      - run: npm run test:e2e -w @kofra/mail-web -- --shard="$SHARD/4"
+        env:
+          SHARD: ${{ matrix.shard }}
 
   mail-backend:
     runs-on: ubuntu-latest
@@ -89,7 +109,7 @@ jobs:
 
   ci-ok:
     name: ci-ok
-    needs: [workflow-lint, web, mail-backend]
+    needs: [workflow-lint, web, mail-browser, mail-backend]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

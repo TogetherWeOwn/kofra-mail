@@ -11,6 +11,12 @@ test('reads the HTTP session before listing threads', async ({ page }) => {
   await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeEnabled();
   expect(operations[0]).toBe('/api/v1/session');
   expect(operations).toContain('/api/v1/threads');
+  const query = 'after:2026-11-22';
+  const request = page.waitForRequest((request) => new URL(request.url()).searchParams.get('q') === query);
+  await page.getByRole('searchbox').fill(query);
+  await page.getByRole('searchbox').press('Enter');
+  expect(new URL((await request).url()).searchParams.get('tz'))
+    .toBe(await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone));
 });
 
 test('loads the next page using the opaque cursor for the same inbox query', async ({ page }) => {
@@ -29,6 +35,13 @@ test('loads the next page using the opaque cursor for the same inbox query', asy
   expect(requests[1].searchParams.get('cursor')).toBeTruthy();
   expect(requests[1].searchParams.get('view')).toBe('inbox');
   await expect(page.getByRole('button', { name: 'Load more' })).toHaveCount(0);
+  const later = page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem').nth(1).locator('button.open-mail');
+  const id = await later.getAttribute('id');
+  expect(id).toBeTruthy();
+  await later.click();
+  await page.getByRole('button', { name: 'Back to list' }).click();
+  await expect(page.locator(`#${id}`)).toBeFocused();
+  await expect(page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem')).toHaveCount(2);
 });
 
 test('leaves sending, uploads and the disabled Drive picker unavailable', async ({ page }) => {

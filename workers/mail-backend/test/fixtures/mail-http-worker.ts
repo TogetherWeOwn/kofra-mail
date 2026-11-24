@@ -34,7 +34,7 @@ function key(env: FixtureEnv) {
 }
 const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 const de64 = (value: string) => Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), (char) => char.charCodeAt(0));
-function now(env: FixtureEnv) { return time ?? env.INITIAL_TIME; }
+function now(env: FixtureEnv) { return time ?? (env.DEFAULT_ACCOUNT ? Date.now() : env.INITIAL_TIME); }
 
 export class HttpMailbox extends Mailbox {
   protected mailApiNow() { return now(this.env as FixtureEnv); }
@@ -140,7 +140,7 @@ export default {
       const principal = account && Object.hasOwn(env.ACCOUNTS, account) ? env.ACCOUNTS[account] : undefined;
       if (!principal) return null;
       return { userId: principal.userId, name: principal.name, workspaceId: principal.ws, role: principal.role, credentialEpoch: 1,
-        authTime: env.INITIAL_TIME - (principal.stale ? 660_000 : 0),
+        authTime: (env.DEFAULT_ACCOUNT ? Date.now() : env.INITIAL_TIME) - (principal.stale ? 660_000 : 0),
         csrfToken: b64(new Uint8Array(await crypto.subtle.sign('HMAC', authKey, encoder.encode(account!)))), };
     };
     const port: MailApiEnvironment = {

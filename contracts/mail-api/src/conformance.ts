@@ -367,12 +367,12 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const { limits } = await mail.getSession();
       const target = await h.deliver(message('Invoice', { text: 'The blue train left ref:ÉTÉ', attachments: [file] }));
       const decoy = await h.deliver(message('Meeting', {
-        from: { name: 'Morgan', email: 'morgan@example.com' }, text: 'The blue evening train left',
+        from: { name: 'Morgan', email: 'morgan@example.com' }, text: 'The blue evening train left. See ref below.',
       }));
       const label = await mail.createLabel({ name: 'Quarter End' }, key('label'));
       await mail.updateThreads({ ids: [target.threadId], set: { unread: true, addLabelIds: [label.id] } });
       await mail.updateThreads({ ids: [decoy.threadId], set: { unread: false } });
-      for (const q of ['from:casey@example.net', 'subject:invoice', 'has:attachment', 'label:"quarter end"', 'is:unread', '"blue train"', 'ref:été']) {
+      for (const q of ['from:casey@example.net', 'subject:invoice', 'has:attachment', 'label:"quarter end"', 'is:unread', '"blue train"', 'ref:été', 'ref:']) {
         assert.deepEqual(ids(await mail.listThreads({ view: 'inbox', q })), [target.threadId], q);
       }
       assert.deepEqual(ids(await mail.listThreads({ view: 'archive', q: 'subject:invoice' })), []);

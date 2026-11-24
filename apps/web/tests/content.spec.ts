@@ -23,6 +23,7 @@ test.describe('without a configured content origin', () => {
 
 test('opens a truncated plain message in the isolated reader on request', async ({ page, origins }) => {
   await page.goto('/');
+  await expect(page.getByRole('searchbox')).toBeEnabled();
   const all = page.getByRole('button', { name: 'All mail', exact: true });
   if (!(await all.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
   await all.click();
