@@ -46,6 +46,19 @@ test('reads the HTTP session before listing threads', async ({ page, origins }) 
   await page.getByRole('searchbox').press('Enter');
   expect(new URL((await request).url()).searchParams.get('tz'))
     .toBe(await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone));
+
+  await page.getByRole('button', { name: planRow }).click();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
+  await page.route('**/api/v1/session', (route) => route.fulfill({ status: 401, json: {
+    type: 'urn:kofra-mail:problem:unauthenticated', title: 'Mail session expired', status: 401, code: 'unauthenticated',
+  } }), { times: 1 });
+  const ended = page.waitForResponse((response) => response.url().endsWith('/api/v1/session') && response.status() === 401);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  expect((await ended).status()).toBe(401);
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Mail unavailable' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeDisabled();
+  await expect(page.getByRole('searchbox')).toBeDisabled();
 });
 
 test('clears the reader and mailbox controls when a real transfer races a focus check', async ({ page, origins }) => {
@@ -190,6 +203,21 @@ test('preserves unsaved draft during CSRF recovery, while outbound controls stay
   await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
   await expect(editor).toBeHidden();
   expect((await service.listDrafts({})).items.find((draft) => draft.subject === subject)?.body).toBe(text);
+
+  const nextOwner = (await service.listMembers({})).items.find((member) => !member.hasMailbox && member.id !== before.user.id);
+  expect(nextOwner).toBeTruthy();
+  await page.getByRole('button', { name: 'Compose', exact: true }).click();
+  await editor.getByLabel('Message body').fill('New edits before a real transfer.');
+  await page.route('**/api/v1/drafts', async (route) => {
+    await service.updateMailbox(before.mailbox!.id, { ownerUserId: nextOwner!.id });
+    await route.continue({ headers: { ...route.request().headers(), 'x-csrf-token': 'invalid-fixture-token' } });
+  }, { times: 1 });
+  const transferred = page.waitForResponse((response) => response.url().endsWith('/api/v1/drafts') && response.status() === 403);
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  expect(await (await transferred).json()).toMatchObject({ code: 'csrf_failed' });
+  await expect(editor).toBeHidden();
+  await expect(page.getByRole('heading', { name: 'No mailbox assigned' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeDisabled();
 });
 
 test('outbound, upload and undo routes return typed 501 without removing a draft', async ({ origins }) => {

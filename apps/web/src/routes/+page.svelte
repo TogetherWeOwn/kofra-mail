@@ -106,11 +106,15 @@
       const next = await api.getSession();
       if (scope === access && applySession(next) && next.mailbox) await refresh();
     } catch {
-      // A failed auth refresh is not proof of a mailbox transfer. Leave edits
-      // mounted so the user can retry; the API still enforces authorization.
+      // The problem handler clears access on a definitive denial. A network
+      // failure alone does not prove that the binding or session is gone.
     } finally { recoveringAccess = false; }
   }
   function handleProblem(failure: MailApiError, operation: Operation) {
+    if (operation === 'getSession' && isMailApiError(failure, 'unauthenticated')) {
+      applySession(undefined);
+      return;
+    }
     if (isMailApiError(failure, 'forbidden') && ROUTES[operation].access === 'member') {
       if (operation === 'getSession') applySession(undefined);
       else if (session?.mailbox) applySession({ ...session, mailbox: undefined });
