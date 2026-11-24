@@ -340,6 +340,57 @@ test('restored saved draft retains If-Match and exposes a concurrent edit confli
   expect((await service.listDrafts({})).items).toEqual([external]);
 });
 
+test('restores edits as a new draft when another context deletes the original during expiry', async ({ page, browser, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const { saved } = await existingReply(service);
+  await page.goto('/');
+  const editor = await openSavedDraft(page, saved.subject);
+  const body = 'Recover these edits despite the deletion.';
+  await editor.getByLabel('Message body').fill(body);
+  await expireSession(page);
+  const other = await browser.newContext();
+  try {
+    const session = await other.request.get(`${origins.appOrigin}/api/v1/session`);
+    expect(session.ok()).toBe(true);
+    const { csrfToken } = await session.json();
+    const removed = await other.request.delete(`${origins.appOrigin}/api/v1/drafts/${saved.id}`, {
+      headers: { Origin: origins.appOrigin, 'X-CSRF-Token': csrfToken, 'If-Match': saved.revision },
+    });
+    expect(removed.status()).toBe(204);
+  } finally { await other.close(); }
+  let oldReads = 0;
+  page.on('request', (request) => {
+    if (request.method() === 'GET' && new URL(request.url()).pathname === `/api/v1/drafts/${saved.id}`) oldReads++;
+  });
+  const missing = page.waitForResponse((response) => response.request().method() === 'GET' &&
+    new URL(response.url()).pathname === `/api/v1/drafts/${saved.id}`);
+  await page.getByRole('button', { name: 'Try again' }).click();
+  expect((await missing).status()).toBe(404);
+  await expect(editor.getByLabel('Message body')).toHaveValue(body);
+  const created = page.waitForResponse((response) => response.url().endsWith('/api/v1/drafts') && response.request().method() === 'POST');
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  expect((await created).status()).toBe(201);
+  await expect(editor).toHaveCount(0);
+  expect(oldReads).toBe(1);
+  const drafts = (await service.listDrafts({})).items;
+  expect(drafts).toHaveLength(1);
+  expect(drafts[0].id).not.toBe(saved.id);
+  expect(drafts[0].body).toBe(body);
+});
+
+test('retains a new unsaved draft whose only content is a Bcc recipient', async ({ page, origins }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Compose', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'New message' });
+  await editor.getByRole('button', { name: 'Cc and Bcc' }).click();
+  await editor.getByLabel('Bcc', { exact: true }).fill('only-bcc@example.com');
+  await expireSession(page);
+  await page.getByRole('button', { name: 'Try again' }).click();
+  await expect(editor.getByLabel('Bcc', { exact: true })).toHaveValue('only-bcc@example.com');
+  for (const name of ['To', 'Cc', 'Subject', 'Message body']) await expect(editor.getByLabel(name, { exact: true })).toHaveValue('');
+  expect((await serviceAt(origins.appOrigin).listDrafts({})).items).toEqual([]);
+});
+
 test('outbound, upload and undo routes return typed 501 without removing a draft', async ({ origins }) => {
   const api = createHttpMailService({
     baseUrl: `${origins.appOrigin}/api/v1`,

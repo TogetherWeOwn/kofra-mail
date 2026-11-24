@@ -313,21 +313,39 @@
       const available = await api.listIdentities();
       if (scope !== access) return;
       identities = available.items;
-      const saved = !event && !draftId ? matchingDraft(session) : undefined;
+      let saved = !event && !draftId ? matchingDraft(session) : undefined;
       const reference = saved?.edits.existing;
       const existingId = draftId ?? reference?.id;
       if (existingId) {
-        const existing = await api.getDraft(existingId);
-        if (scope !== access) return;
-        restoredEdits = saved?.edits;
-        if (saved) forgetRetainedDraft();
-        // Use the freshly authorized record as the base, but keep the original
-        // revision so concurrently saved edits still produce an If-Match conflict.
-        draft = reference ? { ...existing, id: reference.id, revision: reference.revision } : existing;
-        return;
+        let existing: Draft | undefined;
+        try { existing = await api.getDraft(existingId); }
+        catch (cause) {
+          if (!saved || !reference || !isMailApiError(cause) || cause.status !== 404) throw cause;
+          if (scope !== access || retainedDraft !== saved) return;
+          // The record is gone. Keep the local fields, but never retry its id.
+          const { existing: _deleted, ...edits } = saved.edits;
+          saved = { ...saved, edits };
+          retainedDraft = saved;
+        }
+        if (scope !== access || (saved && retainedDraft !== saved)) return;
+        if (existing) {
+          restoredEdits = saved?.edits;
+          if (saved) forgetRetainedDraft();
+          // Keep the original revision so concurrently saved edits still
+          // produce an If-Match conflict on the freshly authorized record.
+          draft = reference ? { ...existing, id: reference.id, revision: reference.revision } : existing;
+          return;
+        }
       }
       const preferences = await api.getSettings();
-      if (scope !== access) return;
+      if (scope !== access || (saved && retainedDraft !== saved)) return;
+      if (saved) {
+        // A draft lookup can also return 404 after a binding change. Confirm
+        // the scope before consuming retained text in a new compose editor.
+        const current = await api.getSession();
+        if (scope !== access || retainedDraft !== saved) return;
+        if (applySession(current)) { await refresh(); return; }
+      }
       const active = identities.filter((identity) => identity.sendAs === 'active');
       const isOwn = (email: string) => active.some((identity) => identity.email.toLowerCase() === email.toLowerCase());
       const message = event?.message;
