@@ -8,7 +8,7 @@
   import { Archive, File, Inbox, Mail, OctagonAlert, Paperclip, Pencil, Plus, RefreshCw, Shield, Search, Send, Star, Tag, Trash2 } from '@lucide/svelte';
   import { onMount, tick } from 'svelte';
   import { ROUTES, createHttpMailService, isMailApiError, type Conversation, type Draft, type Identity, type Label, type MailApiError, type MailboxPage, type Message, type MessageAttachment, type Operation, type Session, type Settings, type ThreadChange, type ThreadQuery, type ThreadSummary, type View, type ViewList } from '@kofra/mail-contract';
-  import Compose, { type ComposeDraft } from '$lib/Compose.svelte';
+  import Compose, { type ComposeDraft, type DraftEdits } from '$lib/Compose.svelte';
   import MailSettings from '$lib/MailSettings.svelte';
   import MailAdmin from '$lib/MailAdmin.svelte';
   import ThreadView from '$lib/ThreadView.svelte';
@@ -54,6 +54,10 @@
   let settings = $state<Settings>();
   let admin = $state(false);
   let draft = $state.raw<ComposeDraft>();
+  let restoredEdits = $state.raw<DraftEdits>();
+  type RetainedDraft = { userId: string; workspaceId: string; mailboxId: string; edits: DraftEdits };
+  let retainedDraft: RetainedDraft | undefined;
+  let composer = $state.raw<{ snapshotEdits(): DraftEdits }>();
   let openingCompose = false;
   let labelDialog: HTMLDialogElement;
   let headingHost: HTMLElement;
@@ -80,13 +84,23 @@
     return { view: view === 'drafts' ? 'inbox' : view };
   }
   function showError(cause: unknown) { error = cause instanceof Error ? cause.message : 'This action did not complete.'; }
+  function matchingDraft(current: Session | undefined): RetainedDraft | undefined {
+    const saved = retainedDraft;
+    return saved && current && current.user.id === saved.userId && current.workspace.id === saved.workspaceId &&
+      current.mailbox?.id === saved.mailboxId ? saved : undefined;
+  }
+  function forgetRetainedDraft() { retainedDraft = undefined; }
+  async function restoreRetainedDraft() {
+    if (matchingDraft(session)) await compose();
+  }
   function applySession(next: Session | undefined): boolean {
+    if (next && !matchingDraft(next)) forgetRetainedDraft();
     const changed = session?.user.id !== next?.user.id || session?.workspace.id !== next?.workspace.id ||
       session?.mailbox?.id !== next?.mailbox?.id;
     if (changed) {
       // Invalidate in-flight mailbox work before dropping its data from the UI.
       access++; request++; threadRequest++;
-      thread = undefined; draft = undefined; settings = undefined; admin = false;
+      thread = undefined; draft = undefined; restoredEdits = undefined; settings = undefined; admin = false;
       rows = []; drafts = []; selected = []; labels = []; identities = []; views = undefined;
       cursor = null; loadedPages = 1; listState = undefined; lastOpen = undefined;
       view = 'inbox'; labelId = undefined; searchText = ''; query = ''; navOpen = false;
@@ -104,7 +118,10 @@
     const scope = access;
     try {
       const next = await api.getSession();
-      if (scope === access && applySession(next) && next.mailbox) await refresh();
+      if (scope === access && applySession(next) && next.mailbox) {
+        await refresh();
+        await restoreRetainedDraft();
+      }
     } catch {
       // The problem handler clears access on a definitive denial. A network
       // failure alone does not prove that the binding or session is gone.
@@ -112,10 +129,16 @@
   }
   function handleProblem(failure: MailApiError, operation: Operation) {
     if (operation === 'getSession' && isMailApiError(failure, 'unauthenticated')) {
+      const prior = session;
+      const edits = draft && composer?.snapshotEdits();
+      if (prior?.mailbox && edits && (edits.to || edits.subject || edits.body || edits.inReplyTo)) {
+        retainedDraft = { userId: prior.user.id, workspaceId: prior.workspace.id, mailboxId: prior.mailbox.id, edits };
+      }
       applySession(undefined);
       return;
     }
     if (isMailApiError(failure, 'forbidden') && ROUTES[operation].access === 'member') {
+      forgetRetainedDraft();
       if (operation === 'getSession') applySession(undefined);
       else if (session?.mailbox) applySession({ ...session, mailbox: undefined });
       return;
@@ -210,6 +233,7 @@
       syncHash();
     } catch (cause) { showError(cause); }
     finally { initializing = false; }
+    await restoreRetainedDraft();
   }
   async function checkForChanges() {
     if (initializing || busy || moreBusy || mutating || checkingForChanges) return;
@@ -221,7 +245,11 @@
       if (scope !== access) return;
       const changed = applySession(next);
       if (!next.mailbox) return;
-      if (changed) { await refresh(); return; }
+      if (changed) {
+        await refresh();
+        await restoreRetainedDraft();
+        return;
+      }
       if (ticket !== request) return;
       const latest = await api.listViews();
       if (ticket !== request) return;
@@ -243,7 +271,7 @@
       void navigate('inbox');
     };
     document.addEventListener('click', followMailLink, true);
-    return () => { access++; request++; threadRequest++; document.removeEventListener('click', followMailLink, true); };
+    return () => { forgetRetainedDraft(); access++; request++; threadRequest++; document.removeEventListener('click', followMailLink, true); };
   });
 
   async function openSettings() {
@@ -301,6 +329,9 @@
       const to = message && reply ? (message.sent ? message.to.slice(0, 1) : message.replyTo?.length ? message.replyTo : [message.from]) : [];
       const preferred = message?.sent && reply ? message.from : message && reply && preferences.replyFromReceivedAddress ? [...message.to, ...message.cc].find((address) => isOwn(address.email)) : undefined;
       const from = active.find((identity) => identity.email.toLowerCase() === preferred?.email.toLowerCase())?.email ?? preferences.defaultFrom;
+      const saved = !event ? matchingDraft(session) : undefined;
+      restoredEdits = saved?.edits;
+      if (saved) forgetRetainedDraft();
       draft = {
         from, to, cc: [], bcc: [], subject, body: signature + quote,
         inReplyTo: reply ? message?.id : undefined, forwardOf: reply ? undefined : message?.id,
@@ -443,7 +474,7 @@
   function toggleSelect(id: string) { selected = selected.includes(id) ? selected.filter((item) => item !== id) : [...selected, id]; }
 </script>
 
-<svelte:window onhashchange={syncHash} onfocus={checkForChanges} onkeydown={(event) => { if (event.key === 'Escape') navOpen = false; }} />
+<svelte:window onhashchange={syncHash} onfocus={checkForChanges} onpagehide={forgetRetainedDraft} onkeydown={(event) => { if (event.key === 'Escape') navOpen = false; }} />
 <svelte:head><title>Riaklo Mail</title><meta name="description" content="Riaklo Mail inbox" /></svelte:head>
 <a class="skip" href="#mail-content" onclick={(event) => { event.preventDefault(); headingHost.focus(); }}>Skip to mail</a>
 <TopBar productName="Riaklo Mail" productHref="#mail" productIcon="mail" currentAppId="mail" {apps} {account} accountHref={canUseMail ? '#mail-settings' : '#mail'} onMenuClick={toggleNav} menuControls="mail-nav" settingsLabel="Mail settings" settingsHref={canUseMail ? '#mail-settings' : undefined}>
@@ -536,7 +567,10 @@
 </div>
 <div class="status" class:sr-only={!status} aria-live="polite">{status}{#if status}<button class="icon" aria-label="Dismiss notification" onclick={() => status = ''}>×</button>{/if}</div>
 {#if draft}
-  <Compose initial={draft} {identities} {api} m3={session?.features.m3 === true} onClose={() => { draft = undefined; void refresh(); }} onStatus={(message) => status = message} />
+  {@const activeDraft = draft}
+  <Compose bind:this={composer} initial={activeDraft} {restoredEdits} {identities} {api} m3={session?.features.m3 === true}
+    onClose={() => { if (draft === activeDraft) { draft = undefined; restoredEdits = undefined; void refresh(); } }}
+    onStatus={(message) => { if (draft === activeDraft) status = message; }} />
 {/if}
 <dialog bind:this={labelDialog} class="modal" aria-labelledby="label-heading" oncancel={(event) => { if (labelSaving) event.preventDefault(); }}>
   <form onsubmit={createLabel}>

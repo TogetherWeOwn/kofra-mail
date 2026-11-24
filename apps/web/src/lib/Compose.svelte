@@ -1,6 +1,7 @@
 <script module lang="ts">
   import type { Draft, DraftAttachment, DraftInput } from '@kofra/mail-contract';
   export type ComposeDraft = Draft | (Omit<DraftInput, 'attachments'> & { attachments: DraftAttachment[] });
+  export type DraftEdits = { to: string; subject: string; body: string; inReplyTo?: string };
 </script>
 
 <script lang="ts">
@@ -9,16 +10,28 @@
   import { isMailApiError, type AddressInput, type Identity, type MailService } from '@kofra/mail-contract';
   import { mailAction } from './mail-action';
 
-  let { initial, identities, api, m3, onClose, onStatus }: {
-    initial: ComposeDraft; identities: Identity[]; api: MailService; m3: boolean;
+  let { initial, restoredEdits, identities, api, m3, onClose, onStatus }: {
+    initial: ComposeDraft; restoredEdits?: DraftEdits; identities: Identity[]; api: MailService; m3: boolean;
     onClose: () => void; onStatus: (message: string) => void;
   } = $props();
   const addressText = (items: AddressInput[]) => items.map(({ email }) => email).join(', ');
   function start(value: ComposeDraft) {
     return { ...value, toText: addressText(value.to), ccText: addressText(value.cc), bccText: addressText(value.bcc), attachments: [...value.attachments] };
   }
-  function startInitial() { return start(initial); }
+  function startInitial() {
+    const next = start(initial);
+    if (restoredEdits) {
+      next.toText = restoredEdits.to;
+      next.subject = restoredEdits.subject;
+      next.body = restoredEdits.body;
+      next.inReplyTo = restoredEdits.inReplyTo;
+    }
+    return next;
+  }
   let form = $state(startInitial());
+  export function snapshotEdits(): DraftEdits {
+    return { to: form.toText, subject: form.subject, body: form.body, inReplyTo: form.inReplyTo };
+  }
   function initiallyShowCc() { return initial.cc.length > 0 || initial.bcc.length > 0; }
   let ccVisible = $state(initiallyShowCc());
   let pending = $state(false);

@@ -220,6 +220,62 @@ test('preserves unsaved draft during CSRF recovery, while outbound controls stay
   await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeDisabled();
 });
 
+test('restores expired draft edits only for the same verified mailbox binding', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const before = await service.getSession();
+  const mailbox = before.mailbox!;
+  const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
+  const replied = (await service.getThread(plan.id)).messages[0];
+  const editor = page.getByRole('dialog', { name: 'New message' });
+  const compose = page.getByRole('button', { name: 'Compose', exact: true });
+  async function expire() {
+    await expect(page.locator('#mail-content')).toHaveAttribute('aria-busy', 'false');
+    await page.route('**/api/v1/session', (route) => route.fulfill({ status: 401, json: {
+      type: 'urn:kofra-mail:problem:unauthenticated', title: 'Mail session expired', status: 401, code: 'unauthenticated',
+    } }), { times: 1 });
+    const rejected = page.waitForResponse((response) => response.url().endsWith('/api/v1/session') && response.status() === 401);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await rejected;
+    await expect(editor).toHaveCount(0);
+    await expect(compose).toBeDisabled();
+  }
+
+  await page.goto('/');
+  await page.getByRole('button', { name: planRow }).click();
+  await page.getByRole('button', { name: 'Reply', exact: true }).click();
+  await editor.getByLabel('To', { exact: true }).fill('draft-recipient@example.com');
+  await editor.getByLabel('Subject').fill('Unsaved reply');
+  await editor.getByLabel('Message body').fill('Reply text before session expiry.');
+  await expire();
+  await page.getByRole('button', { name: 'Try again' }).click();
+  await expect(editor).toBeVisible();
+  await expect(editor.getByLabel('To', { exact: true })).toHaveValue('draft-recipient@example.com');
+  await expect(editor.getByLabel('Subject')).toHaveValue('Unsaved reply');
+  await expect(editor.getByLabel('Message body')).toHaveValue('Reply text before session expiry.');
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  expect((await service.listDrafts({})).items.find((item) => item.subject === 'Unsaved reply')?.inReplyTo).toBe(replied.id);
+
+  await compose.click();
+  await editor.getByLabel('Message body').fill('Do not carry this edit into a different mailbox.');
+  await expire();
+  const nextOwner = (await service.listMembers({})).items.find((member) => !member.hasMailbox && member.id !== before.user.id);
+  expect(nextOwner).toBeTruthy();
+  await service.updateMailbox(mailbox.id, { ownerUserId: nextOwner!.id });
+  const replacement = await service.createMailbox({
+    ownerUserId: before.user.id, displayName: before.user.name,
+    primaryAddress: `replacement@${mailbox.primaryAddress.split('@').at(-1)}`,
+  }, { idempotencyKey: crypto.randomUUID() });
+  expect(replacement.id).not.toBe(mailbox.id);
+  await page.getByRole('button', { name: 'Try again' }).click();
+  await expect(compose).toBeEnabled();
+  await expect(editor).toHaveCount(0);
+  await compose.click();
+  await expect(editor.getByLabel('To', { exact: true })).toHaveValue('');
+  await expect(editor.getByLabel('Subject')).toHaveValue('');
+  await expect(editor.getByLabel('Message body')).toHaveValue('');
+});
+
 test('outbound, upload and undo routes return typed 501 without removing a draft', async ({ origins }) => {
   const api = createHttpMailService({
     baseUrl: `${origins.appOrigin}/api/v1`,
