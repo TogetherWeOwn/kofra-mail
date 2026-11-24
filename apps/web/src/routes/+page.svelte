@@ -146,7 +146,7 @@
     try {
       const previous = views?.state;
       const latest = await api.listViews();
-      if (previous !== latest.state) await Promise.all([refresh(), refreshOpenThread()]);
+      if (previous !== latest.state) await Promise.all([refresh(true), refreshOpenThread()]);
     } catch (cause) { showError(cause); }
     finally { checkingForChanges = false; }
   }
@@ -254,11 +254,21 @@
       if (unread) await api.updateThreads({ ids: [id], set: { unread: false } });
       const latest = await api.getThread(id);
       if (ticket !== threadRequest) return;
-      if (unread) await refresh(true);
-      if (ticket !== threadRequest) return;
       thread = latest;
-      await focusHeading();
+      if (unread) {
+        rows = rows.map((row) => row.id === id ? { ...row, unread: false } : row);
+        if (view === 'search') void refresh(true);
+        else void refreshViewCounts(request);
+      }
+      // Do not steal focus if the user began using the shell while mail loaded.
+      if (document.activeElement === button || document.activeElement === document.body) await focusHeading();
     } catch (cause) { if (ticket === threadRequest) showError(cause); }
+  }
+  async function refreshViewCounts(ticket: number) {
+    try {
+      const next = await api.listViews();
+      if (ticket === request) views = next;
+    } catch (cause) { if (ticket === request) showError(cause); }
   }
   async function closeThread() {
     threadRequest++;

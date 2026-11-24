@@ -42,6 +42,7 @@ test('loads the next page using the opaque cursor for the same inbox query', asy
   await page.getByRole('button', { name: 'Back to list' }).click();
   await expect(page.locator(`#${id}`)).toBeFocused();
   await expect(page.getByRole('list', { name: 'Inbox', exact: true }).getByRole('listitem')).toHaveCount(2);
+  expect(requests).toHaveLength(2); // Opening an unread row does not walk the loaded pages again.
 });
 
 test('leaves sending, uploads and the disabled Drive picker unavailable', async ({ page }) => {

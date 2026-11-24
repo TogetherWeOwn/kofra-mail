@@ -93,6 +93,7 @@ test('locks draft fields while a save is in flight', async ({ page }) => {
 test('browser Back from settings restores the open conversation', async ({ page }) => {
   await page.goto('/');
   await page.getByRole('button', { name: /^Mira Chen.*Floor plan revisions/ }).click();
+  await expect(page.getByRole('heading', { name: 'Floor plan revisions' })).toBeVisible();
   await page.getByRole('button', { name: 'Account menu' }).click();
   await page.getByRole('link', { name: 'Mail settings' }).click();
   await expect(page.getByRole('heading', { name: 'Mail settings' })).toBeVisible();
