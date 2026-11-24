@@ -1,4 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
+import type { Operation } from '../../../contracts/mail-api/src/service.ts';
+import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions, type MailboxApiResult, type MailContentResult } from './mailbox-api.ts';
+import { ApiFault, isId } from './mailbox-api-input.ts';
+import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
 import { kofra } from './kofra.ts';
 import { MailboxIndex, PermanentMailError, storedLifecycle } from './mailbox-index.ts';
@@ -31,9 +35,63 @@ export class Mailbox extends DurableObject<Env> {
   // Set when a call asked for an immediate wake-up; consumed by the alarm run.
   private wakeRequested = false;
 
+  private scoped(scope: Scope): boolean {
+    return this.ctx.id.equals(this.env.MAILBOX.idFromName(mailboxName(scope.workspaceId, scope.mailboxId)));
+  }
+
   private verifyScope(scope: Scope): void {
-    const expected = this.env.MAILBOX.idFromName(mailboxName(scope.workspaceId, scope.mailboxId));
-    if (!this.ctx.id.equals(expected)) throw new Error('Delivery mailbox scope mismatch');
+    if (!this.scoped(scope)) throw new Error('Delivery mailbox scope mismatch');
+  }
+
+  protected mailApiNow(): number { return Date.now(); }
+
+  async mailApi(workspaceId: string, mailboxId: string, operation: Operation, params: Record<string, string>, input: unknown,
+    options: MailboxApiOptions): Promise<MailboxApiResult> {
+    const scope = { workspaceId, mailboxId };
+    if (!this.scoped(scope)) return { error: { code: 'not_found' } };
+    if (!enabled(this.env) || this.env.MAIL_LOCAL_API !== 'on') return { error: { code: 'not_implemented' } };
+    const now = this.mailApiNow();
+    try {
+      // The executing operation durably reserves its key before awaiting the
+      // object write. A retry can observe this without waiting in the work lane.
+      if (isIdempotentCreate(operation) && isId(options.idempotencyKey) && storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' &&
+          this.ctx.storage.sql.exec(`SELECT 1 FROM mailbox_api_in_progress p WHERE p.key = ? AND p.expires_at > ?
+            AND NOT EXISTS (SELECT 1 FROM mailbox_api_idempotency r WHERE r.key = p.key AND r.expires_at > ?)`,
+          options.idempotencyKey, now, now).toArray().length) {
+        return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
+      }
+      return await this.work.run(async () => {
+        const index = this.index(workspaceId);
+        if (!await this.ready(index, scope)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+        const life = index.lifecycle<Lifecycle>();
+        if (life?.state !== 'ready' || index.unindexed('', 1).length) {
+          return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+        }
+        if (mailApiMutation(operation)) await this.armFor(operation === 'updateThreads' ? FLAGS_FLUSH_MS : SETTINGS_FLUSH_MS);
+        return new MailboxApi(index, this.ctx.storage.sql, workspaceId, mailboxId, life.incarnation, now).call(operation, params, input, options);
+      });
+    } catch (error) {
+      if (error instanceof ApiFault) return { error: error.problem };
+      return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
+    }
+  }
+
+  async mailContent(workspaceId: string, mailboxId: string, messageId: string, part?: number): Promise<MailContentResult> {
+    const scope = { workspaceId, mailboxId };
+    if (!enabled(this.env) || this.env.MAIL_LOCAL_API !== 'on' || !this.scoped(scope)) return { error: { code: 'not_found' } };
+    try {
+      return await this.work.run(async () => {
+        const index = this.index(workspaceId);
+        const life = index.lifecycle<Lifecycle>();
+        // A content request never initializes or restores a mailbox.
+        if (life?.state !== 'ready') return { error: { code: 'not_found' } };
+        return new MailboxApi(index, this.ctx.storage.sql, workspaceId, mailboxId, life.incarnation, this.mailApiNow()).content(messageId, part);
+      });
+    } catch (error) {
+      if (error instanceof ApiFault) return { error: error.problem };
+      if (error instanceof ObjectMissingError) return { error: { code: 'not_found' } };
+      return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
+    }
   }
 
   private index(workspaceId: string): MailboxIndex {
@@ -42,7 +100,7 @@ export class Mailbox extends DurableObject<Env> {
       ...kofra(this.env, workspaceId),
       register: (kind, digest, holder) => refs.register(kind, digest, holder),
       hold: (key, holder) => refs.hold(key, holder), release: (key, holder) => refs.release(key, holder),
-    }, this.ctx.id.toString());
+    }, this.ctx.id.toString(), this.env.MAIL_LOCAL_API === 'on');
   }
 
   private recovery(index: MailboxIndex): MailboxRecovery {
@@ -229,7 +287,10 @@ export class Mailbox extends DurableObject<Env> {
       let failed = false;
       try {
         if (life.state === 'restoring') next = await this.restoreSlice(index, life);
-        else if (life.state === 'ready') next = await this.backupSlice(index, life, now);
+        else if (life.state === 'ready') {
+          if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
+          next = await this.backupSlice(index, life, now);
+        }
         else next = now + HELD_RECHECK_MS;
       } catch {
         failed = true;

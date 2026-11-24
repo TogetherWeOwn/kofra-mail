@@ -32,6 +32,7 @@ export const ERROR_STATUS = {
   rate_limited: 429,
   internal: 500,
   feature_unavailable: 501,
+  not_implemented: 501,
   mailbox_restoring: 503,
   unavailable: 503,
 } as const;

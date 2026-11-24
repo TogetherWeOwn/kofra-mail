@@ -5,3 +5,4 @@ export * from './routes.ts';
 export * from './errors.ts';
 export * from './limits.ts';
 export * from './headers.ts';
+export { createHttpMailService } from './http-client.ts';

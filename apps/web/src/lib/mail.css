@@ -139,12 +139,8 @@ time { white-space: nowrap; color: var(--body); font-size: .87rem; text-align: r
 .file-picker input { position: absolute; inset: 0; width: 100%; opacity: 0; cursor: pointer; }
 .file-picker:focus-within { outline: 2px solid var(--action); }
 .form-error { margin-inline: 12px; }
-.drive-picker { width: min(530px, calc(100vw - 24px)); }
-.drive-picker .compose-head { border-radius: 6px; margin-bottom: 12px; }
-.drive-files { margin-top: 10px; }
-.drive-files label { display: flex; align-items: center; gap: 10px; min-height: 42px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
-.drive-files label span { flex: 1; min-width: 0; }
-.drive-files small, .address-list small { color: var(--muted); }
+.compose-availability { padding: 6px 12px; }
+.address-list small { color: var(--muted); }
 .settings-screen { padding: 18px 24px 32px; max-width: 680px; }
 .settings-screen h2 { margin: 20px 0 6px; }
 .address-list { margin-block: 12px 22px; }
@@ -154,10 +150,6 @@ time { white-space: nowrap; color: var(--body); font-size: .87rem; text-align: r
 .saved { color: var(--green); margin-top: 8px; }
 .draft-list button { min-height: 45px; width: 100%; padding: 8px 20px; text-align: left; border: 0; border-bottom: 1px solid var(--line); background: var(--surface); overflow-wrap: anywhere; }
 .draft-list button:hover { background: var(--raised); }
-.send-notices { position: fixed; z-index: 3; bottom: 64px; left: 16px; width: min(340px, calc(100vw - 32px)); display: grid; gap: 4px; }
-.compose-undo:not(:empty) { padding: 6px 12px; }
-.compose-undo .send-notices { position: static; width: 100%; }
-.send-notice { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px 6px 14px; border-radius: 6px; background: var(--ink); color: var(--surface); }
 .admin-entry { margin-top: 18px; }
 .admin-layout { display: grid; grid-template-columns: 170px minmax(0, 1fr); gap: 20px; padding: 20px; }
 .admin-nav { display: flex; flex-direction: column; align-items: stretch; gap: 6px; }

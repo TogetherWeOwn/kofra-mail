@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_by_header_id ON messages(message_id, internal_date DESC, id DESC);
 CREATE INDEX IF NOT EXISTS messages_by_thread ON messages(thread_id, internal_date DESC);
 CREATE INDEX IF NOT EXISTS messages_unindexed ON messages(id) WHERE indexed = 0;
+CREATE INDEX IF NOT EXISTS mailbox_api_recent ON messages(internal_date DESC, thread_id DESC, id DESC) WHERE indexed = 1;
 CREATE TABLE IF NOT EXISTS receipts (id TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS fingerprints (key TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, subject_norm TEXT NOT NULL, last_date INTEGER NOT NULL, count INTEGER NOT NULL, assigned INTEGER NOT NULL,
@@ -29,6 +30,24 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(id UNINDEXED, subject, addresses, body, attachment_names);
 CREATE TABLE IF NOT EXISTS drafts (id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, holder TEXT NOT NULL);
+-- These columns extend M1's replayed rows without changing the meaning of legacy drafts/flags.
+CREATE TABLE IF NOT EXISTS mailbox_api_drafts (
+  id TEXT PRIMARY KEY REFERENCES drafts(id) ON DELETE CASCADE, revision TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mailbox_api_draft_page ON mailbox_api_drafts(updated_at DESC, id ASC);
+CREATE TABLE IF NOT EXISTS mailbox_api_idempotency (
+  key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, expires_at INTEGER NOT NULL, result TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mailbox_api_idempotency_expiry ON mailbox_api_idempotency(expires_at, key);
+CREATE TABLE IF NOT EXISTS mailbox_api_in_progress (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS mailbox_api_progress_expiry ON mailbox_api_in_progress(expires_at, key);
+CREATE TABLE IF NOT EXISTS mailbox_api_settings (id INTEGER PRIMARY KEY CHECK(id=1), definition TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mailbox_api_expiry (id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS mailbox_api_expiry_time ON mailbox_api_expiry(expires_at, id);
+-- Derived from the digest-verified raw MIME; never copied into snapshots or journal.
+CREATE TABLE IF NOT EXISTS mailbox_api_display (
+  id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, data TEXT NOT NULL, body_override TEXT
+);
 CREATE TABLE IF NOT EXISTS bayes (token TEXT PRIMARY KEY, ham INTEGER NOT NULL, spam INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS settings (kind TEXT NOT NULL, id TEXT NOT NULL, definition TEXT NOT NULL, PRIMARY KEY (kind, id));
 CREATE TABLE IF NOT EXISTS backup_capture (row_no INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL);
