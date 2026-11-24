@@ -84,6 +84,8 @@
     return { view: view === 'drafts' ? 'inbox' : view };
   }
   function showError(cause: unknown) { error = cause instanceof Error ? cause.message : 'This action did not complete.'; }
+  // Restore only for the same user and mailbox IDs in the same workspace.
+  // An observed transfer, a denial, or a reload purges the in-memory copy.
   function matchingDraft(current: Session | undefined): RetainedDraft | undefined {
     const saved = retainedDraft;
     return saved && current && current.user.id === saved.userId && current.workspace.id === saved.workspaceId &&
@@ -131,7 +133,7 @@
     if (operation === 'getSession' && isMailApiError(failure, 'unauthenticated')) {
       const prior = session;
       const edits = draft && composer?.snapshotEdits();
-      if (prior?.mailbox && edits && (edits.to || edits.subject || edits.body || edits.inReplyTo)) {
+      if (prior?.mailbox && edits && (edits.to || edits.cc || edits.bcc || edits.subject || edits.body || edits.inReplyTo || edits.existing)) {
         retainedDraft = { userId: prior.user.id, workspaceId: prior.workspace.id, mailboxId: prior.mailbox.id, edits };
       }
       applySession(undefined);
@@ -311,9 +313,17 @@
       const available = await api.listIdentities();
       if (scope !== access) return;
       identities = available.items;
-      if (draftId) {
-        const existing = await api.getDraft(draftId);
-        if (scope === access) draft = existing;
+      const saved = !event && !draftId ? matchingDraft(session) : undefined;
+      const reference = saved?.edits.existing;
+      const existingId = draftId ?? reference?.id;
+      if (existingId) {
+        const existing = await api.getDraft(existingId);
+        if (scope !== access) return;
+        restoredEdits = saved?.edits;
+        if (saved) forgetRetainedDraft();
+        // Use the freshly authorized record as the base, but keep the original
+        // revision so concurrently saved edits still produce an If-Match conflict.
+        draft = reference ? { ...existing, id: reference.id, revision: reference.revision } : existing;
         return;
       }
       const preferences = await api.getSettings();
@@ -329,7 +339,6 @@
       const to = message && reply ? (message.sent ? message.to.slice(0, 1) : message.replyTo?.length ? message.replyTo : [message.from]) : [];
       const preferred = message?.sent && reply ? message.from : message && reply && preferences.replyFromReceivedAddress ? [...message.to, ...message.cc].find((address) => isOwn(address.email)) : undefined;
       const from = active.find((identity) => identity.email.toLowerCase() === preferred?.email.toLowerCase())?.email ?? preferences.defaultFrom;
-      const saved = !event ? matchingDraft(session) : undefined;
       restoredEdits = saved?.edits;
       if (saved) forgetRetainedDraft();
       draft = {

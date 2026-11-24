@@ -1,7 +1,10 @@
 <script module lang="ts">
   import type { Draft, DraftAttachment, DraftInput } from '@kofra/mail-contract';
   export type ComposeDraft = Draft | (Omit<DraftInput, 'attachments'> & { attachments: DraftAttachment[] });
-  export type DraftEdits = { to: string; subject: string; body: string; inReplyTo?: string };
+  export type DraftEdits = {
+    to: string; cc: string; bcc: string; subject: string; body: string; inReplyTo?: string;
+    existing?: Pick<Draft, 'id' | 'revision'>;
+  };
 </script>
 
 <script lang="ts">
@@ -22,6 +25,8 @@
     const next = start(initial);
     if (restoredEdits) {
       next.toText = restoredEdits.to;
+      next.ccText = restoredEdits.cc;
+      next.bccText = restoredEdits.bcc;
       next.subject = restoredEdits.subject;
       next.body = restoredEdits.body;
       next.inReplyTo = restoredEdits.inReplyTo;
@@ -30,9 +35,14 @@
   }
   let form = $state(startInitial());
   export function snapshotEdits(): DraftEdits {
-    return { to: form.toText, subject: form.subject, body: form.body, inReplyTo: form.inReplyTo };
+    return {
+      to: form.toText, cc: form.ccText, bcc: form.bccText, subject: form.subject, body: form.body, inReplyTo: form.inReplyTo,
+      existing: 'id' in form ? { id: form.id, revision: form.revision } : undefined,
+    };
   }
-  function initiallyShowCc() { return initial.cc.length > 0 || initial.bcc.length > 0; }
+  function initiallyShowCc() {
+    return restoredEdits ? Boolean(restoredEdits.cc || restoredEdits.bcc) : initial.cc.length > 0 || initial.bcc.length > 0;
+  }
   let ccVisible = $state(initiallyShowCc());
   let pending = $state(false);
   let error = $state('');

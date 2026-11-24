@@ -1,4 +1,5 @@
 import { createHttpMailService, type DraftInput } from '@kofra/mail-contract';
+import type { Page } from '@playwright/test';
 import { expect, test } from './fixtures/mail';
 
 function serviceAt(origin: string) {
@@ -10,6 +11,39 @@ function serviceAt(origin: string) {
 }
 
 const planRow = /^Mira Chen.*Floor plan revisions/;
+
+async function expireSession(page: Page) {
+  await expect(page.locator('#mail-content')).toHaveAttribute('aria-busy', 'false');
+  await page.route('**/api/v1/session', (route) => route.fulfill({ status: 401, json: {
+    type: 'urn:kofra-mail:problem:unauthenticated', title: 'Mail session expired', status: 401, code: 'unauthenticated',
+  } }), { times: 1 });
+  const rejected = page.waitForResponse((response) => response.url().endsWith('/api/v1/session') && response.status() === 401);
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await rejected;
+  await expect(page.getByRole('dialog', { name: 'New message' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Compose', exact: true })).toBeDisabled();
+}
+
+async function openSavedDraft(page: Page, subject: string) {
+  await expect(page.getByRole('searchbox')).toBeEnabled();
+  const drafts = page.getByRole('button', { name: 'Drafts', exact: true });
+  if (!(await drafts.isVisible())) await page.getByRole('button', { name: 'Navigation menu' }).click();
+  await drafts.click();
+  await page.getByRole('button', { name: `Open draft ${subject}`, exact: true }).click();
+  return page.getByRole('dialog', { name: 'New message' });
+}
+
+async function existingReply(service: ReturnType<typeof serviceAt>) {
+  const session = await service.getSession();
+  const plan = (await service.listThreads({ view: 'inbox' })).items.find(({ subject }) => subject === 'Floor plan revisions')!;
+  const detail = await service.getThread(plan.id);
+  const input: DraftInput = {
+    from: session.mailbox!.primaryAddress, to: [{ email: 'initial@example.com' }],
+    cc: [{ email: 'initial-cc@example.com' }], bcc: [{ email: 'initial-bcc@example.com' }],
+    subject: 'Saved reply', body: 'Original body', attachments: [], inReplyTo: detail.messages[0].id,
+  };
+  return { input, saved: await service.createDraft(input, { idempotencyKey: crypto.randomUUID() }) };
+}
 
 test('reads the HTTP session before listing threads', async ({ page, origins }) => {
   const service = serviceAt(origins.appOrigin);
@@ -228,25 +262,13 @@ test('restores expired draft edits only for the same verified mailbox binding', 
   const replied = (await service.getThread(plan.id)).messages[0];
   const editor = page.getByRole('dialog', { name: 'New message' });
   const compose = page.getByRole('button', { name: 'Compose', exact: true });
-  async function expire() {
-    await expect(page.locator('#mail-content')).toHaveAttribute('aria-busy', 'false');
-    await page.route('**/api/v1/session', (route) => route.fulfill({ status: 401, json: {
-      type: 'urn:kofra-mail:problem:unauthenticated', title: 'Mail session expired', status: 401, code: 'unauthenticated',
-    } }), { times: 1 });
-    const rejected = page.waitForResponse((response) => response.url().endsWith('/api/v1/session') && response.status() === 401);
-    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
-    await rejected;
-    await expect(editor).toHaveCount(0);
-    await expect(compose).toBeDisabled();
-  }
-
   await page.goto('/');
   await page.getByRole('button', { name: planRow }).click();
   await page.getByRole('button', { name: 'Reply', exact: true }).click();
   await editor.getByLabel('To', { exact: true }).fill('draft-recipient@example.com');
   await editor.getByLabel('Subject').fill('Unsaved reply');
   await editor.getByLabel('Message body').fill('Reply text before session expiry.');
-  await expire();
+  await expireSession(page);
   await page.getByRole('button', { name: 'Try again' }).click();
   await expect(editor).toBeVisible();
   await expect(editor.getByLabel('To', { exact: true })).toHaveValue('draft-recipient@example.com');
@@ -258,7 +280,7 @@ test('restores expired draft edits only for the same verified mailbox binding', 
 
   await compose.click();
   await editor.getByLabel('Message body').fill('Do not carry this edit into a different mailbox.');
-  await expire();
+  await expireSession(page);
   const nextOwner = (await service.listMembers({})).items.find((member) => !member.hasMailbox && member.id !== before.user.id);
   expect(nextOwner).toBeTruthy();
   await service.updateMailbox(mailbox.id, { ownerUserId: nextOwner!.id });
@@ -274,6 +296,48 @@ test('restores expired draft edits only for the same verified mailbox binding', 
   await expect(editor.getByLabel('To', { exact: true })).toHaveValue('');
   await expect(editor.getByLabel('Subject')).toHaveValue('');
   await expect(editor.getByLabel('Message body')).toHaveValue('');
+});
+
+test('restores all saved-draft fields and replaces the original draft', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const { input, saved } = await existingReply(service);
+  await page.goto('/');
+  const editor = await openSavedDraft(page, saved.subject);
+  const edits = { To: 'edited-to@example.com', Cc: 'edited-cc@example.com', Bcc: 'edited-bcc@example.com',
+    Subject: 'Edited reply', 'Message body': 'Edits made before expiry.' };
+  for (const [field, value] of Object.entries(edits)) await editor.getByLabel(field, { exact: true }).fill(value);
+  await expireSession(page);
+  await page.getByRole('button', { name: 'Try again' }).click();
+  for (const [field, value] of Object.entries(edits)) await expect(editor.getByLabel(field, { exact: true })).toHaveValue(value);
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(editor).toHaveCount(0);
+  const drafts = (await service.listDrafts({})).items;
+  expect(drafts).toHaveLength(1);
+  expect(drafts[0]).toMatchObject({ id: saved.id, inReplyTo: input.inReplyTo, subject: edits.Subject, body: edits['Message body'],
+    to: [{ email: edits.To }], cc: [{ email: edits.Cc }], bcc: [{ email: edits.Bcc }] });
+  expect(drafts[0].revision).not.toBe(saved.revision);
+});
+
+test('restored saved draft retains If-Match and exposes a concurrent edit conflict', async ({ page, origins }) => {
+  const service = serviceAt(origins.appOrigin);
+  const { input, saved } = await existingReply(service);
+  await page.goto('/');
+  const editor = await openSavedDraft(page, saved.subject);
+  const body = 'Local unsaved edit.';
+  await editor.getByLabel('Message body').fill(body);
+  await expireSession(page);
+  const external = await service.replaceDraft(saved.id, { ...input, body: 'Concurrent saved edit.' }, { ifMatch: saved.revision });
+  await page.getByRole('button', { name: 'Try again' }).click();
+  await expect(editor.getByLabel('Message body')).toHaveValue(body);
+  const response = page.waitForResponse((res) => /\/api\/v1\/drafts(?:\/[^/?]+)?$/.test(new URL(res.url()).pathname) && res.request().method() !== 'GET');
+  await editor.getByRole('button', { name: 'Save draft', exact: true }).click();
+  const write = await response;
+  expect(write.status()).toBe(412);
+  expect(write.request().method()).toBe('PUT');
+  expect(write.request().headers()['if-match']).toBe(saved.revision);
+  await expect(editor.getByRole('alert')).toContainText('This draft changed elsewhere');
+  await expect(editor.getByLabel('Message body')).toHaveValue(body);
+  expect((await service.listDrafts({})).items).toEqual([external]);
 });
 
 test('outbound, upload and undo routes return typed 501 without removing a draft', async ({ origins }) => {
