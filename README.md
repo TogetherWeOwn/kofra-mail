@@ -9,6 +9,7 @@ Use Node.js 24 and npm. From the repository root:
 ```sh
 npm ci --ignore-scripts
 npm ci --prefix workers/mail-backend --ignore-scripts
+npm exec -w @kofra/mail-web -- svelte-kit sync
 (cd apps/web && node tests/fixtures/mail-app.mjs)
 ```
 

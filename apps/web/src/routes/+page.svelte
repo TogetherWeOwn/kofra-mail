@@ -60,6 +60,7 @@
   let lastOpen: HTMLButtonElement | undefined;
   let request = 0;
   let threadRequest = 0;
+  let threadRefresh = 0;
   let loadedPages = 1;
   let checkingForChanges = false;
   const canUseMail = $derived(!!session?.mailbox && !initializing);
@@ -146,7 +147,10 @@
     try {
       const previous = views?.state;
       const latest = await api.listViews();
-      if (previous !== latest.state) await Promise.all([refresh(true), refreshOpenThread()]);
+      await Promise.all([
+        previous !== latest.state ? refresh(true) : undefined,
+        thread && thread.state !== latest.state ? refreshOpenThread() : undefined,
+      ]);
     } catch (cause) { showError(cause); }
     finally { checkingForChanges = false; }
   }
@@ -218,11 +222,12 @@
     const id = thread?.thread.id;
     if (!id) return;
     const ticket = threadRequest;
+    const refreshTicket = ++threadRefresh;
     try {
       const latest = await api.getThread(id);
-      if (ticket === threadRequest && thread?.thread.id === id) thread = latest;
+      if (ticket === threadRequest && refreshTicket === threadRefresh && thread?.thread.id === id) thread = latest;
     } catch (cause) {
-      if (ticket !== threadRequest) return;
+      if (ticket !== threadRequest || refreshTicket !== threadRefresh) return;
       if (isMailApiError(cause, 'not_found')) await closeThread();
       else showError(cause);
     }
@@ -293,7 +298,7 @@
         await refresh();
         if (ticket === threadRequest && thread && ids.includes(thread.thread.id)) await closeThread();
       } else {
-        await Promise.all([refresh(), thread && ids.includes(thread.thread.id) ? refreshOpenThread() : undefined]);
+        await Promise.all([refresh(true), thread && ids.includes(thread.thread.id) ? refreshOpenThread() : undefined]);
       }
     } catch (cause) { showError(cause); }
     finally { mutating = false; }

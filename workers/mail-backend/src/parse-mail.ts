@@ -1,3 +1,4 @@
+import { Parser } from 'htmlparser2';
 import PostalMime, { addressParser, type Address } from 'postal-mime';
 import { sha256 } from './bytes.ts';
 import { bodyForIndex } from './mail-text.ts';
@@ -100,6 +101,21 @@ export async function parseMail(raw: Uint8Array<ArrayBuffer>, rawKey: string, ma
   };
 }
 
+function hasRemoteImages(html: string): boolean {
+  let remote = false;
+  const parser = new Parser({
+    onopentag(name, attrs) {
+      if (name !== 'img' && name !== 'source') return;
+      remote = (name === 'img' && /^(?:https?:)?\/\//i.test(attrs.src?.trimStart() ?? '')) ||
+        /(?:^|,)\s*(?:https?:)?\/\//i.test(attrs.srcset ?? '');
+      if (remote) parser.pause();
+    },
+  }, { decodeEntities: true });
+  parser.write(html);
+  if (!remote) parser.end();
+  return remote;
+}
+
 function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject: string, body: string,
   messageId: string | null, kept: number): MessageDisplay {
   const from = wireAddresses(parsed.from ? [parsed.from] : [])[0] ?? { name: '', email: '' };
@@ -109,7 +125,7 @@ function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject:
   const encoder = new TextEncoder();
   return {
     from, to, cc, replyTo: wireAddresses(parsed.replyTo), hasHtml: !!parsed.html,
-    remoteImages: !!parsed.html && /<img\b[^>]*\b(?:src|srcset)\s*=\s*["']?\s*(?:https?:)?\/\//i.test(parsed.html),
+    remoteImages: !!parsed.html && hasRemoteImages(parsed.html),
     textTruncated: parsed.text
       ? encoder.encodeInto(parsed.text, new Uint8Array(LIMITS.messageTextBytes)).read < parsed.text.length
       : encoder.encode(body).byteLength >= LIMITS.messageTextBytes - 3,

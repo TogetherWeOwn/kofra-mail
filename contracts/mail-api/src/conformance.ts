@@ -645,9 +645,11 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const { limits, workspace, user } = session;
       const mailbox = requiredMailbox(session);
       const html = await h.deliver(message('Formatted', {
-        html: '<p>Formatted</p><img src="https://example.net/image.png">', remoteImages: true, attachments: [file],
+        html: '<p>Formatted</p><img src="cid:local" srcset="cid:local 1x, https&#58;//example.net/image.png 2x">',
+        remoteImages: true, attachments: [file],
       }));
       const { messages: [delivered] } = await mail.getThread(html.threadId);
+      assert.equal(delivered.remoteImages, true);
       const now = Date.parse(delivered.receivedAt);
       const [{ part }] = delivered.attachments;
       const without = await mail.getBodyUrl(html.messageId, { remoteImages: false });
