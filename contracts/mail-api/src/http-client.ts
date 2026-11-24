@@ -33,7 +33,9 @@ export function createHttpMailService({ baseUrl = API_PREFIX, fetch: fetcher = g
   baseUrl?: string;
   fetch?: typeof globalThis.fetch;
 } = {}): MailService {
-  const base = baseUrl.replace(/\/+$/, '');
+  let end = baseUrl.length;
+  while (end > 0 && baseUrl[end - 1] === '/') end--;
+  const base = baseUrl.slice(0, end);
   let csrfToken: string | undefined;
   let sessionRead: Promise<Session> | undefined;
 

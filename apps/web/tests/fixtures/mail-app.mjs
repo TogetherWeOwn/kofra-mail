@@ -44,7 +44,11 @@ try {
     configFile: false,
     plugins: await sveltekit({ ...svelte, ...kit, adapter: undefined, outDir: join(scratch, 'svelte-kit') }),
     cacheDir: join(scratch, 'vite'),
-    server: { middlewareMode: true, watch: null, hmr: false, ws: false },
+    server: {
+      middlewareMode: true, hmr: false, ws: false,
+      // The production check/build owns this directory. Its rewrites must not invalidate this SSR module graph.
+      watch: { ignored: [fileURLToPath(new URL('../../.svelte-kit', import.meta.url)), '**/.svelte-kit/**'] },
+    },
   });
   http = createHttpServer(server.middlewares).listen(0, '127.0.0.1');
   await once(http, 'listening');
