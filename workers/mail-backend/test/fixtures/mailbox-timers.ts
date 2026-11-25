@@ -106,7 +106,8 @@ export class TimerMailbox extends Mailbox {
       CREATE TABLE IF NOT EXISTS fixture_rebuilds (kind TEXT NOT NULL, state TEXT);
       CREATE TABLE IF NOT EXISTS fixture_dispatch (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS fixture_settings (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS fixture_alarm_runs (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, at INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS fixture_alarm_runs (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS fixture_crash (armed INTEGER, rows TEXT NOT NULL);`);
   }
 
   private async fire(kind: string, { ref, now, local }: TimerRun) {
@@ -160,9 +161,13 @@ export class TimerMailbox extends Mailbox {
       return;
     }
     if (action === 'crash') {
+      // What survives the crash: the alarm armed when it happens, and the other rows' due times.
+      const armed = await this.ctx.storage.getAlarm();
       this.ctx.storage.transactionSync(() => {
         this.record(kind, ref, now);
         new TimerTable(sql).delete(kind, ref);
+        const others = sql.exec("SELECT due_at, ref FROM timers WHERE kind <> 'journal_flush' ORDER BY ref").toArray();
+        sql.exec('INSERT INTO fixture_crash VALUES (?, ?)', armed, JSON.stringify(others));
       });
       // The commit is durable before the object is reset mid-run; nothing re-armed after it.
       await this.ctx.storage.sync();
@@ -298,6 +303,11 @@ export class TimerMailbox extends Mailbox {
 
   async setClockOffset(ms: number) { this.clockOffset = ms; }
   async setBackendEnabled(on: boolean) { this.env.MAIL_BACKEND_ENABLED = on ? 'on' : 'off'; }
+  async crashState() {
+    this.fixtureSchema();
+    const row = this.ctx.storage.sql.exec<{ armed: number | null; rows: string }>('SELECT armed, rows FROM fixture_crash').toArray()[0];
+    return row ? { armed: row.armed, rows: JSON.parse(row.rows) as Array<{ due_at: number; ref: string }> } : null;
+  }
   async alarmRuns() {
     this.fixtureSchema();
     return JSON.stringify(this.ctx.storage.sql.exec('SELECT label, at FROM fixture_alarm_runs ORDER BY seq').toArray());

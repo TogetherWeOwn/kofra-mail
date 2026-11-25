@@ -150,27 +150,22 @@ test('a crash after a handler commit and before re-arm still fires the remaining
   const crashed = await poll(target => fired(target), seen => seen.length >= 1, 'the crash');
   let after = crashed.target;
   assert.deepEqual(crashed.value.map(({ label, ref }) => [label, ref]), [['crash', 'a']], 'the handler commit is durable');
-  // After the crash nothing writes an alarm (the test only reads), so the only
-  // wake-up left is the successor the claim armed before the crash. If no other
-  // alarm call has run yet, check it directly; on a slow host it may already have run.
+  // Recorded in the crashing handler's committed transaction: the alarm armed at
+  // the crash (the successor the claim wrote), and the rows left for it.
   type Run = { label: string | null; at: number };
-  if ((JSON.parse(await after.alarmRuns()) as Run[]).length === 1) {
-    const alarm = await after.alarmAt();
-    const left = (await rows(after)).filter(row => row.kind !== 'journal_flush');
-    if ((JSON.parse(await after.alarmRuns()) as Run[]).length === 1 && left.length) {
-      assert.ok(alarm !== null, 'the durable successor wake-up survives the crash');
-      assert.deepEqual(left.map(row => row.ref), ['b', 'c'], 'the crashed run left the other rows');
-      for (const row of left) assert.ok(alarm <= row.due_at, 'the armed alarm is no later than each remaining row');
-    }
-  }
+  const crash = await after.crashState();
+  assert.ok(crash && crash.armed !== null, 'a durable successor wake-up was armed when the object crashed');
+  const armed = crash.armed;
+  assert.deepEqual(crash.rows.map(row => row.ref), ['b', 'c'], 'the crashed run left the other rows');
+  for (const row of crash.rows) assert.ok(armed <= row.due_at, 'the armed alarm is no later than each remaining row');
   // The platform delivers that successor; it runs the remaining rows.
   const done = await poll(target => fired(target), seen => seen.length >= 3, 'the successor');
   after = done.target;
   assert.deepEqual(done.value.map(({ label, ref }) => [label, ref]), [['crash', 'a'], ['successor', 'b'], ['successor', 'c']]);
   const runs = JSON.parse(await after.alarmRuns()) as Run[];
   assert.deepEqual(runs.map(run => run.label), ['crash', 'successor'], 'the second platform alarm call, not a retry, ran them');
-  // Claimed rows wait the 2 s retry from the claim, which came after `claimedAfter`.
-  assert.ok(runs[1].at >= claimedAfter + 2_000 - 50, `the successor ran ${runs[1].at - claimedAfter} ms after the claim`);
+  assert.ok(runs[1].at >= armed, 'at the successor time armed before the crash');
+  assert.ok(armed >= claimedAfter + 2_000 - 50, 'which is the 2 s retry after the claim');
   assert.deepEqual((await rows(after)).filter(row => row.kind !== 'journal_flush'), []);
 });
 
@@ -375,6 +370,8 @@ test('an in-flight call blocks a new start only for its lease, and its late sett
   await box.run('third');
   assert.deepEqual((await fired()).map(row => row.label), ['first', 'third'], 'an expired lease no longer blocks a start');
   // The first call settles: it must not clear the entry the third call holds.
+  // Both calls have registered their hang gates (a start is recorded before its gate).
+  while (await box.hangCount() < 2) await new Promise(resolve => setTimeout(resolve, 10));
   await box.releaseHang(0);
   // Once an RPC sees the first call finished, its settlement (in the same turn) has been processed.
   while ((await box.handlerState()).running['test_a/slow'] !== 1) await new Promise(resolve => setTimeout(resolve, 10));
