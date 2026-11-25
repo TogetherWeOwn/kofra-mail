@@ -424,8 +424,13 @@ export class Mailbox extends DurableObject<Env> {
         // With nothing due (an early, retried or held wake-up) the journal lane
         // runs anyway and decides for itself what is due, as every alarm did before timers.
         if (laneDue || !due.length) due.unshift({ due_at: lane ?? now, kind: JOURNAL_FLUSH, ref: JOURNAL_FLUSH_REF });
-        const claimed: TimerClaim[] = due.map(row => ({ ...row, token: crypto.randomUUID(),
-          until: now + (row.kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : this.timerRetryMs) }));
+        // A row still claimed by a call that is running within its lease stays
+        // that call's: its late failure keeps its retry. A replaced row has no
+        // claim and gets a new token, so a stale call can never move it.
+        const running = new Set([...this.inFlight.values()].filter(entry => now - entry.started < TIMER_LEASE_MS).map(entry => entry.token));
+        const claimed: TimerClaim[] = due.map(({ due_at, kind, ref, claim }) => ({ due_at, kind, ref,
+          token: claim && running.has(claim) ? claim : crypto.randomUUID(),
+          until: now + (kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : this.timerRetryMs) }));
         // More than one batch due re-arms at once.
         await this.rearm(() => this.ctx.storage.transactionSync(() => {
           for (const row of claimed) timers.claim(row.kind, row.ref, row.until, row.token);
@@ -557,10 +562,11 @@ export class Mailbox extends DurableObject<Env> {
       if (!timers.owned(claim.kind, claim.ref, claim.token)) return 'skipped';
       // A call still running in this isolate is not started twice within its lease; the row waits for its claim.
       const running = this.inFlight.get(key);
-      if (running && now - running.started < TIMER_LEASE_MS) {
-        // Hand the row back to the running call, so its late failure still gets its retry.
-        await this.rearm(() => timers.claim(claim.kind, claim.ref, claim.until, running.token));
-        return 'skipped';
+      if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
+      // The earlier call's lease ran out after this claim kept its token: a new call gets its own.
+      if (running?.token === claim.token) {
+        claim.token = crypto.randomUUID();
+        timers.claim(claim.kind, claim.ref, claim.until, claim.token);
       }
       // Checked again here, just before the handler starts: this step may have waited behind other work.
       if (this.laneDue()) return 'lane';

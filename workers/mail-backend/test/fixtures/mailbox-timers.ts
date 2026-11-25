@@ -296,6 +296,8 @@ export class TimerMailbox extends Mailbox {
     this.ctx.abort('Fixture eviction');
   }
   async editTimes() { return this.editWindow; }
+  // Resolves after every work-lane step queued before it.
+  async barrier() { await this.workLane(async () => {}); }
   // A stored message, before the mailbox has a lifecycle.
   async seedMessage(id: string, rawKey: string) {
     this.localIndex().restoreSnapshotRow({ row_no: 1, kind: 'message', value: JSON.stringify({

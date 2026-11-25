@@ -509,6 +509,26 @@ test('a late throw keeps its 60 s retry across an alarm that skipped the still-r
   assert.ok(due >= thrown + RETRY_MS, `the retry is ${Math.round((due - thrown) / 1000)} s after the throw, not at the skipped claim`);
 });
 
+test('a stale call that throws late does not delay a replacement of its row', { timeout: 10_000 }, async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  await box.schedule('test_a', 'x', Date.now() - 1_000);
+  await box.plan('x', 'hang-throw');
+  await box.run('first');
+  // An RPC replaces the row while the first call still runs; the replacement comes due a minute later.
+  await box.setClockOffset(RETRY_MS + 1_000);
+  await box.schedule('test_a', 'x', Date.now());
+  await box.run('second');
+  const claimed = (await rows()).find(row => row.ref === 'x')!.due_at;
+  // The stale first call throws at 119 s.
+  await box.setClockOffset(119_000);
+  await box.releaseHang();
+  while (!(await box.handlerState()).errors.includes('Fixture late handler failure')) await new Promise(resolve => setTimeout(resolve, 10));
+  await box.barrier();
+  assert.equal((await rows()).find(row => row.ref === 'x')?.due_at, claimed, 'the replacement keeps its own schedule');
+});
+
 test('an eviction does not turn an ordinary timer into a journal_flush row', async t => {
   const { box, stub, rows } = await setup(t);
   await box.setup('ready');

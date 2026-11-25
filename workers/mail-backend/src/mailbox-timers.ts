@@ -29,7 +29,7 @@ export const TIMER_LEASE_MS = 5 * 60_000;
 export const JOURNAL_FLUSH = 'journal_flush';
 export const JOURNAL_FLUSH_REF = 'lane';
 
-export type TimerRow = { due_at: number; kind: string; ref: string };
+export type TimerRow = { due_at: number; kind: string; ref: string; claim?: string | null };
 
 // A step that returns a promise is a type error (and refused at run time):
 // it would hold the work lane open across I/O.
@@ -165,7 +165,7 @@ export class TimerTable {
 
   // Due rows in run order (optionally without one kind), bounded by the timers_due index.
   dueRows(now: number, limit = TIMER_BATCH, exceptKind = ''): TimerRow[] {
-    return this.live().exec<TimerRow>(`SELECT due_at, kind, ref FROM timers WHERE due_at <= ? AND kind <> ?
+    return this.live().exec<TimerRow>(`SELECT due_at, kind, ref, claim FROM timers WHERE due_at <= ? AND kind <> ?
       ORDER BY due_at, kind, ref LIMIT ?`, now, exceptKind, limit).toArray();
   }
 }
