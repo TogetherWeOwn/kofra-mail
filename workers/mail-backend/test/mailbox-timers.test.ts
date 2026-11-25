@@ -46,6 +46,7 @@ async function setup(t: TestContext) {
     rows: async (target = box) => JSON.parse(await target.rows()) as Row[],
     fired: async (target = box) => JSON.parse(await target.fired()) as Fired[],
     lifecycle: async (target = box) => JSON.parse(await target.lifecycle()) as { state: string; phase?: string },
+    labels: async (target = box) => JSON.parse(await target.labels()) as Array<{ id: string; name: string }>,
   };
 }
 
@@ -453,14 +454,72 @@ test('a handler that throws after losing its race is retried 60 s after the thro
   assert.ok(due >= thrown + RETRY_MS && due <= Date.now() + 20_000 + RETRY_MS, `due ${due - thrown} ms after the throw`);
 });
 
-test('a first edit during an init alarm run keeps its journal_flush deadline', { timeout: 10_000 }, async t => {
+const FLAGS_DEADLINE_MS = 60 * 60_000 - 15_000;
+const SETTINGS_DEADLINE_MS = 60_000 - 15_000;
+
+test('a first flag edit during an init alarm run keeps its exact journal_flush deadline', { timeout: 10_000 }, async t => {
   const { box, rows, lifecycle } = await setup(t);
+  const message = '01KBN8ZJ7G0000000000000000';
+  await box.seedMessage(message, `raw/${'a'.repeat(64)}/${message}`);
   // No lifecycle yet: the alarm takes the init path while the edit creates the mailbox.
+  await box.run('first', { kind: 'edit', message });
+  assert.equal((await lifecycle()).state, 'ready');
+  assert.equal(await box.messageFlags(message), 1, 'the first write succeeded');
+  const window = await box.editTimes();
+  assert.ok(window);
+  const flush = lane(await rows());
+  assert.ok(flush && flush.due_at >= window.before + FLAGS_DEADLINE_MS && flush.due_at <= window.after + FLAGS_DEADLINE_MS,
+    `the row carries the edit's own deadline, not the run's fallback (${flush && flush.due_at - window.after} ms)`);
+  assert.equal(await box.lastArmed(), flush.due_at, 'and is armed');
+});
+
+test('a first label edit during an init alarm run keeps its exact journal_flush deadline', { timeout: 10_000 }, async t => {
+  const { box, rows, lifecycle, labels } = await setup(t);
   await box.run('first', { kind: 'edit' });
   assert.equal((await lifecycle()).state, 'ready');
+  assert.deepEqual(await labels(), [{ id: 'first', name: 'First' }], 'the first write succeeded');
+  const window = await box.editTimes();
+  assert.ok(window);
   const flush = lane(await rows());
-  assert.ok(flush, 'the journal_flush row is kept for the edit');
-  assert.equal(await box.lastArmed(), flush.due_at, 'and armed');
+  assert.ok(flush && flush.due_at >= window.before + SETTINGS_DEADLINE_MS && flush.due_at <= window.after + SETTINGS_DEADLINE_MS,
+    `the row carries the edit's own deadline (${flush && flush.due_at - window.after} ms)`);
+});
+
+test('a late throw keeps its 60 s retry across an alarm that skipped the still-running call', { timeout: 10_000 }, async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  await box.schedule('test_a', 'x', Date.now() - 1_000);
+  await box.plan('x', 'hang-throw');
+  await box.run('first');
+  // A minute later the row is due again; the call is still running, so this alarm skips it.
+  await box.setClockOffset(RETRY_MS + 1_000);
+  await box.run('second');
+  // The call throws at 119 s without having moved its row.
+  await box.setClockOffset(119_000);
+  const thrown = Date.now() + 119_000;
+  const skipped = (await rows()).find(row => row.ref === 'x')!.due_at;
+  await box.releaseHang();
+  const giveUp = Date.now() + 5_000;
+  let due = skipped;
+  while (due === skipped && Date.now() < giveUp) {
+    await new Promise(resolve => setTimeout(resolve, 20));
+    due = (await rows()).find(row => row.ref === 'x')!.due_at;
+  }
+  assert.ok(due >= thrown + RETRY_MS, `the retry is ${Math.round((due - thrown) / 1000)} s after the throw, not at the skipped claim`);
+});
+
+test('an eviction does not turn an ordinary timer into a journal_flush row', async t => {
+  const { box, stub, rows } = await setup(t);
+  await box.setup('ready');
+  const at = Date.now() + 10 * 60_000;
+  await box.schedule('test_a', 'only', at);
+  await assert.rejects(box.evict());
+  const after = stub();
+  assert.equal(lane(await rows(after)), undefined, 'no journal_flush row is adopted from this version\'s alarm');
+  await after.cancel('test_a', 'only');
+  assert.deepEqual(await rows(after), []);
+  assert.equal(await after.alarmAt(), null);
 });
 
 test('an alarm armed by an earlier version becomes the journal_flush row when the object starts', async t => {

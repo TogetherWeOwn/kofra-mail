@@ -46,7 +46,7 @@ export class Mailbox extends DurableObject<Env> {
   // Handler calls still running in this isolate, by kind and ref, including
   // ones that lost their race; an evicted isolate takes its calls with it.
   // An entry blocks a new start for TIMER_LEASE_MS at most.
-  private readonly inFlight = new Map<string, { started: number; id: string }>();
+  private readonly inFlight = new Map<string, { started: number; id: string; token: string }>();
   // Resolved when a write moves the journal_flush deadline earlier, so a
   // running dispatcher re-evaluates the race it is waiting on.
   private laneMoved: PromiseWithResolvers<void> | null = null;
@@ -59,15 +59,22 @@ export class Mailbox extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
-  // An alarm an earlier version armed, before the journal lane had a row, is
-  // that lane's deadline. Taken over once, before the object serves any call.
+  // An alarm an earlier version (without timers) armed is the journal lane's
+  // deadline. A one-time migration, before the object serves any call: the
+  // marker is recorded on this version's first start, so later alarms (which
+  // are always some row's due time) are never taken over.
   private async adoptArmedAlarm(): Promise<void> {
-    const armed = await this.ctx.storage.getAlarm();
-    if (armed === null) return;
     const state = storedLifecycle<Lifecycle>(this.ctx.storage)?.state;
-    if (!state || state === 'init') return;
+    const sql = this.ctx.storage.sql;
+    if (sql.exec('SELECT 1 FROM timers_migrated').toArray().length) return;
+    const armed = await this.ctx.storage.getAlarm();
     const timers = this.timerTable();
-    if (timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null) timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
+    this.ctx.storage.transactionSync(() => {
+      if (armed !== null && state && state !== 'init' && timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null) {
+        timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
+      }
+      sql.exec('INSERT OR IGNORE INTO timers_migrated VALUES (1)');
+    });
   }
 
   // Registers a timer kind. Call from the constructor.
@@ -550,7 +557,11 @@ export class Mailbox extends DurableObject<Env> {
       if (!timers.owned(claim.kind, claim.ref, claim.token)) return 'skipped';
       // A call still running in this isolate is not started twice within its lease; the row waits for its claim.
       const running = this.inFlight.get(key);
-      if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
+      if (running && now - running.started < TIMER_LEASE_MS) {
+        // Hand the row back to the running call, so its late failure still gets its retry.
+        await this.rearm(() => timers.claim(claim.kind, claim.ref, claim.until, running.token));
+        return 'skipped';
+      }
       // Checked again here, just before the handler starts: this step may have waited behind other work.
       if (this.laneDue()) return 'lane';
       if (now >= runDeadline) return 'budget';
@@ -560,7 +571,7 @@ export class Mailbox extends DurableObject<Env> {
         await this.rearm(() => timers.setIfOwned(claim.kind, claim.ref, claim.token, now + HELD_RECHECK_MS));
         return 'skipped';
       }
-      this.inFlight.set(key, { started: now, id });
+      this.inFlight.set(key, { started: now, id, token: claim.token });
       return 'start';
     });
     if (start !== 'start' || !handler) return start === 'start' ? 'skipped' : start;
@@ -622,8 +633,9 @@ export class Mailbox extends DurableObject<Env> {
         const state = this.lifecycleState();
         await this.rearm(() => {
           // A call during this run made the mailbox ready (or started a
-          // restore): the lane has work now, whatever its row says.
-          if (state && state !== 'init') timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, Date.now());
+          // restore). Keep the deadline it armed; if it armed none past the
+          // claim, the lane has work now.
+          if (state && state !== 'init') timers.settleIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token, Date.now());
           // Nothing to publish or restore; keep a deadline a call set during this run.
           else if (held) timers.setIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token, Date.now() + HELD_RECHECK_MS);
           else timers.deleteIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token);

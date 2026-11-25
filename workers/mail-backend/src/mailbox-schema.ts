@@ -5,9 +5,13 @@ export const ATTACHMENT_SEARCH_BOUNDARY = String.fromCodePoint(0xE000);
 // Never journalled or copied into snapshots; rebuilt after a restore.
 export const TIMERS_SCHEMA = `
 -- claim: the token of the alarm call that claimed the row; every other write clears it.
-CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, claim TEXT,
+-- requested: the earliest lower-only deadline asked for while the row was claimed
+-- (later than its claimed fallback); it governs when the claim settles.
+CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, claim TEXT, requested INTEGER,
   PRIMARY KEY (kind, ref));
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
+-- Present once this object has taken over (or had no) alarm from a version without timers.
+CREATE TABLE IF NOT EXISTS timers_migrated (id INTEGER PRIMARY KEY CHECK (id = 1));
 `;
 
 export const MAILBOX_SCHEMA = `

@@ -15,7 +15,8 @@ const scope = { workspaceId: 'workspace', mailboxId: 'mailbox' };
 type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 'hang-throw' | 'due-lane' | 'async-step' | 'async-write';
 // Work a test injects right after an alarm call claims its rows (its first alarm write).
 // `hold` keeps the work lane for `ms`, then moves the timer clock forward by `advance`.
-type OnClaim = { kind: 'edit' } | { kind: 'hold'; ms: number; advance?: number } | { kind: 'replace'; ref: string };
+// `edit` is a first write on a mailbox without state: a flag edit on `message`, or a label edit.
+type OnClaim = { kind: 'edit'; message?: string } | { kind: 'hold'; ms: number; advance?: number } | { kind: 'replace'; ref: string };
 
 // A mailbox with two test-only timer kinds. Fixture tables live in the same
 // SQLite database, so a handler's record commits atomically with its row change.
@@ -32,6 +33,8 @@ export class TimerMailbox extends Mailbox {
   private errors: string[] = [];
   private onClaim: OnClaim | null = null;
   private injected: Promise<unknown> = Promise.resolve();
+  // When the injected edit ran: its deadline was armed between these times.
+  private editWindow: { before: number; after: number } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, { ...env, SWEEPER: { getByName: () => ({
@@ -84,8 +87,12 @@ export class TimerMailbox extends Mailbox {
   // Queued in the work lane behind the claim, as a concurrent RPC would be.
   private inject(work: OnClaim) {
     if (work.kind === 'edit') {
-      // A first edit on a mailbox without state: ready() creates its baseline, then a flag edit arms the hourly deadline.
-      this.injected = this.setFlags(scope.workspaceId, scope.mailboxId, 'missing-message', 0, []).catch(() => {});
+      // ready() creates the mailbox's baseline, then the edit arms its deadline (hourly for flags, a minute for a label).
+      const before = Date.now();
+      const edit = work.message
+        ? this.setFlags(scope.workspaceId, scope.mailboxId, work.message, 1, [])
+        : this.setLabel(scope.workspaceId, scope.mailboxId, 'first', 'First');
+      this.injected = edit.then(() => { this.editWindow = { before, after: Date.now() }; });
     } else if (work.kind === 'hold') {
       this.injected = this.workLane(async () => {
         await new Promise(resolve => setTimeout(resolve, work.ms));
@@ -276,9 +283,27 @@ export class TimerMailbox extends Mailbox {
   // State an earlier version left: its alarm armed, and no journal_flush row. The object restarts.
   async seedLegacyAlarm(at: number) {
     new TimerTable(this.ctx.storage.sql).delete(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    // An earlier version had no timers table, so it never recorded the one-time migration.
+    this.ctx.storage.sql.exec('DELETE FROM timers_migrated');
     await this.ctx.storage.setAlarm(at);
     await this.ctx.storage.sync();
     this.ctx.abort('Fixture restart after seeding a legacy alarm');
+  }
+
+  // Restarts the object, as an eviction would.
+  async evict() {
+    await this.ctx.storage.sync();
+    this.ctx.abort('Fixture eviction');
+  }
+  async editTimes() { return this.editWindow; }
+  // A stored message, before the mailbox has a lifecycle.
+  async seedMessage(id: string, rawKey: string) {
+    this.localIndex().restoreSnapshotRow({ row_no: 1, kind: 'message', value: JSON.stringify({
+      id, rawKey, threadId: id, createdAt: 1, dedupeKey: 'fixture', flags: 0, gmailId: null, labels: [], auth: 'none', attKeys: [],
+    }) });
+  }
+  async messageFlags(id: string) {
+    return this.ctx.storage.sql.exec<{ flags: number }>('SELECT flags FROM messages WHERE id = ?', id).one().flags;
   }
 
   async plan(ref: string, action: Plan, at: number | null = null) {

@@ -103,16 +103,21 @@ export class TimerTable {
 
   set(kind: string, ref: string, at: number): void {
     check(kind, ref, at);
-    this.live().exec(`INSERT INTO timers (due_at, kind, ref, claim) VALUES (?, ?, ?, NULL)
-      ON CONFLICT(kind, ref) DO UPDATE SET due_at = excluded.due_at, claim = NULL`, at, kind, ref);
+    this.live().exec(`INSERT INTO timers (due_at, kind, ref, claim, requested) VALUES (?, ?, ?, NULL, NULL)
+      ON CONFLICT(kind, ref) DO UPDATE SET due_at = excluded.due_at, claim = NULL, requested = NULL`, at, kind, ref);
   }
 
-  // Never moves an existing row later. A lower that changes nothing keeps the claim.
+  // Never moves an existing row later. A lower that changes nothing keeps the
+  // claim; on a claimed row it is recorded as `requested`, so the claim's
+  // temporary fallback time never hides it.
   lower(kind: string, ref: string, at: number): void {
     check(kind, ref, at);
-    this.live().exec(`INSERT INTO timers (due_at, kind, ref, claim) VALUES (?, ?, ?, NULL)
-      ON CONFLICT(kind, ref) DO UPDATE SET due_at = min(due_at, excluded.due_at),
-        claim = CASE WHEN excluded.due_at < due_at THEN NULL ELSE claim END`, at, kind, ref);
+    this.live().exec(`INSERT INTO timers (due_at, kind, ref, claim, requested) VALUES (?, ?, ?, NULL, NULL)
+      ON CONFLICT(kind, ref) DO UPDATE SET
+        due_at = min(due_at, excluded.due_at),
+        claim = CASE WHEN excluded.due_at < due_at THEN NULL ELSE claim END,
+        requested = CASE WHEN excluded.due_at < due_at THEN NULL WHEN claim IS NULL THEN requested
+          ELSE min(coalesce(requested, excluded.due_at), excluded.due_at) END`, at, kind, ref);
   }
 
   delete(kind: string, ref: string): void {
@@ -120,7 +125,8 @@ export class TimerTable {
     this.live().exec('DELETE FROM timers WHERE kind = ? AND ref = ?', kind, ref);
   }
 
-  // Claims a row for one alarm call: moves it to `at` under `token`.
+  // Claims a row for one alarm call: moves it to `at` under `token`. A
+  // requested deadline is kept for when the claim settles.
   claim(kind: string, ref: string, at: number, token: string): void {
     check(kind, ref, at);
     this.live().exec(`INSERT INTO timers (due_at, kind, ref, claim) VALUES (?, ?, ?, ?)
@@ -131,13 +137,24 @@ export class TimerTable {
     return this.live().exec('SELECT 1 FROM timers WHERE kind = ? AND ref = ? AND claim = ?', kind, ref, token).toArray().length === 1;
   }
 
-  // Moves a row only while it is still claimed under `token`.
+  // Moves a row only while it is still claimed under `token`, to `at` or an earlier requested deadline.
   setIfOwned(kind: string, ref: string, token: string, at: number): void {
     check(kind, ref, at);
-    this.live().exec('UPDATE timers SET due_at = ?, claim = NULL WHERE kind = ? AND ref = ? AND claim = ?', at, kind, ref, token);
+    this.live().exec(`UPDATE timers SET due_at = min(?, coalesce(requested, ?)), claim = NULL, requested = NULL
+      WHERE kind = ? AND ref = ? AND claim = ?`, at, at, kind, ref, token);
   }
 
+  // Ends a claim under `token`: the row keeps a deadline requested during the claim, or takes `fallback`.
+  settleIfOwned(kind: string, ref: string, token: string, fallback: number): void {
+    check(kind, ref, fallback);
+    this.live().exec(`UPDATE timers SET due_at = coalesce(requested, ?), claim = NULL, requested = NULL
+      WHERE kind = ? AND ref = ? AND claim = ?`, fallback, kind, ref, token);
+  }
+
+  // Deletes a row claimed under `token`, unless a deadline was requested during the claim.
   deleteIfOwned(kind: string, ref: string, token: string): void {
+    this.live().exec(`UPDATE timers SET due_at = requested, claim = NULL, requested = NULL
+      WHERE kind = ? AND ref = ? AND claim = ? AND requested IS NOT NULL`, kind, ref, token);
     this.live().exec('DELETE FROM timers WHERE kind = ? AND ref = ? AND claim = ?', kind, ref, token);
   }
 
