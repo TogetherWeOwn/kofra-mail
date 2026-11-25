@@ -118,36 +118,56 @@ test('set replaces a due time and the lower-only variant keeps the earlier one',
   assert.match(await box.scheduleError('test_a', '', now) ?? '', /timer/i);
 });
 
-test('a crash after a handler commit and before re-arm still fires the remaining timers next alarm', { timeout: 15_000 }, async t => {
+test('a crash after a handler commit and before re-arm still fires the remaining timers next alarm', { timeout: 20_000 }, async t => {
   const { box, stub, rows, fired } = await setup(t);
   await box.setup('ready');
   // A shortened retry lets the platform itself deliver the successor alarm.
-  await box.setRetry(500);
+  await box.setRetry(2_000);
   const due = Date.now() - 10;
   for (const ref of ['b', 'c']) await box.seedStale('test_a', ref, due);
   await box.plan('a', 'crash');
   // The handler of `a` commits directly and resets the object before any re-arm.
-  // Later requests cover a platform retry of the reset alarm as well as the successor.
-  await box.dispatchAlarms('crash', 'next', 'next', 'next');
+  await box.dispatchAlarms('crash', 'successor', 'spare-1', 'spare-2');
+  const claimedAfter = Date.now();
   // Arming the first row lets the platform fire the alarm.
   await box.schedule('test_a', 'a', due);
-  const giveUp = Date.now() + 12_000;
-  let after = stub();
-  let seen: Fired[] = [];
-  for (;;) {
-    // Fail within the test's own timeout instead of polling after it.
-    assert.ok(Date.now() < giveUp, `the platform did not deliver the successor alarm: ${JSON.stringify(seen)}`);
-    try {
-      seen = await fired(after);
-      if (seen.length >= 3) break;
-    } catch {
-      // A stub to the reset object fails once; take a fresh one.
-      after = stub();
+  const poll = async <T>(read: (target: typeof box) => Promise<T>, done: (value: T) => boolean, what: string) => {
+    const giveUp = Date.now() + 15_000;
+    let target = stub();
+    for (;;) {
+      // Fail within the test's own timeout instead of polling after it.
+      assert.ok(Date.now() < giveUp, `timed out waiting for ${what}`);
+      try {
+        const value = await read(target);
+        if (done(value)) return { value, target };
+      } catch {
+        // A stub to the reset object fails once; take a fresh one.
+        target = stub();
+      }
+      await new Promise(resolve => setTimeout(resolve, 20));
     }
-    await new Promise(resolve => setTimeout(resolve, 20));
+  };
+  const crashed = await poll(target => fired(target), seen => seen.length >= 1, 'the crash');
+  let after = crashed.target;
+  assert.deepEqual(crashed.value.map(({ label, ref }) => [label, ref]), [['crash', 'a']], 'the handler commit is durable');
+  // Before any other alarm call: the successor the claim armed survived the crash.
+  type Run = { label: string | null; at: number };
+  assert.deepEqual((JSON.parse(await after.alarmRuns()) as Run[]).map(run => run.label), ['crash'], 'no retry or successor has run yet');
+  const alarm = await after.alarmAt();
+  assert.ok(alarm !== null, 'the durable successor wake-up survives the crash');
+  const left = (await rows(after)).filter(row => row.kind !== 'journal_flush');
+  assert.deepEqual(left.map(row => row.ref), ['b', 'c'], 'the crashed run left the other rows');
+  for (const row of left) {
+    assert.ok(row.due_at >= claimedAfter + 2_000 - 1_000, 'claimed rows wait one retry interval');
+    assert.ok(alarm <= row.due_at, 'the armed alarm is no later than each remaining row');
   }
-  assert.deepEqual(seen.map(({ label, ref }) => [label, ref]), [['crash', 'a'], ['next', 'b'], ['next', 'c']],
-    'the commit before the crash is durable and the platform-fired successor ran the rest');
+  // The platform delivers that successor; it runs the remaining rows.
+  const done = await poll(target => fired(target), seen => seen.length >= 3, 'the successor');
+  after = done.target;
+  assert.deepEqual(done.value.map(({ label, ref }) => [label, ref]), [['crash', 'a'], ['successor', 'b'], ['successor', 'c']]);
+  const runs = JSON.parse(await after.alarmRuns()) as Run[];
+  assert.deepEqual(runs.map(run => run.label), ['crash', 'successor'], 'the second platform alarm call, not a retry, ran them');
+  assert.ok(runs[1].at >= alarm, 'at the armed successor time');
   assert.deepEqual((await rows(after)).filter(row => row.kind !== 'journal_flush'), []);
 });
 
@@ -458,13 +478,29 @@ test('a due row on a mailbox that is not ready is held while journal_flush still
   assert.equal(alerts.length, 1, 'journal_flush ran (it raised restore_blocked)');
 });
 
+test('armSoon after a disabled period arms an overdue journal_flush row at once', async t => {
+  const { box } = await setup(t);
+  await box.setup('missing');
+  await box.setLaneDue(Date.now() - 1_000);
+  // A disabled alarm moves only the platform alarm, to the held recheck.
+  await box.setBackendEnabled(false);
+  await box.run('off');
+  const held = await box.lastArmed();
+  assert.ok(held !== null && held > Date.now() + 60_000);
+  await box.setBackendEnabled(true);
+  assert.equal(await box.restoreFromBackup(...scope, true), 'restoring');
+  const armed = await box.lastArmed();
+  assert.ok(armed !== null && armed <= Date.now() + 1_000, 'the restore request wakes the mailbox at once, not after the held recheck');
+});
+
 test('armSoon keeps a journal_flush wake-up already due within one second', async t => {
   const { box, rows } = await setup(t);
   await box.setup('missing');
   const at = Date.now() + 800;
-  await box.setLaneDue(at);
+  await box.setLaneDue(at, true);
   assert.equal(await box.restoreFromBackup(...scope, true), 'restoring');
   assert.equal(lane(await rows())?.due_at, at);
+  assert.equal(await box.lastArmed(), at, 'the armed wake-up is kept');
 });
 
 test('a hung handler does not delay a journal_flush that is due when the alarm starts', { timeout: 10_000 }, async t => {

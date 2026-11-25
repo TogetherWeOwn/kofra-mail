@@ -220,9 +220,14 @@ export class Mailbox extends DurableObject<Env> {
     // An alarm run in progress re-reads this before arming its next wake-up.
     this.wakeRequested = true;
     const now = Date.now();
-    // A journal wake-up already due within a second is soon enough.
+    // A journal wake-up already due within a second, with the platform alarm
+    // armed that soon, is soon enough. A held fallback alarm (for example
+    // after a disabled period) is not: re-arm from the rows.
     const due = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
-    if (due !== null && due <= now + 1000) return;
+    if (due !== null && due <= now + 1000) {
+      const armed = await this.ctx.storage.getAlarm();
+      if (armed !== null && armed <= now + 1000) return;
+    }
     await this.lowerLane(now);
   }
 

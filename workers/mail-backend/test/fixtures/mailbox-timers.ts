@@ -90,7 +90,8 @@ export class TimerMailbox extends Mailbox {
       CREATE TABLE IF NOT EXISTS fixture_plan (ref TEXT PRIMARY KEY, action TEXT NOT NULL, at INTEGER);
       CREATE TABLE IF NOT EXISTS fixture_rebuilds (kind TEXT NOT NULL, state TEXT);
       CREATE TABLE IF NOT EXISTS fixture_dispatch (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS fixture_settings (name TEXT PRIMARY KEY, value INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS fixture_settings (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS fixture_alarm_runs (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, at INTEGER NOT NULL);`);
   }
 
   private async fire(kind: string, { ref, now, local }: TimerRun) {
@@ -197,6 +198,9 @@ export class TimerMailbox extends Mailbox {
   override async alarm() {
     this.fixtureSchema();
     const sql = this.ctx.storage.sql;
+    // Every platform-fired alarm call is recorded, consumed request or not.
+    const next = sql.exec<{ label: string }>('SELECT label FROM fixture_dispatch ORDER BY seq LIMIT 1').toArray()[0];
+    sql.exec('INSERT INTO fixture_alarm_runs (label, at) VALUES (?, ?)', next?.label ?? null, Date.now());
     const request = sql.exec<{ seq: number; label: string }>('SELECT seq, label FROM fixture_dispatch ORDER BY seq LIMIT 1').toArray()[0];
     if (!request) return;
     sql.exec('DELETE FROM fixture_dispatch WHERE seq = ?', request.seq);
@@ -276,12 +280,20 @@ export class TimerMailbox extends Mailbox {
   }
 
   async setClockOffset(ms: number) { this.clockOffset = ms; }
+  async setBackendEnabled(on: boolean) { this.env.MAIL_BACKEND_ENABLED = on ? 'on' : 'off'; }
+  async alarmRuns() {
+    this.fixtureSchema();
+    return JSON.stringify(this.ctx.storage.sql.exec('SELECT label, at FROM fixture_alarm_runs ORDER BY seq').toArray());
+  }
   async setBudgets(handlerMs: number, runMs: number) {
     this.timerHandlerBudgetMs = handlerMs;
     this.timerRunBudgetMs = runMs;
   }
   // Sets the journal_flush row directly, as the lane's own deadline would.
-  async setLaneDue(at: number) { new TimerTable(this.ctx.storage.sql).set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, at); }
+  async setLaneDue(at: number, arm = false) {
+    new TimerTable(this.ctx.storage.sql).set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, at);
+    if (arm) await this.ctx.storage.setAlarm(at);
+  }
   // Releases one hung call (by start order), or all of them.
   async releaseHang(index?: number) {
     for (const [i, gate] of this.hangs.entries()) if (index === undefined || i === index) gate.resolve();
