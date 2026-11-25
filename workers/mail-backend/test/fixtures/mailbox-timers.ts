@@ -16,7 +16,8 @@ type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 
 // Work a test injects right after an alarm call claims its rows (its first alarm write).
 // `hold` keeps the work lane for `ms`, then moves the timer clock forward by `advance`.
 // `edit` is a first write on a mailbox without state: a flag edit on `message`, or a label edit.
-type OnClaim = { kind: 'edit'; message?: string } | { kind: 'hold'; ms: number; advance?: number } | { kind: 'replace'; ref: string };
+// `release` (optional) releases that hung call halfway through the hold, after the dispatcher queued its next step.
+type OnClaim = { kind: 'edit'; message?: string } | { kind: 'hold'; ms: number; advance?: number; release?: number } | { kind: 'replace'; ref: string };
 
 // A mailbox with two test-only timer kinds. Fixture tables live in the same
 // SQLite database, so a handler's record commits atomically with its row change.
@@ -95,7 +96,9 @@ export class TimerMailbox extends Mailbox {
       this.injected = edit.then(() => { this.editWindow = { before, after: Date.now() }; });
     } else if (work.kind === 'hold') {
       this.injected = this.workLane(async () => {
-        await new Promise(resolve => setTimeout(resolve, work.ms));
+        await new Promise(resolve => setTimeout(resolve, work.ms / 2));
+        if (work.release !== undefined) this.hangs[work.release].resolve();
+        await new Promise(resolve => setTimeout(resolve, work.ms / 2));
         this.clockOffset += work.advance ?? 0;
       });
     } else {

@@ -529,6 +529,44 @@ test('a stale call that throws late does not delay a replacement of its row', { 
   assert.equal((await rows()).find(row => row.ref === 'x')?.due_at, claimed, 'the replacement keeps its own schedule');
 });
 
+test('a call that settles after the next start was queued cannot clear the new call\'s claim', { timeout: 10_000 }, async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  await box.schedule('test_a', 'x', Date.now() - 1_000);
+  await box.plan('x', 'hang-throw');
+  await box.run('first');
+  // A minute later the row is due again and still claimed by the running first call.
+  await box.setClockOffset(RETRY_MS + 1_000);
+  // While an RPC holds the lane, the first call throws; its retry queues behind the next start.
+  await box.run('second', { kind: 'hold', ms: 300, release: 0, advance: 30_000 });
+  await box.barrier();
+  const due = (await rows()).find(row => row.ref === 'x')!.due_at;
+  // The second call claimed the row at 61 s (until 121 s); the stale retry would have set 91 s + 60 s.
+  assert.ok(due <= Date.now() + 2 * RETRY_MS + 5_000, `the row keeps the second call's claim (${Math.round((due - Date.now()) / 1000)} s)`);
+  await box.releaseHang();
+});
+
+test('a claim kept from a call whose lease runs out before dispatch starts the new call under its own token', { timeout: 10_000 }, async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  await box.schedule('test_a', 'x', Date.now() - 1_000);
+  await box.plan('x', 'hang-throw');
+  await box.run('first');
+  await box.setClockOffset(RETRY_MS + 1_000);
+  // The claim keeps the running call's token; the lease then runs out while an RPC holds the lane.
+  await box.run('second', { kind: 'hold', ms: 200, advance: LEASE_MS });
+  assert.deepEqual((await box.handlerState()).running, { 'test_a/x': 2 }, 'a new call started after the lease ran out');
+  const claimed = (await rows()).find(row => row.ref === 'x')!.due_at;
+  // The first call now throws: it no longer owns the row.
+  await box.releaseHang(0);
+  while (!(await box.handlerState()).errors.includes('Fixture late handler failure')) await new Promise(resolve => setTimeout(resolve, 10));
+  await box.barrier();
+  assert.equal((await rows()).find(row => row.ref === 'x')?.due_at, claimed, 'the stale failure does not move the new call\'s row');
+  await box.releaseHang();
+});
+
 test('an eviction does not turn an ordinary timer into a journal_flush row', async t => {
   const { box, stub, rows } = await setup(t);
   await box.setup('ready');

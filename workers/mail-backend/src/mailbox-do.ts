@@ -25,7 +25,7 @@ import { enabled, mailboxName, type Env } from './worker.ts';
 export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
 const HELD_RECHECK_MS = 15 * 60_000;
-type TimerClaim = TimerRow & { token: string; until: number };
+type TimerClaim = TimerRow & { token: string; until: number; retained?: boolean };
 const thenable = (value: unknown): value is PromiseLike<unknown> => typeof (value as { then?: unknown } | null)?.then === 'function';
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
 const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
@@ -428,9 +428,11 @@ export class Mailbox extends DurableObject<Env> {
         // that call's: its late failure keeps its retry. A replaced row has no
         // claim and gets a new token, so a stale call can never move it.
         const running = new Set([...this.inFlight.values()].filter(entry => now - entry.started < TIMER_LEASE_MS).map(entry => entry.token));
-        const claimed: TimerClaim[] = due.map(({ due_at, kind, ref, claim }) => ({ due_at, kind, ref,
-          token: claim && running.has(claim) ? claim : crypto.randomUUID(),
-          until: now + (kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : this.timerRetryMs) }));
+        const claimed: TimerClaim[] = due.map(({ due_at, kind, ref, claim }) => {
+          const retained = !!claim && running.has(claim);
+          return { due_at, kind, ref, retained, token: retained ? claim! : crypto.randomUUID(),
+            until: now + (kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : this.timerRetryMs) };
+        });
         // More than one batch due re-arms at once.
         await this.rearm(() => this.ctx.storage.transactionSync(() => {
           for (const row of claimed) timers.claim(row.kind, row.ref, row.until, row.token);
@@ -563,9 +565,12 @@ export class Mailbox extends DurableObject<Env> {
       // A call still running in this isolate is not started twice within its lease; the row waits for its claim.
       const running = this.inFlight.get(key);
       if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
-      // The earlier call's lease ran out after this claim kept its token: a new call gets its own.
-      if (running?.token === claim.token) {
+      // This claim kept an earlier call's token, and that call has since settled
+      // or its lease ran out: the new call gets its own token, so the earlier
+      // call's queued retry cannot touch it.
+      if (claim.retained) {
         claim.token = crypto.randomUUID();
+        claim.retained = false;
         timers.claim(claim.kind, claim.ref, claim.until, claim.token);
       }
       // Checked again here, just before the handler starts: this step may have waited behind other work.
