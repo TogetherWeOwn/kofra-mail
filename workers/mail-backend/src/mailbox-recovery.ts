@@ -101,6 +101,9 @@ export type RestorePorts = {
   fence(): Promise<number | null>;
   replayPage(after: number): Promise<ReplayDelivery[]>;
   release(key: string, holder: string): Promise<void>;
+  // Recreates local state derived from the restored rows (timer rows), inside
+  // the transaction that finishes the restore.
+  rebuild?(now: number): void;
 };
 
 export class MailboxRecovery {
@@ -521,7 +524,10 @@ export class MailboxRecovery {
           const ready: ReadyLife = { ...readyLife(life.scope, life.incarnation, life.etag!, life.rev, now),
             nextSnapshotAt: now, lastSnapshotAt: life.startedAt, restoreSkipped: life.skipped,
             baseSeq: life.baseSeq, baseChain: life.baseChain };
-          this.index.setLifecycle(ready);
+          this.index.transaction(() => {
+            this.index.setLifecycle(ready);
+            ports.rebuild?.(now);
+          });
           return ready;
         }
         let after = life.after;
