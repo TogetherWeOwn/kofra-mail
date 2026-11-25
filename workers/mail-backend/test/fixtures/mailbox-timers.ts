@@ -284,13 +284,15 @@ export class TimerMailbox extends Mailbox {
   async seedStale(kind: string, ref: string, at: number) { new TimerTable(this.ctx.storage.sql).set(kind, ref, at); }
 
   // State an earlier version left: its alarm armed, and no journal_flush row. The object restarts.
-  async seedLegacyAlarm(at: number) {
-    new TimerTable(this.ctx.storage.sql).delete(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
-    // An earlier version had no timers table, so it never recorded the one-time migration.
-    this.ctx.storage.sql.exec('DELETE FROM timers_migrated');
-    await this.ctx.storage.setAlarm(at);
+  // State another version left, then a restart: its armed alarm, and the
+  // journal_flush row it left (`null` for none, as before timers existed).
+  async seedRestart(alarmAt: number, laneAt: number | null) {
+    const timers = new TimerTable(this.ctx.storage.sql);
+    if (laneAt === null) timers.delete(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    else timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, laneAt);
+    await this.ctx.storage.setAlarm(alarmAt);
     await this.ctx.storage.sync();
-    this.ctx.abort('Fixture restart after seeding a legacy alarm');
+    this.ctx.abort('Fixture restart after seeding another version\'s state');
   }
 
   // Restarts the object, as an eviction would.

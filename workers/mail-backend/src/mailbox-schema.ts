@@ -10,8 +10,6 @@ export const TIMERS_SCHEMA = `
 CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, claim TEXT, requested INTEGER,
   PRIMARY KEY (kind, ref));
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
--- Present once this object has taken over (or had no) alarm from a version without timers.
-CREATE TABLE IF NOT EXISTS timers_migrated (id INTEGER PRIMARY KEY CHECK (id = 1));
 `;
 
 export const MAILBOX_SCHEMA = `

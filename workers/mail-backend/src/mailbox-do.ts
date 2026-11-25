@@ -59,22 +59,18 @@ export class Mailbox extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
-  // An alarm an earlier version (without timers) armed is the journal lane's
-  // deadline. A one-time migration, before the object serves any call: the
-  // marker is recorded on this version's first start, so later alarms (which
-  // are always some row's due time) are never taken over.
+  // On every start, before the object serves any call: a stored alarm earlier
+  // than every row (or, with no rows, for a mailbox past init) was armed by
+  // another version, so it is the journal lane's deadline; lower the lane to it.
+  // This version never arms the alarm earlier than its earliest row, except
+  // the disabled-backend fallback, where lowering only runs the lane early.
   private async adoptArmedAlarm(): Promise<void> {
     const state = storedLifecycle<Lifecycle>(this.ctx.storage)?.state;
-    const sql = this.ctx.storage.sql;
-    if (sql.exec('SELECT 1 FROM timers_migrated').toArray().length) return;
     const armed = await this.ctx.storage.getAlarm();
+    if (armed === null) return;
     const timers = this.timerTable();
-    this.ctx.storage.transactionSync(() => {
-      if (armed !== null && state && state !== 'init' && timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null) {
-        timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
-      }
-      sql.exec('INSERT OR IGNORE INTO timers_migrated VALUES (1)');
-    });
+    const earliest = timers.earliest();
+    if (earliest === null ? !!state && state !== 'init' : armed < earliest) timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
   }
 
   // Registers a timer kind. Call from the constructor.
@@ -485,7 +481,8 @@ export class Mailbox extends DurableObject<Env> {
     await this.work.run(async () => {
       const timers = this.timerTable();
       await this.rearm(() => this.ctx.storage.transactionSync(() => {
-        for (const claim of claims) timers.setIfOwned(claim.kind, claim.ref, claim.token, claim.due_at);
+        // A claim kept for a still-running call stays that call's: its deferred retry is already set.
+        for (const claim of claims) if (!claim.retained) timers.setIfOwned(claim.kind, claim.ref, claim.token, claim.due_at);
       }));
     });
   }
@@ -565,14 +562,6 @@ export class Mailbox extends DurableObject<Env> {
       // A call still running in this isolate is not started twice within its lease; the row waits for its claim.
       const running = this.inFlight.get(key);
       if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
-      // This claim kept an earlier call's token, and that call has since settled
-      // or its lease ran out: the new call gets its own token, so the earlier
-      // call's queued retry cannot touch it.
-      if (claim.retained) {
-        claim.token = crypto.randomUUID();
-        claim.retained = false;
-        timers.claim(claim.kind, claim.ref, claim.until, claim.token);
-      }
       // Checked again here, just before the handler starts: this step may have waited behind other work.
       if (this.laneDue()) return 'lane';
       if (now >= runDeadline) return 'budget';
@@ -581,6 +570,14 @@ export class Mailbox extends DurableObject<Env> {
       if (!handler || this.lifecycleState() !== 'ready') {
         await this.rearm(() => timers.setIfOwned(claim.kind, claim.ref, claim.token, now + HELD_RECHECK_MS));
         return 'skipped';
+      }
+      // This claim kept an earlier call's token, and that call has since settled
+      // or its lease ran out: the new call gets its own token, so the earlier
+      // call's queued retry cannot touch it. Only now, when a call really starts.
+      if (claim.retained) {
+        claim.token = crypto.randomUUID();
+        claim.retained = false;
+        timers.claim(claim.kind, claim.ref, claim.until, claim.token);
       }
       this.inFlight.set(key, { started: now, id, token: claim.token });
       return 'start';

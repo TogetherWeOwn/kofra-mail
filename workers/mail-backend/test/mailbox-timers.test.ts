@@ -567,6 +567,55 @@ test('a claim kept from a call whose lease runs out before dispatch starts the n
   await box.releaseHang();
 });
 
+test('after a rollback and redeploy, an earlier platform alarm lowers a stale journal_flush row', async t => {
+  const { box, stub, rows } = await setup(t);
+  await box.setup('ready');
+  // The older version armed its settings deadline a minute out; the row this version left is days away.
+  const alarm = Date.now() + 60_000;
+  await assert.rejects(box.seedRestart(alarm, Date.now() + 3 * 24 * 60 * 60_000));
+  const after = stub();
+  assert.equal(lane(await rows(after))?.due_at, alarm, 'the journal lane runs at the earlier armed time');
+  assert.equal(await after.alarmAt(), alarm);
+});
+
+test('a disabled-backend fallback alarm earlier than every row only runs the journal lane early', async t => {
+  const { box, stub, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setLaneDue(Date.now() + 7 * 24 * 60 * 60_000);
+  await box.setBackendEnabled(false);
+  await box.run('off');
+  const held = await box.alarmAt();
+  assert.ok(held !== null && held < Date.now() + 7 * 24 * 60 * 60_000);
+  await assert.rejects(box.evict());
+  const after = stub();
+  assert.equal(lane(await rows(after))?.due_at, held, 'the lane is lowered to the held recheck');
+});
+
+test('a budget exit keeps a still-running call\'s row, so its late throw gets the 60 s retry', { timeout: 10_000 }, async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  await box.schedule('test_a', 'x', Date.now() - 1_000);
+  await box.plan('x', 'hang-throw');
+  await box.run('first');
+  // A minute later: an earlier row `a` hangs past the run budget before `x`, still held by the first call, is reached.
+  await box.setClockOffset(RETRY_MS + 1_000);
+  await box.schedule('test_a', 'a', Date.now() - 1_000);
+  await box.plan('a', 'hang');
+  await box.setBudgets(100, 50);
+  await box.run('second');
+  assert.deepEqual((await box.handlerState()).running, { 'test_a/a': 1, 'test_a/x': 1 });
+  // The first call throws at 119 s, inside its lease, without moving its row.
+  await box.setClockOffset(119_000);
+  const thrown = Date.now() + 119_000;
+  await box.releaseHang(0);
+  while (!(await box.handlerState()).errors.includes('Fixture late handler failure')) await new Promise(resolve => setTimeout(resolve, 10));
+  await box.barrier();
+  const due = (await rows()).find(row => row.ref === 'x')!.due_at;
+  assert.ok(due >= thrown + RETRY_MS, `the retry is ${Math.round((due - thrown) / 1000)} s after the throw`);
+  await box.releaseHang();
+});
+
 test('an eviction does not turn an ordinary timer into a journal_flush row', async t => {
   const { box, stub, rows } = await setup(t);
   await box.setup('ready');
@@ -584,7 +633,7 @@ test('an alarm armed by an earlier version becomes the journal_flush row when th
   const { box, stub, rows } = await setup(t);
   await box.setup('ready');
   const at = Date.now() + 10 * 60_000;
-  await assert.rejects(box.seedLegacyAlarm(at));
+  await assert.rejects(box.seedRestart(at, null));
   const after = stub();
   assert.deepEqual(lane(await rows(after))?.due_at, at);
   await after.schedule('test_a', 'later', at + 60_000);
