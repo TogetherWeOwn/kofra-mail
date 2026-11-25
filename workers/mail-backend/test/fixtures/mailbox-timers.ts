@@ -12,7 +12,8 @@ const scope = { workspaceId: 'workspace', mailboxId: 'mailbox' };
 // - `due-lane` makes journal_flush due and deletes its own row;
 // - `crash` commits directly (no handler-side alarm write), then resets the object;
 // - `async-step` and `async-write` hand `local` a step that returns a promise.
-type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 'hang-throw' | 'due-lane' | 'async-step' | 'async-write';
+// - `hang-advance` moves the timer clock forward by `at` once started, then hangs;
+type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 'hang-throw' | 'hang-advance' | 'due-lane' | 'async-step' | 'async-write';
 // Work a test injects right after an alarm call claims its rows (its first alarm write).
 // `hold` keeps the work lane for `ms`, then moves the timer clock forward by `advance`.
 // `edit` is a first write on a mailbox without state: a flag edit on `message`, or a label edit.
@@ -194,6 +195,10 @@ export class TimerMailbox extends Mailbox {
     });
     if (action === 'throw' || action === 'move-and-throw') throw new Error('Fixture handler failure');
     if (action === 'hang') await this.hang();
+    if (action === 'hang-advance') {
+      this.clockOffset += plan!.at ?? 0;
+      await this.hang();
+    }
     if (action === 'hang-throw') {
       await this.hang();
       throw new Error('Fixture late handler failure');

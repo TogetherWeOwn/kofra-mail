@@ -592,7 +592,7 @@ test('a disabled-backend fallback alarm earlier than every row only runs the jou
 });
 
 test('a budget exit keeps a still-running call\'s row, so its late throw gets the 60 s retry', { timeout: 10_000 }, async t => {
-  const { box, rows } = await setup(t);
+  const { box, rows, fired } = await setup(t);
   await box.setup('ready');
   await box.setBudgets(100, 20 * 60_000);
   await box.schedule('test_a', 'x', Date.now() - 1_000);
@@ -601,9 +601,11 @@ test('a budget exit keeps a still-running call\'s row, so its late throw gets th
   // A minute later: an earlier row `a` hangs past the run budget before `x`, still held by the first call, is reached.
   await box.setClockOffset(RETRY_MS + 1_000);
   await box.schedule('test_a', 'a', Date.now() - 1_000);
-  await box.plan('a', 'hang');
-  await box.setBudgets(100, 50);
+  // Once started, `a` moves the timer clock past the 60 s run budget, then hangs: no wall-clock margin.
+  await box.plan('a', 'hang-advance', RETRY_MS + 1_000);
+  await box.setBudgets(100, 60_000);
   await box.run('second');
+  assert.deepEqual((await fired()).map(row => row.ref), ['x', 'a'], '`a` ran, then the budget ended the run before `x`');
   assert.deepEqual((await box.handlerState()).running, { 'test_a/a': 1, 'test_a/x': 1 });
   // The first call throws at 119 s, inside its lease, without moving its row.
   await box.setClockOffset(119_000);
