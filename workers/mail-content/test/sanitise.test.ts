@@ -42,6 +42,26 @@ test('one CID slot is reused for 1,000 images with the same content ID', async (
   assert.equal(new Set(images).size, 1);
 });
 
+test('interleaved CIDs and remote images each resolve to their own slot', async () => {
+  const output = await render(runtime, {
+    html: '<img src="cid:a"><img src="https://sender.example/x.png"><img src="cid:b"><img src="cid:a"><img src="https://sender.example/y.png">',
+    ri: true,
+  });
+  const expected = [
+    { kind: 'cid', contentId: 'a' }, { kind: 'img', url: 'https://sender.example/x.png' }, { kind: 'cid', contentId: 'b' },
+    { kind: 'cid', contentId: 'a' }, { kind: 'img', url: 'https://sender.example/y.png' },
+  ];
+  const { images } = checkOutput(output.filled);
+  assert.equal(images.length, expected.length);
+  images.forEach((src, i) => {
+    const match = /\/asset\/(cid|img)\/(\d+)\?/.exec(src);
+    assert.ok(match, `unexpected image URL ${src}`);
+    assert.equal(match[1], expected[i].kind);
+    assert.deepEqual(output.refs[Number(match[2])], expected[i]);
+  });
+  assert.equal(output.refs.filter(r => r.kind === 'cid').length, 2);
+});
+
 test('refs keep the exact source URL and decoded CID; filling escapes attribute and raw CSS contexts', async () => {
   const url = 'https://sender.example/pixel%2Fimage?q=1&k=2';
   const encoded = url.replaceAll('&', '&amp;');
