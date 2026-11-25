@@ -10,6 +10,10 @@ import {
   BackupConflict, FLAGS_FLUSH_MS, MailboxRecovery, PUBLISH_BUDGET_MS, readyLife, restoringLife, SETTINGS_FLUSH_MS, SNAPSHOT_INTERVAL_MS,
   type CleanupCursor, type Lifecycle, type ReadyLife, type RestoringLife, type Scope,
 } from './mailbox-recovery.ts';
+import {
+  JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TIMER_BATCH, TIMER_HANDLER_BUDGET_MS, TIMER_LEASE_MS, TIMER_RETRY_MS, TIMER_RUN_BUDGET_MS, TimerTable,
+  validTimerKind, type TimerKind, type TimerRow, type TimerRun,
+} from './mailbox-timers.ts';
 import { MailboxWork } from './mailbox-work.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
@@ -21,6 +25,8 @@ import { enabled, mailboxName, type Env } from './worker.ts';
 export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
 const HELD_RECHECK_MS = 15 * 60_000;
+type TimerClaim = TimerRow & { token: string; until: number; retained?: boolean };
+const thenable = (value: unknown): value is PromiseLike<unknown> => typeof (value as { then?: unknown } | null)?.then === 'function';
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
 const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
 const RESTORE_RESTART_ALERT = 3;
@@ -34,6 +40,131 @@ export class Mailbox extends DurableObject<Env> {
   protected reindexBatch = 16;
   // Set when a call asked for an immediate wake-up; consumed by the alarm run.
   private wakeRequested = false;
+  // Timer kinds by name. journal_flush is the backup and restore lane; its row
+  // survives a restore reset, so it needs no rebuild.
+  private readonly timerKinds = new Map<string, TimerKind>([[JOURNAL_FLUSH, { run: async () => { await this.runLaneIfDue(); } }]]);
+  // Handler calls still running in this isolate, by kind and ref, including
+  // ones that lost their race; an evicted isolate takes its calls with it.
+  // An entry blocks a new start for TIMER_LEASE_MS at most.
+  private readonly inFlight = new Map<string, { started: number; id: string; token: string }>();
+  // Resolved when a write moves the journal_flush deadline earlier, so a
+  // running dispatcher re-evaluates the race it is waiting on.
+  private laneMoved: PromiseWithResolvers<void> | null = null;
+  protected timerHandlerBudgetMs = TIMER_HANDLER_BUDGET_MS;
+  protected timerRunBudgetMs = TIMER_RUN_BUDGET_MS;
+  protected timerRetryMs = TIMER_RETRY_MS;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
+  }
+
+  // On every start, before the object serves any call, restore alarm =
+  // MIN(due_at) after another version may have armed it:
+  // - a stored alarm earlier than every row (or, with no rows, for a mailbox
+  //   past init) is the journal lane's deadline, so lower the lane to it. This
+  //   version never arms earlier than its earliest row except the
+  //   disabled-backend fallback, where lowering only runs the lane early;
+  // - with the backend enabled, a missing alarm or one later than the
+  //   earliest row is re-armed at that row. A disabled backend keeps its held
+  //   recheck.
+  private async adoptArmedAlarm(): Promise<void> {
+    const state = storedLifecycle<Lifecycle>(this.ctx.storage)?.state;
+    const armed = await this.ctx.storage.getAlarm();
+    const timers = this.timerTable();
+    const earliest = timers.earliest();
+    if (armed !== null && (earliest === null ? !!state && state !== 'init' : armed < earliest)) {
+      timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
+    }
+    if (!enabled(this.env)) return;
+    const due = timers.earliest();
+    if (due !== null && (armed === null || armed > due)) await this.ctx.storage.setAlarm(due);
+  }
+
+  // Registers a timer kind. Call from the constructor.
+  protected registerTimerKind(kind: string, handler: TimerKind): void {
+    if (!validTimerKind(kind) || this.timerKinds.has(kind)) throw new Error('Invalid mailbox timer kind');
+    this.timerKinds.set(kind, handler);
+  }
+
+  protected timerNow(): number { return Date.now(); }
+
+  private timerTable(): TimerTable { return new TimerTable(this.ctx.storage.sql); }
+
+  private lifecycleState(): Lifecycle['state'] | null {
+    const row = this.ctx.storage.sql.exec<{ state: Lifecycle['state'] }>(
+      "SELECT json_extract(value, '$.state') AS state FROM lifecycle WHERE id = 1").toArray()[0];
+    return row?.state ?? null;
+  }
+
+  // Runs an operation in the mailbox work lane, in order with deliveries, API calls and timer handlers.
+  protected workLane<T>(operation: () => Promise<T>): Promise<T> { return this.work.run(operation); }
+
+  private registeredKind(kind: string): void {
+    // The journal_flush row is moved only by armFor, armSoon and its own lane.
+    if (kind === JOURNAL_FLUSH || !this.timerKinds.has(kind)) throw new Error('Unknown mailbox timer kind');
+  }
+
+  // Sets a row's due time (or, with lowerOnly, never moves it later) and
+  // re-arms. Call in the work lane: from a timer handler or a mailbox operation.
+  protected async setTimer(kind: string, ref: string, at: number, lowerOnly = false): Promise<void> {
+    this.registeredKind(kind);
+    const timers = this.timerTable();
+    await this.rearm(() => {
+      if (lowerOnly) timers.lower(kind, ref, at);
+      else timers.set(kind, ref, at);
+    });
+  }
+
+  // Deletes a row and re-arms. Call in the work lane.
+  protected async deleteTimer(kind: string, ref: string): Promise<void> {
+    this.registeredKind(kind);
+    const timers = this.timerTable();
+    await this.rearm(() => timers.delete(kind, ref));
+  }
+
+  // Applies `write`, then arms the alarm at the earliest row (or clears it
+  // when there is none). The armed alarm is read before the write, so no
+  // other call can interleave between the row write and the alarm write. The
+  // alarm handler forces the alarm write: a wake-up it does not set itself
+  // may be cleared when it returns.
+  private async rearm(write: () => void = () => {}, force = false): Promise<void> {
+    const current = force ? undefined : await this.ctx.storage.getAlarm();
+    write();
+    const at = this.timerTable().earliest();
+    if (at === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+    } else if (current !== at) await this.ctx.storage.setAlarm(at);
+  }
+
+  // Moves the journal_flush row to `at` unless it is already earlier, and re-arms. Call in the work lane.
+  private async lowerLane(at: number): Promise<void> {
+    const timers = this.timerTable();
+    let moved = false;
+    await this.rearm(() => {
+      const before = timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+      timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, at);
+      moved = before === null || at < before;
+    });
+    if (moved) this.laneMoved?.resolve();
+  }
+
+  // Inside the transaction that finishes a restore: each kind recreates its rows from the restored state.
+  private rebuildTimers(now: number): void {
+    const timers = this.timerTable();
+    try {
+      for (const kind of this.timerKinds.values()) {
+        const result: unknown = kind.rebuild?.(timers, now);
+        // Its deferred writes would miss the transaction that sets the mailbox ready.
+        if (thenable(result)) {
+          result.then(undefined, () => {});
+          throw new Error('Timer rebuilds must be synchronous');
+        }
+      }
+    } finally {
+      timers.revoke();
+    }
+  }
 
   private scoped(scope: Scope): boolean {
     return this.ctx.id.equals(this.env.MAILBOX.idFromName(mailboxName(scope.workspaceId, scope.mailboxId)));
@@ -111,9 +242,16 @@ export class Mailbox extends DurableObject<Env> {
   private async armSoon(): Promise<void> {
     // An alarm run in progress re-reads this before arming its next wake-up.
     this.wakeRequested = true;
-    const at = await this.ctx.storage.getAlarm();
     const now = Date.now();
-    if (at === null || at > now + 1000) await this.ctx.storage.setAlarm(now);
+    // A journal wake-up already due within a second, with the platform alarm
+    // armed that soon, is soon enough. A held fallback alarm (for example
+    // after a disabled period) is not: re-arm from the rows.
+    const due = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    if (due !== null && due <= now + 1000) {
+      const armed = await this.ctx.storage.getAlarm();
+      if (armed !== null && armed <= now + 1000) return;
+    }
+    await this.lowerLane(now);
   }
 
   // Call in the work lane. A mailbox is ready only after a durable backup
@@ -126,7 +264,10 @@ export class Mailbox extends DurableObject<Env> {
       // The alarm lane keeps its own wake-up (and restart or failure backoff)
       // for restoring and missing mailboxes; only replace a lost alarm, so
       // client and delivery traffic cannot cancel that backoff.
-      if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
+      // The journal row is checked on its own: another kind's row may hold the alarm.
+      if (this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null || await this.ctx.storage.getAlarm() === null) {
+        await this.lowerLane(Date.now());
+      }
       return false;
     }
     if (!life) {
@@ -178,9 +319,7 @@ export class Mailbox extends DurableObject<Env> {
   // Arms before committing. Further edits coalesce with the earliest deadline;
   // a stream of edits must not push the first one past its recovery point.
   private async armFor(delay: number): Promise<void> {
-    const existing = await this.ctx.storage.getAlarm();
-    const due = Date.now() + delay - PUBLISH_BUDGET_MS;
-    if (existing === null || due < existing) await this.ctx.storage.setAlarm(due);
+    await this.lowerLane(Date.now() + delay - PUBLISH_BUDGET_MS);
   }
 
   async deliver(id: string): Promise<MailboxDeliveryResult> {
@@ -270,44 +409,284 @@ export class Mailbox extends DurableObject<Env> {
       return;
     }
     await this.backups.run(async () => {
-      // Requests made before this run are being served by it.
-      this.wakeRequested = false;
       const life = storedLifecycle<Lifecycle>(this.ctx.storage);
-      if (!life || life.state === 'init') {
-        try { await this.checkBackupAlerts(null); }
-        catch { await this.work.run(() => this.ctx.storage.setAlarm(Date.now() + HELD_RECHECK_MS)); }
-        return;
-      }
-      this.verifyScope(life.scope);
-      const index = this.index(life.scope.workspaceId);
-      const now = Date.now();
-      // Cloudflare retries a thrown alarm only a few times; keep a durable wake-up.
-      await this.work.run(() => this.ctx.storage.setAlarm(now + SETTINGS_FLUSH_MS));
-      let next: number;
-      let failed = false;
-      try {
-        if (life.state === 'restoring') next = await this.restoreSlice(index, life);
-        else if (life.state === 'ready') {
-          if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
-          next = await this.backupSlice(index, life, now);
-        }
-        else next = now + HELD_RECHECK_MS;
-      } catch {
-        failed = true;
-        next = now + this.failed(index);
-      }
-      try { next = Math.min(next, await this.checkBackupAlerts(index)); }
-      catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); }
-      await this.work.run(async () => {
-        // A change committed during this run must not wait for the next deadline.
-        const current = index.lifecycle<Lifecycle>();
-        // A failed run retries unpublished changes within the settings recovery point, not the backoff.
-        const pending = current?.state === 'ready' && index.journal.flushed() < index.journal.revision();
-        const soon = Date.now() + (failed ? SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS : 1000);
-        const requested = this.wakeRequested ? Date.now() : Infinity;
-        this.wakeRequested = false;
-        await this.ctx.storage.setAlarm(Math.min(pending ? Math.min(next, soon) : next, requested));
+      if (life && life.state !== 'init') this.verifyScope(life.scope);
+      // Cloudflare retries a thrown alarm only a few times; keep a durable
+      // wake-up before any work. Each row this call runs is first claimed: it
+      // moves to its retry time (journal_flush to the settings recovery point,
+      // as before) under this call's token, so a crash in a handler or before
+      // the final re-arm runs it again on the next alarm, a row is never run
+      // twice by one call, and any later write to the row ends the claim.
+      const started = this.timerNow();
+      const claims = await this.work.run(async () => {
+        const timers = this.timerTable();
+        const now = this.timerNow();
+        const lane = timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+        const laneDue = lane !== null && lane <= now;
+        // A due journal_flush always runs first and takes one of the batch's places.
+        const due: TimerRow[] = timers.dueRows(now, TIMER_BATCH - (laneDue ? 1 : 0), JOURNAL_FLUSH);
+        // With nothing due (an early, retried or held wake-up) the journal lane
+        // runs anyway and decides for itself what is due, as every alarm did before timers.
+        if (laneDue || !due.length) due.unshift({ due_at: lane ?? now, kind: JOURNAL_FLUSH, ref: JOURNAL_FLUSH_REF });
+        // A row still claimed by a call that is running within its lease stays
+        // that call's: its late failure keeps its retry. A replaced row has no
+        // claim and gets a new token, so a stale call can never move it.
+        const running = new Set([...this.inFlight.values()].filter(entry => now - entry.started < TIMER_LEASE_MS).map(entry => entry.token));
+        const claimed: TimerClaim[] = due.map(({ due_at, kind, ref, claim }) => {
+          const retained = !!claim && running.has(claim);
+          return { due_at, kind, ref, retained, token: retained ? claim! : crypto.randomUUID(),
+            until: now + (kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : this.timerRetryMs) };
+        });
+        // More than one batch due re-arms at once.
+        await this.rearm(() => this.ctx.storage.transactionSync(() => {
+          for (const row of claimed) timers.claim(row.kind, row.ref, row.until, row.token);
+        }), true);
+        return claimed;
       });
+      // Rows dispatched by this call, journal_flush runs included; at most TIMER_BATCH.
+      let dispatched = 0;
+      // Whether another kind ran since the lane last ran in this call.
+      let handlerRan = false;
+      for (let i = 0; i < claims.length; i++) {
+        const claim = claims[i];
+        if (claim.kind === JOURNAL_FLUSH) {
+          dispatched++;
+          await this.runLane(claim.token);
+          continue;
+        }
+        // A journal_flush deadline that fell due since the claim (or during
+        // another handler) never waits behind the next handler.
+        if (dispatched < TIMER_BATCH && await this.runLaneIfDue()) {
+          dispatched++;
+          handlerRan = false;
+        }
+        if (dispatched >= TIMER_BATCH || this.timerNow() - started >= this.timerRunBudgetMs) {
+          await this.releaseClaims(claims.slice(i));
+          break;
+        }
+        const result = await this.runTimer(claim, started + this.timerRunBudgetMs);
+        if (result === 'budget') {
+          await this.releaseClaims(claims.slice(i));
+          break;
+        }
+        // journal_flush fell due while this claim waited for the work lane: run it, then reconsider the claim.
+        if (result === 'lane') {
+          i--;
+          continue;
+        }
+        if (result === 'ran') {
+          dispatched++;
+          handlerRan = true;
+        }
+      }
+      if (handlerRan && dispatched < TIMER_BATCH) await this.runLaneIfDue();
+      await this.work.run(() => this.rearm(undefined, true));
+    });
+  }
+
+  // Unstarted rows go back to their due time, so the final re-arm wakes the next call at once.
+  private async releaseClaims(claims: TimerClaim[]): Promise<void> {
+    await this.work.run(async () => {
+      const timers = this.timerTable();
+      await this.rearm(() => this.ctx.storage.transactionSync(() => {
+        // A claim kept for a still-running call stays that call's: its deferred retry is already set.
+        for (const claim of claims) if (!claim.retained) timers.setIfOwned(claim.kind, claim.ref, claim.token, claim.due_at);
+      }));
+    });
+  }
+
+  private laneDue(): boolean {
+    const due = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    return due !== null && due <= this.timerNow();
+  }
+
+  // Runs journal_flush now if its row is due, claiming it first like any due row.
+  private async runLaneIfDue(): Promise<boolean> {
+    if (!this.laneDue()) return false;
+    const token = crypto.randomUUID();
+    await this.work.run(async () => {
+      const timers = this.timerTable();
+      await this.rearm(() => timers.claim(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, this.timerNow() + SETTINGS_FLUSH_MS, token));
+    });
+    await this.runLane(token);
+    return true;
+  }
+
+  // The lane takes the work lane for each step that touches the index and
+  // keeps its backup I/O outside it, so deliveries never wait on R2.
+  private async runLane(token: string): Promise<void> {
+    try {
+      await this.flushLane(token);
+    } catch {
+      await this.work.run(async () => {
+        const timers = this.timerTable();
+        await this.rearm(() => timers.setIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token, this.timerNow() + TIMER_RETRY_MS));
+      });
+    }
+  }
+
+  // One synchronous storage step of a timer handler, in the work lane. The
+  // table it gets is revoked when the step returns, so a write the step
+  // defers past an await cannot land outside the transaction.
+  private localStep<T>(step: (timers: TimerTable) => T): Promise<T> {
+    return this.work.run(async () => {
+      let value!: T;
+      const timers = this.timerTable();
+      await this.rearm(() => {
+        value = this.ctx.storage.transactionSync(() => {
+          let result: T;
+          try {
+            result = step(timers);
+          } finally {
+            // Before anything the step deferred can run.
+            timers.revoke();
+          }
+          // A promise here would hold the step open across I/O; refuse it and roll back.
+          if (thenable(result)) {
+            // Its own later failure (for example a write to the revoked table) is expected; do not leave it unhandled.
+            result.then(undefined, () => {});
+            throw new Error('Timer steps must be synchronous');
+          }
+          return result;
+        });
+      });
+      return value;
+    });
+  }
+
+  private readonly local = ((step: (timers: TimerTable) => unknown) => this.localStep(step)) as TimerRun['local'];
+
+  // Starts one claimed row of another kind. Returns 'lane' when journal_flush
+  // fell due before the handler could start, so the caller runs it first.
+  private async runTimer(claim: TimerClaim, runDeadline: number): Promise<'ran' | 'skipped' | 'lane' | 'budget'> {
+    const handler = this.timerKinds.get(claim.kind);
+    const key = JSON.stringify([claim.kind, claim.ref]);
+    const id = crypto.randomUUID();
+    const start = await this.work.run(async () => {
+      const timers = this.timerTable();
+      const now = this.timerNow();
+      // Replaced or deleted since the claim: its new schedule governs.
+      if (!timers.owned(claim.kind, claim.ref, claim.token)) return 'skipped';
+      // A call still running in this isolate is not started twice within its lease; the row waits for its claim.
+      const running = this.inFlight.get(key);
+      if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
+      // Checked again here, just before the handler starts: this step may have waited behind other work.
+      if (this.laneDue()) return 'lane';
+      if (now >= runDeadline) return 'budget';
+      // Other kinds act on mailbox state, which is complete only while ready.
+      // A kind this version does not know (for example after a rollback) waits too.
+      if (!handler || this.lifecycleState() !== 'ready') {
+        await this.rearm(() => timers.setIfOwned(claim.kind, claim.ref, claim.token, now + HELD_RECHECK_MS));
+        return 'skipped';
+      }
+      // This claim kept an earlier call's token, and that call has since settled
+      // or its lease ran out: the new call gets its own token, so the earlier
+      // call's queued retry cannot touch it. Only now, when a call really starts.
+      if (claim.retained) {
+        claim.token = crypto.randomUUID();
+        claim.retained = false;
+        timers.claim(claim.kind, claim.ref, claim.until, claim.token);
+      }
+      this.inFlight.set(key, { started: now, id, token: claim.token });
+      return 'start';
+    });
+    if (start !== 'start' || !handler) return start === 'start' ? 'skipped' : start;
+    const now = this.timerNow();
+    const call = (async () => handler.run({ ref: claim.ref, now, local: this.local }))();
+    const outcome = call.then(() => ({ failed: false }), () => ({ failed: true }));
+    void outcome.then(() => {
+      // A later call may hold the entry after this one's lease ran out.
+      if (this.inFlight.get(key)?.id === id) this.inFlight.delete(key);
+    });
+    const result = await this.race(outcome, now + this.timerHandlerBudgetMs);
+    if (result === 'failed') await this.retryFailed(claim);
+    // A call that lost its race and fails later still gets its retry, unless its row was rescheduled since.
+    else if (result === 'lost') void outcome.then(({ failed }) => failed ? this.retryFailed(claim) : undefined).catch(() => {});
+    return 'ran';
+  }
+
+  // A failing handler neither blocks the remaining rows nor spins: a row still
+  // claimed for its call waits TIMER_RETRY_MS from the failure.
+  private async retryFailed(claim: TimerClaim): Promise<void> {
+    await this.work.run(async () => {
+      const timers = this.timerTable();
+      await this.rearm(() => timers.setIfOwned(claim.kind, claim.ref, claim.token, this.timerNow() + this.timerRetryMs));
+    });
+  }
+
+  // Waits for a handler until the earlier of its budget and the journal_flush
+  // deadline, re-reading that deadline whenever a write moves it earlier.
+  private async race(outcome: Promise<{ failed: boolean }>, budget: number): Promise<'settled' | 'failed' | 'lost'> {
+    for (;;) {
+      const lane = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+      const until = Math.min(budget, lane ?? Infinity);
+      const wait = until - this.timerNow();
+      if (wait <= 0) return 'lost';
+      const moved = this.laneMoved = Promise.withResolvers<void>();
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const tick = new Promise<null>(resolve => { timeout = setTimeout(() => resolve(null), wait); });
+      try {
+        const result = await Promise.race([outcome, tick, moved.promise.then(() => null)]);
+        if (result) return result.failed ? 'failed' : 'settled';
+      } finally {
+        clearTimeout(timeout);
+        if (this.laneMoved === moved) this.laneMoved = null;
+      }
+    }
+  }
+
+  // The journal_flush row's handler: the backup and restore lane. Its row
+  // carries the deadline this lane computes, which the alarm used to carry.
+  private async flushLane(token: string): Promise<void> {
+    // Requests made before this run are being served by it.
+    this.wakeRequested = false;
+    const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+    if (!life || life.state === 'init') {
+      let held = false;
+      try { await this.checkBackupAlerts(null); } catch { held = true; }
+      await this.work.run(async () => {
+        const timers = this.timerTable();
+        const state = this.lifecycleState();
+        await this.rearm(() => {
+          // A call during this run made the mailbox ready (or started a
+          // restore). Keep the deadline it armed; if it armed none past the
+          // claim, the lane has work now.
+          if (state && state !== 'init') timers.settleIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token, Date.now());
+          // Nothing to publish or restore; keep a deadline a call set during this run.
+          else if (held) timers.setIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token, Date.now() + HELD_RECHECK_MS);
+          else timers.deleteIfOwned(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, token);
+        }, true);
+      });
+      return;
+    }
+    this.verifyScope(life.scope);
+    const index = this.index(life.scope.workspaceId);
+    const now = Date.now();
+    let next: number;
+    let failed = false;
+    try {
+      if (life.state === 'restoring') next = await this.restoreSlice(index, life);
+      else if (life.state === 'ready') {
+        if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
+        next = await this.backupSlice(index, life, now);
+      }
+      else next = now + HELD_RECHECK_MS;
+    } catch {
+      failed = true;
+      next = now + this.failed(index);
+    }
+    try { next = Math.min(next, await this.checkBackupAlerts(index)); }
+    catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); }
+    await this.work.run(async () => {
+      // A change committed during this run must not wait for the next deadline.
+      const current = index.lifecycle<Lifecycle>();
+      // A failed run retries unpublished changes within the settings recovery point, not the backoff.
+      const pending = current?.state === 'ready' && index.journal.flushed() < index.journal.revision();
+      const soon = Date.now() + (failed ? SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS : 1000);
+      const requested = this.wakeRequested ? Date.now() : Infinity;
+      this.wakeRequested = false;
+      const timers = this.timerTable();
+      await this.rearm(() => timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, Math.min(pending ? Math.min(next, soon) : next, requested)), true);
     });
   }
 
@@ -374,13 +753,18 @@ export class Mailbox extends DurableObject<Env> {
         fence: () => outbox.bumpRecoveryEpoch(workspaceId, mailboxId),
         replayPage: after => outbox.replayPage(workspaceId, mailboxId, after),
         release: (key, holder) => refs.release(key, holder),
+        rebuild: now => this.rebuildTimers(now),
       });
       // A restart means the manifest vanished under this restore. Each restart
       // counts against restore_blocked and backs off, so a manifest that keeps
       // disappearing cannot spin fence and baseline writes in a silent loop.
       if (life.state === 'restoring' && (life.restarts ?? 0) > restarts) return Date.now() + backoff(life.restarts ?? 1);
     } while (life.state === 'restoring' && Date.now() < deadline);
-    if (life.state === 'ready') await outbox.markBackedUp(workspaceId, mailboxId).catch(() => {});
+    if (life.state === 'ready') {
+      // Rows rebuilt by the finishing transaction are armed before anything else runs.
+      await this.work.run(() => this.rearm());
+      await outbox.markBackedUp(workspaceId, mailboxId).catch(() => {});
+    }
     return Date.now() + (life.state === 'restoring' ? 0 : 1000);
   }
 
