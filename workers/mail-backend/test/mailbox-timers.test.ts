@@ -127,7 +127,10 @@ test('a crash after a handler commit and before re-arm still fires the remaining
   // Arming the first row lets the platform fire the alarm; the handler of `a` commits, then the object is reset.
   await box.schedule('test_a', 'a', due);
   let after = stub();
+  const giveUp = Date.now() + 8_000;
   for (;;) {
+    // Fail within the test's own timeout instead of polling after it.
+    assert.ok(Date.now() < giveUp, 'the platform-fired alarm did not run the handler');
     try {
       if ((await fired(after)).length) break;
     } catch {
