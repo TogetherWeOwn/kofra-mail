@@ -59,18 +59,26 @@ export class Mailbox extends DurableObject<Env> {
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
-  // On every start, before the object serves any call: a stored alarm earlier
-  // than every row (or, with no rows, for a mailbox past init) was armed by
-  // another version, so it is the journal lane's deadline; lower the lane to it.
-  // This version never arms the alarm earlier than its earliest row, except
-  // the disabled-backend fallback, where lowering only runs the lane early.
+  // On every start, before the object serves any call, restore alarm =
+  // MIN(due_at) after another version may have armed it:
+  // - a stored alarm earlier than every row (or, with no rows, for a mailbox
+  //   past init) is the journal lane's deadline, so lower the lane to it. This
+  //   version never arms earlier than its earliest row except the
+  //   disabled-backend fallback, where lowering only runs the lane early;
+  // - with the backend enabled, a missing alarm or one later than the
+  //   earliest row is re-armed at that row. A disabled backend keeps its held
+  //   recheck.
   private async adoptArmedAlarm(): Promise<void> {
     const state = storedLifecycle<Lifecycle>(this.ctx.storage)?.state;
     const armed = await this.ctx.storage.getAlarm();
-    if (armed === null) return;
     const timers = this.timerTable();
     const earliest = timers.earliest();
-    if (earliest === null ? !!state && state !== 'init' : armed < earliest) timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
+    if (armed !== null && (earliest === null ? !!state && state !== 'init' : armed < earliest)) {
+      timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, armed);
+    }
+    if (!enabled(this.env)) return;
+    const due = timers.earliest();
+    if (due !== null && (armed === null || armed > due)) await this.ctx.storage.setAlarm(due);
   }
 
   // Registers a timer kind. Call from the constructor.

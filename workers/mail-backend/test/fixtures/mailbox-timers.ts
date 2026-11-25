@@ -39,7 +39,12 @@ export class TimerMailbox extends Mailbox {
   private editWindow: { before: number; after: number } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, { ...env, SWEEPER: { getByName: () => ({
+    // A backend switched off by a test stays off across a restart, so the object starts disabled.
+    let disabled = false;
+    try {
+      disabled = ctx.storage.sql.exec("SELECT 1 FROM fixture_settings WHERE name = 'backend_off'").toArray().length > 0;
+    } catch { /* no fixture tables yet */ }
+    super(ctx, { ...env, ...(disabled ? { MAIL_BACKEND_ENABLED: 'off' } : {}), SWEEPER: { getByName: () => ({
       register: async () => { throw new Error('Unexpected timer fixture registration'); },
       hold: async () => {}, release: async () => {},
     }) } });
@@ -291,6 +296,14 @@ export class TimerMailbox extends Mailbox {
   // State an earlier version left: its alarm armed, and no journal_flush row. The object restarts.
   // State another version left, then a restart: its armed alarm, and the
   // journal_flush row it left (`null` for none, as before timers existed).
+  // Another version armed (or cleared) the platform alarm and left the rows as they are; the object restarts.
+  async seedAlarmRestart(alarmAt: number | null) {
+    if (alarmAt === null) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(alarmAt);
+    await this.ctx.storage.sync();
+    this.ctx.abort('Fixture restart after another version armed the alarm');
+  }
+
   async seedRestart(alarmAt: number, laneAt: number | null) {
     const timers = new TimerTable(this.ctx.storage.sql);
     if (laneAt === null) timers.delete(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
@@ -339,7 +352,14 @@ export class TimerMailbox extends Mailbox {
   }
 
   async setClockOffset(ms: number) { this.clockOffset = ms; }
-  async setBackendEnabled(on: boolean) { this.env.MAIL_BACKEND_ENABLED = on ? 'on' : 'off'; }
+  async setBackendEnabled(on: boolean, persist = false) {
+    this.env.MAIL_BACKEND_ENABLED = on ? 'on' : 'off';
+    if (persist) {
+      this.fixtureSchema();
+      if (on) this.ctx.storage.sql.exec("DELETE FROM fixture_settings WHERE name = 'backend_off'");
+      else this.ctx.storage.sql.exec("INSERT OR REPLACE INTO fixture_settings VALUES ('backend_off', 1)");
+    }
+  }
   async crashState() {
     this.fixtureSchema();
     const row = this.ctx.storage.sql.exec<{ armed: number | null; rows: string }>('SELECT armed, rows FROM fixture_crash').toArray()[0];

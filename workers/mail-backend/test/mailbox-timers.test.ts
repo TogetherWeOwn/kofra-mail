@@ -622,6 +622,47 @@ test('a budget exit keeps a still-running call\'s row, so its late throw gets th
   await box.releaseHang();
 });
 
+for (const [name, alarm] of [['a platform alarm days later', 3 * 24 * 60 * 60_000], ['no platform alarm', null]] as const) {
+  test(`on start, a due row with ${name} is re-armed at the row, and the timer runs`, { timeout: 10_000 }, async t => {
+    const { box, stub, fired } = await setup(t);
+    await box.setup('ready');
+    const due = Date.now() - 1_000;
+    await box.schedule('test_a', 'now', due);
+    // The next platform-fired alarm runs the dispatcher.
+    await box.dispatchAlarms('woken');
+    // An older version consumed the wake-up and armed a later backup (or none).
+    await assert.rejects(box.seedAlarmRestart(alarm === null ? null : Date.now() + alarm));
+    const giveUp = Date.now() + 8_000;
+    let after = stub();
+    let seen: Fired[] = [];
+    for (;;) {
+      assert.ok(Date.now() < giveUp, `the timer did not run: ${JSON.stringify(seen)}`);
+      try {
+        // A read-only RPC starts the object.
+        seen = await fired(after);
+        if (seen.length) break;
+      } catch {
+        after = stub();
+      }
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.deepEqual(seen.map(({ label, ref }) => [label, ref]), [['woken', 'now']]);
+  });
+}
+
+test('on start, a disabled backend keeps its held recheck', async t => {
+  const { box, stub } = await setup(t);
+  await box.setup('ready');
+  await box.schedule('test_a', 'now', Date.now() - 1_000);
+  await box.setBackendEnabled(false, true);
+  await box.run('off');
+  const held = await box.alarmAt();
+  assert.ok(held !== null && held > Date.now() + 60_000);
+  await assert.rejects(box.evict());
+  const after = stub();
+  assert.equal(await after.alarmAt(), held, 'the held recheck is not replaced by the due row');
+});
+
 test('an eviction does not turn an ordinary timer into a journal_flush row', async t => {
   const { box, stub, rows } = await setup(t);
   await box.setup('ready');
