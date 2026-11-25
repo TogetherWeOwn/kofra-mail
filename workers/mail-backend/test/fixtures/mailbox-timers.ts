@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex, storedLifecycle } from '../../src/mailbox-index.ts';
-import { MailboxRecovery, readyLife, type Lifecycle } from '../../src/mailbox-recovery.ts';
+import { MailboxRecovery, readyLife, SNAPSHOT_INTERVAL_MS, type Lifecycle } from '../../src/mailbox-recovery.ts';
 import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TimerTable, type TimerRun } from '../../src/mailbox-timers.ts';
 import type { Env } from '../../src/worker.ts';
 
@@ -60,7 +60,8 @@ export class TimerMailbox extends Mailbox {
       CREATE TABLE IF NOT EXISTS fixture_fired (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, kind TEXT NOT NULL,
         ref TEXT NOT NULL, now INTEGER NOT NULL, flushed INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS fixture_plan (ref TEXT PRIMARY KEY, action TEXT NOT NULL, at INTEGER);
-      CREATE TABLE IF NOT EXISTS fixture_rebuilds (kind TEXT NOT NULL, state TEXT);`);
+      CREATE TABLE IF NOT EXISTS fixture_rebuilds (kind TEXT NOT NULL, state TEXT);
+      CREATE TABLE IF NOT EXISTS fixture_dispatch (label TEXT NOT NULL);`);
   }
 
   private async fire(kind: string, { ref, now, local }: TimerRun) {
@@ -109,7 +110,8 @@ export class TimerMailbox extends Mailbox {
     }, this.ctx.id.toString());
   }
 
-  async setup(mode: 'ready' | 'missing') {
+  // `stale` backdates the last snapshot, so the journal lane raises backup_stale.
+  async setup(mode: 'ready' | 'missing', stale = false) {
     const index = this.localIndex();
     const now = Date.now();
     const incarnation = crypto.randomUUID();
@@ -117,15 +119,30 @@ export class TimerMailbox extends Mailbox {
     if (mode === 'ready') {
       const etag = await new MailboxRecovery(index, this.env.MAIL_STATE, this.ctx.id.toString()).create(incarnation);
       if (!etag) throw new Error('Fixture manifest exists');
-      index.setLifecycle(readyLife(scope, incarnation, etag, 1, now));
+      const life = readyLife(scope, incarnation, etag, 1, now);
+      index.setLifecycle(stale ? { ...life, lastSnapshotAt: now - 2 * SNAPSHOT_INTERVAL_MS - 1000 } : life);
     } else {
       index.setLifecycle({ state: 'missing', scope, incarnation, since: now, failures: 0 });
     }
     return this.ctx.id.toString();
   }
 
-  // Drive the real handler explicitly so background alarms cannot race test checkpoints.
-  override async alarm() {}
+  // Background alarms are ignored so they cannot race test checkpoints, except
+  // one platform-fired alarm a test asked for. The request is stored, so it
+  // is consumed once even if the object is reset during that alarm.
+  override async alarm() {
+    this.fixtureSchema();
+    const sql = this.ctx.storage.sql;
+    const request = sql.exec<{ label: string }>('SELECT label FROM fixture_dispatch').toArray()[0];
+    if (!request) return;
+    sql.exec('DELETE FROM fixture_dispatch');
+    this.label = request.label;
+    await super.alarm();
+  }
+  async dispatchNextAlarm(label: string) {
+    this.fixtureSchema();
+    this.ctx.storage.sql.exec('INSERT INTO fixture_dispatch VALUES (?)', label);
+  }
   async run(label: string) {
     this.label = label;
     await super.alarm();

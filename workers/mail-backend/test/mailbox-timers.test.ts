@@ -116,15 +116,27 @@ test('set replaces a due time and the lower-only variant keeps the earlier one',
   assert.match(await box.scheduleError('test_a', '', now) ?? '', /timer/i);
 });
 
-test('a crash after a handler commit and before re-arm still fires the remaining timers next alarm', async t => {
+test('a crash after a handler commit and before re-arm still fires the remaining timers next alarm', { timeout: 10_000 }, async t => {
   const { box, stub, rows, fired } = await setup(t);
   await box.setup('ready');
   const due = Date.now() - 10;
-  for (const ref of ['a', 'b', 'c']) await box.schedule('test_a', ref, due);
+  for (const ref of ['b', 'c']) await box.seedStale('test_a', ref, due);
   await box.plan('a', 'crash');
+  await box.dispatchNextAlarm('crash');
   const claimedAfter = Date.now();
-  await assert.rejects(box.run('crash'));
-  const after = stub();
+  // Arming the first row lets the platform fire the alarm; the handler of `a` commits, then the object is reset.
+  await box.schedule('test_a', 'a', due);
+  let after = stub();
+  for (;;) {
+    try {
+      if ((await fired(after)).length) break;
+    } catch {
+      // A stub to the reset object fails once; take a fresh one.
+    }
+    after = stub();
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  after = stub();
   assert.deepEqual((await fired(after)).map(({ label, ref }) => [label, ref]), [['crash', 'a']], 'the handler commit is durable');
   const left = await rows(after);
   assert.deepEqual(left.map(row => row.ref), ['b', 'c'], 'the crashed run left the other rows');
@@ -134,6 +146,7 @@ test('a crash after a handler commit and before re-arm still fires the remaining
     assert.ok(row.due_at >= claimedAfter + RETRY_MS - 1_000 && row.due_at <= Date.now() + RETRY_MS, 'claimed rows wait one retry interval');
     assert.ok(alarm <= row.due_at, 'the armed alarm is no later than each remaining row');
   }
+  // That alarm fires a minute later; run its handler directly with the clock moved past it.
   await after.setClockOffset(alarm - Date.now() + RETRY_MS);
   await after.run('next');
   assert.deepEqual((await fired(after)).map(({ label, ref }) => [label, ref]), [['crash', 'a'], ['next', 'b'], ['next', 'c']]);
@@ -296,6 +309,26 @@ test('a due journal_flush runs first, even behind more than 64 earlier due rows'
   assert.equal(ran.length, 63, 'journal_flush takes one of the 64 places');
   assert.ok(ran.every(row => row.flushed === 1), 'the journal was published before any other handler ran');
   assert.equal((await rows()).filter(row => row.kind !== 'journal_flush').length, 37);
+});
+
+test('a journal_flush that falls due after the claim runs before the first other-kind handler', { timeout: 10_000 }, async t => {
+  const { box, fired, alertGate, bucket } = await setup(t);
+  const id = await box.setup('ready', true);
+  // Rows are claimed a minute ahead, so an edit armed mid-run is already due for the dispatcher.
+  await box.setClockOffset(60_000);
+  await box.setLaneDue(Date.now() - 1);
+  await box.schedule('test_a', 'next', Date.now() - 1);
+  alertGate.entered = Promise.withResolvers<void>();
+  alertGate.release = Promise.withResolvers<void>();
+  const run = box.run('first');
+  // The claimed journal_flush runs first and is sending its backup_stale alert.
+  await alertGate.entered.promise;
+  await box.setLabel(...scope, 'edit', 'Edit');
+  alertGate.release.resolve();
+  await run;
+  assert.deepEqual((await fired()).map(row => [row.ref, row.flushed]), [['next', 1]],
+    'the journal deadline that fell due after the claim ran before the other handler started');
+  assert.equal(await published(bucket, id), 1);
 });
 
 test('a hung handler does not delay a journal_flush that is due when the alarm starts', { timeout: 10_000 }, async t => {

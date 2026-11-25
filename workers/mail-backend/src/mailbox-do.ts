@@ -384,8 +384,9 @@ export class Mailbox extends DurableObject<Env> {
           await this.runLane();
           continue;
         }
-        // A journal_flush deadline that arrived during another handler never waits behind the next one.
-        if (handlerRan && await this.runLaneIfDue()) handlerRan = false;
+        // A journal_flush deadline that fell due since the claim (or during
+        // another handler) never waits behind the next handler.
+        if (await this.runLaneIfDue()) handlerRan = false;
         if (this.timerNow() - started >= this.timerRunBudgetMs) {
           await this.releaseClaims(claims.slice(i));
           break;
