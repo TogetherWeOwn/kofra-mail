@@ -1,6 +1,13 @@
 // FTS5's unicode61 tokenizer drops punctuation but indexes private-use tokens.
 export const ATTACHMENT_SEARCH_BOUNDARY = String.fromCodePoint(0xE000);
 
+// Local scheduling state of the mailbox object's one alarm (mailbox-timers.ts).
+// Never journalled or copied into snapshots; rebuilt after a restore.
+export const TIMERS_SCHEMA = `
+CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (kind, ref));
+CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
+`;
+
 export const MAILBOX_SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, size INTEGER NOT NULL,
@@ -59,4 +66,4 @@ CREATE TABLE IF NOT EXISTS journal (seq INTEGER PRIMARY KEY, event TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id = 1), modseq INTEGER NOT NULL, flushed INTEGER NOT NULL);
 INSERT OR IGNORE INTO state VALUES (1, 0, 0);
 CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL);
-`;
+${TIMERS_SCHEMA}`;

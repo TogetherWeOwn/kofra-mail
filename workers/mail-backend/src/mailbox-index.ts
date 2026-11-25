@@ -4,6 +4,7 @@ import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
+import { JOURNAL_FLUSH } from './mailbox-timers.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
@@ -535,11 +536,15 @@ export class MailboxIndex {
   clearSnapshot() { this.sql.exec('DELETE FROM backup_capture'); }
 
   // Call inside the transaction that also records the restore's first phase.
+  // Timer rows derive from the state being replaced; the journal_flush row is
+  // the restore's own schedule and stays. Each kind rebuilds its rows when the
+  // restore finishes.
   resetForRestore() {
     this.sql.exec(`DELETE FROM fts; DELETE FROM message_labels; DELETE FROM attachments; DELETE FROM messages; DELETE FROM threads;
       DELETE FROM receipts; DELETE FROM fingerprints; DELETE FROM labels; DELETE FROM drafts; DELETE FROM bayes;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
+    this.sql.exec('DELETE FROM timers WHERE kind <> ?', JOURNAL_FLUSH);
   }
 
   finishSnapshot(seq: number) {
