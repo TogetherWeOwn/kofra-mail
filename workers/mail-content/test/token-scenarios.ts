@@ -267,7 +267,7 @@ s('tokens: malformed tokens and claims fail even with a valid MAC', async (ctx) 
   const shapes = [
     '', kid, `${kid}.${payload}`, `${token}.`, `.${token}`, `${token}.x`, `${kid}..${mac}`, `${kid}.${payload}.`,
     `${kid}.${payload}=.${mac}`, `${kid}.${payload}.${mac}=`, `${kid}.${payload}.${mac.slice(1)}`, `${kid}.${payload}.${mac}A`,
-    `${kid}.${payload.replace(/[-_]/g, '+')}.${mac}`, ` ${token}`, `${token}\n`, `${kid}.${'A'.repeat(20_000)}.${mac}`,
+    `${kid}.${payload.slice(0, -1)}+.${mac}`, ` ${token}`, `${token}\n`, `${kid}.${'A'.repeat(20_000)}.${mac}`,
   ];
   for (const shape of shapes) await refused(verifier.verify('body', shape, NOW), `shape ${shapes.indexOf(shape)}`);
   const bad: unknown[] = [
