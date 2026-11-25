@@ -627,9 +627,11 @@ for (const [name, alarm] of [['a platform alarm days later', 3 * 24 * 60 * 60_00
     const { box, stub, fired } = await setup(t);
     await box.setup('ready');
     const due = Date.now() - 1_000;
-    await box.schedule('test_a', 'now', due);
+    // Written without arming anything: only the start step can arm a wake-up for it.
+    await box.seedStale('test_a', 'now', due);
     // The next platform-fired alarm runs the dispatcher.
     await box.dispatchAlarms('woken');
+    assert.deepEqual(JSON.parse(await box.alarmRuns()), [], 'no alarm ran before the restart');
     // An older version consumed the wake-up and armed a later backup (or none).
     await assert.rejects(box.seedAlarmRestart(alarm === null ? null : Date.now() + alarm));
     const giveUp = Date.now() + 8_000;
