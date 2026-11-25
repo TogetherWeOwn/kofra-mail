@@ -4,7 +4,9 @@ export const ATTACHMENT_SEARCH_BOUNDARY = String.fromCodePoint(0xE000);
 // Local scheduling state of the mailbox object's one alarm (mailbox-timers.ts).
 // Never journalled or copied into snapshots; rebuilt after a restore.
 export const TIMERS_SCHEMA = `
-CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, PRIMARY KEY (kind, ref));
+-- claim: the token of the alarm call that claimed the row; every other write clears it.
+CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, ref TEXT NOT NULL, claim TEXT,
+  PRIMARY KEY (kind, ref));
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
 `;
 
