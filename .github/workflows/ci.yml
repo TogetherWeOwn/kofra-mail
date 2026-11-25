@@ -108,9 +108,24 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  mail-content:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.3'
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck -w @kofra/mail-content
+      - run: npm test -w @kofra/mail-content
+
   ci-ok:
     name: ci-ok
-    needs: [workflow-lint, web, mail-browser, mail-backend]
+    needs: [workflow-lint, web, mail-browser, mail-backend, mail-content]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
