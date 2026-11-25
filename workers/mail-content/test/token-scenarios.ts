@@ -244,6 +244,19 @@ s('tokens: a payload over 4 KiB fails', async (ctx) => {
   check(parts(big).payload.length > 4096 && encoder.encode(quoted).length <= 2048, 'fixture: an oversized payload with valid claims');
   await refused(verifier.verify('img', big, NOW), 'payload over 4 KiB');
   await throws(() => mintAny(k.keys, 'img', { ...ids, ep: 1, u: quoted }, NOW), 'mint payload over 4 KiB');
+  // At the boundary: the whole token stays short, so only the payload rule can refuse it.
+  const url = (n: number) => `https://sender.example/${'"'.repeat(n)}`;
+  const sized = (n: number) => full(ids, { u: url(n) });
+  const length = (n: number) => b64url(encoder.encode(JSON.stringify(sized(n)))).length;
+  let n = 0;
+  while (length(n + 1) <= 4096) n++;
+  check(length(n) > 4090 && length(n + 1) > 4096 && length(n + 1) < 4110, 'fixture: payloads either side of 4,096');
+  const edge = await forge(k, 'k1', 'img', sized(n));
+  ctx.sensitive(edge);
+  await accepted(verifier.verify('img', edge, NOW), 'payload at most 4,096 characters');
+  await accepted(verifier.verify('img', await mintAny(k.keys, 'img', { ...ids, ep: 1, u: url(n) }, NOW), NOW), 'mint at the limit');
+  await refused(verifier.verify('img', await forge(k, 'k1', 'img', sized(n + 1)), NOW), 'payload just over 4,096 characters');
+  await throws(() => mintAny(k.keys, 'img', { ...ids, ep: 1, u: url(n + 1) }, NOW), 'mint just over the limit');
   const longest = `https://sender.example/${'a'.repeat(2048 - 23)}`;
   check(encoder.encode(longest).length === 2048, 'fixture: 2,048-byte URL');
   await accepted(verifier.verify('img', await issue('img', { u: longest }), NOW), 'u of 2,048 bytes');
