@@ -603,9 +603,13 @@ test('a budget exit keeps a still-running call\'s row, so its late throw gets th
   await box.schedule('test_a', 'a', Date.now() - 1_000);
   // Once started, `a` moves the timer clock past the 60 s run budget, then hangs: no wall-clock margin.
   await box.plan('a', 'hang-advance', RETRY_MS + 1_000);
+  // `z` comes after `x` and has no running call: only a budget exit leaves it unstarted.
+  const xDue = (await rows()).find(row => row.ref === 'x')!.due_at;
+  await box.schedule('test_a', 'z', xDue + 1);
   await box.setBudgets(100, 60_000);
   await box.run('second');
-  assert.deepEqual((await fired()).map(row => row.ref), ['x', 'a'], '`a` ran, then the budget ended the run before `x`');
+  assert.deepEqual((await fired()).map(row => row.ref), ['x', 'a'], '`a` ran, then the budget ended the run');
+  assert.equal((await rows()).find(row => row.ref === 'z')?.due_at, xDue + 1, '`z` was released to its own due time, not run');
   assert.deepEqual((await box.handlerState()).running, { 'test_a/a': 1, 'test_a/x': 1 });
   // The first call throws at 119 s, inside its lease, without moving its row.
   await box.setClockOffset(119_000);
