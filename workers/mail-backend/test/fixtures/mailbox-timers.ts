@@ -2,12 +2,13 @@ import { DurableObject } from 'cloudflare:workers';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex, storedLifecycle } from '../../src/mailbox-index.ts';
 import { MailboxRecovery, readyLife, type Lifecycle } from '../../src/mailbox-recovery.ts';
-import { TimerTable } from '../../src/mailbox-timers.ts';
+import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TimerTable, type TimerRun } from '../../src/mailbox-timers.ts';
 import type { Env } from '../../src/worker.ts';
 
 const scope = { workspaceId: 'workspace', mailboxId: 'mailbox' };
 // What the test-only handler does with the row it runs.
-type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash';
+// `hang` moves the row to `at` (if given) in its first step, then awaits until released.
+type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 'async-step';
 
 // A mailbox with two test-only timer kinds. Fixture tables live in the same
 // SQLite database, so a handler's record commits atomically with its row change.
@@ -16,6 +17,10 @@ export class TimerMailbox extends Mailbox {
   private label = '';
   private armed: number | null = null;
   private rebuildFault = false;
+  private hang = Promise.withResolvers<void>();
+  private readonly active = new Set<string>();
+  private overlaps = 0;
+  private errors: string[] = [];
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, { ...env, SWEEPER: { getByName: () => ({
@@ -36,7 +41,7 @@ export class TimerMailbox extends Mailbox {
     } });
     for (const kind of ['test_a', 'test_b']) {
       this.registerTimerKind(kind, {
-        run: (ref, now) => this.fire(kind, ref, now),
+        run: timer => this.fire(kind, timer),
         rebuild: (timers, now) => {
           if (this.rebuildFault) throw new Error('Fixture rebuild failure');
           this.fixtureSchema();
@@ -53,23 +58,43 @@ export class TimerMailbox extends Mailbox {
   private fixtureSchema() {
     this.ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS fixture_fired (seq INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, kind TEXT NOT NULL,
-        ref TEXT NOT NULL, now INTEGER NOT NULL);
+        ref TEXT NOT NULL, now INTEGER NOT NULL, flushed INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS fixture_plan (ref TEXT PRIMARY KEY, action TEXT NOT NULL, at INTEGER);
       CREATE TABLE IF NOT EXISTS fixture_rebuilds (kind TEXT NOT NULL, state TEXT);`);
   }
 
-  private async fire(kind: string, ref: string, now: number) {
+  private async fire(kind: string, { ref, now, local }: TimerRun) {
+    const key = `${kind}/${ref}`;
+    if (this.active.has(key)) this.overlaps++;
+    this.active.add(key);
+    try {
+      await this.act(kind, ref, now, local);
+    } catch (error) {
+      this.errors.push(error instanceof Error ? error.message : String(error));
+      throw error;
+    } finally {
+      this.active.delete(key);
+    }
+  }
+
+  private async act(kind: string, ref: string, now: number, local: TimerRun['local']) {
     this.fixtureSchema();
     const sql = this.ctx.storage.sql;
     const plan = sql.exec<{ action: Plan; at: number | null }>('SELECT action, at FROM fixture_plan WHERE ref = ?', ref).toArray()[0];
     const action = plan?.action ?? 'delete';
-    const timers = new TimerTable(sql);
-    this.ctx.storage.transactionSync(() => {
-      sql.exec('INSERT INTO fixture_fired (label, kind, ref, now) VALUES (?, ?, ?, ?)', this.label, kind, ref, now);
+    if (action === 'async-step') {
+      await local((async () => {}) as unknown as () => void);
+      return;
+    }
+    await local(timers => {
+      // Whether the mailbox journal was fully published when this handler first ran.
+      const { flushed } = sql.exec<{ flushed: number }>('SELECT modseq = flushed AS flushed FROM state').one();
+      sql.exec('INSERT INTO fixture_fired (label, kind, ref, now, flushed) VALUES (?, ?, ?, ?, ?)', this.label, kind, ref, now, flushed);
       if (action === 'delete' || action === 'crash') timers.delete(kind, ref);
-      if (action === 'move-and-throw') timers.set(kind, ref, plan!.at!);
+      if ((action === 'move-and-throw' || action === 'hang') && plan!.at !== null) timers.set(kind, ref, plan!.at);
     });
     if (action === 'throw' || action === 'move-and-throw') throw new Error('Fixture handler failure');
+    if (action === 'hang') await this.hang.promise;
     if (action === 'crash') {
       // The commit above is durable before the object is reset mid-run.
       await this.ctx.storage.sync();
@@ -142,7 +167,7 @@ export class TimerMailbox extends Mailbox {
 
   async fired() {
     this.fixtureSchema();
-    return JSON.stringify(this.ctx.storage.sql.exec('SELECT label, kind, ref, now FROM fixture_fired ORDER BY seq').toArray());
+    return JSON.stringify(this.ctx.storage.sql.exec('SELECT label, kind, ref, now, flushed FROM fixture_fired ORDER BY seq').toArray());
   }
 
   async rebuilds() {
@@ -151,6 +176,17 @@ export class TimerMailbox extends Mailbox {
   }
 
   async setClockOffset(ms: number) { this.clockOffset = ms; }
+  async setBudgets(handlerMs: number, runMs: number) {
+    this.timerHandlerBudgetMs = handlerMs;
+    this.timerRunBudgetMs = runMs;
+  }
+  // Sets the journal_flush row directly, as the lane's own deadline would.
+  async setLaneDue(at: number) { new TimerTable(this.ctx.storage.sql).set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, at); }
+  async releaseHang() {
+    this.hang.resolve();
+    this.hang = Promise.withResolvers<void>();
+  }
+  async handlerState() { return { active: [...this.active].sort(), overlaps: this.overlaps, errors: this.errors }; }
   async setRebuildFault(on: boolean) { this.rebuildFault = on; }
   async alarmAt() { return this.ctx.storage.getAlarm(); }
   async lastArmed() { return this.armed; }

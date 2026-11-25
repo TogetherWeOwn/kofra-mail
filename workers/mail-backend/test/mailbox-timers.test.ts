@@ -8,7 +8,7 @@ import { migrateDirectory, seedDirectory } from './fixtures/directory-db.ts';
 import { mailboxName } from '../src/worker.ts';
 
 type Row = { due_at: number; kind: string; ref: string };
-type Fired = { label: string; kind: string; ref: string; now: number };
+type Fired = { label: string; kind: string; ref: string; now: number; flushed: number };
 const scope = ['workspace', 'mailbox'] as const;
 const RETRY_MS = 60_000;
 
@@ -265,4 +265,143 @@ test('restore takeover calls every registered rebuild inside the transaction tha
     ['test_a/rebuilt', 'test_b/rebuilt']);
   assert.ok(lane(restored), 'the journal_flush row survives a restore');
   assert.equal(await box.alarmAt(), Math.min(...restored.map(row => row.due_at)));
+});
+
+const published = async (bucket: Awaited<ReturnType<typeof setup>>['bucket'], id: string) => {
+  const manifest = await bucket.get(`journal/${id}/manifest.json`);
+  return (JSON.parse(await manifest!.text()) as { last_seq: number }).last_seq;
+};
+
+test('a timer written by an RPC is armed before the RPC answers', async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  const at = Date.now() + 5 * 60_000;
+  await box.schedule('test_a', 'armed', at);
+  assert.equal(await box.alarmAt(), at);
+  await box.setLabel(...scope, 'edit', 'Edit');
+  const flush = lane(await rows());
+  assert.ok(flush && flush.due_at < at);
+  assert.equal(await box.alarmAt(), flush.due_at, 'an edit arms its journal_flush deadline before it answers');
+});
+
+test('a due journal_flush runs first, even behind more than 64 earlier due rows', async t => {
+  const { box, rows, fired, bucket } = await setup(t);
+  const id = await box.setup('ready');
+  await box.setLabel(...scope, 'edit', 'Edit');
+  await box.seed(100, Date.now() - 60_000);
+  await box.setLaneDue(Date.now() - 1);
+  await box.run('first');
+  assert.equal(await published(bucket, id), 1);
+  const ran = (await fired()).filter(row => row.label === 'first');
+  assert.equal(ran.length, 63, 'journal_flush takes one of the 64 places');
+  assert.ok(ran.every(row => row.flushed === 1), 'the journal was published before any other handler ran');
+  assert.equal((await rows()).filter(row => row.kind !== 'journal_flush').length, 37);
+});
+
+test('a hung handler does not delay a journal_flush that is due when the alarm starts', { timeout: 10_000 }, async t => {
+  const { box, fired, bucket } = await setup(t);
+  const id = await box.setup('ready');
+  await box.setBudgets(10 * 60_000, 20 * 60_000);
+  await box.setLabel(...scope, 'edit', 'Edit');
+  await box.schedule('test_a', 'hung', Date.now() - 1_000);
+  await box.plan('hung', 'hang');
+  await box.setLaneDue(Date.now() - 1);
+  const run = box.run('first');
+  // The handler's ten-minute budget is still running; journal_flush has already run.
+  while ((await box.handlerState()).active.length === 0) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(await published(bucket, id), 1);
+  assert.deepEqual((await fired()).map(row => [row.ref, row.flushed]), [['hung', 1]], 'journal_flush ran before the hung handler');
+  await box.releaseHang();
+  await run;
+});
+
+test('a hung handler does not delay a journal_flush that becomes due while it runs', { timeout: 10_000 }, async t => {
+  const { box, fired, bucket } = await setup(t);
+  const id = await box.setup('ready');
+  // The handler's own budget is ten minutes: only the journal deadline can end its race.
+  await box.setBudgets(10 * 60_000, 20 * 60_000);
+  await box.setLabel(...scope, 'edit', 'Edit');
+  await box.schedule('test_a', 'hung', Date.now() - 1_000);
+  await box.plan('hung', 'hang');
+  const started = Date.now();
+  await box.setLaneDue(started + 500);
+  await box.run('first');
+  const elapsed = Date.now() - started;
+  assert.equal(await published(bucket, id), 1, 'journal_flush ran at its deadline');
+  assert.ok(elapsed < 8_000, `the run took ${elapsed} ms`);
+  assert.deepEqual((await fired()).map(row => [row.ref, row.flushed]), [['hung', 0]], 'the handler started before the deadline');
+  assert.deepEqual((await box.handlerState()).active, ['test_a/hung'], 'the handler is still awaiting');
+  await box.releaseHang();
+});
+
+test('an RPC that moves journal_flush earlier while a handler hangs runs it at once', { timeout: 10_000 }, async t => {
+  const { box, bucket } = await setup(t);
+  const id = await box.setup('ready');
+  await box.setBudgets(10 * 60_000, 20 * 60_000);
+  await box.schedule('test_a', 'hung', Date.now() - 1_000);
+  await box.plan('hung', 'hang');
+  await box.setLaneDue(Date.now() + 10 * 60_000);
+  const run = box.run('first');
+  while ((await box.handlerState()).active.length === 0) await new Promise(resolve => setTimeout(resolve, 10));
+  // Past the new deadline the edit arms, so the moved deadline is already due.
+  await box.setClockOffset(60_000);
+  // The edit's work-lane step completes while the handler awaits: the handler does not hold the work lane.
+  await box.setLabel(...scope, 'edit', 'Edit');
+  await run;
+  assert.equal(await published(bucket, id), 1, 'the moved deadline ran journal_flush without waiting for the handler');
+  assert.deepEqual((await box.handlerState()).active, ['test_a/hung']);
+  await box.releaseHang();
+});
+
+test('a handler that lost its race is not started again in this isolate until it settles', { timeout: 10_000 }, async t => {
+  const { box, rows, fired } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(100, 20 * 60_000);
+  const due = Date.now() - 1_000;
+  await box.schedule('test_a', 'slow', due);
+  // The handler re-arms its own row (still due) before it hangs.
+  await box.plan('slow', 'hang', due);
+  await box.run('first');
+  assert.equal((await rows()).find(row => row.ref === 'slow')?.due_at, due, 'a lost race keeps the due time the handler set');
+  await box.run('second');
+  assert.deepEqual((await fired()).map(row => row.label), ['first'], 'the in-flight call is not started twice');
+  const waiting = (await rows()).find(row => row.ref === 'slow');
+  assert.ok(waiting && waiting.due_at > Date.now(), 'the skipped row waits for its retry instead of spinning');
+  await box.releaseHang();
+  await box.setClockOffset(RETRY_MS + 1_000);
+  await box.plan('slow', 'delete');
+  await box.run('third');
+  assert.deepEqual((await fired()).map(row => row.label), ['first', 'third'], 'it runs again once the earlier call settled');
+  assert.equal((await box.handlerState()).overlaps, 0);
+});
+
+test('rows left when the run budget is spent wait for an immediate re-arm', { timeout: 10_000 }, async t => {
+  const { box, rows, fired } = await setup(t);
+  await box.setup('ready');
+  await box.setBudgets(150, 200);
+  const due = Date.now() - 1_000;
+  for (const ref of ['h1', 'h2', 'h3', 'h4']) {
+    await box.schedule('test_a', ref, due);
+    await box.plan(ref, 'hang');
+  }
+  await box.run('first');
+  const ran = (await fired()).map(row => row.ref);
+  assert.ok(ran.length >= 1 && ran.length < 4, `ran ${ran.join(',')}`);
+  const left = (await rows()).filter(row => !ran.includes(row.ref));
+  assert.ok(left.length > 0 && left.every(row => row.due_at === due), 'unstarted rows keep their original due time');
+  const armed = await box.lastArmed();
+  assert.ok(armed !== null && armed <= Date.now(), 'and the alarm re-arms at once');
+  await box.releaseHang();
+});
+
+test('a handler step must be synchronous', async t => {
+  const { box, rows } = await setup(t);
+  await box.setup('ready');
+  await box.schedule('test_a', 'async', Date.now() - 1_000);
+  await box.plan('async', 'async-step');
+  const before = Date.now();
+  await box.run('first');
+  assert.deepEqual((await box.handlerState()).errors, ['Timer steps must be synchronous']);
+  const row = (await rows()).find(r => r.ref === 'async');
+  assert.ok(row && row.due_at >= before + RETRY_MS, 'the refused handler is retried like any failure');
 });

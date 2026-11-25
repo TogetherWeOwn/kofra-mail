@@ -12,6 +12,13 @@ import { TIMERS_SCHEMA } from './mailbox-schema.ts';
 export const TIMER_BATCH = 64;
 // A row its handler did not move (or whose handler threw) waits this long.
 export const TIMER_RETRY_MS = 60_000;
+// Each handler of another kind is raced against the earlier of this and the
+// next journal_flush deadline; one that loses keeps running, but the alarm
+// moves on and runs journal_flush when it is due.
+export const TIMER_HANDLER_BUDGET_MS = 30_000;
+// After this much of one alarm call, rows not yet started wait for an
+// immediate re-arm, keeping a call well inside the platform's alarm limits.
+export const TIMER_RUN_BUDGET_MS = 60_000;
 // The mailbox journal's backup and restore lane: one row that carries the
 // lane's next deadline (delta publication, snapshots, restore slices, backoff).
 export const JOURNAL_FLUSH = 'journal_flush';
@@ -19,11 +26,25 @@ export const JOURNAL_FLUSH_REF = 'lane';
 
 export type TimerRow = { due_at: number; kind: string; ref: string };
 
+export type TimerRun = {
+  ref: string;
+  now: number;
+  // Runs one synchronous storage step inside the mailbox work lane, in a
+  // transaction, then re-arms the alarm. This is the handler's only way into
+  // the work lane, so it can never hold the lane across a remote call.
+  local<T>(step: (timers: TimerTable) => T): Promise<T>;
+};
+
 export type TimerKind = {
-  // Runs one due row inside the mailbox work lane. It must move (set) or
-  // delete its own row; a row left in place waits TIMER_RETRY_MS. A handler
-  // that changes state should move its row in the same transaction.
-  run(ref: string, now: number): Promise<void>;
+  // Runs one due row, outside the mailbox work lane: every storage read or
+  // write goes through `timer.local`, and remote calls happen between steps.
+  // The row is claimed at now + TIMER_RETRY_MS when the call starts. The
+  // handler re-arms its own row (moves or deletes it) in its first step,
+  // before it acts; a row it leaves in place waits for that claim, and a
+  // handler that throws without moving it waits TIMER_RETRY_MS from the throw.
+  // A call that outlives its race keeps the due time it set and is not
+  // started again in this isolate until it settles.
+  run(timer: TimerRun): Promise<void>;
   // Recreates this kind's rows from restored, journalled state. Runs
   // synchronously inside the transaction that finishes a restore.
   rebuild?(timers: TimerTable, now: number): void;
@@ -76,9 +97,9 @@ export class TimerTable {
     return row?.due_at ?? null;
   }
 
-  // Due rows in run order, bounded by the timers_due index.
-  dueRows(now: number, limit = TIMER_BATCH): TimerRow[] {
-    return this.sql.exec<TimerRow>('SELECT due_at, kind, ref FROM timers WHERE due_at <= ? ORDER BY due_at, kind, ref LIMIT ?',
-      now, limit).toArray();
+  // Due rows in run order (optionally without one kind), bounded by the timers_due index.
+  dueRows(now: number, limit = TIMER_BATCH, exceptKind = ''): TimerRow[] {
+    return this.sql.exec<TimerRow>(`SELECT due_at, kind, ref FROM timers WHERE due_at <= ? AND kind <> ?
+      ORDER BY due_at, kind, ref LIMIT ?`, now, exceptKind, limit).toArray();
   }
 }
