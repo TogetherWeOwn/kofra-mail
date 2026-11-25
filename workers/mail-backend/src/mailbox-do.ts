@@ -26,6 +26,7 @@ export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
 const HELD_RECHECK_MS = 15 * 60_000;
 type TimerClaim = TimerRow & { token: string; until: number };
+const thenable = (value: unknown): value is PromiseLike<unknown> => typeof (value as { then?: unknown } | null)?.then === 'function';
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
 const MAX_FAILURE_BACKOFF_MS = 15 * 60_000;
 const RESTORE_RESTART_ALERT = 3;
@@ -140,7 +141,18 @@ export class Mailbox extends DurableObject<Env> {
   // Inside the transaction that finishes a restore: each kind recreates its rows from the restored state.
   private rebuildTimers(now: number): void {
     const timers = this.timerTable();
-    for (const kind of this.timerKinds.values()) kind.rebuild?.(timers, now);
+    try {
+      for (const kind of this.timerKinds.values()) {
+        const result: unknown = kind.rebuild?.(timers, now);
+        // Its deferred writes would miss the transaction that sets the mailbox ready.
+        if (thenable(result)) {
+          result.then(undefined, () => {});
+          throw new Error('Timer rebuilds must be synchronous');
+        }
+      }
+    } finally {
+      timers.revoke();
+    }
   }
 
   private scoped(scope: Scope): boolean {
@@ -241,7 +253,10 @@ export class Mailbox extends DurableObject<Env> {
       // The alarm lane keeps its own wake-up (and restart or failure backoff)
       // for restoring and missing mailboxes; only replace a lost alarm, so
       // client and delivery traffic cannot cancel that backoff.
-      if (await this.ctx.storage.getAlarm() === null) await this.lowerLane(Date.now());
+      // The journal row is checked on its own: another kind's row may hold the alarm.
+      if (this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null || await this.ctx.storage.getAlarm() === null) {
+        await this.lowerLane(Date.now());
+      }
       return false;
     }
     if (!life) {
@@ -431,7 +446,11 @@ export class Mailbox extends DurableObject<Env> {
           await this.releaseClaims(claims.slice(i));
           break;
         }
-        const result = await this.runTimer(claim);
+        const result = await this.runTimer(claim, started + this.timerRunBudgetMs);
+        if (result === 'budget') {
+          await this.releaseClaims(claims.slice(i));
+          break;
+        }
         // journal_flush fell due while this claim waited for the work lane: run it, then reconsider the claim.
         if (result === 'lane') {
           i--;
@@ -504,7 +523,11 @@ export class Mailbox extends DurableObject<Env> {
             timers.revoke();
           }
           // A promise here would hold the step open across I/O; refuse it and roll back.
-          if (typeof (result as { then?: unknown } | null)?.then === 'function') throw new Error('Timer steps must be synchronous');
+          if (thenable(result)) {
+            // Its own later failure (for example a write to the revoked table) is expected; do not leave it unhandled.
+            result.then(undefined, () => {});
+            throw new Error('Timer steps must be synchronous');
+          }
           return result;
         });
       });
@@ -516,7 +539,7 @@ export class Mailbox extends DurableObject<Env> {
 
   // Starts one claimed row of another kind. Returns 'lane' when journal_flush
   // fell due before the handler could start, so the caller runs it first.
-  private async runTimer(claim: TimerClaim): Promise<'ran' | 'skipped' | 'lane'> {
+  private async runTimer(claim: TimerClaim, runDeadline: number): Promise<'ran' | 'skipped' | 'lane' | 'budget'> {
     const handler = this.timerKinds.get(claim.kind);
     const key = JSON.stringify([claim.kind, claim.ref]);
     const id = crypto.randomUUID();
@@ -530,6 +553,7 @@ export class Mailbox extends DurableObject<Env> {
       if (running && now - running.started < TIMER_LEASE_MS) return 'skipped';
       // Checked again here, just before the handler starts: this step may have waited behind other work.
       if (this.laneDue()) return 'lane';
+      if (now >= runDeadline) return 'budget';
       // Other kinds act on mailbox state, which is complete only while ready.
       // A kind this version does not know (for example after a rollback) waits too.
       if (!handler || this.lifecycleState() !== 'ready') {
@@ -539,7 +563,7 @@ export class Mailbox extends DurableObject<Env> {
       this.inFlight.set(key, { started: now, id });
       return 'start';
     });
-    if (start !== 'start' || !handler) return start === 'lane' ? 'lane' : 'skipped';
+    if (start !== 'start' || !handler) return start === 'start' ? 'skipped' : start;
     const now = this.timerNow();
     const call = (async () => handler.run({ ref: claim.ref, now, local: this.local }))();
     const outcome = call.then(() => ({ failed: false }), () => ({ failed: true }));

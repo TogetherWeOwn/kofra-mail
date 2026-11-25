@@ -58,8 +58,10 @@ export type TimerKind = {
   // TIMER_LEASE_MS has passed.
   run(timer: TimerRun): Promise<void>;
   // Recreates this kind's rows from restored, journalled state. Runs
-  // synchronously inside the transaction that finishes a restore.
-  rebuild?(timers: TimerTable, now: number): void;
+  // synchronously inside the transaction that finishes a restore; a rebuild
+  // that returns a promise is a type error and fails the restore step, and
+  // its table is revoked when the transaction ends.
+  rebuild?(timers: TimerTable, now: number): undefined;
 };
 
 const KIND = /^[a-z][a-z0-9_]{0,31}$/;
@@ -69,7 +71,8 @@ export function validTimerKind(kind: unknown): kind is string { return typeof ki
 
 function check(kind: string, ref: string, at?: number) {
   if (!validTimerKind(kind) || typeof ref !== 'string' || !ref.length || ref.length > MAX_REF ||
-      (at !== undefined && !Number.isSafeInteger(at))) {
+      // The platform alarm takes only positive times; anything due now is armed as overdue.
+      (at !== undefined && (!Number.isSafeInteger(at) || at < 1))) {
     throw new Error('Invalid mailbox timer');
   }
 }

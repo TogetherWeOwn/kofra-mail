@@ -14,7 +14,8 @@ const scope = { workspaceId: 'workspace', mailboxId: 'mailbox' };
 // - `async-step` and `async-write` hand `local` a step that returns a promise.
 type Plan = 'delete' | 'keep' | 'throw' | 'move-and-throw' | 'crash' | 'hang' | 'hang-throw' | 'due-lane' | 'async-step' | 'async-write';
 // Work a test injects right after an alarm call claims its rows (its first alarm write).
-type OnClaim = { kind: 'edit' } | { kind: 'hold'; ms: number } | { kind: 'replace'; ref: string };
+// `hold` keeps the work lane for `ms`, then moves the timer clock forward by `advance`.
+type OnClaim = { kind: 'edit' } | { kind: 'hold'; ms: number; advance?: number } | { kind: 'replace'; ref: string };
 
 // A mailbox with two test-only timer kinds. Fixture tables live in the same
 // SQLite database, so a handler's record commits atomically with its row change.
@@ -22,7 +23,9 @@ export class TimerMailbox extends Mailbox {
   private clockOffset = 0;
   private label = '';
   private armed: number | null = null;
-  private rebuildFault = false;
+  private rebuildFault: false | 'throw' | 'async' = false;
+  private alarmWriteCount = 0;
+  private hangsReleased = false;
   private readonly hangs: Array<PromiseWithResolvers<void>> = [];
   private readonly active = new Map<string, number>();
   private overlaps = 0;
@@ -45,6 +48,7 @@ export class TimerMailbox extends Mailbox {
     // Record what the mailbox armed: an immediate alarm fires (and is cleared) before a test can read it.
     Object.defineProperty(storage, 'setAlarm', { value: (...args: Parameters<typeof setAlarm>) => {
       this.armed = Number(args[0]);
+      this.alarmWriteCount++;
       const inject = this.onClaim;
       this.onClaim = null;
       if (inject) this.inject(inject);
@@ -58,7 +62,15 @@ export class TimerMailbox extends Mailbox {
       this.registerTimerKind(kind, {
         run: timer => this.fire(kind, timer),
         rebuild: (timers, now) => {
-          if (this.rebuildFault) throw new Error('Fixture rebuild failure');
+          if (this.rebuildFault === 'throw') throw new Error('Fixture rebuild failure');
+          if (this.rebuildFault === 'async') {
+            // Defers its write past an await: refused, and the write must not land.
+            const late = async () => {
+              await Promise.resolve();
+              timers.set(kind, 'late-rebuild', now + 600_000);
+            };
+            return late() as unknown as undefined;
+          }
           this.ctx.storage.sql.exec(`INSERT INTO fixture_rebuilds (kind, state)
             VALUES (?, (SELECT json_extract(value, '$.state') FROM lifecycle WHERE id = 1))`, kind);
           timers.set(kind, 'rebuilt', now + 600_000);
@@ -75,7 +87,10 @@ export class TimerMailbox extends Mailbox {
       // A first edit on a mailbox without state: ready() creates its baseline, then a flag edit arms the hourly deadline.
       this.injected = this.setFlags(scope.workspaceId, scope.mailboxId, 'missing-message', 0, []).catch(() => {});
     } else if (work.kind === 'hold') {
-      this.injected = this.workLane(() => new Promise(resolve => setTimeout(resolve, work.ms)));
+      this.injected = this.workLane(async () => {
+        await new Promise(resolve => setTimeout(resolve, work.ms));
+        this.clockOffset += work.advance ?? 0;
+      });
     } else {
       const due = new TimerTable(this.ctx.storage.sql).due('test_a', work.ref)!;
       // Replace the claimed row with the same due time.
@@ -121,6 +136,8 @@ export class TimerMailbox extends Mailbox {
   private hang(): Promise<void> {
     const gate = Promise.withResolvers<void>();
     this.hangs.push(gate);
+    // A release of every call also covers one that registers its gate later.
+    if (this.hangsReleased) gate.resolve();
     return gate.promise;
   }
 
@@ -296,10 +313,16 @@ export class TimerMailbox extends Mailbox {
   }
   // Releases one hung call (by start order), or all of them.
   async releaseHang(index?: number) {
+    if (index === undefined) this.hangsReleased = true;
+    else if (!this.hangs[index]) throw new Error('Fixture hang not registered');
     for (const [i, gate] of this.hangs.entries()) if (index === undefined || i === index) gate.resolve();
   }
-  async handlerState() { return { active: [...this.active.keys()].sort(), overlaps: this.overlaps, errors: this.errors }; }
-  async setRebuildFault(on: boolean) { this.rebuildFault = on; }
+  async hangCount() { return this.hangs.length; }
+  async handlerState() {
+    return { active: [...this.active.keys()].sort(), running: Object.fromEntries(this.active), overlaps: this.overlaps, errors: this.errors };
+  }
+  async setRebuildFault(fault: false | 'throw' | 'async') { this.rebuildFault = fault; }
+  async alarmWrites() { return { count: this.alarmWriteCount, last: this.armed }; }
   async alarmAt() { return this.ctx.storage.getAlarm(); }
   async lastArmed() { return this.armed; }
   async lifecycle() { return JSON.stringify(storedLifecycle<Lifecycle>(this.ctx.storage)); }
