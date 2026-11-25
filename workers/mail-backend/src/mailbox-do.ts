@@ -10,6 +10,9 @@ import {
   BackupConflict, FLAGS_FLUSH_MS, MailboxRecovery, PUBLISH_BUDGET_MS, readyLife, restoringLife, SETTINGS_FLUSH_MS, SNAPSHOT_INTERVAL_MS,
   type CleanupCursor, type Lifecycle, type ReadyLife, type RestoringLife, type Scope,
 } from './mailbox-recovery.ts';
+import {
+  JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TIMER_BATCH, TIMER_RETRY_MS, TimerTable, validTimerKind, type TimerKind, type TimerRow,
+} from './mailbox-timers.ts';
 import { MailboxWork } from './mailbox-work.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
@@ -34,6 +37,79 @@ export class Mailbox extends DurableObject<Env> {
   protected reindexBatch = 16;
   // Set when a call asked for an immediate wake-up; consumed by the alarm run.
   private wakeRequested = false;
+  // Timer kinds by name. journal_flush is the backup and restore lane; its row
+  // survives a restore reset, so it needs no rebuild.
+  private readonly timerKinds = new Map<string, TimerKind>([[JOURNAL_FLUSH, { run: () => this.flushLane() }]]);
+
+  // Registers a timer kind. Call from the constructor.
+  protected registerTimerKind(kind: string, handler: TimerKind): void {
+    if (!validTimerKind(kind) || this.timerKinds.has(kind)) throw new Error('Invalid mailbox timer kind');
+    this.timerKinds.set(kind, handler);
+  }
+
+  protected timerNow(): number { return Date.now(); }
+
+  private timerTable(): TimerTable { return new TimerTable(this.ctx.storage.sql); }
+
+  private lifecycleState(): Lifecycle['state'] | null {
+    const row = this.ctx.storage.sql.exec<{ state: Lifecycle['state'] }>(
+      "SELECT json_extract(value, '$.state') AS state FROM lifecycle WHERE id = 1").toArray()[0];
+    return row?.state ?? null;
+  }
+
+  // Runs an operation in the mailbox work lane, in order with deliveries, API calls and timer handlers.
+  protected workLane<T>(operation: () => Promise<T>): Promise<T> { return this.work.run(operation); }
+
+  private registeredKind(kind: string): void {
+    // The journal_flush row is moved only by armFor, armSoon and its own lane.
+    if (kind === JOURNAL_FLUSH || !this.timerKinds.has(kind)) throw new Error('Unknown mailbox timer kind');
+  }
+
+  // Sets a row's due time (or, with lowerOnly, never moves it later) and
+  // re-arms. Call in the work lane: from a timer handler or a mailbox operation.
+  protected async setTimer(kind: string, ref: string, at: number, lowerOnly = false): Promise<void> {
+    this.registeredKind(kind);
+    const timers = this.timerTable();
+    if (lowerOnly) timers.lower(kind, ref, at);
+    else timers.set(kind, ref, at);
+    await this.rearm();
+  }
+
+  // Deletes a row and re-arms. Call in the work lane.
+  protected async deleteTimer(kind: string, ref: string): Promise<void> {
+    this.registeredKind(kind);
+    this.timerTable().delete(kind, ref);
+    await this.rearm();
+  }
+
+  // Arms the alarm at the earliest row, or clears it when there is none. The
+  // alarm handler forces the write: a wake-up it does not set itself may be
+  // cleared when it returns.
+  private async rearm(force = false): Promise<void> {
+    const at = this.timerTable().earliest();
+    const current = force ? undefined : await this.ctx.storage.getAlarm();
+    if (at === null) {
+      if (current !== null) await this.ctx.storage.deleteAlarm();
+    } else if (current !== at) await this.ctx.storage.setAlarm(at);
+  }
+
+  // Moves the journal_flush row to `at` unless it is already earlier, and re-arms. Call in the work lane.
+  private async lowerLane(at: number): Promise<void> {
+    const timers = this.timerTable();
+    if (timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === null) {
+      // An alarm armed before this lane had a row (by an earlier version) is its deadline.
+      const armed = await this.ctx.storage.getAlarm();
+      if (armed !== null) at = Math.min(at, armed);
+    }
+    timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, at);
+    await this.rearm();
+  }
+
+  // Inside the transaction that finishes a restore: each kind recreates its rows from the restored state.
+  private rebuildTimers(now: number): void {
+    const timers = this.timerTable();
+    for (const kind of this.timerKinds.values()) kind.rebuild?.(timers, now);
+  }
 
   private scoped(scope: Scope): boolean {
     return this.ctx.id.equals(this.env.MAILBOX.idFromName(mailboxName(scope.workspaceId, scope.mailboxId)));
@@ -111,9 +187,7 @@ export class Mailbox extends DurableObject<Env> {
   private async armSoon(): Promise<void> {
     // An alarm run in progress re-reads this before arming its next wake-up.
     this.wakeRequested = true;
-    const at = await this.ctx.storage.getAlarm();
-    const now = Date.now();
-    if (at === null || at > now + 1000) await this.ctx.storage.setAlarm(now);
+    await this.lowerLane(Date.now());
   }
 
   // Call in the work lane. A mailbox is ready only after a durable backup
@@ -126,7 +200,7 @@ export class Mailbox extends DurableObject<Env> {
       // The alarm lane keeps its own wake-up (and restart or failure backoff)
       // for restoring and missing mailboxes; only replace a lost alarm, so
       // client and delivery traffic cannot cancel that backoff.
-      if (await this.ctx.storage.getAlarm() === null) await this.ctx.storage.setAlarm(Date.now());
+      if (await this.ctx.storage.getAlarm() === null) await this.lowerLane(Date.now());
       return false;
     }
     if (!life) {
@@ -178,9 +252,7 @@ export class Mailbox extends DurableObject<Env> {
   // Arms before committing. Further edits coalesce with the earliest deadline;
   // a stream of edits must not push the first one past its recovery point.
   private async armFor(delay: number): Promise<void> {
-    const existing = await this.ctx.storage.getAlarm();
-    const due = Date.now() + delay - PUBLISH_BUDGET_MS;
-    if (existing === null || due < existing) await this.ctx.storage.setAlarm(due);
+    await this.lowerLane(Date.now() + delay - PUBLISH_BUDGET_MS);
   }
 
   async deliver(id: string): Promise<MailboxDeliveryResult> {
@@ -270,44 +342,111 @@ export class Mailbox extends DurableObject<Env> {
       return;
     }
     await this.backups.run(async () => {
-      // Requests made before this run are being served by it.
-      this.wakeRequested = false;
       const life = storedLifecycle<Lifecycle>(this.ctx.storage);
-      if (!life || life.state === 'init') {
-        try { await this.checkBackupAlerts(null); }
-        catch { await this.work.run(() => this.ctx.storage.setAlarm(Date.now() + HELD_RECHECK_MS)); }
+      if (life && life.state !== 'init') this.verifyScope(life.scope);
+      // Cloudflare retries a thrown alarm only a few times; keep a durable
+      // wake-up before any work. Each row this call runs first moves to its
+      // retry time (journal_flush to the settings recovery point, as before),
+      // so a crash in a handler or before the final re-arm runs it again on
+      // the next alarm, and a row is never run twice by one call.
+      const claims = await this.work.run(async () => {
+        const timers = this.timerTable();
+        const now = this.timerNow();
+        const due: Array<Pick<TimerRow, 'kind' | 'ref'>> = timers.dueRows(now, TIMER_BATCH);
+        // Nothing due: an early, retried or held wake-up. Run the journal lane,
+        // which decides for itself what is due, as every alarm did before timers.
+        if (!due.length) due.push({ kind: JOURNAL_FLUSH, ref: JOURNAL_FLUSH_REF });
+        const claimed = due.map(({ kind, ref }) => ({ kind, ref,
+          until: now + (kind === JOURNAL_FLUSH ? SETTINGS_FLUSH_MS : TIMER_RETRY_MS) }));
+        this.ctx.storage.transactionSync(() => { for (const row of claimed) timers.set(row.kind, row.ref, row.until); });
+        // More than one batch due re-arms at once.
+        await this.rearm(true);
+        return claimed;
+      });
+      for (const claim of claims) await this.runTimer(claim);
+      await this.work.run(() => this.rearm(true));
+    });
+  }
+
+  private async runTimer(claim: { kind: string; ref: string; until: number }): Promise<void> {
+    const handler = this.timerKinds.get(claim.kind);
+    try {
+      if (claim.kind === JOURNAL_FLUSH) {
+        // The lane takes the work lane for each step that touches the index and
+        // keeps its backup I/O outside it, so deliveries never wait on R2.
+        await handler!.run(claim.ref, this.timerNow());
         return;
       }
-      this.verifyScope(life.scope);
-      const index = this.index(life.scope.workspaceId);
-      const now = Date.now();
-      // Cloudflare retries a thrown alarm only a few times; keep a durable wake-up.
-      await this.work.run(() => this.ctx.storage.setAlarm(now + SETTINGS_FLUSH_MS));
-      let next: number;
-      let failed = false;
-      try {
-        if (life.state === 'restoring') next = await this.restoreSlice(index, life);
-        else if (life.state === 'ready') {
-          if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
-          next = await this.backupSlice(index, life, now);
-        }
-        else next = now + HELD_RECHECK_MS;
-      } catch {
-        failed = true;
-        next = now + this.failed(index);
-      }
-      try { next = Math.min(next, await this.checkBackupAlerts(index)); }
-      catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); }
       await this.work.run(async () => {
-        // A change committed during this run must not wait for the next deadline.
-        const current = index.lifecycle<Lifecycle>();
-        // A failed run retries unpublished changes within the settings recovery point, not the backoff.
-        const pending = current?.state === 'ready' && index.journal.flushed() < index.journal.revision();
-        const soon = Date.now() + (failed ? SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS : 1000);
-        const requested = this.wakeRequested ? Date.now() : Infinity;
-        this.wakeRequested = false;
-        await this.ctx.storage.setAlarm(Math.min(pending ? Math.min(next, soon) : next, requested));
+        const timers = this.timerTable();
+        // Moved or deleted since the claim: its new due time governs.
+        if (timers.due(claim.kind, claim.ref) !== claim.until) return;
+        // Other kinds act on mailbox state, which is complete only while ready.
+        // A kind this version does not know (for example after a rollback) waits too.
+        if (!handler || this.lifecycleState() !== 'ready') {
+          timers.set(claim.kind, claim.ref, this.timerNow() + HELD_RECHECK_MS);
+        } else await handler.run(claim.ref, this.timerNow());
+        await this.rearm();
       });
+    } catch {
+      // A failing handler neither blocks the remaining rows nor spins.
+      await this.work.run(async () => {
+        const timers = this.timerTable();
+        if (timers.due(claim.kind, claim.ref) === claim.until) timers.set(claim.kind, claim.ref, this.timerNow() + TIMER_RETRY_MS);
+        await this.rearm();
+      });
+    }
+  }
+
+  // The journal_flush row's handler: the backup and restore lane. Its row
+  // carries the deadline this lane computes, which the alarm used to carry.
+  private async flushLane(): Promise<void> {
+    // Requests made before this run are being served by it.
+    this.wakeRequested = false;
+    const claimed = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+    if (!life || life.state === 'init') {
+      let held = false;
+      try { await this.checkBackupAlerts(null); } catch { held = true; }
+      await this.work.run(async () => {
+        const timers = this.timerTable();
+        // Nothing to publish or restore; keep a deadline a call made during this run.
+        if (timers.due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF) === claimed) {
+          if (held) timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, Date.now() + HELD_RECHECK_MS);
+          else timers.delete(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+        }
+        await this.rearm(true);
+      });
+      return;
+    }
+    this.verifyScope(life.scope);
+    const index = this.index(life.scope.workspaceId);
+    const now = Date.now();
+    let next: number;
+    let failed = false;
+    try {
+      if (life.state === 'restoring') next = await this.restoreSlice(index, life);
+      else if (life.state === 'ready') {
+        if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
+        next = await this.backupSlice(index, life, now);
+      }
+      else next = now + HELD_RECHECK_MS;
+    } catch {
+      failed = true;
+      next = now + this.failed(index);
+    }
+    try { next = Math.min(next, await this.checkBackupAlerts(index)); }
+    catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); }
+    await this.work.run(async () => {
+      // A change committed during this run must not wait for the next deadline.
+      const current = index.lifecycle<Lifecycle>();
+      // A failed run retries unpublished changes within the settings recovery point, not the backoff.
+      const pending = current?.state === 'ready' && index.journal.flushed() < index.journal.revision();
+      const soon = Date.now() + (failed ? SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS : 1000);
+      const requested = this.wakeRequested ? Date.now() : Infinity;
+      this.wakeRequested = false;
+      this.timerTable().set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, Math.min(pending ? Math.min(next, soon) : next, requested));
+      await this.rearm(true);
     });
   }
 
@@ -374,6 +513,7 @@ export class Mailbox extends DurableObject<Env> {
         fence: () => outbox.bumpRecoveryEpoch(workspaceId, mailboxId),
         replayPage: after => outbox.replayPage(workspaceId, mailboxId, after),
         release: (key, holder) => refs.release(key, holder),
+        rebuild: now => this.rebuildTimers(now),
       });
       // A restart means the manifest vanished under this restore. Each restart
       // counts against restore_blocked and backs off, so a manifest that keeps
