@@ -8,6 +8,9 @@ export interface Vector {
   verdict?: 'phishing';
   refs?: number;
   hrefs?: number;
+  anchorUrls?: string[];
+  imageUrls?: string[];
+  unsafe?: 'ambiguous_markup';
   has?: string;
   absent?: string;
   text?: string;

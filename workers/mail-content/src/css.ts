@@ -98,6 +98,16 @@ function declarationValue(property: string, value: string): CssPart[] | undefine
   return parts;
 }
 
+function decodePositionKeyword(value: string): string {
+  // Decode only for comparison with the closed keyword list. Other values
+  // still reject escapes; no decoded punctuation is serialized into CSS.
+  return value.replace(/\\(?:([\da-f]{1,6})(?:\r\n|[ \t\r\n\f])?|([^\r\n\f]))/gi, (_, hex?: string, char?: string) => {
+    if (!hex) return char!;
+    const code = parseInt(hex, 16);
+    return code <= 0x10ffff ? String.fromCodePoint(code) : '�';
+  }).toLowerCase();
+}
+
 function declarations(items: Statement[]): CssPart[] {
   const result: CssPart[] = [];
   for (const { value: statement } of items) {
@@ -110,7 +120,7 @@ function declarations(items: Statement[]): CssPart[] {
     if (important) value = value.slice(0, important.index).trimEnd();
     if (!value) continue;
     if (property === 'position') {
-      value = value.toLowerCase();
+      value = decodePositionKeyword(value);
       if (value === 'fixed' || value === 'sticky') value = 'static';
       if (!/^(?:absolute|relative|static|initial|inherit|unset|revert|revert-layer)$/.test(value)) continue;
     }

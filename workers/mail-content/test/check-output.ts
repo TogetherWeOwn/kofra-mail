@@ -50,6 +50,12 @@ function checkCSS(css: string, origin: string, inline: boolean) {
 
 export function checkOutput(html: string, origin = 'https://content.example') {
   const allowWrapper = new Set(['html', 'head', 'body']);
+  // Text, attributes and CSS never contain a literal '<' in serialized output.
+  // Inspect tags before DOM construction can discard a forbidden token.
+  for (const [, name] of html.matchAll(/<\/?([a-z][^\t\n\f\r />]*)/gi)) {
+    const tag = name.toLowerCase();
+    assert.ok(elements.has(tag) || allowWrapper.has(tag) || tag === 'meta', `unpermitted serialized element ${tag}`);
+  }
   const root = parse(html, { scriptingEnabled: true });
   const anchors: string[] = [];
   const images: string[] = [];

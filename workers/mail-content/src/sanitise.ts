@@ -2,13 +2,15 @@ import { sanitiseCss } from './css.ts';
 import { cssUrl, decodeAttribute, escapeAttribute, escapeText, getContentId, isAnchorUrl, isDataImage,
   isRemoteImageUrl, isWebUrl, quoteEncodedAttribute, trimUrl } from './urls.ts';
 
-export const SANITIZER_VERSION = 1;
+export const SANITIZER_VERSION = 2;
 
 export type ContentRef = { kind: 'cid'; contentId: string } | { kind: 'img'; url: string };
 export interface SanitisedBody {
   html: string;
   refs: ContentRef[];
   version: number;
+  /** The caller should fall back to plain text or a notice, not display this body. */
+  unsafe?: 'ambiguous_markup';
 }
 export interface SanitiseOptions {
   ri?: boolean;
@@ -42,14 +44,40 @@ function slot(context: RefContext, index: number): string {
 export async function sanitise(html: string, { ri = false, verdict }: SanitiseOptions = {}): Promise<SanitisedBody> {
   const result: string[] = [];
   const refs: ContentRef[] = [];
+  const cidSlots = new Map<string, number>();
   const remoteAllowed = ri && verdict !== 'phishing';
   let remoteCount = 0;
   let styleParts: string[] | undefined;
+  const textParts: string[] = [];
+  let pendingEntity = false;
+
+  function emitMarkup(markup: string) {
+    pendingEntity = false;
+    result.push(markup);
+  }
+
+  function emitText(text: string) {
+    if (!text) return;
+    // Text tokens already contain HTML references. Escape only literal markup
+    // delimiters and, at adjacent text-node boundaries, prevent a new match
+    // across a discarded node. A new reference starts with '&', which ends any
+    // preceding reference without inserting a DOM node or visible separator.
+    let escaped = text.replaceAll('<', '&lt;').replaceAll('\0', '�');
+    if (pendingEntity && /^[a-z\d#;]/i.test(escaped)) {
+      escaped = `&#${escaped.charCodeAt(0)};${escaped.slice(1)}`;
+    }
+    pendingEntity = /&(?:[a-z\d]*|#[a-z\d]*)$/i.test(escaped);
+    result.push(escaped);
+  }
 
   function ref(context: RefContext, value: ContentRef): string {
     if (value.kind === 'img') {
       if (!remoteAllowed || remoteCount >= 100) return context === 'h' ? '' : 'none';
       remoteCount++;
+    } else {
+      const existing = cidSlots.get(value.contentId);
+      if (existing !== undefined) return slot(context, existing);
+      cidSlots.set(value.contentId, refs.length);
     }
     return slot(context, refs.push(value) - 1);
   }
@@ -108,7 +136,7 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
           const parts: string[] = [];
           styleParts = parts;
           element.onEndTag(() => {
-            result.push(`<style${attributes(tag, attrs)}>${css(parts.join(''), false)}</style>`);
+            emitMarkup(`<style${attributes(tag, attrs)}>${css(parts.join(''), false)}</style>`);
             styleParts = undefined;
           });
           // An unclosed style is not emitted; no original raw text is copied.
@@ -123,29 +151,33 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
           else if (isWebUrl(value)) {
             src = isRemoteImageUrl(value) ? ref('h', { kind: 'img', url: value }) : '';
             if (!src) {
-              result.push(emptyImage);
+              emitMarkup(emptyImage);
               return;
             }
           }
         }
-        result.push(`<${tag}${attributes(tag, element.attributes)}${src}>`);
-        if (!voidKept.has(tag)) element.onEndTag(() => { result.push(`</${tag}>`); });
+        emitMarkup(`<${tag}${attributes(tag, element.attributes)}${src}>`);
+        if (!voidKept.has(tag)) element.onEndTag(() => emitMarkup(`</${tag}>`));
       },
     }).onDocument({
       text(chunk) {
         if (styleParts) {
           styleParts.push(chunk.text);
         } else {
-          // Text tokens retain HTML entities. Keep those entities, but never
-          // carry a literal delimiter into the newly serialized document.
-          result.push(chunk.text.replaceAll('<', '&lt;').replaceAll('\0', '�'));
+          textParts.push(chunk.text);
+          if (chunk.lastInTextNode) {
+            emitText(textParts.join(''));
+            textParts.length = 0;
+          }
         }
       },
     }).transform(new Response(cleaned)).text();
   } catch (error) {
     // workerd can refuse ambiguous raw-text parsing in malformed markup.
-    // A partial transform is not a safe document or a complete ref manifest.
-    if (error instanceof TypeError && (error.message.startsWith('Parser error:') || error.message === 'Uncertain HTML structure')) return wrap('');
+    // Do not serve partial output; report the need for a plain-text fallback.
+    if (error instanceof TypeError && (error.message.startsWith('Parser error:') || error.message === 'Uncertain HTML structure')) {
+      return { ...wrap(''), unsafe: 'ambiguous_markup' };
+    }
     throw error;
   }
   return wrap(result.join(''), refs);

@@ -18,11 +18,28 @@ for (const vector of vectors) test(`allowlist: ${vector.id}`, async () => {
   assert.ok(Number.isSafeInteger(output.version) && output.version > 0);
   assert.ok(!output.html.includes('/asset/'), 'cached HTML contains a minted URL');
   const doc = checkOutput(output.filled);
+  assert.equal(output.unsafe, vector.unsafe);
   if (vector.refs !== undefined) assert.equal(output.refs.length, vector.refs);
   if (vector.hrefs !== undefined) assert.equal(doc.anchors.length, vector.hrefs);
+  if (vector.anchorUrls !== undefined) assert.deepEqual(doc.anchors, vector.anchorUrls);
+  if (vector.imageUrls !== undefined) assert.deepEqual(output.refs, vector.imageUrls.map(url => ({ kind: 'img', url })));
   if (vector.has !== undefined) assert.ok(output.html.includes(vector.has), `missing ${vector.has}`);
   if (vector.absent !== undefined) assert.ok(!output.html.includes(vector.absent), `unexpected ${vector.absent}`);
   if (vector.text !== undefined) assert.equal(doc.text, vector.text);
+});
+
+test('the checker rejects a serialized frame even if the DOM parser discards it', async () => {
+  const { filled } = await render(runtime, { html: '<p>Keep</p>' });
+  const withFrame = filled.replace('<body>', '<body><frame>');
+  assert.throws(() => checkOutput(withFrame), /unpermitted serialized element frame/);
+});
+
+test('one CID slot is reused for 1,000 images with the same content ID', async () => {
+  const output = await render(runtime, { html: '<img src="cid:logo">'.repeat(1_000) });
+  assert.deepEqual(output.refs, [{ kind: 'cid', contentId: 'logo' }]);
+  const { images } = checkOutput(output.filled);
+  assert.equal(images.length, 1_000);
+  assert.equal(new Set(images).size, 1);
 });
 
 test('refs keep the exact source URL and decoded CID; filling escapes attribute and raw CSS contexts', async () => {

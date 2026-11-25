@@ -8,6 +8,26 @@ const named = new Map(Object.entries({
   apos: "'", nbsp: '\u00a0', colon: ':', sol: '/', bsol: '\\', Tab: '\t', NewLine: '\n',
 }));
 
+// The 106 case-sensitive HTML named character references defined without a
+// semicolon in the WHATWG entity table. Only prefix matching is needed here.
+const legacyNamed = new Set(`AElig AMP Aacute Acirc Agrave Aring Atilde Auml COPY Ccedil ETH Eacute Ecirc Egrave Euml GT Iacute Icirc
+Igrave Iuml LT Ntilde Oacute Ocirc Ograve Oslash Otilde Ouml QUOT REG THORN Uacute Ucirc Ugrave Uuml
+Yacute aacute acirc acute aelig agrave amp aring atilde auml brvbar ccedil cedil cent copy curren deg
+divide eacute ecirc egrave eth euml frac12 frac14 frac34 gt iacute icirc iexcl igrave iquest iuml laquo lt
+macr micro middot nbsp not ntilde oacute ocirc ograve ordf ordm oslash otilde ouml para plusmn pound quot
+raquo reg sect shy sup1 sup2 sup3 szlig thorn times uacute ucirc ugrave uml uuml yacute yen yuml`.split(/\s+/));
+const longestLegacyName = Math.max(...Array.from(legacyNamed, name => name.length));
+
+function semicolonlessIsLiteral(input: string, offset: number, token: string): boolean {
+  for (let length = Math.min(longestLegacyName, token.length - 1); length > 0; length--) {
+    if (!legacyNamed.has(token.slice(1, length + 1))) continue;
+    // In an attribute, only a following ASCII alphanumeric or '=' makes
+    // the longest semicolonless match literal. In other cases fail closed.
+    return /^[a-z\d=]$/i.test(input[offset + length + 1] ?? '');
+  }
+  return true;
+}
+
 export function decodeAttribute(input: string): string | undefined {
   let valid = true;
   const decoded = input.replace(/&(?:#(?:x[\da-f]+|\d+);?|[a-z][a-z\d]*;?)/gi, (token, offset: number) => {
@@ -24,9 +44,7 @@ export function decodeAttribute(input: string): string | undefined {
     if (token.endsWith(';')) {
       const char = named.get(token.slice(1, -1));
       if (char !== undefined) return char;
-    } else if (input[offset + token.length] === '=') {
-      // The HTML attribute tokenizer leaves semicolonless names followed by
-      // '=' literal, e.g. a query-string '&page=2'.
+    } else if (semicolonlessIsLiteral(input, offset, token)) {
       return token;
     }
     valid = false;
