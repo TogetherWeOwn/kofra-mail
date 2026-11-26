@@ -32,6 +32,8 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   CONTROL_KEY: string;
   CONTENT_PORT?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
+  REAL_CONTENT_ORIGIN?: string;
+  MAIL_CONTENT?: MailApiEnvironment['MAIL_CONTENT'];
 }
 
 const encoder = new TextEncoder();
@@ -270,6 +272,7 @@ export class Sweeper extends MailSweeper {
       .toArray().map(row => row.holder);
   }
 }
+export { ContentLookup } from '../../src/entry.ts';
 
 const signedBytes = (purpose: string, payload: string) => encoder.encode(`kofra-mail-content/v1\n${purpose}\n${payload}`);
 function contentOrigin(url: URL, env: FixtureEnv) { return `http://localhost:${env.CONTENT_PORT || url.port}`; }
@@ -436,8 +439,8 @@ export default {
       MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
-      MAIL_CONTENT_ORIGIN: contentOrigin(url, env),
-      MAIL_CONTENT: { mint: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
+      MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: env.REAL_CONTENT_ORIGIN ?? contentOrigin(url, env),
+      MAIL_CONTENT: env.MAIL_CONTENT ?? { mintForWeb: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
     };
     if (req.headers.get('x-fixture-watch-body') === 'true' && req.body) {
       const reader = req.body.getReader();

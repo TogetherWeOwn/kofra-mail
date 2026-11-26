@@ -34,6 +34,25 @@ test('the checker rejects a serialized frame even if the DOM parser discards it'
   assert.throws(() => checkOutput(withFrame), /unpermitted serialized element frame/);
 });
 
+test('sanitiser stops before constructing oversized kept markup without CID references', async () => {
+  const value = '"'.repeat(8 * 1024);
+  const output = await render(runtime, { html: `<p title='${value}'>fixture</p>`.repeat(175) });
+  assert.equal(output.unsafe, 'output_too_large', `sanitiser returned ${Buffer.byteLength(output.html)} bytes`);
+  assert.ok(Buffer.byteLength(output.html) < 1024);
+  assert.deepEqual(output.refs, []);
+});
+
+test('oversized raw style is dropped without charging the paragraph output', async () => {
+  const css = '/*drop*/'.repeat((9 * 1024 * 1024) / 8);
+  const html = `<style class="discard-this-style">${css}</style><p>Keep this paragraph.</p>`;
+  assert.ok(Buffer.byteLength(html) < 25 * 1024 * 1024);
+  const output = await render(runtime, { html });
+  assert.equal(output.unsafe, undefined);
+  assert.equal(checkOutput(output.filled).text, 'Keep this paragraph.');
+  assert.ok(!output.html.includes('discard-this-style'));
+  assert.ok(!output.html.includes('/*drop*/'));
+});
+
 test('one CID slot is reused for 1,000 images with the same content ID', async () => {
   const output = await render(runtime, { html: '<img src="cid:logo">'.repeat(1_000) });
   assert.deepEqual(output.refs, [{ kind: 'cid', contentId: 'logo' }]);

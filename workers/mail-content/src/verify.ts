@@ -39,7 +39,7 @@ export interface ContentPorts {
   /** A directory point lookup: the user id owning mailbox `mb` of workspace `ws`, or null. */
   mailboxOwner(ws: string, mb: string): Promise<string | null>;
   /** The mailbox Durable Object (ws, mb): the raw key, each attachment part with its object key, and the verdict; null once deleted or expired. */
-  message(ws: string, mb: string, msg: string): Promise<MessageRecord | null>;
+  message(ws: string, mb: string, msg: string, sub: string): Promise<MessageRecord | null>;
 }
 
 export type Verified =
@@ -116,7 +116,7 @@ export function createVerifier({ keys, ports, epochs }: { keys: ContentUrlKeys; 
         if (ep !== claims.ep) return REFUSED;
         if (await ports.mailboxOwner(claims.ws, claims.mb) !== claims.sub) return REFUSED;
         // Step 5: the message still exists in the Durable Object named by the verified claims.
-        const message = await ports.message(claims.ws, claims.mb, claims.msg);
+        const message = await ports.message(claims.ws, claims.mb, claims.msg, claims.sub);
         if (typeof message !== 'object' || message === null) return REFUSED;
         const result = Object.freeze({ ok: true, purpose, claims: Object.freeze(claims), message }) as Verified;
         if (purpose === 'body') verifiedBodies.add(result);

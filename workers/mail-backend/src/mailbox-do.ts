@@ -6,6 +6,7 @@ import { ApiFault, fail, isId } from './mailbox-api-input.ts';
 import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult } from './mailbox-api-idempotency.ts';
 import { idemExpiry, uploadExpiry } from './mailbox-expiry.ts';
 import { IDEM_EXPIRY, IN_PROGRESS_TTL_MS, UPLOAD_EXPIRY, UPLOAD_TTL_MS, readUpload, uploadMediaType, uploadName, wireUpload, type UploadBody } from './mailbox-upload.ts';
+import { contentRecord, type MailboxContentRecord } from './mailbox-api-messages.ts';
 import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
 import { kofra } from './kofra.ts';
@@ -345,6 +346,14 @@ export class Mailbox extends DurableObject<Env> {
     } finally {
       if ('token' in reservation) await this.work.run(async () => clearApiKey(sql, key, reservation.token));
     }
+  }
+
+  async contentRecord(workspaceId: string, mailboxId: string, messageId: string): Promise<MailboxContentRecord | null> {
+    if (!enabled(this.env) || this.env.MAIL_CONTENT_ENABLED !== 'on' || !isId(messageId) ||
+        !this.scoped({ workspaceId, mailboxId }) || this.lifecycleState() !== 'ready') return null;
+    // A cold DO still runs its existing constructor schema/alarm self-repair.
+    // This RPC itself never initializes, restores, indexes or arms a mailbox.
+    return contentRecord(this.ctx.storage.sql, messageId, this.mailApiNow());
   }
 
   async mailContent(workspaceId: string, mailboxId: string, messageId: string, part?: number): Promise<MailContentResult> {

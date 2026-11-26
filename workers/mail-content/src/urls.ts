@@ -53,19 +53,38 @@ export function decodeAttribute(input: string): string | undefined {
   return valid ? decoded : undefined;
 }
 
-export function escapeAttribute(value: string): string {
-  return escapeText(value).replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+const textEscapes: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\0': '\ufffd' };
+const escapeRules = {
+  text: { pattern: /[&<>\0]/g, values: textEscapes },
+  attribute: { pattern: /[&<>"'\0]/g, values: { ...textEscapes, '"': '&quot;', "'": '&#39;' } },
+  // The original references stay references in already-encoded input.
+  encodedAttribute: { pattern: /[<>"\0]/g, values: { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\0': '\ufffd' } },
+  rewriterText: { pattern: /[<\0]/g, values: { '<': '&lt;', '\0': '\ufffd' } },
+} as const satisfies Record<string, { pattern: RegExp; values: Record<string, string> }>;
+export type HtmlEscape = keyof typeof escapeRules;
+
+export function escapeHtml(value: string, mode: HtmlEscape): string {
+  const rule = escapeRules[mode];
+  const values: Record<string, string> = rule.values;
+  return value.replace(rule.pattern, char => values[char]);
 }
 
-export function escapeText(value: string): string {
-  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\0', '\ufffd');
+/** Count UTF-8 bytes without allocating the escaped form; stop at the ceiling. */
+export function measureHtml(value: string, limit: number, mode?: HtmlEscape): number | null {
+  if (value.length > limit) return null;
+  const values: Record<string, string> | undefined = mode && escapeRules[mode].values;
+  let size = 0;
+  for (const char of value) {
+    const escaped = values?.[char];
+    const unit = char.charCodeAt(0);
+    size += escaped ? (escaped === '\ufffd' ? 3 : escaped.length) : char.length === 2 ? 4 : unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+    if (size > limit) return null;
+  }
+  return size;
 }
 
-// The original attribute is already encoded; its references stay references
-// inside the new quotes, with any literal delimiters escaped.
-export function quoteEncodedAttribute(value: string): string {
-  return value.replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll('\0', '\ufffd');
-}
+export const escapeAttribute = (value: string): string => escapeHtml(value, 'attribute');
+export const escapeText = (value: string): string => escapeHtml(value, 'text');
 
 export function trimUrl(value: string): string {
   return value.replace(/^ +| +$/g, '');

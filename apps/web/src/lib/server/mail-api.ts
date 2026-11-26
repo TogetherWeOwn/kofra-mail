@@ -1,6 +1,6 @@
 import { API_PREFIX, LIMITS, ROUTES, MailApiError, problem } from '@kofra/mail-contract';
 import type { ContentUrl, MailErrorCode, Member, Operation, Problem, RouteSpec, Session } from '@kofra/mail-contract';
-import { separateContentOrigin } from '../content-origin.ts';
+import { contentFrameUrl, separateContentOrigin } from '../content-origin.ts';
 import { Directory, type DirectoryDatabase } from './mail-directory.ts';
 
 export interface LocalPrincipal {
@@ -35,8 +35,9 @@ export interface MailApiEnvironment {
         httpWrite?: { stream: ReadableStream<Uint8Array> | null; mediaType: string; contentLength: string | null;
           query: [string, string][] } }): Promise<OperationResult>;
   } };
+  MAIL_CONTENT_ENABLED?: string;
   MAIL_CONTENT_ORIGIN?: string;
-  MAIL_CONTENT?: { mint(purpose: 'body' | 'att', claims: ContentClaims): Promise<ContentUrl> };
+  MAIL_CONTENT?: { mintForWeb(purpose: 'body' | 'att', claims: ContentClaims): Promise<ContentUrl> };
 }
 
 const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -169,7 +170,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     } else if (op === 'listIdentities' && mailbox) {
       result = { body: { items: await directory.identities(mailbox.id) } };
     } else {
-      const contentOrigin = separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true);
+      const contentOrigin = env.MAIL_CONTENT_ENABLED === 'on' ? separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true) : undefined;
       if (mailbox) {
         const draftWrite = op === 'createDraft' || op === 'replaceDraft';
         const canSendAs = draftWrite || op === 'getSettings' || op === 'updateSettings'
@@ -192,13 +193,14 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
       }
       if (!result.error && mailbox && (op === 'getBodyUrl' || op === 'getAttachmentUrl')) {
         if (!contentOrigin || !env.MAIL_CONTENT) fail('feature_unavailable');
-        const value = await env.MAIL_CONTENT.mint(op === 'getBodyUrl' ? 'body' : 'att', {
+        const value = await env.MAIL_CONTENT.mintForWeb(op === 'getBodyUrl' ? 'body' : 'att', {
           ws: principal.workspaceId, mb: mailbox.id, msg: params.messageId,
           sub: principal.userId, ep: principal.credentialEpoch,
           ...(op === 'getBodyUrl' ? { ri: input.remoteImages as boolean } : { part: Number(params.part) }),
         });
-        if (new URL(value.url).origin !== contentOrigin) fail('unavailable');
-        result = { body: value };
+        const signedUrl = contentFrameUrl(value.url, contentOrigin);
+        if (!signedUrl) fail('unavailable');
+        result = { body: { url: signedUrl, expiresAt: value.expiresAt } };
       }
     }
     if (result.error) {

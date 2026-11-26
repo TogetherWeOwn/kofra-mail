@@ -2,8 +2,8 @@
 //
 // This module decides which remote URLs may be fetched and how. It never logs:
 // the only log output is the line built by `remoteImageLogLine`, which holds no
-// URL and no token. Token verification and the fetch cache (rule 6) belong to
-// the `img` handler, which must call `fetchRemoteImage` only after the token
+// URL and no token. Token verification belongs to the `img` handler,
+// which must call `fetchRemoteImage` only after the token
 // has passed every verification step.
 
 /** The subset of `fetch` the proxy uses. The global `fetch` satisfies it. */
@@ -56,9 +56,8 @@ export const remoteImageAccept = 'image/avif,image/webp,image/png,image/*;q=0.8'
 export const remoteImageUserAgent = 'Mozilla/5.0 (compatible; ImageProxy/1.0)';
 
 /**
- * Turns off Worker-controlled caching of every hop, so an upstream body is
- * never stored before the proxy has judged it (rule 6 caches only behind the
- * verifier). `cf` is used rather than `cache: 'no-store'`, because workerd
+ * Turns off Worker-controlled caching of every hop (rule 6). `cf` is used
+ * rather than `cache: 'no-store'`, because workerd
  * turns `no-store` into `Cache-Control: no-cache` and `Pragma: no-cache`
  * request headers, and rule 3 allows only Accept and User-Agent. A negative
  * `cacheTtlByStatus` means "do not cache at all"; `cacheTtl: 0` would still
@@ -71,7 +70,12 @@ export const remoteImageCacheOptions = Object.freeze({
 
 export type RemoteImageFailure = 'url' | 'redirect' | 'status' | 'type' | 'magic' | 'size' | 'timeout' | 'network';
 export interface RemoteImage { ok: true; contentType: string; bytes: Uint8Array; length: number }
-export type RemoteImageResult = RemoteImage | { ok: false; reason: RemoteImageFailure };
+export interface StreamingRemoteImage extends RemoteImage {
+  body: ReadableStream<Uint8Array>;
+  startTransfer(signal?: AbortSignal): void;
+}
+type ImageRefusal = { ok: false; reason: RemoteImageFailure };
+export type RemoteImageResult = RemoteImage | ImageRefusal;
 export type RemoteImageUrlVerdict = { ok: true; url: URL } | { ok: false };
 
 // ---- Rule 1: methods ----
@@ -224,6 +228,11 @@ function mediaType(header: string | null): string | undefined {
   return type !== undefined && imageTypes.has(type) ? type : undefined;
 }
 
+const inlineImageTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+export function isInlineImage(type: string, bytes: Uint8Array): boolean {
+  return inlineImageTypes.has(type) && imageTypes.get(type)!(bytes);
+}
+
 class Deadline extends Error {}
 
 const copyList = (list: unknown) => (Array.isArray(list) ? Object.freeze([...list]) : list) as readonly string[];
@@ -250,6 +259,8 @@ function snapshotConfig(config: RemoteImageConfig): RemoteImageConfig {
 
 // Rule 4: concurrent body reads in one isolate share an in-flight budget.
 let inFlightBytes = 0;
+const transferDeadlineMs = 60_000;
+const transferDeadlines = new Map<() => void, number>();
 
 /** Bytes currently reserved by body reads in this isolate. */
 export function remoteImageInFlight(): number {
@@ -267,9 +278,13 @@ function discard(response: Response) {
  * the byte limit and the total deadline. Never throws; any refusal is the
  * failure result, which the handler answers as 404 with an empty body.
  */
+export function fetchRemoteImage(
+  input: string, given: RemoteImageConfig, fetchImpl: FetchLike, now: () => number, lifetime: 'response',
+): Promise<StreamingRemoteImage | ImageRefusal>;
+export function fetchRemoteImage(input: string, given: RemoteImageConfig, fetchImpl?: FetchLike, now?: () => number): Promise<RemoteImageResult>;
 export async function fetchRemoteImage(
-  input: string, given: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now,
-): Promise<RemoteImageResult> {
+  input: string, given: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now, lifetime?: 'response',
+): Promise<RemoteImageResult | StreamingRemoteImage> {
   const fail = (reason: RemoteImageFailure): RemoteImageResult => ({ ok: false, reason });
   // Validate and use a request-local copy, so changing a shared config mid-request cannot move its limits.
   let config: RemoteImageConfig;
@@ -308,6 +323,10 @@ export async function fetchRemoteImage(
   });
   let reserved = 0;
   const reserve = (bytes: number): boolean => {
+    // If a disconnected request's timer was discarded by the runtime, reclaim
+    // its expired charge before admitting new work. Do not use its stream here.
+    const current = Date.now();
+    for (const [drop, until] of transferDeadlines) if (current >= until) drop();
     if (inFlightBytes + bytes > config.remoteImageInFlightBytes) return false;
     inFlightBytes += bytes;
     reserved += bytes;
@@ -374,7 +393,11 @@ export async function fetchRemoteImage(
     // A fixed-length buffer for callers (Response bodies, the cache); V8 can move the backing store without copying.
     const bytes = new Uint8Array(buffer.transferToFixedLength());
     if (!imageTypes.get(contentType)!(bytes)) return fail('magic');
-    return { ok: true, contentType, bytes, length };
+    const image: RemoteImage = { ok: true, contentType, bytes, length };
+    if (lifetime !== 'response') return image;
+    const transfer = reservedImageBody(bytes, () => { inFlightBytes -= length; });
+    reserved -= length; // The transfer now owns this portion of the reservation.
+    return { ...image, ...transfer };
   } catch (error) {
     return fail(error instanceof Deadline || controller.signal.aborted ? 'timeout' : 'network');
   } finally {
@@ -386,6 +409,58 @@ export async function fetchRemoteImage(
   }
 }
 
+function reservedImageBody(bytes: Uint8Array, release: () => void) {
+  let offset = 0;
+  let buffer: Uint8Array | undefined = bytes;
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let requestSignal: AbortSignal | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const drop = () => {
+    if (!buffer) return;
+    buffer = undefined;
+    transferDeadlines.delete(drop);
+    release();
+  };
+  const finish = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    requestSignal?.removeEventListener('abort', abort);
+    drop();
+  };
+  const fail = (reason: unknown) => {
+    const output = controller;
+    controller = undefined;
+    finish();
+    output?.error(reason);
+  };
+  const abort = () => fail(requestSignal?.reason);
+  const timeout = () => fail(new DOMException('image transfer deadline exceeded', 'TimeoutError'));
+  const body = new ReadableStream<Uint8Array>({
+    start(value) { controller = value; },
+    pull(output) {
+      if (!buffer) { timeout(); return; }
+      if (offset === buffer.length) {
+        output.close();
+        controller = undefined;
+        finish();
+        return;
+      }
+      // A queued chunk cannot pin the complete image after the deadline.
+      const chunk = buffer.slice(offset, offset + 64 * 1024);
+      offset += chunk.length;
+      output.enqueue(chunk);
+    },
+    cancel() { controller = undefined; finish(); },
+  }, { highWaterMark: 0 });
+  return { body, startTransfer(signal?: AbortSignal) {
+    if (!buffer || timer !== undefined) return;
+    requestSignal = signal;
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener('abort', abort, { once: true });
+    transferDeadlines.set(drop, Date.now() + transferDeadlineMs);
+    timer = setTimeout(timeout, transferDeadlineMs);
+  } };
+}
+
 // ---- Rule 4 and section 3.1: outgoing headers, rebuilt from scratch ----
 
 export interface ContentOrigins {
@@ -393,26 +468,32 @@ export interface ContentOrigins {
   contentOrigin: string;
   /** `https://mail.<suite-domain>` */
   appOrigin: string;
+  /** Local HTTP fixtures only; both origins must be different loopback hosts. */
+  localLoopback?: boolean;
 }
 
-function bareHttpsOrigin(value: string): string {
+function bareOrigin(value: string, localLoopback: boolean): URL {
   let url: URL | undefined;
   try {
     url = new URL(value);
   } catch {
     url = undefined;
   }
-  if (url === undefined || url.protocol !== 'https:' || url.origin !== value) throw new TypeError('invalid content or app origin');
-  return url.origin;
+  const loopback = url?.hostname === 'localhost' || url?.hostname === '127.0.0.1';
+  if (!url || url.origin !== value || (url.protocol !== 'https:' && !(localLoopback && loopback && url.protocol === 'http:'))) {
+    throw new TypeError('invalid content or app origin');
+  }
+  return url;
 }
 
 /** The section 3.1 headers that every content-origin response carries. */
 export function contentSecurityHeaders(origins: ContentOrigins): Headers {
-  const content = bareHttpsOrigin(origins.contentOrigin);
-  const app = bareHttpsOrigin(origins.appOrigin);
+  const content = bareOrigin(origins.contentOrigin, origins.localLoopback === true);
+  const app = bareOrigin(origins.appOrigin, origins.localLoopback === true);
+  if (content.protocol !== app.protocol || content.hostname === app.hostname) throw new TypeError('content and app origins must be separate');
   return new Headers({
-    'content-security-policy': `default-src 'none'; img-src ${content} data:; style-src 'unsafe-inline'; font-src data:; `
-      + `base-uri 'none'; form-action 'none'; frame-ancestors ${app}; sandbox allow-popups allow-popups-to-escape-sandbox`,
+    'content-security-policy': `default-src 'none'; img-src ${content.origin} data:; style-src 'unsafe-inline'; font-src data:; `
+      + `base-uri 'none'; form-action 'none'; frame-ancestors ${app.origin}; sandbox allow-popups allow-popups-to-escape-sandbox`,
     'referrer-policy': 'no-referrer',
     'x-content-type-options': 'nosniff',
     'cache-control': 'private, no-store',

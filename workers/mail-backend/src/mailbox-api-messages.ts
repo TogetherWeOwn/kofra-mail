@@ -1,7 +1,7 @@
 import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import { VIEWS, type Address, type Conversation, type Folder, type Label, type Message, type MessageAttachment,
-  type ThreadSummary, type View, type ViewList } from '../../../contracts/mail-api/src/wire.ts';
+  type ThreadSummary, type Verdict, type View, type ViewList } from '../../../contracts/mail-api/src/wire.ts';
 import type { JournalEvent } from './mail-journal.ts';
 import { fail, invalid, iso, isId, need, object, requireId, text } from './mailbox-api-input.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY } from './mailbox-schema.ts';
@@ -16,6 +16,8 @@ const READ = 1 << 18;
 const STARRED = 1 << 19;
 const DAY = 86_400_000;
 export const folderOf = (flags: number): Folder => FOLDERS[(flags & FOLDER_MASK) >> FOLDER_SHIFT];
+const verdictOf = (flags: number): Verdict => folderOf(flags) === 'spam'
+  ? { level: 'spam', reasons: ['user_reported'] } : { level: 'none', reasons: [] };
 const unread = (flags: number) => !(flags & READ);
 const starred = (flags: number) => !!(flags & STARRED);
 const idList = (value: string) => JSON.parse(value) as string[];
@@ -69,6 +71,23 @@ export function attachmentRow(sql: SqlStorage, message: MessageRow, part: number
     message.id, part).toArray()[0]);
   return { ...row, name: indexedAttachmentName(row.name) };
 }
+export interface MailboxContentRecord {
+  rawKey: string;
+  attachments: { part: number; objectKey: string | null }[];
+  verdict: Verdict['level'];
+}
+
+export function contentRecord(sql: SqlStorage, id: string, now: number): MailboxContentRecord | null {
+  const row = sql.exec<{ rawKey: string; flags: number; syntheticPart: number | null }>(`
+    SELECT m.raw_key AS rawKey, m.flags, json_extract(d.data, '$.syntheticPart') AS syntheticPart
+      FROM messages m LEFT JOIN mailbox_api_display d ON d.id = m.id WHERE m.id = ? AND ${active('m')}`, id, now).toArray()[0];
+  if (!row) return null;
+  const attachments = sql.exec<{ part: number; objectKey: string | null }>(`
+    SELECT part, object_key AS objectKey FROM attachments WHERE message_id = ? AND part IS NOT ? ORDER BY part`,
+    id, row.syntheticPart).toArray().map(({ part, objectKey }) => ({ part, objectKey }));
+  return { rawKey: row.rawKey, attachments, verdict: verdictOf(row.flags).level };
+}
+
 export function partNumber(value: string | number | undefined, field: string): number {
   const part = typeof value === 'number' ? value : typeof value === 'string' && /^\d{1,9}$/.test(value) ? Number(value) : NaN;
   if (!Number.isSafeInteger(part) || part < 1) return invalid(field);
@@ -123,7 +142,7 @@ export function getThread(sql: SqlStorage, id: string, now: number, state: strin
       ...(display?.replyTo.length ? { replyTo: display.replyTo } : {}), date: iso(Number.isFinite(date) ? date : row.internal_date),
       receivedAt: iso(row.internal_date), subject: row.subject, text: body, textTruncated: display?.textTruncated ?? false,
       hasHtml: display?.hasHtml ?? false, remoteImages: display?.remoteImages ?? false, size: row.size, attachments,
-      verdict: folder === 'spam' ? { level: 'spam', reasons: ['user_reported'] } : { level: 'none', reasons: [] },
+      verdict: verdictOf(row.flags),
     };
   });
   return { thread: summarize(rows, rows), messages, state };

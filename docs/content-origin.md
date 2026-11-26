@@ -18,9 +18,9 @@ Status: design, version 1. It pairs with the [Mail API contract](../contracts/ma
 
 **The `mail-content` Worker:**
 - It runs on `content.<content-domain>` and holds the URL-signing keys.
-- It has read-only object-store credentials covering only the workspaces' mail buckets (`mail-<workspace_id>`, one per workspace). It derives the bucket from the verified `ws` claim, never from other input, and reads only keys of the form `raw/<sha256>/<gen>` or `att/<sha256>/<gen>` that the mailbox Durable Object returned. If storage keys cannot be scoped to the `mail-` buckets, it holds one read-only key per workspace bucket, selected by `ws`.
-- It has a binding to the mailbox Durable Objects and a service binding to the account service.
-- It has no write access to anything, and no VPC, Tunnel or other binding into a private network.
+- It uses one separate read-only object-store credential pair with one grant per authorised workspace mail bucket (`mail-<workspace_id>`). It derives the bucket from the verified `ws` claim, never from other input, and reads only keys of the form `raw/<sha256>/<gen>` or `att/<sha256>/<gen>` that the mailbox Durable Object returned. Checking the grants is an operator acceptance step at deploy, and provisioning a workspace adds its grant. Separate credentials selected per workspace are not implemented.
+- It has two service bindings and no direct mailbox storage bindings: `MAIL_LOOKUP` to a read-only named entrypoint of the mail backend (`ContentLookup`: the mailbox owner and the owner-checked message record, no mutation methods) and a named account entrypoint that exposes only `credentialEpoch`. It has no D1, Durable Object, queue, KV or R2 binding. A lookup on a cold mailbox still runs the Durable Object constructor's existing schema and alarm self-repair; the lookup method itself only reads.
+- It has no VPC, Tunnel or other binding into a private network.
 
 **The app:**
 - It reads the content origin from trusted server configuration and checks it with `separateContentOrigin` (`apps/web/src/lib/content-origin.ts`): `https:`, a different registrable domain, and no credentials or path.
@@ -61,7 +61,7 @@ https://content.<content-domain>/v1/<purpose>/<kid>.<payload>.<mac>
 
 ### 2.2 Minting
 
-- **Bodies and attachments:** `mail-web` authenticates the session and resolves its mailbox. It then calls `mint(claims)` on the `mail-content` Worker over a service binding: an RPC entrypoint that is not reachable from the internet.
+- **Bodies and attachments:** `mail-web` authenticates the session and resolves its mailbox. It then calls `mintForWeb(purpose, claims)` on the `mail-content` Worker over a service binding: an RPC entrypoint that is not reachable from the internet.
   - Only `mail-content` holds the keys.
   - `mail-web` sets `ws`, `mb` and `sub` from the session, never from request input.
 - **`cid` and `img` URLs** are minted by `mail-content` itself, while it sanitises a body it has already authorised. They copy that body token's `ws`, `mb`, `msg`, `sub`, `ep` and `exp`, so a body's images expire with the body.
@@ -112,6 +112,10 @@ An `img` URL skips steps 4 and 5 because it carries no mailbox data: it lets its
 
 ## 3. Responses
 
+The raw MIME is read and parsed under a per-isolate budget that is released before the response starts. cid and att requests for the same message share one read and parse; any request that cannot be admitted waits up to 2 s before 503. The 503 includes Retry-After. This bounds queue time, not object-store I/O. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
+
+The sharing key is scoped to the workspace. A loading flight accepts up to 16 members, of which at most two can request rendered bodies. A subject can lead one flight at a time. An abort cancels only that response; a raw MIME load times out at 25 s and is cancelled early when its last member leaves. A follower of a failed or unsettled load re-leads once (waiting for an unsettled load until 27 s, then using normal admission). If that attempt fails, it returns 503 with Retry-After. A stale load is closed to new requests after 27 s, and its charge is kept until it settles or 30 s pass. The 30 s watchdog only reclaims an unsettled load and reports a metric without request data. Once a load settles, its charge stays held until active preparations settle.
+
 ### 3.1 Headers on every response
 
 ```
@@ -125,7 +129,7 @@ Cache-Control: private, no-store
 - **`frame-ancestors`** stops other sites from framing a leaked URL.
 - **Scripts:** there is no `script-src`, so `default-src 'none'` forbids scripts even if the sanitiser misses one.
 - **`img-src`** names the content host explicitly. Under `sandbox` the document's origin is opaque, so `'self'` is not relied on.
-- **`no-store` applies to every response,** including `cid` and image proxy responses. A browser cache entry could otherwise be reused after the token expired or was revoked; with `no-store`, every use of a signed URL passes the verifier. Caching of remote images happens only behind the verifier (section 5, rule 6).
+- **`no-store` applies to every response,** including `cid` and image proxy responses. A browser cache entry could otherwise be reused after the token expired or was revoked; with `no-store`, every use of a signed URL passes the verifier.
 
 ### 3.2 `body`
 
@@ -134,7 +138,7 @@ Cache-Control: private, no-store
 2. Check its SHA-256 against the content-addressed key.
 3. Parse it.
 4. Pick the HTML part. A plain-text-only message is rendered as escaped text in `<pre>`, so long text has one display path.
-5. Sanitise (section 4) and wrap in a minimal document with `<meta charset="utf-8">` and a base stylesheet: system font, `overflow-wrap: anywhere`, `img { max-width: 100% }`.
+5. Sanitise (section 4) and wrap in a minimal document with `<meta charset="utf-8">` and a base stylesheet: system font, `overflow-wrap: anywhere`, `img { max-width: 100% }`. Count the expanded HTML in UTF-8 before materialising it; if it exceeds 8 MiB, use escaped plain text that fits or a neutral notice.
 
 **Inline images:** `cid:` references become `cid` URLs for that message's parts.
 
@@ -151,7 +155,7 @@ Cache-Control: private, no-store
 
 ### 3.4 `att`
 
-- The part is streamed: from its own content-addressed object when one exists (parts of 256 KiB or more), otherwise decoded from the raw MIME.
+- The part is streamed: from its own content-addressed object when one exists (parts of 256 KiB or more), otherwise decoded from the raw MIME. Object-backed `att` and `cid` transfers have 60 seconds to receive headers and a 30-second upstream idle timeout between chunks, not a total body deadline.
 - **Headers:**
   - always `Content-Type: application/octet-stream`;
   - `Content-Disposition: attachment; filename="<ASCII fallback>"; filename*=UTF-8''<percent-encoded name>`. The name has control characters, `/` and `\` removed and is at most 255 bytes. In the ASCII fallback, `"`, `\`, `;` and every non-ASCII character are replaced by `_`, so a name from the message cannot add or end a parameter; `filename*` carries the full name, percent-encoded.
@@ -179,6 +183,7 @@ Cache-Control: private, no-store
 - **`img src`:** only `cid:`, `data:image/(png|jpeg|gif|webp)` up to 64 KiB, or remote `http(s)`. Remote URLs are rewritten as in section 3.2.
 
 **CSS** (in `style` attributes and `<style>` elements):
+- A `<style>` element larger than 1 MiB is removed with its content.
 - Removed: `@import`, `@font-face`, `expression(…)`, `behavior`, `-moz-binding`, and `url(…)` other than `data:image/…`.
 - When remote images are in effect (`ri` true and the verdict is not `phishing`), remote `url(…)` in `background`/`background-image` is rewritten to an `img` URL, like an `<img>`.
 - `position: fixed` and `position: sticky` become `position: static`.
@@ -210,10 +215,8 @@ Cache-Control: private, no-store
    - Concurrent image reads in one isolate share an in-flight budget (32 MiB); a read that cannot reserve its bytes fails as too large.
    - Outgoing headers are rebuilt from scratch: the normalised `Content-Type`, `Content-Length` when known, and the security headers of section 3.1. No upstream header is passed through.
 5. **Failures:** anything else answers 404 with an empty body, so the browser shows a broken image.
-6. **Caching, behind the verifier only:** the Worker may keep the upstream image in its own fetch cache, keyed by the remote URL, for up to a day. Senders then see fewer opens; they never see who opened.
-   - The Worker consults that cache only after the token passed every verification step, so a cached image is never served for an expired, tampered or revoked token.
-   - Its response to the browser is still `Cache-Control: private, no-store` (section 3.1). No shared or browser cache stores the signed response.
-7. **Logging:** never the token, never the remote URL. Only the purpose, status, byte count and the first 8 characters of `SHA-256(token)`.
+6. Version 1 keeps no fetch cache; every image request fetches upstream after verification.
+7. **Logging:** never the token, never the remote URL. Only the purpose, status, byte count and the first 8 characters of `SHA-256(token)`. Workers invocation logs are off for mail-content; any log export is an operator acceptance step that verifies request URLs are redacted.
 
 **What users should know:** proxying still tells a sender that someone opened the message, and when. That is why images stay blocked until the user asks. The UI says so next to "Show images".
 
@@ -247,9 +250,9 @@ Cache-Control: private, no-store
    - Refusals: IP literals, private and own-zone names, a fourth redirect, a redirect to a refused host, SVG, a mislabelled HTML body, more than 5 MiB, and over 10 s.
    - It never forwards a cookie or `Referer`, checked with a local upstream fixture.
    - An upstream body with no `Content-Length` that grows past 5 MiB answers 404, and nothing is cached.
-5. **Headers and caching:**
+5. **Headers and image verification:**
    - Every response, including `cid` and `img`, has the section 3.1 headers, `Cache-Control: private, no-store` included, and downloads are `application/octet-stream` with `attachment`.
-   - An `img` URL whose image is in the fetch cache answers 404 once its token has expired or its MAC is flipped, and the cache is not read for it.
+   - Repeated valid requests for the same image fetch upstream each time. Expired or MAC-flipped image tokens answer 404 before an upstream fetch.
 6. **Logs:** no token or remote URL appears in captured logs.
 
 **Stop rule:** no live domain, DNS, certificate or secret is created by the lane. Choosing and attaching the content domain is an operator step after review. If the sanitiser cannot meet the corpus with `HTMLRewriter` alone, stop and report the failing vectors instead of adding a dependency.
