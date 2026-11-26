@@ -1055,3 +1055,49 @@ test('a send already fingerprinted on the synthetic row fails with delivery_erro
     await h.advance(minute);
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
   }));
+
+test('a large forwarded part whose att/ object no longer matches its digest fails the send with delivery_error, an alert and no MIME',
+  { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
+    const large = new Uint8Array(300 * 1024).fill(65);
+    const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Large file',
+      text: 'Attached', attachments: [{ name: 'large.bin', type: 'application/octet-stream', bytes: large }] });
+    const { messages: [delivered] } = await mail.getThread(source.threadId);
+    const draft = await mail.createDraft(draftInput(from, { to: [{ email: 'friend@example.net' }, { email: 'other@example.com' }],
+      attachments: [{ kind: 'message', messageId: source.messageId, part: delivered.attachments[0].part }] }), key('draft'));
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    const [partKey] = (JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[] }).attachmentKeys;
+    assert.match(partKey, /^att\//, 'a large part is its own content-addressed object');
+    // The stored bytes are corrupted in place: same length, different content.
+    h.objects.set(objectPath(partKey), new Uint8Array(large.byteLength).fill(66).buffer);
+    const builds = (await h.sends.builds()).length;
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), Array(2).fill({ state: 'failed', reason: 'delivery_error' }));
+    assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+    assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.deepEqual(await sentCopies(mail), []);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+
+test('a transient read failure of a large forwarded part still retries instead of failing the send', { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
+  const large = new Uint8Array(300 * 1024).fill(65);
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Large file',
+    text: 'Attached', attachments: [{ name: 'large.bin', type: 'application/octet-stream', bytes: large }] });
+  const { messages: [delivered] } = await mail.getThread(source.threadId);
+  const draft = await mail.createDraft(draftInput(from, { attachments: [{ kind: 'message', messageId: source.messageId, part: delivered.attachments[0].part }] }),
+    key('draft'));
+  const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+  const [partKey] = (JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[] }).attachmentKeys;
+  const stored = h.objects.get(objectPath(partKey))!;
+  h.objects.delete(objectPath(partKey));
+  await h.advance(UNDO);
+  assert.equal((await h.sends.row(pending.id))?.state, 'releasing', 'a missing read retries');
+  h.objects.set(objectPath(partKey), stored);
+  await h.advance(DRIVE_BACKOFF);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  assert.equal((await h.sends.queue()).length, 1);
+}));

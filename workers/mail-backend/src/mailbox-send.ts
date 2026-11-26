@@ -280,6 +280,8 @@ export class SendApi {
 }
 
 const STALE = Symbol('stale');
+// A send attachment whose bytes do not match its content-addressed key.
+class SourceMismatch extends Error { constructor() { super('Send attachment digest mismatch'); } }
 const EMPTY_DIGEST = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 type Stale = typeof STALE;
 type Start = { token: string; incarnation: string; scope: SendScope; row: SendRow };
@@ -403,26 +405,18 @@ export class SendDriver {
     else if (!this.withinLimits(record, draft = await this.draftOf(start, record))) failure = 'message_too_large';
     // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
     else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
-    if (failure || !draft || !forwarded) {
-      const reason = failure ?? 'delivery_error';
-      const unusable = !forwarded;
-      const failed = await this.commit(start, ['releasing'], (timers, row, index) => {
-        index.commitEvents([
-          ...(unusable ? [{ type: 'api_source_lost' as const, kind: 'send' as const, id: this.ref, holder: row.holder }] : []),
-          { type: 'send_fail', id: this.ref, reason, kinds },
-        ]);
-        timers.set(SEND_DRIVE, this.ref, this.timer.now);
-        this.resetBackoff();
-        ports.journalDue(timers);
-        return sendRow(ports.sql, this.ref)!;
-      });
-      if (failed === STALE) return;
-      return this.finish({ ...start, row: failed });
-    }
+    if (failure || !draft || !forwarded) return this.fail(start, kinds, failure ?? 'delivery_error', !forwarded);
     // Step 3: build, register (holders before PUT), then PUT.
     const builder = ports.mime.get(record.builderVersion);
     if (!builder) return this.breach(start);
-    const bytes = await builder.build(mimeMessage(record, draft), this.parts(start, draft, forwarded));
+    let bytes: Uint8Array<ArrayBuffer>;
+    try { bytes = await builder.build(mimeMessage(record, draft), this.parts(start, draft, forwarded)); }
+    catch (error) {
+      // An att/ object that does not match its content-addressed digest is
+      // corrupt for good, like a lost source; a failed read still retries.
+      if (error instanceof SourceMismatch) return this.fail(start, kinds, 'delivery_error', true);
+      throw error;
+    }
     const digest = await sha256(bytes);
     const registration = await ports.sweeper(start.scope.workspaceId).registerSend(start.scope.mailboxId, record.id, digest,
       { raw: sendRawHolder(start.scope.holderScope, record.id), index: `message:${start.scope.holderScope}:${sentCopyId(record.id)}` });
@@ -443,6 +437,24 @@ export class SendDriver {
     if (queued === STALE) return;
     await ports.checkpoint?.('queued');
     return this.dispatch({ ...start, row: queued });
+  }
+
+  // A release-time failure (section 2.4, step 2); `unusable` also marks the send's
+  // source unusable, which raises the lost-source alert.
+  private async fail(start: Start, kinds: SendRecipientKind[], reason: SendFailure, unusable: boolean): Promise<void> {
+    const { ports } = this;
+    const failed = await this.commit(start, ['releasing'], (timers, row, index) => {
+      index.commitEvents([
+        ...(unusable ? [{ type: 'api_source_lost' as const, kind: 'send' as const, id: this.ref, holder: row.holder }] : []),
+        { type: 'send_fail', id: this.ref, reason, kinds },
+      ]);
+      timers.set(SEND_DRIVE, this.ref, this.timer.now);
+      this.resetBackoff();
+      ports.journalDue(timers);
+      return sendRow(ports.sql, this.ref)!;
+    });
+    if (failed === STALE) return;
+    return this.finish({ ...start, row: failed });
   }
 
   // Step 4a and 5: publish the release, then enqueue while an external recipient is not terminal.
@@ -536,11 +548,11 @@ export class SendDriver {
       if (parsed?.kind !== 'att') throw new Error('Invalid send attachment reference');
       // Object reads refuse a declared empty body, but an empty upload is a valid file.
       if (wire.size === 0) {
-        if (parsed.digest !== EMPTY_DIGEST) throw new Error('Send attachment digest mismatch');
+        if (parsed.digest !== EMPTY_DIGEST) throw new SourceMismatch();
         return new Uint8Array(0);
       }
       const raw = await ready.index.readObject(key);
-      if (await sha256(raw) !== parsed.digest) throw new Error('Send attachment digest mismatch');
+      if (await sha256(raw) !== parsed.digest) throw new SourceMismatch();
       return raw;
     };
   }
