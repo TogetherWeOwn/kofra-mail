@@ -435,7 +435,10 @@ export default {
         authTime: (env.DEFAULT_ACCOUNT ? Date.now() : env.INITIAL_TIME) - (principal.stale ? 660_000 : 0),
         csrfToken: b64(new Uint8Array(await crypto.subtle.sign('HMAC', authKey, encoder.encode(account!)))), };
     };
+    const allow = { async limit() { return { success: true }; } };
     const port: MailApiEnvironment = {
+      MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow, MAIL_RATE_UPLOADS: allow, MAIL_RATE_SENDS: allow,
+      MAIL_RATE_UNDO: allow, MAIL_RATE_UNDO_FLOOD: allow, MAIL_RATE_ADMIN_WRITES: allow,
       MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },

@@ -21,9 +21,25 @@ export type OperationResult = {
   replayed?: boolean;
   error?: { code: MailErrorCode } & Pick<Partial<Problem>, 'errors' | 'limit' | 'retryAfterSeconds'>;
 };
-export interface MailApiEnvironment {
+const rateBindings = {
+  reads: 'MAIL_RATE_READS',
+  writes: 'MAIL_RATE_WRITES',
+  uploads: 'MAIL_RATE_UPLOADS',
+  sends: 'MAIL_RATE_SENDS',
+  undo: 'MAIL_RATE_UNDO',
+  undo_flood: 'MAIL_RATE_UNDO_FLOOD',
+  admin_writes: 'MAIL_RATE_ADMIN_WRITES',
+} as const;
+type RateBucket = keyof typeof rateBindings;
+interface RateLimitBinding {
+  limit(input: { key: string }): Promise<{ success: boolean }>;
+}
+type RateLimitBindings = Partial<Record<(typeof rateBindings)[RateBucket], RateLimitBinding>>;
+
+export interface MailApiEnvironment extends RateLimitBindings {
   MAIL_LOCAL_API?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
+  MAIL_SEND_ENABLED?: string;
   MAIL_DEV_SESSION?: {
     resolve(request: Request): Promise<LocalPrincipal | null>;
     members?(workspaceId: string): Promise<Omit<Member, 'hasMailbox'>[]>;
@@ -47,6 +63,8 @@ const drive = new Set<Operation>(['saveAttachmentToDrive', 'importFromDrive']);
 const matchers = (Object.entries(ROUTES) as [Operation, RouteSpec][]).map(([op, route]) => ({
   op, route, pattern: new RegExp(`^${API_PREFIX}${route.path.replace(/\{([A-Za-z]+)\}/g, '(?<$1>[^/]+)')}$`),
 }));
+// Keep this in sync with the local Wrangler namespaces' configured period.
+const rateLimitPeriodSeconds = 60;
 const keyPattern = /^[A-Za-z0-9_-]{1,64}$/;
 const jsonFields: Partial<Record<Operation, readonly string[]>> = {
   updateThreads: ['ids', 'set'], getBodyUrl: ['remoteImages'],
@@ -59,6 +77,35 @@ jsonFields.replaceDraft = jsonFields.createDraft;
 
 export function fail(code: MailErrorCode, extra: Omit<Partial<Problem>, 'code' | 'status' | 'type'> = {}): never {
   throw new MailApiError(problem(code, extra));
+}
+
+function rateBinding(env: MailApiEnvironment, bucket: RateBucket): RateLimitBinding {
+  try {
+    const binding = env[rateBindings[bucket]];
+    if (typeof binding?.limit === 'function') return binding;
+  } catch {
+    // An unusable binding must not admit a request or expose its error.
+  }
+  return fail('unavailable');
+}
+
+async function checkRate(binding: RateLimitBinding, bucket: RateBucket, key: string): Promise<void> {
+  let success: unknown;
+  try {
+    success = (await binding.limit({ key }))?.success;
+  } catch {
+    fail('unavailable');
+  }
+  if (success === true) return;
+  if (success !== false) fail('unavailable');
+  console.warn({ bucket, count: 1 });
+  fail('rate_limited', { retryAfterSeconds: rateLimitPeriodSeconds });
+}
+
+function parsePath(pattern: RegExp, pathname: string): Record<string, string> {
+  const raw = pattern.exec(pathname)?.groups ?? {};
+  try { return Object.fromEntries(Object.entries(raw).map(([name, value]) => [name, decodeURIComponent(value)])); }
+  catch { return fail('not_found'); }
 }
 
 const pageQuery = (key: string, value: string): unknown => {
@@ -143,8 +190,30 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     const directory = new Directory(env.DIRECTORY, principal.workspaceId, env.MAIL_DEV_SESSION.members?.bind(env.MAIL_DEV_SESSION));
     const mailbox = await directory.byUser(principal.userId);
     if (route.access !== 'admin' && op !== 'getSession' && !mailbox) fail('forbidden');
-    if (m3.has(op) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
+    const sendEnabled = env.MAIL_SEND_ENABLED === 'on';
+    if ((m3.has(op) && !sendEnabled) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
     if (drive.has(op)) fail('feature_unavailable');
+    const contentOrigin = env.MAIL_CONTENT_ENABLED === 'on' ? separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true) : undefined;
+    const content = contentOrigin ? env.MAIL_CONTENT : undefined;
+    const contentUrl = op === 'getBodyUrl' || op === 'getAttachmentUrl';
+    if (contentUrl && !content) fail('feature_unavailable');
+
+    let undoParams: Record<string, string> | undefined;
+    if (op === 'sendDraft' || op === 'undoSend') {
+      if (!mailbox) fail('forbidden');
+      if (op === 'sendDraft') await checkRate(rateBinding(env, 'sends'), 'sends', mailbox.id);
+      else {
+        // Require both bindings up front. Check the flood guard before allocating a counter for a send id.
+        const undo = rateBinding(env, 'undo');
+        await checkRate(rateBinding(env, 'undo_flood'), 'undo_flood', principal.userId);
+        undoParams = parsePath(pattern, url.pathname);
+        await checkRate(undo, 'undo', JSON.stringify([mailbox.id, undoParams.sendId]));
+      }
+    } else {
+      const bucket = route.method === 'GET' ? 'reads' : route.access === 'admin' ? 'admin_writes'
+        : op === 'createUpload' ? 'uploads' : 'writes';
+      await checkRate(rateBinding(env, bucket), bucket, bucket === 'admin_writes' ? principal.workspaceId : principal.userId);
+    }
 
     const idempotencyKey = request.headers.get('idempotency-key') ?? undefined;
     const ifMatch = request.headers.get('if-match') ?? undefined;
@@ -157,10 +226,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     const httpWrite = keyedMailbox ? { stream: request.body, mediaType: request.headers.get('content-type') ?? '',
       contentLength: request.headers.get('content-length'), query: [...url.searchParams] } : undefined;
     const query = httpWrite ? {} : parseQuery(url, route);
-    const raw = pattern.exec(url.pathname)?.groups ?? {};
-    let params: Record<string, string>;
-    try { params = Object.fromEntries(Object.entries(raw).map(([name, value]) => [name, decodeURIComponent(value)])); }
-    catch { return fail('not_found'); }
+    const params = undoParams ?? parsePath(pattern, url.pathname);
     const input = !httpWrite && route.body === 'json' ? await readJson(request, op) : query;
     if (op === 'getBodyUrl' && (!('remoteImages' in input) || typeof input.remoteImages !== 'boolean')) fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
 
@@ -170,7 +236,6 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     } else if (op === 'listIdentities' && mailbox) {
       result = { body: { items: await directory.identities(mailbox.id) } };
     } else {
-      const contentOrigin = env.MAIL_CONTENT_ENABLED === 'on' ? separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true) : undefined;
       if (mailbox) {
         const draftWrite = op === 'createDraft' || op === 'replaceDraft';
         const canSendAs = draftWrite || op === 'getSettings' || op === 'updateSettings'
@@ -186,14 +251,13 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
           user: { id: principal.userId, name: principal.name }, mailbox: mailbox ? { id: mailbox.id, primaryAddress: mailbox.primary_address } : undefined,
           workspace: { id: principal.workspaceId, role: principal.role }, csrfToken: principal.csrfToken,
           authTime: new Date(principal.authTime).toISOString(), limits: LIMITS,
-          features: { drive: false, htmlContent: Boolean(contentOrigin && env.MAIL_CONTENT), m3: false },
+          features: { drive: false, htmlContent: Boolean(content), m3: sendEnabled },
           state: (result.body as { state: string }).state,
         };
         result = { body: session };
       }
-      if (!result.error && mailbox && (op === 'getBodyUrl' || op === 'getAttachmentUrl')) {
-        if (!contentOrigin || !env.MAIL_CONTENT) fail('feature_unavailable');
-        const value = await env.MAIL_CONTENT.mintForWeb(op === 'getBodyUrl' ? 'body' : 'att', {
+      if (!result.error && mailbox && contentUrl && content) {
+        const value = await content.mintForWeb(op === 'getBodyUrl' ? 'body' : 'att', {
           ws: principal.workspaceId, mb: mailbox.id, msg: params.messageId,
           sub: principal.userId, ep: principal.credentialEpoch,
           ...(op === 'getBodyUrl' ? { ri: input.remoteImages as boolean } : { part: Number(params.part) }),
