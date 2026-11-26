@@ -8,8 +8,10 @@ import { receive } from '../../src/inbound.ts';
 import { kofra } from '../../src/kofra.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
+import { fingerprintOf, RESULT_TTL_MS } from '../../src/mailbox-api-idempotency.ts';
+import { SETTINGS_FLUSH_MS } from '../../src/mailbox-recovery.ts';
 import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TIMER_HANDLER_BUDGET_MS, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
-import { journalPrefix } from '../../src/journal-backup.ts';
+import { deltaRange, journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
@@ -48,6 +50,8 @@ export class HttpMailbox extends Mailbox {
   private expiryCompletion?: PromiseWithResolvers<void>;
   private startedExpiry = 0;
   private failPublish = false;
+  private blockedDeltaAfter?: number;
+  blockLaterDelta(after: number) { this.blockedDeltaAfter = after; }
   private failAlert = false;
   private realtimeHolderClock = false;
   private readonly emittedAlerts: string[] = [];
@@ -56,6 +60,11 @@ export class HttpMailbox extends Mailbox {
     let mailbox: HttpMailbox;
     const state = new Proxy(env.MAIL_STATE, { get(target, property) {
       const value: unknown = Reflect.get(target, property);
+      if (property === 'get') return (key: string, options?: R2GetOptions) => {
+        const range = mailbox.blockedDeltaAfter === undefined ? null : deltaRange(journalPrefix(ctx.id.toString()), key);
+        if (range && range.from > mailbox.blockedDeltaAfter!) throw new Error('Fixture later delta unreadable');
+        return target.get(key, options);
+      };
       if (property === 'put') return (...args: Parameters<R2Bucket['put']>) => {
         if (mailbox.failPublish) throw new Error('Fixture publish failure');
         return target.put(...args);
@@ -138,6 +147,15 @@ export class HttpMailbox extends Mailbox {
   expireUploadLease(key: string) {
     this.ctx.storage.sql.exec('UPDATE mailbox_api_in_progress SET expires_at = 0 WHERE key = ?', key);
   }
+  async seedLegacyLabel(ws: string, mb: string) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, async index => {
+      const label = { id: crypto.randomUUID(), name: 'Legacy' };
+      index.changeMany([{ type: 'label', ...label }, { type: 'api_result', key: 'legacy',
+        fingerprint: await fingerprintOf('createLabel', {}, { name: label.name }),
+        expiresAt: this.mailApiNow() + RESULT_TTL_MS, result: JSON.stringify({ label }) }]);
+      return label;
+    });
+  }
   hasIdempotency(key: string) {
     return this.ctx.storage.sql.exec('SELECT 1 FROM mailbox_api_idempotency WHERE key = ?', key).toArray().length === 1;
   }
@@ -213,6 +231,8 @@ export class HttpMailbox extends Mailbox {
 export class Sweeper extends MailSweeper {
   private failRelease = false;
   private failConfirm = false;
+  private failOneConfirm = false;
+  failNextConfirmation() { this.failOneConfirm = true; }
   private slowConfirm = false;
   private slowRelease?: string;
   stallConfirmation() { this.slowConfirm = true; }
@@ -223,7 +243,10 @@ export class Sweeper extends MailSweeper {
   setConfirmFailure(failing: boolean) { this.failConfirm = failing; }
   confirmBatches() { return this.confirmationBatches; }
   async confirm(entries: ConfirmEntry[]) {
-    if (this.failConfirm) throw new Error('Fixture confirmation outage');
+    if (this.failConfirm || this.failOneConfirm) {
+      this.failOneConfirm = false;
+      throw new Error('Fixture confirmation outage');
+    }
     if (this.slowConfirm) await this.stalled();
     this.confirmationBatches.push(entries.length);
     return super.confirm(entries);
@@ -336,6 +359,7 @@ export default {
         switch (url.pathname) {
           case '/__fixture/timers': return Response.json(await box.timers());
           case '/__fixture/has-idempotency': return Response.json(await box.hasIdempotency(await req.text()));
+          case '/__fixture/seed-legacy-label': return Response.json(await box.seedLegacyLabel(ws, mailboxId!));
           case '/__fixture/events': return Response.json(await box.eventCount(await req.text()));
           case '/__fixture/expiry-starts': return Response.json(await box.expiryStarts());
           case '/__fixture/pause-expiry': await box.pauseExpiry(await req.text()); break;
@@ -345,6 +369,9 @@ export default {
           case '/__fixture/confirmations': return Response.json(await box.confirmations());
           case '/__fixture/confirm-batches': return Response.json(await refs.confirmBatches());
           case '/__fixture/confirm-failure': await refs.setConfirmFailure(await req.text() === 'true'); break;
+          case '/__fixture/fail-next-confirmation': await refs.failNextConfirmation(); break;
+          case '/__fixture/block-later-delta': await box.blockLaterDelta(Number(await req.text())); break;
+          case '/__fixture/exposes-legacy-writer': return Response.json(Object.hasOwn(Mailbox.prototype, 'saveDraft'));
           case '/__fixture/stall-confirmation': await box.shortenHolderBudget(); await refs.stallConfirmation(); break;
           case '/__fixture/stall-release': await box.shortenHolderBudget(); await refs.stallRelease(await req.text()); break;
           case '/__fixture/expire-upload-lease': await box.expireUploadLease(await req.text()); break;
@@ -412,6 +439,22 @@ export default {
       MAIL_CONTENT_ORIGIN: contentOrigin(url, env),
       MAIL_CONTENT: { mint: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
     };
+    if (req.headers.get('x-fixture-watch-body') === 'true' && req.body) {
+      const reader = req.body.getReader();
+      let firstPull = true;
+      req = new Request(req, { body: new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          if (firstPull) {
+            firstPull = false;
+            await fetch('https://object-store.example.test/fixture-body-read', { method: 'POST' });
+          }
+          const { done, value } = await reader.read();
+          if (done) { reader.releaseLock(); controller.close(); }
+          else controller.enqueue(value);
+        },
+        cancel: reason => reader.cancel(reason),
+      }, { highWaterMark: 0 }) });
+    }
     return handleMailApi(req, port);
   },
 };

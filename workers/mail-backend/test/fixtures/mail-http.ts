@@ -51,6 +51,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
+  let watchedBody: PromiseWithResolvers<void> | undefined;
   const control = crypto.randomUUID();
   const startTime = Math.floor(startedAt / 1000) * 1000;
   let now = startTime;
@@ -68,6 +69,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     outboundService: async (req: LocalRequest) => {
       const { host, pathname } = new NodeURL(req.url);
       assert.equal(host, 'object-store.example.test');
+      if (pathname === '/fixture-body-read' && req.method === 'POST') {
+        watchedBody?.resolve();
+        return new LocalResponse(null, { status: 204 });
+      }
       switch (req.method) {
         case 'PUT': {
           await inspectPut?.(pathname);
@@ -216,6 +221,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
       stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
+      watchBodyRead: () => (watchedBody = Promise.withResolvers<void>()).promise,
+      failNextConfirmation: () => controlAction('fail-next-confirmation'),
+      blockLaterDelta: (after: number) => controlAction('block-later-delta', String(after)),
+      exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
+      seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
       m3: false, credentialEpoch: async () => 1,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {

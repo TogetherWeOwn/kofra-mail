@@ -1,6 +1,7 @@
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex, storedLifecycle } from '../../src/mailbox-index.ts';
-import { BackupConflict, MailboxRecovery, readyLife, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { BackupConflict, MailboxRecovery, readyLife, SETTINGS_FLUSH_MS, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { legacyFixtureObjects, seedLegacyDraft } from './legacy-draft.ts';
 import type { Env } from '../../src/worker.ts';
 export { Sweeper } from '../../src/sweeper-do.ts';
 
@@ -76,6 +77,10 @@ export class RegressionMailbox extends Mailbox {
       if (this.useScheduler && this.scheduledDelay === null) this.scheduledDelay = Number(args[0]) - Date.now();
       return setAlarm(...args);
     } });
+  }
+
+  async saveDraft(ws: string, mb: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => seedLegacyDraft(index, legacyFixtureObjects(this.env, ws), id, bytes));
   }
 
   private localIndex() {

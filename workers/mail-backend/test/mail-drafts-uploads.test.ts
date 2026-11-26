@@ -68,6 +68,99 @@ test('case 11: keys replay labels, deleted drafts and uploads, but not changed b
   assert.equal(h.writes.filter(write => write.key.startsWith('att/')).length, 1);
 }));
 
+function pausedDraftRequest(h: Awaited<ReturnType<typeof startMailHttpFixture>>, input: DraftInput, csrfToken: string, idempotencyKey: string) {
+  const encoded = new TextEncoder().encode(JSON.stringify(input));
+  let sink!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { sink = controller; controller.enqueue(encoded.subarray(0, 1)); } });
+  const reading = h.watchBodyRead();
+  const options: RequestInit & { duplex: 'half' } = {
+    method: 'POST', duplex: 'half', body, signal: AbortSignal.timeout(5_000),
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-fixture-watch-body': 'true', 'x-csrf-token': csrfToken,
+      'idempotency-key': idempotencyKey, 'content-type': 'application/json' },
+  };
+  const response = fetch(`${h.origin}/api/v1/drafts`, options);
+  return { reading: Promise.race([reading, response.then(() => assert.fail('draft answered before it read the body'))]), response,
+    finish(complete: boolean) { if (complete) sink.enqueue(encoded.subarray(1)); sink.close(); } };
+}
+
+test('R1: a paused createDraft body reserves the same key before reading', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox, csrfToken } = await mail.getSession();
+  assert.ok(mailbox);
+  const input = draftInput(mailbox.primaryAddress);
+  const first = pausedDraftRequest(h, input, csrfToken, 'draft-stream');
+  try {
+    await first.reading;
+    await assert.rejects(mail.createDraft({ ...input, subject: 'Another tab' }, key('draft-stream')),
+      e => isMailApiError(e, 'idempotency_in_progress'));
+  } finally { first.finish(true); }
+  const response = await first.response;
+  assert.equal(response.status, 201);
+  await response.arrayBuffer();
+  assert.deepEqual((await mail.listDrafts({})).items.map(draft => draft.subject), ['']);
+}));
+
+test('R1: expired and interrupted JSON bodies cannot commit or strand their keys', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox, csrfToken } = await mail.getSession();
+  assert.ok(mailbox);
+  const input = draftInput(mailbox.primaryAddress);
+  const expired = pausedDraftRequest(h, input, csrfToken, 'expired-body');
+  try { await expired.reading; await h.expireUploadLease('expired-body'); }
+  finally { expired.finish(true); }
+  const late = await expired.response;
+  assert.equal(late.status, 409);
+  assert.equal((await late.json<{ code: string }>()).code, 'idempotency_in_progress');
+  assert.equal(await h.hasIdempotency('expired-body'), false);
+  const interrupted = pausedDraftRequest(h, input, csrfToken, 'interrupted-body');
+  try { await interrupted.reading; }
+  finally { interrupted.finish(false); }
+  const bad = await interrupted.response;
+  assert.equal(bad.status, 400);
+  await bad.arrayBuffer();
+  assert.equal(await h.hasIdempotency('interrupted-body'), false);
+  assert.deepEqual((await mail.listDrafts({})).items, []);
+  await mail.createDraft(input, key('expired-body'));
+  await mail.createDraft(input, key('interrupted-body'));
+  assert.equal((await mail.listDrafts({})).items.length, 2);
+}));
+
+test('R3: replaceDraft checks existence and revision before its semantic fields', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  const input = draftInput(mailbox.primaryAddress);
+  const saved = await mail.createDraft(input, key('draft'));
+  const invalid = { ...input, extra: true };
+  await assert.rejects(mail.replaceDraft(saved.id, invalid, { ifMatch: 'stale' }), e => isMailApiError(e, 'revision_mismatch'));
+  await assert.rejects(mail.replaceDraft('missing', invalid, { ifMatch: saved.revision }), e => isMailApiError(e, 'not_found'));
+  await assert.rejects(mail.replaceDraft(saved.id, invalid, { ifMatch: saved.revision }), e => isMailApiError(e, 'unknown_field'));
+}));
+
+test('R3: an oversized JSON request with a committed key compares before the cap error', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox, csrfToken } = await mail.getSession();
+  assert.ok(mailbox);
+  const input = draftInput(mailbox.primaryAddress);
+  await mail.createDraft(input, key('draft'));
+  const oversized = new Blob([JSON.stringify({ ...input, body: 'x'.repeat(6 * LIMITS.bodyBytes + 512 * 1024) })]);
+  const request = (key: string) => fetch(`${h.origin}/api/v1/drafts`, { method: 'POST', body: oversized,
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken, 'idempotency-key': key, 'content-type': 'application/json' } });
+  assert.equal((await request('draft')).status, 422);
+  assert.equal((await request('fresh')).status, 413);
+}));
+
+test('R3: a committed upload key compares before rejecting an extra query field', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { csrfToken } = await mail.getSession();
+  const source = upload();
+  await mail.createUpload(source, key('upload'));
+  const response = await fetch(`${h.origin}/api/v1/uploads?name=note.txt&extra=1`, { method: 'POST', body: source.bytes,
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken, 'idempotency-key': 'upload', 'content-type': source.type } });
+  assert.equal(response.status, 422);
+  assert.equal((await response.json<{ code: string }>()).code, 'idempotency_key_reused');
+}));
+
 test('a fresh invalid filename is rejected before the upload body finishes', () => withMail(async (h) => {
   const { csrfToken } = await h.as('member').getSession();
   const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([1])); } });
@@ -93,6 +186,32 @@ test('an upload whose key lease expires during the PUT cannot commit', () => wit
   await assert.rejects(first, e => isMailApiError(e, 'idempotency_in_progress'));
   assert.equal(await h.hasIdempotency('lease'), false);
   assert.equal(await h.eventCount('api_upload'), 0);
+}));
+
+test('an upload deadline frees staging even while the PUT remains stalled', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { csrfToken } = await mail.getSession();
+  let sink!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({ start(controller) { sink = controller; controller.enqueue(new Uint8Array([1])); } });
+  const reading = h.watchBodyRead();
+  const gate = h.pauseNextPut();
+  const options: RequestInit & { duplex: 'half' } = { method: 'POST', duplex: 'half', body, signal: AbortSignal.timeout(5_000),
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-fixture-watch-body': 'true', 'x-csrf-token': csrfToken,
+      'idempotency-key': 'stalled-put', 'content-type': 'text/plain' } };
+  const first = fetch(`${h.origin}/api/v1/uploads?name=note.txt`, options);
+  try {
+    await Promise.race([reading, first.then(() => assert.fail('upload answered before reading the body'))]);
+    await h.advance(5 * 60_000 - 750);
+    sink.close();
+    await Promise.race([gate.started, first.then(() => assert.fail('the PUT did not reach its gate'))]);
+    const expired = await first;
+    assert.ok(expired.status === 409 || expired.status === 503);
+    await expired.arrayBuffer();
+    assert.equal(await h.hasIdempotency('stalled-put'), false);
+    const next = await mail.createUpload(upload(), key('stalled-put'));
+    assert.ok(next.id);
+    assert.equal(h.writes.length, 2);
+  } finally { gate.release(); }
 }));
 
 test('case 12: only one tab replaces the stored draft revision', () => withMail(async (h) => {
@@ -277,13 +396,27 @@ test('restore while uploads are switched off still rebuilds their expiry schedul
   assert.equal(await h.hasIdempotency('upload'), false);
 }));
 
+test('R4: enabled label and draft retry rows still expire after uploads are switched off', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  await mail.createLabel({ name: 'Ordinary' }, key('ordinary-label'));
+  await mail.createDraft(draftInput(mailbox.primaryAddress), key('ordinary-draft'));
+  await h.advance(60_000);
+  await h.uploadSwitch(false);
+  await h.advance(day);
+  assert.deepEqual(await Promise.all(['ordinary-label', 'ordinary-draft'].map(h.hasIdempotency)), [false, false]);
+  assert.ok(!(await h.timers()).some(row => row.kind === 'idem_expiry' && row.ref.startsWith('ordinary-')));
+}));
+
 test('a rebuilt legacy retry row still expires after uploads are switched off', () => withMail(async (h) => {
   const mail = h.as('member');
   await h.uploadSwitch(false);
-  await mail.createLabel({ name: 'Legacy' }, key('legacy'));
+  const label = await h.seedLegacyLabel();
   await h.advance(60_000);
   await h.uploadSwitch(true);
   await h.restore();
+  assert.deepEqual(await mail.createLabel({ name: 'Legacy' }, key('legacy')), label);
   assert.ok((await h.timers()).some(row => row.kind === 'idem_expiry' && row.ref === 'legacy'));
   await h.uploadSwitch(false);
   await h.advance(ttl);
@@ -452,6 +585,51 @@ test('a crash after the draft PUT leaves a provisional holder that expires', () 
   assert.deepEqual(await h.confirmations(), []);
   await h.sweepAt(holder.expires_at);
   assert.equal((await h.holderDetails(objectKey))[0]?.state, 'expired');
+}));
+
+for (const size of [66, 68] as const) {
+  test(`R2: all ${size} holders from one delta are confirmed before a later delta can block restore`, () => withMail(async (h) => {
+    const mail = h.as('member');
+    const { mailbox } = await mail.getSession();
+    assert.ok(mailbox);
+    if (size === 68) await h.confirmFailure(true);
+    const files = await Promise.all(['first', 'second'].map(name => mail.createUpload(upload(name), key(`upload-${name}`))));
+    if (size === 66) { await h.advance(60_000); await h.confirmFailure(true); }
+    for (let i = 0; i < 22; i++) await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: `Draft ${i}`,
+      attachments: files.map(file => ({ kind: 'upload', uploadId: file.id })) }), key(`draft-${i}`));
+    await h.advance(60_000);
+    assert.equal((await h.confirmations()).length, size);
+    await mail.createLabel({ name: 'Later delta' }, key('later'));
+    await h.advance(60_000);
+    await h.blockLaterDelta(48);
+    await h.confirmFailure(false);
+    await h.restore();
+    await assert.rejects(mail.listDrafts({}), e => isMailApiError(e, 'mailbox_restoring'));
+    assert.deepEqual(await h.confirmations(), []);
+    for (const { key } of h.writes) assert.ok((await h.holderDetails(key)).every(row => row.state === 'held'));
+    assert.deepEqual((await h.confirmBatches()).slice(-2), [64, size - 64]);
+  }));
+}
+
+test('R2: a confirmation that fails once is retried before restore can reach ready', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  await h.confirmFailure(true);
+  const draft = await mail.createDraft(draftInput(mailbox.primaryAddress), key('draft'));
+  await h.advance(60_000);
+  await h.confirmFailure(false);
+  await h.failNextConfirmation();
+  await h.restore();
+  await assert.rejects(mail.getDraft(draft.id), e => isMailApiError(e, 'mailbox_restoring'));
+  assert.equal((await h.holderDetails(h.writes[0].key))[0]?.state, 'provisional');
+  await h.advance(60_000);
+  assert.deepEqual(await mail.getDraft(draft.id), draft);
+  assert.equal((await h.holderDetails(h.writes[0].key))[0]?.state, 'held');
+}));
+
+test('R5: the deployed Mailbox prototype does not export the legacy draft writer', () => withMail(async (h) => {
+  assert.equal(await h.exposesLegacyWriter(), false);
 }));
 
 test('a restore spanning multiple confirmation batches checks published holders without losing any', () => withMail(async (h) => {
