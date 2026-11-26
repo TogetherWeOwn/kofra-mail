@@ -24,6 +24,7 @@ before(async () => {
   for (const mb of ['ready', 'restoring']) {
     await db.prepare("INSERT INTO mailboxes VALUES (?, 'w', ?, ?)").bind(mb, `owner-${mb}`, `${mb}@mail.example`).run();
   }
+  await db.prepare("INSERT INTO mailboxes VALUES ('opaque-owner', 'w', 'account:member', 'opaque@mail.example')").run();
 });
 after(() => mf?.dispose());
 async function call(...args: unknown[]) {
@@ -37,9 +38,16 @@ test('ContentLookup has exactly two own RPC methods and directly extends WorkerE
 });
 test('MAIL_LOOKUP exposes only the named façade, not mailApi, deliver or another name', async () => {
   assert.deepEqual(await call('mailboxOwner', 'w', 'ready'), { value: 'owner-ready' });
-  for (const name of ['mailApi', 'deliver', 'fetch', 'alarm', 'anythingElse']) {
+  for (const name of ['mailApi', 'deliver', 'alarm', 'anythingElse']) {
     assert.deepEqual(await call(name, 'w', 'ready'), { refused: true }, name);
   }
+  assert.deepEqual(await call('fetch', 'https://mail.example/'), { refused: true });
+});
+test('the opaque account subject need not have mailbox-ID syntax', async () => {
+  assert.deepEqual(await call('mailboxOwner', 'w', 'opaque-owner'), { value: 'account:member' });
+  await call('seed', 'opaque-owner', 'ready', Date.now() + 60 * 60 * 1000);
+  const result = await call('messageRecord', 'w', 'opaque-owner', 'account:member', 'm') as { value?: { rawKey: string } };
+  assert.equal(result.value?.rawKey, 'raw-key');
 });
 test('malformed workspace, mailbox, user and message values are refused', async () => {
   for (const [method, ...args] of [

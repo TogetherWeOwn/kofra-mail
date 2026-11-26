@@ -7,6 +7,7 @@
   "preview_urls": false,
   "vars": {
     "MAIL_BACKEND_ENABLED": "off",
+    "MAIL_CONTENT_ENABLED": "off",
     "MAIL_RECOVERY_ENABLED": "off",
     "MAIL_SWEEP_ENABLED": "off",
     "DELIVERY_QUEUE_NAME": "mail-local-deliver",
