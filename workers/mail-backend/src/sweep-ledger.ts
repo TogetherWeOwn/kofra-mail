@@ -48,7 +48,8 @@ type HolderState = 'held' | 'provisional' | 'expired' | 'tombstone';
 export type HoldTarget = { kind: ObjectKind; digest: string } | { key: string };
 export type ConfirmEntry = { key: string; holder: string };
 // held: provisional or already held. rehold: expired, held again on its live
-// generation. lost: expired on a retired generation. released: absent or tombstone.
+// generation. lost: expired on a retired generation, or absent from a deleted
+// raw/ or att/ generation. released: otherwise absent, or a tombstone.
 export type ConfirmAnswer = 'held' | 'rehold' | 'lost' | 'released';
 
 export class SweepLedger {
@@ -117,8 +118,8 @@ export class SweepLedger {
     });
   }
 
-  // One transaction for the whole batch. Absent and tombstone holders answer
-  // released and are never created: they were released by a published state.
+  // One transaction for the whole batch. Absent and tombstone holders are never
+  // created: they were released by a published state, or their object is gone.
   confirm(entries: ConfirmEntry[], now: number): ConfirmAnswer[] {
     if (!Array.isArray(entries)) throw new Error('Invalid sweeper reference');
     if (entries.length > CONFIRM_BATCH) throw new Error(`Confirm at most ${CONFIRM_BATCH} holders per call`);
@@ -142,6 +143,10 @@ export class SweepLedger {
         this.count(key, 1, now);
         return 'rehold';
       }
+      // A raw/ or att/ generation row is dropped only after a confirmed DELETE,
+      // so an absent holder without one lost its object.
+      if (state === undefined && parseObjectKey(key)
+        && !this.sql.exec('SELECT 1 FROM generations WHERE key = ?', key).toArray().length) return 'lost';
       return 'released';
     }));
   }
