@@ -8,7 +8,7 @@ import { receive } from '../../src/inbound.ts';
 import { kofra } from '../../src/kofra.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
-import type { TimerKind, TimerRun } from '../../src/mailbox-timers.ts';
+import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { mailboxName, type Env as BackendEnv } from '../../src/worker.ts';
@@ -57,7 +57,10 @@ export class HttpMailbox extends Mailbox {
       };
       return typeof value === 'function' ? value.bind(target) : value;
     } });
-    super(ctx, { ...env, MAIL_STATE: state });
+    let flag: string | undefined;
+    try { flag = ctx.storage.sql.exec<{ flag: string }>('SELECT flag FROM fixture_upload_switch').toArray()[0]?.flag; }
+    catch { /* no fixture override before the first toggle */ }
+    super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED });
     mailbox = this;
   }
   publishFailure(failing: boolean) { this.failPublish = failing; }
@@ -121,6 +124,24 @@ export class HttpMailbox extends Mailbox {
       for (const { id, flags } of expired) index.setFlags(id, flags, ['trash']);
       return index.emptyTrash();
     });
+  }
+  async changeUploadSwitch(enabled: boolean) {
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_upload_switch (id INTEGER PRIMARY KEY, flag TEXT NOT NULL)');
+    this.ctx.storage.sql.exec('INSERT OR REPLACE INTO fixture_upload_switch VALUES (1, ?)', enabled ? 'on' : 'off');
+    await this.ctx.storage.sync();
+    this.ctx.abort();
+  }
+  async forceSnapshot(): Promise<boolean> {
+    await this.workLane(async () => {
+      this.ctx.storage.sql.exec("UPDATE lifecycle SET value = json_set(value, '$.nextSnapshotAt', 0) WHERE id = 1");
+      new TimerTable(this.ctx.storage.sql).lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, this.mailApiNow());
+    });
+    await this.testAlarm();
+    const { objects } = await this.env.MAIL_STATE.list({ limit: 20 });
+    const manifest = objects.find(row => row.key.endsWith('/manifest.json'));
+    const stored = manifest && await this.env.MAIL_STATE.get(manifest.key);
+    const backup = stored && await stored.json<{ snapshot_key: string | null; delta_keys: string[] }>();
+    return !!backup && backup.snapshot_key !== null && backup.delta_keys.length === 0;
   }
   async restoreFixture(ws: string, mb: string) {
     await this.ctx.storage.deleteAll();
@@ -246,6 +267,13 @@ export default {
           case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;
           case '/__fixture/purge-trash': return Response.json(await box.purgeTrash(ws));
           case '/__fixture/restore': await box.restoreFixture(ws, mailboxId!); break;
+          case '/__fixture/snapshot': return Response.json(await box.forceSnapshot());
+          case '/__fixture/upload-switch': {
+            const enabled = await req.text() === 'true';
+            try { await box.changeUploadSwitch(enabled); }
+            catch { /* the fixture deliberately aborts the isolate after persisting the override */ }
+            break;
+          }
           default: return missing();
         }
         return new Response(null, { status: 204 });

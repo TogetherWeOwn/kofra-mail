@@ -405,14 +405,14 @@ export class MailboxIndex {
     }
   }
 
-  pruneApiKeys(now: number, legacyResults = true): void {
+  pruneApiKeys(now: number): void {
     this.storage.transactionSync(() => {
       // Rows written before M3-2 have no timer unless restored. Preserve the
       // legacy cleanup for those rows, not for a key owned by idem_expiry.
       this.sql.exec(`DELETE FROM mailbox_api_idempotency WHERE key IN (SELECT k.key FROM mailbox_api_idempotency k
-        WHERE expires_at <= ? AND (? OR NOT EXISTS (SELECT 1 FROM timers WHERE kind = ? AND ref = k.key))
-          AND (? OR json_extract(result, '$.status') IS NULL)
-        ORDER BY expires_at, k.key LIMIT 64)`, now, Number(legacyResults), IDEM_EXPIRY, Number(legacyResults));
+        WHERE expires_at <= ? AND NOT EXISTS (SELECT 1 FROM timers WHERE kind = ? AND ref = k.key)
+          AND json_extract(result, '$.status') IS NULL
+        ORDER BY expires_at, k.key LIMIT 64)`, now, IDEM_EXPIRY);
       this.sql.exec(`DELETE FROM mailbox_api_in_progress WHERE key IN (SELECT key FROM mailbox_api_in_progress
         WHERE expires_at <= ? ORDER BY expires_at, key LIMIT 64)`, now);
     });

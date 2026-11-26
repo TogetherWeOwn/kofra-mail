@@ -121,6 +121,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       assert.equal(res.status, 204, res.status === 204 ? undefined : await res.text());
     };
     const restore = () => controlAction('restore');
+    const forceSnapshot = () => readControl<boolean>('snapshot');
+    const uploadSwitch = (enabled: boolean) => controlAction('upload-switch', String(enabled));
     const publishFailure = (failing: boolean) => controlAction('publish-failure', String(failing));
     const releaseFailure = (failing: boolean) => controlAction('release-failure', String(failing));
     const acknowledgedReleases = () => readControl<{ key: string; holder: string }[]>('acknowledged-releases');
@@ -184,7 +186,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, restore,
+    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, restore, forceSnapshot, uploadSwitch,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       m3: false, credentialEpoch: async () => 1,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };

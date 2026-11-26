@@ -49,11 +49,17 @@ export function uploadMediaType(value: string): string {
 // be registered. Read a bounded, rewindable body, hashing each chunk as it
 // arrives; then stream those same chunks into the signed PUT. Never write an
 // untracked staging object or tee a body into an unbounded queue.
-export async function readUpload({ stream, contentLength }: UploadBody): Promise<{
+export async function readUpload({ stream, contentLength }: UploadBody, compareCommitted = false): Promise<{
   digest: string; size: number; bytes: ReadableStream<Uint8Array>;
 }> {
   const max = LIMITS.uploadBytes;
-  if (contentLength !== null && Number(contentLength) > max) return fail('payload_too_large', { limit: max });
+  // No committed upload exceeded the cap, so an oversized retry is already
+  // known to differ without buffering or hashing the rest of its body.
+  const tooLarge = () => compareCommitted ? fail('idempotency_key_reused') : fail('payload_too_large', { limit: max });
+  if (contentLength !== null && Number(contentLength) > max) {
+    void stream?.cancel().catch(() => {});
+    return tooLarge();
+  }
   let size = 0;
   let offset = 0;
   const chunks: Uint8Array<ArrayBuffer>[] = [];
@@ -73,7 +79,7 @@ export async function readUpload({ stream, contentLength }: UploadBody): Promise
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > max) return fail('payload_too_large', { limit: max });
+      if (size > max) return tooLarge();
       if (!value.byteLength) continue;
       await writer.write(value);
       // Coalesce arbitrary inbound chunk boundaries so tiny chunks cannot

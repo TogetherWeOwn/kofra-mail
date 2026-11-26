@@ -42,7 +42,7 @@ export function uploadExpiry({ sql, ready, journalDue }: ExpiryPorts): TimerKind
   };
 }
 
-export function idemExpiry({ sql, ready, journalDue }: ExpiryPorts): TimerKind {
+export function idemExpiry({ sql, ready, journalDue }: ExpiryPorts, includeLegacy: boolean): TimerKind {
   return {
     async run(timer) {
       const read = await timer.local(timers => {
@@ -64,7 +64,8 @@ export function idemExpiry({ sql, ready, journalDue }: ExpiryPorts): TimerKind {
       });
     },
     rebuild(timers) {
-      for (const { key, expires_at } of sql.exec<{ key: string; expires_at: number }>('SELECT key, expires_at FROM mailbox_api_idempotency')) {
+      for (const { key, expires_at } of sql.exec<{ key: string; expires_at: number }>(`SELECT key, expires_at FROM mailbox_api_idempotency
+        WHERE ? OR json_extract(result, '$.status') IS NOT NULL`, Number(includeLegacy))) {
         timers.set(IDEM_EXPIRY, key, Math.max(1, expires_at));
       }
       return undefined;

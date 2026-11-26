@@ -61,20 +61,30 @@ export class Mailbox extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    if (env.MAIL_DRAFT_UPLOADS_ENABLED === 'on') {
-      const ports = {
-        sql: ctx.storage.sql,
-        ready: () => {
-          const life = storedLifecycle<Lifecycle>(ctx.storage);
-          if (life?.state === 'ready') return { incarnation: life.incarnation, index: this.index(life.scope.workspaceId) };
-        },
-        journalDue: (timers: TimerTable) => {
-          if (this.lowerJournal(timers, this.timerNow() + SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS)) this.laneMoved?.resolve();
-        },
-      };
-      this.registerTimerKind(UPLOAD_EXPIRY, uploadExpiry(ports));
-      this.registerTimerKind(IDEM_EXPIRY, idemExpiry(ports));
-    }
+    const outbound = env.MAIL_DRAFT_UPLOADS_ENABLED === 'on';
+    const ports = {
+      sql: ctx.storage.sql,
+      ready: () => {
+        const life = storedLifecycle<Lifecycle>(ctx.storage);
+        if (life?.state === 'ready') return { incarnation: life.incarnation, index: this.index(life.scope.workspaceId) };
+      },
+      journalDue: (timers: TimerTable) => {
+        if (this.lowerJournal(timers, this.timerNow() + SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS)) this.laneMoved?.resolve();
+      },
+    };
+    // A disabled feature still restores schedules for existing outbound state.
+    // Hold its due jobs without changing that state until the feature is on again.
+    const register = (kind: string, handler: TimerKind) => this.registerTimerKind(kind, {
+      ...handler,
+      run: outbound ? handler.run : timer => timer.local(timers => {
+        const due = timers.due(kind, timer.ref);
+        if (this.lifecycleState() === 'ready' && due !== null && due <= timer.now + this.timerRetryMs) {
+          timers.set(kind, timer.ref, timer.now + HELD_RECHECK_MS);
+        }
+      }),
+    });
+    register(UPLOAD_EXPIRY, uploadExpiry(ports));
+    register(IDEM_EXPIRY, idemExpiry(ports, outbound));
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
@@ -250,7 +260,7 @@ export class Mailbox extends DurableObject<Env> {
     try {
       return await this.uploads.run(async () => {
         const mediaType = uploadMediaType(input.mediaType);
-        const { digest, size, bytes } = await readUpload(input);
+        const { digest, size, bytes } = await readUpload(input, 'row' in reservation);
         const fingerprint = await fingerprintOf('createUpload', params, { digest, mediaType });
         if ('row' in reservation) return replayApiKey(index, reservation.row, fingerprint);
         const name = uploadName(params.name);
@@ -745,8 +755,7 @@ export class Mailbox extends DurableObject<Env> {
     try {
       if (life.state === 'restoring') next = await this.restoreSlice(index, life);
       else if (life.state === 'ready') {
-        if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () =>
-          index.pruneApiKeys(this.mailApiNow(), this.env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on'));
+        if (this.env.MAIL_LOCAL_API === 'on') await this.work.run(async () => index.pruneApiKeys(this.mailApiNow()));
         next = await this.backupSlice(index, life, now);
       }
       else next = now + HELD_RECHECK_MS;

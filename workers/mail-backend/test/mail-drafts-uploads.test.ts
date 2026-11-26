@@ -49,6 +49,8 @@ test('case 11: keys replay labels, deleted drafts and uploads, but not changed b
   const uploaded = await mail.createUpload(upload(), key('upload'));
   assert.deepEqual(await mail.createUpload(upload(), key('upload')), uploaded);
   await assert.rejects(mail.createUpload(upload('different'), key('upload')), (e) => isMailApiError(e, 'idempotency_key_reused'));
+  await assert.rejects(mail.createUpload(upload(new Uint8Array(LIMITS.uploadBytes + 1)), key('upload')),
+    (e) => isMailApiError(e, 'idempotency_key_reused'));
   assert.equal(uploaded.sha256, createHash('sha256').update('example attachment').digest('hex'));
   await mail.deleteUpload(uploaded.id);
   await assert.rejects(mail.createDraft(draftInput(mailbox.primaryAddress, {
@@ -208,6 +210,47 @@ test('restore rebuilds the idempotency and upload timers from published state', 
   assert.ok((await h.holders(h.writes[0].key)).includes(holder));
   assert.deepEqual((await h.timers()).filter(row => row.kind === 'upload_expiry').map(row => row.ref), [unattached.id]);
   assert.deepEqual((await h.timers()).filter(row => row.kind === 'idem_expiry').map(row => row.ref), ['attached', 'draft', 'unattached']);
+}));
+
+test('restore while uploads are switched off still rebuilds their expiry schedules', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const uploaded = await mail.createUpload(upload(), key('upload'));
+  await h.advance(60_000);
+  await h.uploadSwitch(false);
+  await assert.rejects(mail.createUpload(upload(), key('disabled')), (e) => isMailApiError(e, 'not_implemented'));
+  await h.restore();
+  const rows = await h.timers();
+  assert.equal(rows.find(row => row.kind === 'upload_expiry')?.ref, uploaded.id);
+  assert.equal(rows.find(row => row.kind === 'idem_expiry')?.ref, 'upload');
+  await h.advance(ttl);
+  assert.equal(await h.eventCount('api_upload_delete'), 0, 'disabled timer does not expire the upload');
+  await h.uploadSwitch(true);
+  await h.advance(15 * 60_000);
+  assert.equal(await h.eventCount('api_upload_delete'), 1, 'expiry resumes on the existing schedule');
+}));
+
+test('snapshot restores upload references before drafts and retains pending holder releases', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  const linked = await mail.createUpload(upload(), key('linked'));
+  const loose = await mail.createUpload(upload(), key('loose'));
+  const input = draftInput(mailbox.primaryAddress, { attachments: [{ kind: 'upload', uploadId: linked.id }] });
+  const original = await mail.createDraft(input, key('draft'));
+  const edited = await mail.replaceDraft(original.id, { ...input, subject: 'In snapshot' }, { ifMatch: original.revision });
+  await h.releaseFailure(true);
+  assert.equal(await h.forceSnapshot(), true, 'manifest has a snapshot and no deltas');
+  const pending = await h.pendingReleases();
+  assert.equal(pending.length, 2);
+  await h.restore();
+  assert.deepEqual(await mail.getDraft(edited.id), edited);
+  assert.deepEqual(await mail.createDraft(input, key('draft')), original);
+  assert.deepEqual(await h.pendingReleases(), pending);
+  assert.deepEqual((await h.timers()).filter(row => row.kind === 'upload_expiry').map(row => row.ref), [loose.id]);
+  await h.releaseFailure(false);
+  await h.advance(60_000);
+  assert.deepEqual(await h.pendingReleases(), []);
+  assert.deepEqual(await mail.getDraft(edited.id), edited);
 }));
 
 test('journal cleanup drains a 200-entry backlog in 64-entry minute batches', () => withMail(async (h) => {
