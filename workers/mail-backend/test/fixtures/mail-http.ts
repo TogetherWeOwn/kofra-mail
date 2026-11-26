@@ -112,7 +112,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       modules: [{ type: 'ESModule', path: 'account.mjs', contents: account.outputFiles[0].text }],
       bindings: { USERS: [...new Set(Object.values(accounts).map(({ userId }) => userId))] },
     }, {
-      name: 'mail-content', compatibilityDate: '2026-07-30',
+      name: 'mail-content', compatibilityDate: '2026-07-30', compatibilityFlags: ['enable_request_signal'],
       modules: [{ type: 'ESModule', path: 'mail-content.mjs', contents: content.outputFiles[0].text }],
       bindings: {
         MAIL_CONTENT_ENABLED: 'on', CONTENT_LOCAL_LOOPBACK: 'on', CONTENT_ORIGIN: realContent.contentOrigin,

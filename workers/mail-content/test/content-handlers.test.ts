@@ -36,7 +36,7 @@ before(async () => {
   mf = new Miniflare({
     handleStructuredLogs: ({ level, message }: { level: string; message: string }) => { logs.push({ level, message }); },
     workers: [{
-      name: 'content', compatibilityDate: '2026-07-30', modules: true, script: content,
+      name: 'content', compatibilityDate: '2026-07-30', compatibilityFlags: ['enable_request_signal'], modules: true, script: content,
       bindings: {
         MAIL_CONTENT_ENABLED: 'on', CONTENT_ORIGIN: origin, MAIL_APP_ORIGIN: 'https://mail.example',
         CONTENT_URL_KEYS: keysJson, CONTENT_S3_ENDPOINT: 'https://objects.example',
@@ -114,7 +114,8 @@ test('local Wrangler config has exactly the two named service bindings and no st
     { binding: 'MAIL_LOOKUP', service: 'mail-backend-local', entrypoint: 'ContentLookup' },
     { binding: 'ACCOUNT_EPOCH', service: 'account-local', entrypoint: 'CredentialEpoch' },
   ]);
-  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'main', 'name', 'preview_urls', 'services', 'vars', 'workers_dev']);
+  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'preview_urls', 'services', 'vars', 'workers_dev']);
+  assert.deepEqual(config.compatibility_flags, ['enable_request_signal']);
   assert.equal(config.vars.MAIL_CONTENT_ENABLED, 'off');
   assert.equal(config.workers_dev, false);
   assert.equal(config.preview_urls, false);
@@ -242,6 +243,30 @@ test('body mints CID only for a real MIME part and serves its matching raster by
   assert.equal(inline.headers.get('content-disposition'), 'inline');
   assert.deepEqual(new Uint8Array(await inline.arrayBuffer()), png);
   await status(await cidUrl(2)); // MIME claims image/png, bytes are not PNG.
+});
+
+test('one large body can open six inline images concurrently without exceeding the MIME budget', async () => {
+  const ids = Array.from({ length: 6 }, (_, i) => `image-${i}@content.example`);
+  const images = ids.map(id => `--parts\r\nContent-Type: image/png\r\nContent-ID: <${id}>\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(png).toString('base64')}\r\n`);
+  const encodedAttachment = Buffer.alloc(17 * 1024 * 1024, 65).toString('base64');
+  const raw = `Content-Type: multipart/mixed; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/html\r\n\r\n${ids.map(id => `<img src="cid:${id}">`).join('')}\r\n`
+    + images.join('') + `--parts\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodedAttachment}\r\n--parts--\r\n`;
+  const rawKey = await record(alpha, raw, ids.map((_, i) => ({ part: i + 1, objectKey: null })));
+  try {
+    assert.ok(Buffer.byteLength(raw) * ids.length > 128 * 1024 * 1024, 'simultaneously buffered raw copies alone would exceed the Worker limit');
+    const body = await get(await bodyUrl());
+    assert.equal(body.status, 200);
+    const urls = [...(await body.text()).matchAll(/src="(https:\/\/content\.example\/v1\/cid\/[^"]+)"/g)].map(match => match[1]);
+    assert.equal(urls.length, ids.length);
+    for (const url of urls) tokenValues.push(new URL(url).pathname.split('/').at(-1)!);
+    await Promise.all(urls.map(async url => {
+      const res = await get(url);
+      assert.equal(res.status, 200);
+      assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
+    }));
+    const observed = await (await get('/__mime-budget')).json();
+    assert.deepEqual(observed, { peak: Buffer.byteLength(raw), inFlight: 0 });
+  } finally { store.delete(objectPath('alpha', rawKey)); }
 });
 
 test('downloads decode raw-only parts and stream external objects with safe filename parameters', async () => {

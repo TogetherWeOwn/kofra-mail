@@ -9,7 +9,7 @@ import {
 } from './proxy.ts';
 import { fillRefs, sanitise, sanitisePlainText } from './sanitise.ts';
 import { CONTENT_URL_SECONDS, isPurpose, mintForWeb, type ClaimsByPurpose, type Purpose, type WebPurpose } from './tokens.ts';
-import { attachmentFor, createVerifier, EpochCache, mintFromBody, type Verified } from './verify.ts';
+import { attachmentFor, createVerifier, EpochCache, mintFromBody, type MessageAttachment, type Verified } from './verify.ts';
 
 export interface AccountEpochPort { credentialEpoch(sub: string): Promise<number | null> }
 export interface MailLookupPort {
@@ -78,13 +78,35 @@ function mimePart<T>(parts: readonly T[], part: number): T | undefined {
   return parts.length > 512 && part >= 512 ? undefined : parts[part - 1];
 }
 
-async function serveMailbox(verified: Exclude<Verified, { purpose: 'img' }>, env: ContentEnv, keys: ContentUrlKeys,
-    origins: ContentOrigins, headers: Headers, now: number): Promise<{ response: Response; bytes: number } | null> {
+type VerifiedMailbox = Exclude<Verified, { purpose: 'img' }>;
+type MailObjects = ReturnType<typeof readOnlyObjects>;
+type MailMime = Awaited<ReturnType<MailObjects['mime']>>['mail'];
+type Served = { response: Response; bytes: number };
+
+async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: ContentUrlKeys,
+    origins: ContentOrigins, headers: Headers, now: number, signal: AbortSignal): Promise<Served | null> {
   const { claims, message, purpose } = verified;
   const entry = purpose !== 'body' ? attachmentFor(message, verified.claims.part) : undefined;
   if (purpose !== 'body' && !entry) return null;
-  const objects = readOnlyObjects(env, claims.ws);
-  const mime = await objects.mime(message.rawKey);
+  const objects = readOnlyObjects(env, claims.ws, signal);
+  const { mail, release } = await objects.mime(message.rawKey);
+  let streaming = false;
+  try {
+    const rendered = await renderMailbox(verified, entry, mail, objects, env, keys, origins, headers, now);
+    if (!rendered?.response.body || !rendered.bytes) return rendered;
+    const output = new FixedLengthStream(rendered.bytes);
+    const response = new Response(output.readable, rendered.response);
+    void rendered.response.body.pipeTo(output.writable).then(release, release);
+    streaming = true;
+    return { response, bytes: rendered.bytes };
+  } finally {
+    if (!streaming) release();
+  }
+}
+
+async function renderMailbox(verified: VerifiedMailbox, entry: MessageAttachment | undefined, mime: MailMime,
+    objects: MailObjects, env: ContentEnv, keys: ContentUrlKeys, origins: ContentOrigins, headers: Headers, now: number): Promise<Served | null> {
+  const { message, purpose } = verified;
   if (purpose === 'body') {
     const output = mime.html ? await sanitise(mime.html, { ri: verified.claims.ri, verdict: message.verdict }) : null;
     let body: string;
@@ -167,7 +189,7 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
       if (verified.ok) {
         result = verified.purpose === 'img'
           ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), io.imageCache)
-          : await serveMailbox(verified, env, keys, origins, headers, now);
+          : await serveMailbox(verified, env, keys, origins, headers, now, request.signal);
       }
     } catch { /* Fail closed; do not expose or log errors from ports, parsers or keys. */ }
   }

@@ -1,13 +1,16 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { serveContent, type ContentEnv } from '../src/entry.ts';
+import { mimeInFlight } from '../src/mime-budget.ts';
 
 let clockOffset = 0;
 let cacheReads = 0;
+let mimeObservedPeak = 0;
 export default {
   async fetch(req: Request, env: ContentEnv) {
     const path = new URL(req.url).pathname;
     if (path === '/__clock') { clockOffset = Number(await req.text()); return new Response(null); }
     if (path === '/__cache') return Response.json(cacheReads);
+    if (path === '/__mime-budget') return Response.json({ peak: mimeObservedPeak, inFlight: mimeInFlight() });
     if (path === '/__owner') { ownerA = await req.json(); return new Response(null); }
     if (path === '/__record') {
       const [key, value] = await req.json<[string, unknown]>();
@@ -19,13 +22,15 @@ export default {
       try { return Response.json({ value: await (env as ContentEnv & BridgeEnv).MINT[method](...args) }); }
       catch { return Response.json({ refused: true }); }
     }
-    return serveContent(req, env, {
+    const response = await serveContent(req, env, {
       now: () => Date.now() + clockOffset,
       imageCache: async () => {
         const cache = await caches.open('test-images');
         return { match: (key) => { cacheReads++; return cache.match(key); }, put: (key, res) => cache.put(key, res) };
       },
     });
+    mimeObservedPeak = Math.max(mimeObservedPeak, mimeInFlight());
+    return response;
   },
 };
 export { ContentMint } from '../src/entry.ts';
