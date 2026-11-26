@@ -31,7 +31,9 @@ export interface MailApiEnvironment {
   DIRECTORY?: DirectoryDatabase;
   MAILBOX?: { getByName(name: string): {
     mailApi(ws: string, mb: string, operation: Operation, params: Record<string, string>, input: unknown,
-      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string }): Promise<OperationResult>;
+      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string;
+        httpWrite?: { stream: ReadableStream<Uint8Array> | null; mediaType: string; contentLength: string | null;
+          query: [string, string][] } }): Promise<OperationResult>;
   } };
   MAIL_CONTENT_ORIGIN?: string;
   MAIL_CONTENT?: { mint(purpose: 'body' | 'att', claims: ContentClaims): Promise<ContentUrl> };
@@ -100,6 +102,9 @@ async function readJson(request: Request, op: Operation): Promise<Record<string,
     }
     text += decoder.decode();
     const input: unknown = JSON.parse(text);
+    // Only decode here: the mailbox checks the resource and revision before
+    // inspecting any replacement fields (including the top-level shape).
+    if (op === 'replaceDraft') return input as Record<string, unknown>;
     if (!input || typeof input !== 'object' || Array.isArray(input)) fail('invalid_request');
     const fields = jsonFields[op];
     // A committed key is resolved by the datastore before field validation.
@@ -145,15 +150,17 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     if ((route.idempotency === 'required' && !idempotencyKey) || (route.ifMatch === 'required' && !ifMatch)) fail('precondition_required');
     if (idempotencyKey !== undefined && !keyPattern.test(idempotencyKey)) fail('invalid_request', { errors: [{ field: '/Idempotency-Key', code: 'invalid' }] });
     if (ifMatch !== undefined && !keyPattern.test(ifMatch)) fail('invalid_request', { errors: [{ field: '/If-Match', code: 'invalid' }] });
-    const query = parseQuery(url, route);
+    // Mailbox creates reserve their key inside the mailbox before consuming
+    // the HTTP body or validating operation-specific query fields.
+    const keyedMailbox = op === 'createDraft' || op === 'createLabel' || op === 'createUpload';
+    const httpWrite = keyedMailbox ? { stream: request.body, mediaType: request.headers.get('content-type') ?? '',
+      contentLength: request.headers.get('content-length'), query: [...url.searchParams] } : undefined;
+    const query = httpWrite ? {} : parseQuery(url, route);
     const raw = pattern.exec(url.pathname)?.groups ?? {};
     let params: Record<string, string>;
     try { params = Object.fromEntries(Object.entries(raw).map(([name, value]) => [name, decodeURIComponent(value)])); }
     catch { return fail('not_found'); }
-    const input = route.body === 'json' ? await readJson(request, op) : route.body === 'bytes'
-      ? { stream: request.body, mediaType: request.headers.get('content-type') ?? 'application/octet-stream',
-        contentLength: request.headers.get('content-length') }
-      : query;
+    const input = !httpWrite && route.body === 'json' ? await readJson(request, op) : query;
     if (op === 'getBodyUrl' && (!('remoteImages' in input) || typeof input.remoteImages !== 'boolean')) fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
 
     let result: OperationResult;
@@ -170,7 +177,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
         result = await env.MAILBOX.getByName(JSON.stringify([principal.workspaceId, mailbox.id])).mailApi(
           principal.workspaceId, mailbox.id, op,
           { ...Object.fromEntries(Object.entries(query).map(([key, value]) => [key, String(value)])), ...params }, input,
-          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId },
+          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId, ...(httpWrite && { httpWrite }) },
         );
       } else result = { body: { state: 'unprovisioned' } };
       if (!result.error && op === 'getSession') {

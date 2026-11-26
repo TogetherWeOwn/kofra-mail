@@ -45,11 +45,24 @@ export function clearApiKey(sql: SqlStorage, key: string, token: string): void {
   sql.exec('DELETE FROM mailbox_api_in_progress WHERE key = ? AND token = ?', key, token);
 }
 
-export function resultEvent(key: string, fingerprint: string, value: Committed, now: number, identifyStatus: boolean):
+export type KeyedCreate = 'createLabel' | 'createDraft' | 'createUpload';
+
+export function resultEvent(operation: KeyedCreate, key: string, fingerprint: string, value: Committed, now: number):
   Extract<JournalEvent, { type: 'api_result' }> {
-  // All three create routes answer 201. Keep legacy rows readable after a restore.
-  const result = identifyStatus ? JSON.stringify({ status: 201, body: value, createdAt: now }) : JSON.stringify(value);
+  const result = JSON.stringify({ operation, status: 201, body: value, createdAt: now });
   return { type: 'api_result', key, fingerprint, expiresAt: now + RESULT_TTL_MS, result };
+}
+
+export function storedCreateOperation(result: string): KeyedCreate | undefined {
+  const stored = JSON.parse(result) as Committed | { operation?: KeyedCreate; status: number; body: Committed } | null;
+  if (!stored || typeof stored !== 'object') return;
+  if ('operation' in stored && stored.operation) return stored.operation;
+  // Existing snapshots may have either a bare result or an older envelope.
+  const body = 'status' in stored ? stored.body : stored;
+  if (!body || typeof body !== 'object') return;
+  if ('upload' in body) return 'createUpload';
+  if ('draft' in body) return 'createDraft';
+  if ('label' in body) return 'createLabel';
 }
 
 export const scheduleResult = (timers: TimerTable, event: Extract<JournalEvent, { type: 'api_result' }>) =>

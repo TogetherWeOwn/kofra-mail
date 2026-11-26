@@ -3,7 +3,8 @@ import type { Operation } from '../../../contracts/mail-api/src/service.ts';
 import type { Label, Settings } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { draftInput, draftObjectKeys, draftRef, draftRefs, draftUploadIds, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft } from './mailbox-api-drafts.ts';
-import { apiKey, clearApiKey, fingerprintOf, replayApiKey, reserveApiKey, resultEvent, scheduleResult, type Committed } from './mailbox-api-idempotency.ts';
+import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult, type Committed } from './mailbox-api-idempotency.ts';
+import type { HttpMailboxWrite } from './mailbox-http-write.ts';
 import { unusableSource, uploadReferenced, uploadRow, UPLOAD_EXPIRY } from './mailbox-upload.ts';
 import type { TimerTable } from './mailbox-timers.ts';
 import { attachmentRow, displayOf, getThread, labels, listViews, messageRow, missingThreadDisplay, partNumber, threadChanges, threadPage } from './mailbox-api-messages.ts';
@@ -13,7 +14,8 @@ import type { JournalEvent } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { decodedAttachment, normalizeSearch, readMailMime } from './parse-mail.ts';
 
-export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string };
+export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; httpWrite?: HttpMailboxWrite };
+export type PreparedApiKey = { token: string; fingerprint: string };
 export type MailboxApiResult = { body?: unknown; status?: number; replayed?: boolean; error?: MailboxApiError };
 export type MailContentBody = { html?: string; text?: string; auth: string };
 export type MailContentAttachment = { stream: ReadableStream<Uint8Array>, name: string; mediaType: string; sizeBytes: number };
@@ -30,7 +32,8 @@ export const mailApiMutation = (operation: Operation) => isIdempotentCreate(oper
 export class MailboxApi {
   constructor(private readonly index: MailboxIndex, private readonly sql: SqlStorage, private readonly workspaceId: string,
     private readonly mailboxId: string, private readonly incarnation: string, private readonly now: number,
-    private readonly timers?: TimerTable) {}
+    private readonly timers?: TimerTable, private readonly preparedKey?: PreparedApiKey,
+    private readonly clock: () => number = () => now, private readonly uploadsEnabled = false) {}
 
   private state() { return `${this.incarnation}-${this.index.journal.revision()}`; }
 
@@ -53,15 +56,20 @@ export class MailboxApi {
     return { ...stored, defaultFrom: canSendAs.includes(stored.defaultFrom) ? stored.defaultFrom : defaults.defaultFrom };
   }
 
-  private async withKey(operation: Operation, params: Record<string, string>, input: unknown, options: MailboxApiOptions,
+  private async withKey(operation: 'createLabel' | 'createDraft', params: Record<string, string>, input: unknown, options: MailboxApiOptions,
     change: (commit: (value: Committed, event: Event, after?: () => void) => void) => Promise<unknown>): Promise<MailboxApiResult> {
     const key = apiKey(options.idempotencyKey);
-    const reservation = reserveApiKey(this.sql, key, this.now);
+    const reservation = this.preparedKey ?? reserveApiKey(this.sql, key, this.now);
     if ('row' in reservation) return replayApiKey(this.index, reservation.row, await fingerprintOf(operation, params, input));
+    const verify = () => {
+      if (!ownsApiKey(this.sql, key, reservation.token, this.clock())) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    };
     try {
-      const fingerprint = await fingerprintOf(operation, params, input);
+      const fingerprint = 'fingerprint' in reservation ? reservation.fingerprint : await fingerprintOf(operation, params, input);
+      verify();
       return { body: await change((value, event, after) => {
-        const stored = resultEvent(key, fingerprint, value, this.now, !!this.timers);
+        verify();
+        const stored = resultEvent(operation, key, fingerprint, value, this.clock());
         this.index.changeMany([event, stored], () => {
           if (this.timers) scheduleResult(this.timers, stored);
           after?.();
@@ -183,7 +191,7 @@ export class MailboxApi {
         return { body: await readDraft(this.index, ref) };
       }
       case 'createDraft': return this.withKey(operation, params, input, options, async commit => {
-        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, !!this.timers);
+        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, this.uploadsEnabled);
         const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
         const ref = await this.index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.now, attachmentKeys);
         const { holder: _holder, ...replay } = ref;
@@ -199,7 +207,7 @@ export class MailboxApi {
         if (previous.revision !== options.ifMatch) return fail('revision_mismatch');
         const oldUploads = this.draftUploads(previous.id);
         const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now,
-          await readDraftObject(this.index, previous), !!this.timers);
+          await readDraftObject(this.index, previous), this.uploadsEnabled);
         const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
         const ref = await this.index.prepareApiDraft(previous.id, encodeDraftObject(draft), this.now, attachmentKeys);
         try {
@@ -214,13 +222,13 @@ export class MailboxApi {
         if (options.ifMatch !== undefined && previous.revision !== options.ifMatch) return fail('revision_mismatch');
         const uploads = this.draftUploads(previous.id);
         const hasObjects = this.sql.exec('SELECT 1 FROM mailbox_api_draft_objects WHERE draft_id = ? LIMIT 1', previous.id).toArray().length;
-        if (!this.timers && hasObjects) return fail('not_implemented');
+        if (!this.uploadsEnabled && hasObjects) return fail('not_implemented');
         this.index.changeMany([{ type: 'draft_delete', id: previous.id, deferRelease: true }],
           () => this.rescheduleUploads(uploads));
         return {};
       }
       case 'deleteUpload': {
-        if (!this.timers) return fail('not_implemented');
+        if (!this.timers || !this.uploadsEnabled) return fail('not_implemented');
         const id = params.uploadId;
         const upload = isId(id) && uploadRow(this.sql, id);
         if (upload && !uploadReferenced(this.sql, id)) this.index.changeMany([

@@ -39,6 +39,7 @@ export type SnapshotRow = { row_no: number; kind: string; value: string };
 type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[]; expiresAt?: number | null };
 export type ApiDraftRef = { id: string; rawKey: string; holder: string; revision: string; updatedAt: number };
 export type PendingConfirmation = ConfirmEntry & { seq: number; publishedAt: number | null };
+export type HolderConfirmationCursor = [seq: number, key: string, holder: string];
 export const HOLDER_CONFIRM_BATCH = 64;
 const trashLabel = 'trash';
 
@@ -306,17 +307,6 @@ export class MailboxIndex {
   setBayes(token: string, ham: number, spam: number) { this.change({ type: 'bayes', token, ham, spam }); }
   setSetting(kind: 'filter' | 'send-as', id: string, definition: string) { this.change({ type: 'setting', kind, id, definition }); }
 
-  async saveDraft(id: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {
-    if (!id || id.length > 256 || !bytes.byteLength || bytes.byteLength > MAX_RAW_BYTES) throw new Error('Invalid draft');
-    const rawKey = `drafts/${await sha256(bytes)}`;
-    const holder = `draft:${crypto.randomUUID()}`;
-    await this.objects.hold(rawKey, holder);
-    await this.objects.put(rawKey, bytes);
-    const previous = this.sql.exec<{ rawKey: string; holder: string }>('SELECT raw_key AS rawKey, holder FROM drafts WHERE id = ?', id).toArray()[0];
-    this.change({ type: 'draft', id, rawKey, holder });
-    if (previous) await this.objects.release(previous.rawKey, previous.holder);
-  }
-
   async emptyTrash(limit = 64): Promise<number> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error('Invalid purge limit');
     const candidates = this.sql.exec<{ id: string }>(`SELECT m.id FROM message_labels l
@@ -408,7 +398,8 @@ export class MailboxIndex {
   private enqueueConfirmation(seq: number, key: string, holder: string, publishedAt: number | null = null): PendingConfirmation {
     if (!count(seq) || seq === 0 || typeof key !== 'string' || !parseObjectKey(key) || !bounded(holder, 256) ||
         (publishedAt !== null && !count(publishedAt))) throw new Error('Invalid pending holder confirmation');
-    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_confirmations VALUES (?, ?, ?, ?)', seq, key, holder, publishedAt);
+    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_confirmations(seq, object_key, holder, published_at) VALUES (?, ?, ?, ?)',
+      seq, key, holder, publishedAt);
     return { seq, key, holder, publishedAt };
   }
 
@@ -417,10 +408,17 @@ export class MailboxIndex {
       WHERE seq <= ? AND published_at IS NULL`, now, through);
   }
 
-  pendingConfirmations(through: number, after = 0): PendingConfirmation[] {
+  pendingConfirmations(through: number): PendingConfirmation[] {
     return this.sql.exec<PendingConfirmation>(`SELECT seq, object_key AS key, holder, published_at AS publishedAt
-      FROM mailbox_pending_confirmations WHERE seq > ? AND seq <= ? ORDER BY seq, object_key, holder LIMIT ?`,
-    after, through, HOLDER_CONFIRM_BATCH).toArray();
+      FROM mailbox_pending_confirmations WHERE seq <= ? ORDER BY seq, object_key, holder LIMIT ?`,
+    through, HOLDER_CONFIRM_BATCH).toArray();
+  }
+
+  pendingRestoreConfirmations(after: HolderConfirmationCursor = [0, '', '']): PendingConfirmation[] {
+    return this.sql.exec<PendingConfirmation>(`SELECT seq, object_key AS key, holder, published_at AS publishedAt
+      FROM mailbox_pending_confirmations WHERE published_at IS NOT NULL AND lost_at IS NULL
+      AND (seq, object_key, holder) > (?, ?, ?) ORDER BY seq, object_key, holder LIMIT ?`,
+    ...after, HOLDER_CONFIRM_BATCH).toArray();
   }
 
   finishConfirmations(rows: PendingConfirmation[], answers: ConfirmAnswer[], restoring: boolean): void {
@@ -431,7 +429,11 @@ export class MailboxIndex {
       for (const [i, { seq, key, holder }] of rows.entries()) {
         const answer = answers[i];
         // Recovery must not write an event into the restored journal history.
-        if (answer === 'lost' && restoring) continue;
+        if (answer === 'lost' && restoring) {
+          this.sql.exec(`UPDATE mailbox_pending_confirmations SET lost_at = ?
+            WHERE seq = ? AND object_key = ? AND holder = ? AND lost_at IS NULL`, Date.now(), seq, key, holder);
+          continue;
+        }
         const removed = this.sql.exec(`DELETE FROM mailbox_pending_confirmations
           WHERE seq = ? AND object_key = ? AND holder = ?`, seq, key, holder).rowsWritten;
         if (removed !== 1) continue;

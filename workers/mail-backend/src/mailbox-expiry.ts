@@ -1,4 +1,4 @@
-import { committedKey } from './mailbox-api-idempotency.ts';
+import { committedKey, storedCreateOperation } from './mailbox-api-idempotency.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import { TIMER_RETRY_MS, type TimerKind, type TimerTable } from './mailbox-timers.ts';
 import { IDEM_EXPIRY, UPLOAD_EXPIRY, uploadReferenced, uploadRow } from './mailbox-upload.ts';
@@ -50,13 +50,9 @@ export function idemExpiry({ sql, ready, journalDue }: ExpiryPorts, outboundEnab
         const row = life && committedKey(sql, timer.ref);
         if (!life || !row) { timers.delete(IDEM_EXPIRY, timer.ref); return; }
         if (row.expiresAt > timer.now) { timers.set(IDEM_EXPIRY, timer.ref, row.expiresAt); return; }
-        if (!outboundEnabled) {
-          const stored: unknown = JSON.parse(row.result);
-          if (stored && typeof stored === 'object' && Object.hasOwn(stored, 'status')) {
-            timers.set(IDEM_EXPIRY, timer.ref, timer.now + parkedMs);
-            return;
-          }
-          // Ordinary label and draft results still expire while uploads are off.
+        if (!outboundEnabled && storedCreateOperation(row.result) === 'createUpload') {
+          timers.set(IDEM_EXPIRY, timer.ref, timer.now + parkedMs);
+          return;
         }
         timers.set(IDEM_EXPIRY, timer.ref, timer.now + TIMER_RETRY_MS);
         return { row, incarnation: life.incarnation };
@@ -72,8 +68,7 @@ export function idemExpiry({ sql, ready, journalDue }: ExpiryPorts, outboundEnab
       });
     },
     rebuild(timers) {
-      for (const { key, expires_at } of sql.exec<{ key: string; expires_at: number }>(`SELECT key, expires_at FROM mailbox_api_idempotency
-        WHERE ? OR json_extract(result, '$.status') IS NOT NULL`, Number(outboundEnabled))) {
+      for (const { key, expires_at } of sql.exec<{ key: string; expires_at: number }>('SELECT key, expires_at FROM mailbox_api_idempotency')) {
         timers.set(IDEM_EXPIRY, key, Math.max(1, expires_at));
       }
       return undefined;

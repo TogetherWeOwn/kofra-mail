@@ -1,6 +1,6 @@
 import { deltaRange, INCARNATION, journalPrefix, readDelta, writeDelta } from './journal-backup.ts';
 import { sha256 } from './bytes.ts';
-import { MissingMailError, type MailboxIndex, type PendingConfirmation, type SnapshotRow } from './mailbox-index.ts';
+import { MissingMailError, type HolderConfirmationCursor, type MailboxIndex, type SnapshotRow } from './mailbox-index.ts';
 import type { ConfirmAnswer, ConfirmEntry } from './sweep-ledger.ts';
 import type { ReplayDelivery } from './outbox.ts';
 
@@ -54,6 +54,7 @@ export type RestoringLife = {
   state: 'restoring'; scope: Scope; incarnation: string; startedAt: number; failures: number; bootstrap: boolean;
   phase: 'reset' | 'fence' | 'takeover' | 'snapshot' | 'deltas' | 'deliveries';
   epoch: number | null; etag: string | null; rev: number; page: number; rowNo: number; delta: number; after: number;
+  confirmationAfter?: HolderConfirmationCursor;
   // Completed deliveries whose raw object was verifiably gone during replay.
   skipped: number;
   baseSeq?: number; baseChain?: string | null;
@@ -441,14 +442,6 @@ export class MailboxRecovery {
     }
   }
 
-  private async confirmRestored(rows: PendingConfirmation[], ports: RestorePorts): Promise<void> {
-    if (!rows.length || !ports.confirm) return;
-    let answers: ConfirmAnswer[];
-    try { answers = await ports.confirm(rows.map(({ key, holder }) => ({ key, holder }))); }
-    catch { return; } // The published entries stay queued for the journal lane.
-    this.index.finishConfirmations(rows, answers, true);
-  }
-
   private async restoreStepOnce(life: RestoringLife, ports: RestorePorts): Promise<Lifecycle> {
     // Every successful step is progress: consecutive failures restart from zero,
     // so a restore that keeps advancing never raises restore_blocked.
@@ -461,6 +454,21 @@ export class MailboxRecovery {
       this.index.setLifecycle(next);
       return next;
     });
+    if (ports.confirm && (life.phase === 'snapshot' || life.phase === 'deltas' || life.phase === 'deliveries')) {
+      // Drain what has already been applied before later backup reads or D1
+      // replay can block. Do one batch per step so the slice can yield. A
+      // failed batch leaves both its rows and its cursor unchanged.
+      let pending = this.index.pendingRestoreConfirmations(life.confirmationAfter);
+      if (!pending.length && life.confirmationAfter) pending = this.index.pendingRestoreConfirmations();
+      if (pending.length) {
+        const answers = await ports.confirm(pending.map(({ key, holder }) => ({ key, holder })));
+        this.index.finishConfirmations(pending, answers, true);
+        // If the object crashes before saving the cursor, the completed rows
+        // are already gone (or marked lost); it resumes at the first pending row.
+        const last = pending[pending.length - 1];
+        return save({ ...life, confirmationAfter: [last.seq, last.key, last.holder] });
+      }
+    }
     switch (life.phase) {
       case 'reset':
         return save({ ...life, phase: 'fence' }, () => this.index.resetForRestore());
@@ -502,8 +510,8 @@ export class MailboxRecovery {
         const found = await getJson<SnapshotRow[]>(this.bucket, this.pageKey(manifest.snapshot_key, page));
         const rows = found?.value;
         if (!Array.isArray(rows) || !rows.length || rows.length > 64) throw new Error('Invalid mailbox snapshot page');
-        const pending: PendingConfirmation[] = [];
-        const next = save({ ...life, page, rowNo: life.rowNo + rows.length }, () => {
+        return save({ ...life, page, rowNo: life.rowNo + rows.length, confirmationAfter: undefined }, () => {
+          let coversHolders = false;
           let rowNo = life.rowNo;
           for (const row of rows) {
             if (!row || row.row_no !== ++rowNo || typeof row.kind !== 'string' || typeof row.value !== 'string') {
@@ -512,13 +520,11 @@ export class MailboxRecovery {
             const entry = this.index.restoreSnapshotRow(row);
             if (entry) {
               if (entry.seq > snapshot.seq) throw new Error('Holder confirmation exceeds snapshot sequence');
-              pending.push(entry);
+              coversHolders = true;
             }
           }
-          if (pending.length) this.index.coverConfirmations(snapshot.seq, ports.now());
+          if (coversHolders) this.index.coverConfirmations(snapshot.seq, ports.now());
         });
-        await this.confirmRestored(pending, ports);
-        return next;
       }
       case 'deltas': {
         const manifest = await this.owned(life);
@@ -532,11 +538,10 @@ export class MailboxRecovery {
         const rows = await readDelta(this.bucket, key, deltaRange(this.prefix, key)!);
         let releases: Array<{ key: string; holder: string }> = [];
         const through = rows[rows.length - 1].seq;
-        const next = save({ ...life, delta: life.delta + 1 }, () => {
+        const next = save({ ...life, delta: life.delta + 1, confirmationAfter: undefined }, () => {
           releases = rows.flatMap(row => this.index.replayRow(row));
           this.index.coverConfirmations(through, ports.now());
         });
-        await this.confirmRestored(this.index.pendingConfirmations(through, rows[0].seq - 1), ports);
         // A crash before these releases only retains an object longer.
         for (const release of releases) await ports.release(release.key, release.holder);
         return next;

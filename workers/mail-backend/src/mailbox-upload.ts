@@ -29,7 +29,7 @@ export function wireUpload(row: UploadRow): Upload {
 }
 
 export type UploadBody = {
-  stream: ReadableStream<Uint8Array<ArrayBuffer>> | null;
+  stream: ReadableStream<Uint8Array> | null;
   mediaType: string;
   contentLength: string | null;
 };

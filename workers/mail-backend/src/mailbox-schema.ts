@@ -76,11 +76,13 @@ CREATE TABLE IF NOT EXISTS mailbox_pending_releases (
 );
 CREATE INDEX IF NOT EXISTS mailbox_release_retry ON mailbox_pending_releases(retry_at, seq, object_key, holder);
 CREATE TABLE IF NOT EXISTS mailbox_pending_confirmations (
-  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, published_at INTEGER,
+  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, published_at INTEGER, lost_at INTEGER,
   PRIMARY KEY (seq, object_key, holder)
 );
 CREATE INDEX IF NOT EXISTS mailbox_confirm_published ON mailbox_pending_confirmations(published_at) WHERE published_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS mailbox_confirm_unpublished ON mailbox_pending_confirmations(seq) WHERE published_at IS NULL;
+CREATE INDEX IF NOT EXISTS mailbox_confirm_restore ON mailbox_pending_confirmations(seq, object_key, holder)
+  WHERE published_at IS NOT NULL AND lost_at IS NULL;
 CREATE TABLE IF NOT EXISTS mailbox_unusable_sources (
   kind TEXT NOT NULL, id TEXT NOT NULL, holder TEXT NOT NULL, PRIMARY KEY (kind, id)
 );

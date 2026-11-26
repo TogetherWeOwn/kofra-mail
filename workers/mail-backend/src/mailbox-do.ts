@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Operation } from '../../../contracts/mail-api/src/service.ts';
-import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions, type MailboxApiResult, type MailContentResult } from './mailbox-api.ts';
+import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions, type MailboxApiResult, type MailContentResult, type PreparedApiKey } from './mailbox-api.ts';
+import { checkReplayInput, createQuery, readMailboxJson, type HttpMailboxWrite } from './mailbox-http-write.ts';
 import { ApiFault, fail, isId } from './mailbox-api-input.ts';
 import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult } from './mailbox-api-idempotency.ts';
 import { idemExpiry, uploadExpiry } from './mailbox-expiry.ts';
@@ -40,6 +41,7 @@ export class Mailbox extends DurableObject<Env> {
   private readonly backups = new MailboxWork();
   // Stage one bounded upload at a time without gating delivery or publication.
   private readonly uploads = new MailboxWork();
+  private readonly jsonWrites = new MailboxWork();
   // Wall-clock budget of one restore run and messages rebuilt per backup run.
   protected restoreSliceMs = 10_000;
   protected reindexBatch = 16;
@@ -225,32 +227,68 @@ export class Mailbox extends DurableObject<Env> {
           options.idempotencyKey, now, now).toArray().length) {
         return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
       }
-      if (operation === 'createUpload') return await this.createUpload(scope, params, input as UploadBody, options.idempotencyKey, now);
-      return await this.work.run(async () => {
-        const index = this.index(workspaceId);
-        if (!await this.ready(index, scope)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
-        const life = index.lifecycle<Lifecycle>();
-        if (life?.state !== 'ready' || index.unindexed('', 1).length) {
-          return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
-        }
-        const mutation = mailApiMutation(operation);
-        if (mutation) await this.armFor(operation === 'updateThreads' ? FLAGS_FLUSH_MS : SETTINGS_FLUSH_MS);
-        const timers = outbound && mutation ? this.timerTable() : undefined;
-        try {
-          return await new MailboxApi(index, this.ctx.storage.sql, workspaceId, mailboxId, life.incarnation, now, timers)
-            .call(operation, params, input, options);
-        } finally {
-          if (timers) { timers.revoke(); await this.rearm(); }
-        }
-      });
+      const http = options.httpWrite;
+      if (operation === 'createUpload') return await this.createUpload(scope, params, http ?? input as UploadBody, options.idempotencyKey, now, http);
+      if (http && (operation === 'createDraft' || operation === 'createLabel')) {
+        return await this.createJsonWrite(scope, operation, http, options, now);
+      }
+      return await this.executeMailApi(scope, operation, params, input, options);
     } catch (error) {
       if (error instanceof ApiFault) return { error: error.problem };
       return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
+    } finally {
+      const stream = options.httpWrite?.stream;
+      if (stream && !stream.locked) void stream.cancel().catch(() => {});
+    }
+  }
+
+  private async executeMailApi(scope: Scope, operation: Operation, params: Record<string, string>, input: unknown,
+    options: MailboxApiOptions, preparedKey?: PreparedApiKey): Promise<MailboxApiResult> {
+    return this.work.run(async () => {
+      const index = this.index(scope.workspaceId);
+      if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const life = index.lifecycle<Lifecycle>();
+      if (life?.state !== 'ready' || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const mutation = mailApiMutation(operation);
+      if (mutation) await this.armFor(operation === 'updateThreads' ? FLAGS_FLUSH_MS : SETTINGS_FLUSH_MS);
+      const timers = mutation ? this.timerTable() : undefined;
+      try {
+        return await new MailboxApi(index, this.ctx.storage.sql, scope.workspaceId, scope.mailboxId, life.incarnation, this.mailApiNow(),
+          timers, preparedKey, () => this.mailApiNow(), this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on').call(operation, params, input, options);
+      } finally {
+        if (timers) { timers.revoke(); await this.rearm(); }
+      }
+    });
+  }
+
+  private async createJsonWrite(scope: Scope, operation: 'createDraft' | 'createLabel', http: HttpMailboxWrite, options: MailboxApiOptions,
+    arrived: number): Promise<MailboxApiResult> {
+    const key = apiKey(options.idempotencyKey);
+    const sql = this.ctx.storage.sql;
+    const index = this.index(scope.workspaceId);
+    const reservation = await this.work.run(async () => {
+      if (!await this.ready(index, scope) || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      return reserveApiKey(sql, key, this.mailApiNow());
+    });
+    const committed = 'row' in reservation;
+    try {
+      const params = createQuery(http, false);
+      const deadline = committed ? arrived + IN_PROGRESS_TTL_MS : reservation.expiresAt;
+      return await this.jsonWrites.run(async () => {
+        const input = await readMailboxJson(http, deadline - this.mailApiNow());
+        const fingerprint = await fingerprintOf(operation, params, input);
+        if (committed) return replayApiKey(index, reservation.row, fingerprint);
+        return this.executeMailApi(scope, operation, params, input, options, { token: reservation.token, fingerprint });
+      });
+    } catch (error) {
+      return checkReplayInput(error, committed);
+    } finally {
+      if ('token' in reservation) await this.work.run(async () => clearApiKey(sql, key, reservation.token));
     }
   }
 
   private async createUpload(scope: Scope, params: Record<string, string>, input: UploadBody, rawKey: string | undefined,
-    now: number): Promise<MailboxApiResult> {
+    now: number, http?: HttpMailboxWrite): Promise<MailboxApiResult> {
     const key = apiKey(rawKey);
     const sql = this.ctx.storage.sql;
     const index = this.index(scope.workspaceId);
@@ -259,13 +297,14 @@ export class Mailbox extends DurableObject<Env> {
       return reserveApiKey(sql, key, this.mailApiNow());
     });
     try {
+      const query = http ? createQuery(http, true) : params;
       // Only a replay must read the body before validating its filename.
-      const reserved = 'row' in reservation ? reservation : { ...reservation, name: uploadName(params.name) };
+      const reserved = 'row' in reservation ? reservation : { ...reservation, name: uploadName(query.name) };
       const deadline = 'row' in reserved ? now + IN_PROGRESS_TTL_MS : reserved.expiresAt;
       return await this.uploads.run(async () => {
         const mediaType = uploadMediaType(input.mediaType);
         const { digest, size, bytes } = await readUpload(input, 'row' in reserved, deadline - this.mailApiNow());
-        const fingerprint = await fingerprintOf('createUpload', params, { digest, mediaType });
+        const fingerprint = await fingerprintOf('createUpload', query, { digest, mediaType });
         if ('row' in reserved) return replayApiKey(index, reserved.row, fingerprint);
         const { name } = reserved;
         const live = () => storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' &&
@@ -285,7 +324,7 @@ export class Mailbox extends DurableObject<Env> {
             const createdAt = this.mailApiNow();
             const row = { id, objectKey, holder, name, mediaType, size, expiresAt: createdAt + UPLOAD_TTL_MS };
             const upload = wireUpload(row);
-            const stored = resultEvent(key, fingerprint, { upload }, createdAt, true);
+            const stored = resultEvent('createUpload', key, fingerprint, { upload }, createdAt);
             index.commitEvents([{ type: 'api_upload', ...row }, stored]);
             timers.set(UPLOAD_EXPIRY, id, row.expiresAt);
             scheduleResult(timers, stored);
@@ -302,7 +341,7 @@ export class Mailbox extends DurableObject<Env> {
       });
     } catch (error) {
       if (!input.stream?.locked) void input.stream?.cancel().catch(() => {});
-      throw error;
+      return checkReplayInput(error, 'row' in reservation);
     } finally {
       if ('token' in reservation) await this.work.run(async () => clearApiKey(sql, key, reservation.token));
     }
@@ -446,7 +485,7 @@ export class Mailbox extends DurableObject<Env> {
     });
   }
 
-  private async mutate<T>(workspaceId: string, mailboxId: string, delay: number, operation: (index: MailboxIndex) => T): Promise<T> {
+  protected async mutate<T>(workspaceId: string, mailboxId: string, delay: number, operation: (index: MailboxIndex) => T): Promise<T> {
     const scope = { workspaceId, mailboxId };
     this.verifyScope(scope);
     return this.work.run(async () => {
@@ -461,10 +500,6 @@ export class Mailbox extends DurableObject<Env> {
 
   async setLabel(workspaceId: string, mailboxId: string, id: string, name: string) {
     return this.mutate(workspaceId, mailboxId, SETTINGS_FLUSH_MS, index => index.setLabel(id, name));
-  }
-
-  async saveDraft(workspaceId: string, mailboxId: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
-    return this.mutate(workspaceId, mailboxId, SETTINGS_FLUSH_MS, index => index.saveDraft(id, bytes));
   }
 
   async setSetting(workspaceId: string, mailboxId: string, kind: 'filter' | 'send-as', id: string, definition: string) {
