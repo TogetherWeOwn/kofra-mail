@@ -71,7 +71,9 @@ export const remoteImageCacheOptions = Object.freeze({
 
 export type RemoteImageFailure = 'url' | 'redirect' | 'status' | 'type' | 'magic' | 'size' | 'timeout' | 'network';
 export interface RemoteImage { ok: true; contentType: string; bytes: Uint8Array; length: number }
-export type RemoteImageResult = RemoteImage | { ok: false; reason: RemoteImageFailure };
+export interface StreamingRemoteImage extends RemoteImage { body: ReadableStream<Uint8Array> }
+type ImageRefusal = { ok: false; reason: RemoteImageFailure };
+export type RemoteImageResult = RemoteImage | ImageRefusal;
 export type RemoteImageUrlVerdict = { ok: true; url: URL } | { ok: false };
 
 // ---- Rule 1: methods ----
@@ -267,9 +269,13 @@ function discard(response: Response) {
  * the byte limit and the total deadline. Never throws; any refusal is the
  * failure result, which the handler answers as 404 with an empty body.
  */
+export function fetchRemoteImage(
+  input: string, given: RemoteImageConfig, fetchImpl: FetchLike, now: () => number, lifetime: 'response',
+): Promise<StreamingRemoteImage | ImageRefusal>;
+export function fetchRemoteImage(input: string, given: RemoteImageConfig, fetchImpl?: FetchLike, now?: () => number): Promise<RemoteImageResult>;
 export async function fetchRemoteImage(
-  input: string, given: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now,
-): Promise<RemoteImageResult> {
+  input: string, given: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now, lifetime?: 'response',
+): Promise<RemoteImageResult | StreamingRemoteImage> {
   const fail = (reason: RemoteImageFailure): RemoteImageResult => ({ ok: false, reason });
   // Validate and use a request-local copy, so changing a shared config mid-request cannot move its limits.
   let config: RemoteImageConfig;
@@ -374,7 +380,11 @@ export async function fetchRemoteImage(
     // A fixed-length buffer for callers (Response bodies, the cache); V8 can move the backing store without copying.
     const bytes = new Uint8Array(buffer.transferToFixedLength());
     if (!imageTypes.get(contentType)!(bytes)) return fail('magic');
-    return { ok: true, contentType, bytes, length };
+    const image: RemoteImage = { ok: true, contentType, bytes, length };
+    if (lifetime !== 'response') return image;
+    const body = reservedImageBody(bytes, () => { inFlightBytes -= length; });
+    reserved -= length; // The stream owns this portion until it closes or is cancelled.
+    return { ...image, body };
   } catch (error) {
     return fail(error instanceof Deadline || controller.signal.aborted ? 'timeout' : 'network');
   } finally {
@@ -384,6 +394,29 @@ export async function fetchRemoteImage(
     inFlightBytes -= reserved;
     reserved = 0;
   }
+}
+
+function reservedImageBody(bytes: Uint8Array, release: () => void): ReadableStream<Uint8Array> {
+  let offset = 0;
+  let buffer: Uint8Array | undefined = bytes;
+  const finish = () => {
+    if (!buffer) return;
+    buffer = undefined;
+    release();
+  };
+  return new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!buffer || offset === buffer.length) {
+        controller.close();
+        finish();
+      } else {
+        const chunk = buffer.subarray(offset, offset + 64 * 1024);
+        offset += chunk.length;
+        controller.enqueue(chunk);
+      }
+    },
+    cancel: finish,
+  }, { highWaterMark: 0 });
 }
 
 // ---- Rule 4 and section 3.1: outgoing headers, rebuilt from scratch ----
