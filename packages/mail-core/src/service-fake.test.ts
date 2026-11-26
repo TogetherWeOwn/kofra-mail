@@ -178,7 +178,7 @@ test('encoded address headers can push a budget-sized file over the send limit',
   const { defaultFrom } = await mail.getSettings();
   const body = 'Hello';
   const uploaded = await mail.createUpload({
-    name: 'file.txt', type: 'text/plain', bytes: new Blob([new Uint8Array(attachmentBudget(limits, Buffer.byteLength(body)))]),
+    name: 'file.txt', type: 'text/plain', bytes: new Blob([new Uint8Array(attachmentBudget(limits, body))]),
   }, { idempotencyKey: 'file' });
   const recipients = Array.from({ length: limits.recipientsPerMessage }, (_, i) => ({
     email: `long-recipient-name-${i}@example.net`, name: 'é'.repeat(limits.displayNameBytes / 2),

@@ -110,16 +110,23 @@ export const LIMITS = {
   undoSecondsOptions: [5, 10, 20, 30],
 } as const satisfies Limits;
 
+/** RFC 2045 text line endings, before applying a MIME transfer encoding. */
+export function canonicalMailText(text: string): string {
+  return text.replace(/\r\n|\r|\n/g, '\r\n');
+}
+
 /**
  * A conservative estimate of the raw attachment bytes that fit in one
- * outbound message with `bodyBytes` of UTF-8 body text. Base64 grows bytes by
- * 4/3 and MIME adds CRLF after every 76 encoded characters (78/76); the body
- * is counted at the same rate (the backend never encodes it larger than
- * base64), and 16 KiB is reserved for headers and MIME structure. Files within
- * the budget pass unless the headers are unusually large; files above it may
- * still pass. The server's check at send time is authoritative.
+ * outbound message. Pass the body text, or its already-canonicalized UTF-8
+ * byte count. Base64 grows bytes by 4/3 and MIME adds CRLF after every 76
+ * encoded characters (78/76); the canonical body is counted at the same rate
+ * (the backend never encodes it larger than base64). 16 KiB is reserved for
+ * headers and MIME structure. Files within the budget pass unless the headers
+ * are unusually large; files above it may still pass. The server's check at
+ * send time is authoritative.
  */
-export function attachmentBudget(limits: Pick<Limits, 'outboundMessageBytes'>, bodyBytes: number): number {
+export function attachmentBudget(limits: Pick<Limits, 'outboundMessageBytes'>, body: string | number): number {
+  const bodyBytes = typeof body === 'string' ? new TextEncoder().encode(canonicalMailText(body)).length : body;
   const encoded = (raw: number) => Math.ceil((raw * 4 * 78) / (3 * 76));
   return Math.max(0, Math.floor(((limits.outboundMessageBytes - encoded(bodyBytes) - 16 * KiB) * 3 * 76) / (4 * 78)));
 }

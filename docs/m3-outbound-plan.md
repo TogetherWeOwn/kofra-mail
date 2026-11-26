@@ -435,7 +435,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Change:** build the structured `send()` request and the RFC 5322 MIME of the sent copy:
 - UTF-8 headers as RFC 2047 encoded words;
-- the text part in quoted-printable or base64, whichever is smaller, so it is never larger than base64 (the client's `attachmentBudget` relies on this);
+- the text part with CRLF line endings, then in quoted-printable or base64, whichever is smaller. The client's `attachmentBudget` counts the canonical UTF-8 bytes for its base64 estimate;
 - `multipart/mixed` with a `text/plain` part and base64 attachments;
 - `In-Reply-To` and `References` from `threadingHeaders` (contract section 8.3): the first id and the last 10, trimmed further by bytes so the unfolded value fits `headerValueBytes`;
 - the request's own headers: only `In-Reply-To` and `References`, each within `headerValueBytes`. The frozen `Reply-To` goes in the structured `replyTo` field and in the sent-copy MIME;
@@ -443,7 +443,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Acceptance:**
 - Golden-file tests, and conformance case 21 in full against the backend (it reads the stored sent copy).
-- Parsing the output back with PostalMime gives the same addresses, subject, text and attachment bytes.
+- Parsing the output back with PostalMime gives the same addresses, subject, text and attachment bytes, after normalizing line endings and the parser's extra trailing LF on quoted-printable text.
 - CR, LF or another control character in any name, subject or address is refused with `invalid_header` before building, never stripped silently. The builder also refuses one as a programming error, in case a draft bypassed the save check.
 - A reply in a thread of 12 legal 200-byte `Message-ID`s: `References` fits 2,048 bytes and keeps the first and newest ids (golden file). An id longer than 2,048 bytes is never sent.
 - Every physical header line of the stored MIME is at most 998 octets: `References` folds between ids.

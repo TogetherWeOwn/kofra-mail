@@ -519,7 +519,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(send({ to: [] }, 'empty'), 'invalid_recipients');
       const invalidDraft = await mail.createDraft({ ...input, to: [{ email: 'invalid' }] }, key('draft-invalid'));
       await rejects(mail.sendDraft(invalidDraft.id, { ...key('send-invalid'), ifMatch: invalidDraft.revision }), 'invalid_recipients');
-      const rawBudget = attachmentBudget(limits, Buffer.byteLength(input.body));
+      const rawBudget = attachmentBudget(limits, input.body);
       const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
       const boundaryDraft = await mail.createDraft({ ...input, attachments: [{ kind: 'upload', uploadId: boundary.id }] }, key('draft-fits'));
       const boundarySend = await mail.sendDraft(boundaryDraft.id, { ...key('send-fits'), ifMatch: boundaryDraft.revision });

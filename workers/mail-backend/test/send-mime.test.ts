@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { URL } from 'node:url';
 import PostalMime from 'postal-mime';
 import { MESSAGE_ID_MAX } from '../../../contracts/mail-api/src/headers.ts';
-import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
+import { attachmentBudget, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { SendMimeInput } from '../src/send-mime.ts';
 
 const encoder = new TextEncoder();
@@ -18,7 +18,7 @@ const frozen: SendMimeInput = {
   dateAt: Date.UTC(2026, 0, 2, 3, 4, 5), sendId: 'send_001', builderVersion: 1,
   attachments: [],
 };
-const file = (name: string, bytes = Uint8Array.of(0, 255, 16)) => ({ name, type: 'application/octet-stream', bytes });
+const file = (name: string, bytes: Uint8Array = Uint8Array.of(0, 255, 16)) => ({ name, type: 'application/octet-stream', bytes });
 const fixture = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8').replace(/\r?\n/g, '\r\n');
 const id = (n: number, length: number) => `<${String(n).padStart(5, '0')}.${'1234567890'.repeat(Math.ceil(length / 10)).slice(0, length - 20)}@example.com>`;
 const header = (mime: string, name: string) => mime.split('\r\n\r\n')[0].split(/\r\n(?![ \t])/).find(line => line.startsWith(`${name}:`));
@@ -39,7 +39,8 @@ test('sent MIME matches the forwarded filename golden file and parses with Posta
   assert.deepEqual(parsed.replyTo, [{ address: 'replies@example.com', name: '' }]);
   assert.equal(parsed.bcc, undefined);
   assert.equal(parsed.subject, frozen.subject);
-  assert.equal(parsed.text, frozen.text);
+  // PostalMime adds the delimiter's framing CRLF as an extra LF to a QP body.
+  assert.equal(parsed.text?.replace(/\n$/, ''), frozen.text);
   assert.equal(parsed.date, '2026-01-02T03:04:05.000Z');
   assert.equal(parsed.messageId, '<send_001@example.com>');
   assert.deepEqual(parsed.attachments.map(({ filename, content }) => [filename, new Uint8Array(content as ArrayBuffer)]),
@@ -77,6 +78,16 @@ test('long Unicode headers and filenames round-trip, with no physical line over 
   assert.deepEqual(parsed.cc?.map(({ address }) => address), cc.map(({ email }) => email));
   assert.equal(parsed.text, unicode);
   assert.equal(parsed.attachments[0].filename, filename);
+});
+
+test('lines with RFC 2047 encoded words stay within 76 characters', async () => {
+  const { buildSentCopy } = await builders();
+  const subject = 'A'.repeat(70);
+  const { bytes } = buildSentCopy({ ...frozen, subject });
+  const lines = header(decoder.decode(bytes), 'Subject')!.split('\r\n').filter(line => line.includes('=?UTF-8?B?'));
+  assert.ok(lines.length > 0);
+  for (const line of lines) assert.ok(line.length <= 76, `encoded-word line is ${line.length} characters`);
+  assert.equal((await PostalMime.parse(bytes)).subject, subject);
 });
 
 test('References golden keeps the first and newest ids of a 12-id thread and folds between ids', async () => {
@@ -223,6 +234,27 @@ test('the exact encoded message limit is accepted and one more byte is refused',
   }
 });
 
+test('multiline base64 text decodes to canonical CRLF', async () => {
+  const { buildSentCopy } = await builders();
+  const unicode = '界🌍'.repeat(40);
+  const text = `${unicode}\n${unicode}\r\n${unicode}\r${unicode}`;
+  const { bytes } = buildSentCopy({ ...frozen, text });
+  assert.equal(unfold(header(decoder.decode(bytes), 'Content-Transfer-Encoding')), 'base64');
+  assert.equal((await PostalMime.parse(bytes)).text, Array(4).fill(unicode).join('\r\n'));
+});
+
+test('attachment budget leaves room for a 1 MiB body with newline-heavy Unicode text', async () => {
+  const { buildSentCopy } = await builders();
+  const text = '界\n'.repeat((1024 * 1024) / 4);
+  assert.equal(Buffer.byteLength(text), LIMITS.bodyBytes);
+  const canonicalBytes = Buffer.byteLength(text.replaceAll('\n', '\r\n'));
+  const budget = attachmentBudget(LIMITS, text);
+  assert.equal(budget, attachmentBudget(LIMITS, canonicalBytes));
+  assert.ok(budget < attachmentBudget(LIMITS, LIMITS.bodyBytes));
+  assert.ok(buildSentCopy({ ...frozen, text, attachments: [file('load.bin', new Uint8Array(budget))] }).encodedSize <=
+    LIMITS.outboundMessageBytes);
+});
+
 test('chooses the smaller complete text part, including transfer header and wraps', async () => {
   const { buildSentCopy } = await builders();
   for (const [text, encoding] of [
@@ -234,7 +266,15 @@ test('chooses the smaller complete text part, including transfer header and wrap
     const mime = decoder.decode(bytes);
     assert.equal(unfold(header(mime, 'Content-Transfer-Encoding')), encoding);
     for (const line of mime.split('\r\n\r\n')[1].split('\r\n')) assert.ok(line.length <= 76);
-    assert.equal((await PostalMime.parse(bytes)).text, text.replaceAll('\r\n', '\n'));
+    const parsed = (await PostalMime.parse(bytes)).text?.replaceAll('\r\n', '\n');
+    const endsInNewline = text.endsWith('\n');
+    if (encoding === 'quoted-printable') {
+      // Without a delimiter there is no framing CRLF to emit in the body.
+      assert.equal(mime.endsWith('\r\n'), endsInNewline);
+    }
+    // The parser appends an LF when the last encoded QP line has no terminator.
+    assert.equal(encoding === 'quoted-printable' && !endsInNewline ? parsed?.replace(/\n$/, '') : parsed,
+      text.replaceAll('\r\n', '\n'));
   }
 });
 

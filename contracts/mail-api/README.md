@@ -267,7 +267,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Downloads:** `getAttachmentUrl` returns a content-origin URL valid for `contentUrlSeconds` (5 minutes). It always downloads as `application/octet-stream` with `Content-Disposition: attachment`, and is never rendered by the app.
 
-**The client's size check:** `attachmentBudget(limits, bodyBytes)` is an estimate that reserves 16 KiB for headers and MIME structure: files within it pass unless the headers are unusually large (for example 50 recipients with long encoded names and many long file names). Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
+**The client's size check:** `attachmentBudget(limits, body)` estimates the encoded size using the UTF-8 byte count of the body with CRLF line endings. It also accepts a precomputed canonical byte count. The estimate reserves 16 KiB for headers and MIME structure: files within it pass unless the headers are unusually large (for example 50 recipients with long encoded names and many long file names). Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
 
 ### 8.5 Drive
 
@@ -393,7 +393,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
 13. **Send checks:**
     - 0 recipients or a malformed address answers `invalid_recipients`; 51 recipients answers `too_many_recipients`.
     - 33 file attachments answers `too_many_attachments`.
-    - A file of exactly `attachmentBudget(limits, bodyBytes)` bytes passes the size check; a file whose base64 alone exceeds `outboundMessageBytes` answers `message_too_large` with `limit`.
+    - A file of exactly `attachmentBudget(limits, body)` bytes passes the size check; a file whose base64 alone exceeds `outboundMessageBytes` answers `message_too_large` with `limit`.
     - A stale `If-Match` answers `revision_mismatch`.
 14. **Send and undo:**
     - `sendDraft` returns `state: 'pending'`, `undoUntil` equal to now plus `undoSeconds`, and the draft leaves `listDrafts`.

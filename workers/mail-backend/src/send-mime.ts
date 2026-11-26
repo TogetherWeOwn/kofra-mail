@@ -1,5 +1,5 @@
 import { hasHeaderControl, threadingHeaders, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
-import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
+import { canonicalMailText, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput } from '../../../contracts/mail-api/src/wire.ts';
 import type { MailErrorCode, Problem } from '../../../contracts/mail-api/src/errors.ts';
 
@@ -127,13 +127,19 @@ function addressList(addresses: readonly Readonly<AddressInput>[]): string[] {
 function fold(name: string, words: readonly string[]): string {
   let line = `${name}:`;
   const lines: string[] = [];
+  let encodedLine = false;
   for (const word of words) {
-    if (line.length + 1 + word.length > (lines.length === 0 && line === `${name}:` ? 998 : 78)) {
+    const encodedWord = word.startsWith('=?UTF-8?B?') && word.endsWith('?=');
+    // RFC 2047 is tighter than the normal folding target on encoded-word lines.
+    const limit = encodedLine || encodedWord ? 76 : line === `${name}:` ? 998 : 78;
+    if (line.length + 1 + word.length > limit) {
       lines.push(line);
       line = '';
+      encodedLine = false;
     }
     line += ` ${word}`;
-    if (line.length > 998) throw new Error('MIME header line too long');
+    encodedLine ||= encodedWord;
+    if (line.length > (encodedLine ? 76 : 998)) throw new Error('MIME header line too long');
   }
   lines.push(line);
   return lines.join(CRLF) + CRLF;
@@ -172,27 +178,29 @@ function wrappedBase64(bytes: Uint8Array): string {
   return lines.join(CRLF) + CRLF;
 }
 
-function quotedPrintable(bytes: Uint8Array, ceiling: number): string | undefined {
+function quotedPrintable(bytes: Uint8Array, ceiling: number, framing: string): string | undefined {
   let size = 0;
   let line = '';
   const lines: string[] = [];
   const flush = (suffix: string) => { lines.push(line + suffix + CRLF); size += line.length + suffix.length + CRLF.length; line = ''; };
   for (let i = 0; i < bytes.length; i++) {
     const byte = bytes[i];
-    if (byte === 10) flush('');
-    else {
+    if (byte === 13 && bytes[i + 1] === 10) {
+      flush('');
+      i++;
+    } else {
       const whiteSpace = byte === 9 || byte === 32;
       // Whitespace cannot end a physical line. A soft break itself ends in '='.
-      const literal = whiteSpace ? i + 1 < bytes.length && bytes[i + 1] !== 10 : byte >= 33 && byte <= 126 && byte !== 61;
+      const literal = whiteSpace ? i + 1 < bytes.length && bytes[i + 1] !== 13 : byte >= 33 && byte <= 126 && byte !== 61;
       const token = literal ? String.fromCharCode(byte) : byteEscape(byte, '=');
       if (line.length + token.length > 75) flush('=');
       line += token;
     }
     if (size + line.length >= ceiling) return;
   }
-  // Do not add a newline to the decoded text just to frame the next MIME delimiter.
-  flush('=');
-  if (size < ceiling) return lines.join('');
+  // A multipart delimiter owns its framing CRLF (RFC 2046). Never use it to
+  // complete a soft break, or add a newline to the content of a single part.
+  if (size + line.length + framing.length < ceiling) return lines.join('') + line + framing;
 }
 
 const textType = `Content-Type: text/plain; charset=UTF-8${CRLF}`;
@@ -200,9 +208,9 @@ const encodingHeader = (name: string) => `Content-Transfer-Encoding: ${name}${CR
 const qpHeader = encodingHeader('quoted-printable');
 const base64Header = encodingHeader('base64');
 
-function textPart(value: string): [string, string | Uint8Array] {
-  const bytes = encoder.encode(value.replaceAll(CRLF, '\n'));
-  const qp = quotedPrintable(bytes, base64Size(bytes.length) + base64Header.length - qpHeader.length);
+function textPart(value: string, multipart: boolean): [string, string | Uint8Array] {
+  const bytes = encoder.encode(canonicalMailText(value));
+  const qp = quotedPrintable(bytes, base64Size(bytes.length) + base64Header.length - qpHeader.length, multipart ? CRLF : '');
   return qp !== undefined ? [textType + qpHeader, qp] : [textType + base64Header, bytes];
 }
 
@@ -281,7 +289,7 @@ function planV1(input: SendMimeInput) {
   if (input.frozenReplyTo) pieces.push(fold('Reply-To', addressWords(input.frozenReplyTo)));
   pieces.push(`MIME-Version: 1.0${CRLF}`);
   if (files.length) pieces.push(`Content-Type: multipart/mixed; boundary="${boundary}"${CRLF}${CRLF}--${boundary}${CRLF}`);
-  const [textHeader, textBody] = textPart(input.text);
+  const [textHeader, textBody] = textPart(input.text, files.length > 0);
   pieces.push(textHeader, CRLF, textBody);
   for (const [i, file] of files.entries()) {
     pieces.push(`--${boundary}${CRLF}Content-Type: ${storedAttachmentType(file.type)}${CRLF}`, base64Header,
