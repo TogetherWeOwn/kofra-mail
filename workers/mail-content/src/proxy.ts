@@ -80,12 +80,22 @@ function dnsName(value: string, minLabels: number): string | undefined {
   return name;
 }
 
-const isCount = (value: unknown, min: number) => Number.isSafeInteger(value) && (value as number) >= min;
+const isCount = (value: unknown, min: number, max: number) =>
+  Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max;
+
+/** Ceilings on configured limits; configuration may tighten the spec's values but not exceed these. */
+const ceilings = {
+  maxUrlBytes: 2048, // the `u` claim's own limit
+  remoteImageRedirects: 20, // the Fetch standard's redirect limit
+  remoteImageBytes: 32 * 1024 * 1024, // far below the Workers isolate memory limit
+  remoteImageTimeoutMs: 2 ** 31 - 1, // the largest delay setTimeout honours
+} as const;
 
 /** Every refused zone, normalised; undefined if any configured value is invalid (fail closed). */
 function refusedNames(config: RemoteImageConfig): string[] | undefined {
-  if (!isCount(config.maxUrlBytes, 1) || !isCount(config.remoteImageRedirects, 0)
-    || !isCount(config.remoteImageBytes, 1) || !isCount(config.remoteImageTimeoutMs, 1)) return undefined;
+  if (!isCount(config.maxUrlBytes, 1, ceilings.maxUrlBytes) || !isCount(config.remoteImageRedirects, 0, ceilings.remoteImageRedirects)
+    || !isCount(config.remoteImageBytes, 1, ceilings.remoteImageBytes)
+    || !isCount(config.remoteImageTimeoutMs, 1, ceilings.remoteImageTimeoutMs)) return undefined;
   const own = config.ownDomains;
   if (!own || !Array.isArray(config.refusedZones) || !Array.isArray(own.storageDomains) || !Array.isArray(own.accountDomains))
     return undefined;
