@@ -250,7 +250,7 @@ test('body mints CID only for a real MIME part and serves its matching raster by
   await status(await cidUrl(2)); // MIME claims image/png, bytes are not PNG.
 });
 
-test('one large body can open six inline images concurrently without exceeding the MIME budget', async () => {
+test('six concurrent CID requests respect the raw MIME budget and deferred images can retry', async () => {
   const ids = Array.from({ length: 6 }, (_, i) => `image-${i}@content.example`);
   const images = ids.map(id => `--parts\r\nContent-Type: image/png\r\nContent-ID: <${id}>\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(png).toString('base64')}\r\n`);
   const encodedAttachment = Buffer.alloc(17 * 1024 * 1024, 65).toString('base64');
@@ -264,13 +264,27 @@ test('one large body can open six inline images concurrently without exceeding t
     const urls = [...(await body.text()).matchAll(/src="(https:\/\/content\.example\/v1\/cid\/[^"]+)"/g)].map(match => match[1]);
     assert.equal(urls.length, ids.length);
     for (const url of urls) tokenValues.push(new URL(url).pathname.split('/').at(-1)!);
-    await Promise.all(urls.map(async url => {
+    const deferred = await Promise.all(urls.map(async url => {
       const res = await get(url);
+      if (res.status === 503) {
+        assert.equal(res.headers.get('retry-after'), '1');
+        assert.equal((await res.arrayBuffer()).byteLength, 0);
+        return url;
+      }
       assert.equal(res.status, 200);
       assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
     }));
-    const observed = await (await get('/__mime-budget')).json();
-    assert.deepEqual(observed, { peak: Buffer.byteLength(raw), inFlight: 0 });
+    assert.ok(deferred.some(url => url === undefined), 'at least one request obtained a reservation');
+    assert.deepEqual(await (await get('/__mime-budget')).json(), { peak: Buffer.byteLength(raw), inFlight: 0 });
+    // Admission is capped on slower hosts too. Once the wave has drained,
+    // every deferred image must succeed without a concurrent reservation.
+    for (const url of deferred) {
+      if (url === undefined) continue;
+      const res = await get(url);
+      assert.equal(res.status, 200);
+      assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
+    }
+    assert.deepEqual(await (await get('/__mime-budget')).json(), { peak: Buffer.byteLength(raw), inFlight: 0 });
   } finally { store.delete(objectPath('alpha', rawKey)); }
 });
 
