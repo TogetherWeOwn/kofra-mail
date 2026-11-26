@@ -53,9 +53,13 @@ interface FixtureOptions {
   startedAt?: number;
   realContent?: { appOrigin: string; contentOrigin: string };
   inlineCids?: boolean;
+  // The send path (M3-3) with fake SEND and EMAIL bindings and manual alarms.
+  send?: boolean;
 }
 
-export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now(), realContent, inlineCids = false }: FixtureOptions = {}) {
+export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
+  send = false }: FixtureOptions = {}) {
+  const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
@@ -79,6 +83,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
+      ...(send && { MAIL_SEND_ENABLED: 'on', MANUAL_ALARMS: 'on' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
       ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },
@@ -235,6 +240,26 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     const expiryStarts = () => readControl<number>('expiry-starts');
     const eventCount = (kind: string) => readControl<number>('events', kind);
     const finishExpiry = () => controlAction('finish-expiry');
+    const sends = {
+      queue: () => readControl<{ kind: string; ws: string; mb: string; sendId: string }[]>('send-queue'),
+      emailCalls: () => readControl<number>('email-calls'),
+      crashAfter: (step: 'released' | 'stored' | 'queued' | 'enqueued') => controlAction('crash-after', step),
+      failNextEpilogue: () => controlAction('fail-next-epilogue'),
+      bumpBuilder: () => controlAction('bump-builder'),
+      builds: () => readControl<{ version: number; parts: number[] }[]>('mime-builds'),
+      shortHandlerBudget: () => controlAction('short-handler-budget'),
+      row: (id: string) => readControl<{ id: string; state: string; undo_until: number; created_seq: number; release_seq: number | null;
+        queued_seq: number | null; terminal_seq: number | null; message_id: string | null; reason: string | null; finish_pending: number;
+        record: string } | null>('send-row', id),
+      lifecycle: async () => { const value = await readControl<string | null>('lifecycle'); return value === null ? null : JSON.parse(value) as Record<string, unknown>; },
+      setReplyTo: (replyTo: unknown) => controlAction('set-reply-to', JSON.stringify(replyTo)),
+      registration: (sendId: string) => readControl<{ digest: string | null; key: string | null; raw_holder: string | null;
+        index_holder: string | null; released: string | null } | null>('send-registration', sendId),
+      generation: (key: string) => readControl<{ key: string; holder_count: number; retry_at: number | null; deleted_at: number | null } | null>('generation', key),
+      activateAlias: (address: string) => controlAction('activate-alias', address),
+      forceLost: (holder: string) => controlAction('force-lost', holder),
+      releaseFailure: (failing: boolean) => controlAction('send-release-failure', String(failing)),
+    };
     if (draftsUploads) inspectPut = async (pathname) => {
       const path = /^\/mail-([^/]+)\/(.+)$/.exec(pathname);
       assert.ok(path, 'expected a workspace-scoped PUT');
@@ -301,7 +326,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, releaseRetryAt, restore, forceSnapshot, uploadSwitch,
+    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, releaseRetryAt, restore, forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
       stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,

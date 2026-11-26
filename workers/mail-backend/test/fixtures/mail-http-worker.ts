@@ -15,7 +15,10 @@ import { deltaRange, journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
-import { mailboxName, type Env as BackendEnv } from '../../src/worker.ts';
+import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
+import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
+import type { SendStep } from '../../src/mailbox-send.ts';
+import { builds, fixtureBuilders } from './send-mime.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -34,6 +37,11 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
   REAL_CONTENT_ORIGIN?: string;
   MAIL_CONTENT?: MailApiEnvironment['MAIL_CONTENT'];
+  // Only the fixture's alarm calls run the mailbox timers, so a real alarm
+  // never releases a send on the wall clock in the middle of a test.
+  MANUAL_ALARMS?: string;
+  // A stand-in for the send_email binding; the send path before M3-5 never calls it.
+  EMAIL?: { send(message: unknown): Promise<unknown> };
 }
 
 const encoder = new TextEncoder();
@@ -56,6 +64,9 @@ export class HttpMailbox extends Mailbox {
   blockLaterDelta(after: number) { this.blockedDeltaAfter = after; }
   private failAlert = false;
   private realtimeHolderClock = false;
+  private crashStep?: SendStep;
+  private failEpilogue = false;
+  private manualAlarm = false;
   private readonly emittedAlerts: string[] = [];
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
@@ -76,7 +87,13 @@ export class HttpMailbox extends Mailbox {
     let flag: string | undefined;
     try { flag = ctx.storage.sql.exec<{ flag: string }>('SELECT flag FROM fixture_upload_switch').toArray()[0]?.flag; }
     catch { /* no fixture override before the first toggle */ }
+    const record = (table: string, body: unknown) => {
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (n INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
+      ctx.storage.sql.exec(`INSERT INTO ${table} (body) VALUES (?)`, JSON.stringify(body));
+    };
     super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED,
+      SEND: { send: async (body: SendDispatch) => { record('fixture_send_queue', body); } },
+      ...{ EMAIL: { send: async (message: unknown) => { record('fixture_email', { kind: typeof message }); return {}; } } },
       ALERTS: { fetch: async (input, init) => {
         const { source } = await new Request(input, init).json<{ source: string }>();
         if (mailbox.failAlert) return new Response(null, { status: 503 });
@@ -84,8 +101,49 @@ export class HttpMailbox extends Mailbox {
         return new Response(null, { status: 204 });
       } } });
     mailbox = this;
+    let bumped = false;
+    try { bumped = ctx.storage.sql.exec('SELECT 1 FROM fixture_builder').toArray().length > 0; }
+    catch { /* never bumped */ }
+    this.sendMime = fixtureBuilders(bumped);
   }
   publishFailure(failing: boolean) { this.failPublish = failing; }
+  private recorded(table: string): unknown[] {
+    try { return this.ctx.storage.sql.exec<{ body: string }>(`SELECT body FROM ${table} ORDER BY n`).toArray().map(row => JSON.parse(row.body)); }
+    catch { return []; }
+  }
+  sendQueue() { return this.recorded('fixture_send_queue'); }
+  emailCalls() { return this.recorded('fixture_email').length; }
+  crashAfter(step: SendStep) { this.crashStep = step; }
+  failNextEpilogue() { this.failEpilogue = true; }
+  bumpBuilder() {
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_builder (id INTEGER PRIMARY KEY)');
+    this.ctx.storage.sql.exec('INSERT OR IGNORE INTO fixture_builder VALUES (1)');
+    this.sendMime = fixtureBuilders(true);
+  }
+  mimeBuilds() { return builds; }
+  shortenHandlerBudget() { this.timerHandlerBudgetMs = 25; this.realtimeHolderClock = true; }
+  sendRow(id: string) {
+    return this.ctx.storage.sql.exec(`SELECT id, state, undo_until, created_seq, release_seq, queued_seq, terminal_seq, message_id, reason,
+      finish_pending, record FROM mailbox_sends WHERE id = ?`, id).toArray()[0] ?? null;
+  }
+  lifecycle() { return this.ctx.storage.sql.exec<{ value: string }>('SELECT value FROM lifecycle WHERE id = 1').toArray()[0]?.value ?? null; }
+  async setReplyTo(ws: string, mb: string, replyTo: unknown) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => {
+      const row = this.ctx.storage.sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
+      const settings = { signature: '', undoSeconds: 10, defaultFrom: '', replyFromReceivedAddress: true,
+        ...(row ? JSON.parse(row.definition) as object : {}), replyTo };
+      index.changeMany([{ type: 'api_settings', definition: JSON.stringify(settings) }]);
+    });
+  }
+  protected override async sendCheckpoint(step: SendStep) {
+    if (step !== this.crashStep) return;
+    this.crashStep = undefined;
+    throw new Error(`Fixture crash after ${step}`);
+  }
+  override async alarm() {
+    if ((this.env as FixtureEnv).MANUAL_ALARMS === 'on' && !this.manualAlarm) return;
+    return super.alarm();
+  }
   pauseExpiry(kind: string) {
     if (this.pauseKind) throw new Error('An expiry pause is already armed');
     this.pauseKind = kind;
@@ -105,6 +163,14 @@ export class HttpMailbox extends Mailbox {
     }
   }
   protected override registerTimerKind(kind: string, handler: TimerKind) {
+    const rebuild = handler.rebuild;
+    if (kind === SEND_DRIVE && rebuild) handler = { ...handler, rebuild: (timers, now) => {
+      if (this.failEpilogue) {
+        this.failEpilogue = false;
+        throw new Error('Fixture crash during the restore epilogue');
+      }
+      return rebuild(timers, now);
+    } };
     super.registerTimerKind(kind, { ...handler, run: async timer => {
       if (kind === this.pauseKind) this.startedExpiry++;
       if (kind !== this.pauseKind || this.resumeExpiry) return handler.run(timer);
@@ -133,8 +199,9 @@ export class HttpMailbox extends Mailbox {
     const actual = Date.now;
     const start = actual(), simulated = this.mailApiNow();
     Date.now = this.pauseKind || this.realtimeHolderClock ? () => simulated + actual() - start : () => simulated;
+    this.manualAlarm = true;
     try { await Promise.all(Array.from({ length: runs }, () => this.alarm())); }
-    finally { Date.now = actual; }
+    finally { Date.now = actual; this.manualAlarm = false; }
   }
   timers() {
     return this.ctx.storage.sql.exec('SELECT kind, ref, due_at FROM timers ORDER BY kind, ref').toArray();
@@ -244,6 +311,10 @@ export class Sweeper extends MailSweeper {
   private readonly releases: { key: string; holder: string }[] = [];
   setConfirmFailure(failing: boolean) { this.failConfirm = failing; }
   confirmBatches() { return this.confirmationBatches; }
+  private lostHolder?: string;
+  private failSendRelease = false;
+  forceLost(holder: string) { this.lostHolder = holder; }
+  setSendReleaseFailure(failing: boolean) { this.failSendRelease = failing; }
   async confirm(entries: ConfirmEntry[]) {
     if (this.failConfirm || this.failOneConfirm) {
       this.failOneConfirm = false;
@@ -251,7 +322,22 @@ export class Sweeper extends MailSweeper {
     }
     if (this.slowConfirm) await this.stalled();
     this.confirmationBatches.push(entries.length);
-    return super.confirm(entries);
+    const answers = await super.confirm(entries);
+    // The sweeper's answer for a source whose object a test declares lost.
+    return answers.map((answer, i) => entries[i].holder === this.lostHolder ? 'lost' as const : answer);
+  }
+  override async releaseSend(...args: Parameters<MailSweeper['releaseSend']>) {
+    if (this.failSendRelease) throw new Error('Fixture sweeper outage');
+    return super.releaseSend(...args);
+  }
+  registration(mailbox: string, sendId: string) {
+    try {
+      return this.ctx.storage.sql.exec('SELECT digest, key, raw_holder, index_holder, released FROM send_registrations WHERE mailbox = ? AND send_id = ?',
+        mailbox, sendId).toArray()[0] ?? null;
+    } catch { return null; }
+  }
+  generation(key: string) {
+    return this.ctx.storage.sql.exec('SELECT key, holder_count, retry_at, deleted_at FROM generations WHERE key = ?', key).toArray()[0] ?? null;
   }
   holderDetails(key: string) {
     return this.ctx.storage.sql.exec('SELECT holder, state, expires_at FROM generation_holders WHERE key = ? ORDER BY holder', key).toArray();
@@ -403,6 +489,24 @@ export default {
           case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;
           case '/__fixture/purge-trash': return Response.json(await box.purgeTrash(ws));
           case '/__fixture/restore': await box.restoreFixture(ws, mailboxId!); break;
+          case '/__fixture/send-queue': return Response.json(await box.sendQueue());
+          case '/__fixture/email-calls': return Response.json(await box.emailCalls());
+          case '/__fixture/crash-after': await box.crashAfter(await req.text() as SendStep); break;
+          case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
+          case '/__fixture/bump-builder': await box.bumpBuilder(); break;
+          case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
+          case '/__fixture/send-row': return Response.json(await box.sendRow(await req.text()));
+          case '/__fixture/lifecycle': return Response.json(await box.lifecycle());
+          case '/__fixture/set-reply-to': await box.setReplyTo(ws, mailboxId!, await req.json()); break;
+          case '/__fixture/send-registration': return Response.json(await refs.registration(mailboxId!, await req.text()));
+          case '/__fixture/generation': return Response.json(await refs.generation(await req.text()));
+          case '/__fixture/force-lost': await refs.forceLost(await req.text()); break;
+          case '/__fixture/send-release-failure': await refs.setSendReleaseFailure(await req.text() === 'true'); break;
+          case '/__fixture/activate-alias': {
+            await env.DIRECTORY.prepare("UPDATE addresses SET send_as_policy = 'active' WHERE address_norm = ?").bind(await req.text()).run();
+            break;
+          }
           case '/__fixture/snapshot': return Response.json(await box.forceSnapshot());
           case '/__fixture/upload-switch': {
             const enabled = await req.text() === 'true';
@@ -439,7 +543,8 @@ export default {
     const port: MailApiEnvironment = {
       MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow, MAIL_RATE_UPLOADS: allow, MAIL_RATE_SENDS: allow,
       MAIL_RATE_UNDO: allow, MAIL_RATE_UNDO_FLOOD: allow, MAIL_RATE_ADMIN_WRITES: allow,
-      MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
+      MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAIL_SEND_ENABLED: env.MAIL_SEND_ENABLED,
+      MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
       MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: env.REAL_CONTENT_ORIGIN ?? contentOrigin(url, env),
