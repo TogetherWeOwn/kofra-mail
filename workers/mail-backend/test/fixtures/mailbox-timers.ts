@@ -47,6 +47,7 @@ export class TimerMailbox extends Mailbox {
     super(ctx, { ...env, ...(disabled ? { MAIL_BACKEND_ENABLED: 'off' } : {}), SWEEPER: { getByName: () => ({
       register: async () => { throw new Error('Unexpected timer fixture registration'); },
       hold: async () => {}, release: async () => {},
+      holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
     }) } });
     this.fixtureSchema();
     // A shortened retry survives an object reset, so the platform delivers the successor alarm in a test.

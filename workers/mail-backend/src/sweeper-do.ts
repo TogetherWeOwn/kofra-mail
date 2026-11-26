@@ -4,7 +4,7 @@ import { kofra } from './kofra.ts';
 import { MailboxWork } from './mailbox-work.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { RETENTION_MS } from './reconcile.ts';
-import { SweepLedger } from './sweep-ledger.ts';
+import { PROVISIONAL_TTL, SweepLedger, type ConfirmAnswer, type ConfirmEntry, type HoldTarget } from './sweep-ledger.ts';
 import { enabled, type Env } from './worker.ts';
 
 const DISABLED_RECHECK_MS = 24 * 60 * 60_000;
@@ -30,6 +30,18 @@ export class Sweeper extends DurableObject<Env> {
     return this.ledger().register(kind, digest, holder, Date.now());
   }
   async hold(key: string, holder: string): Promise<void> { this.ledger().hold(key, holder, Date.now()); }
+  async holdProvisional(target: HoldTarget, holder: string): Promise<string> {
+    const ledger = this.ledger();
+    return this.alarms.run(async () => {
+      const now = Date.now();
+      // Arm before committing, as release does, so an expiry never lacks a wake-up.
+      const due = Math.min(now + PROVISIONAL_TTL, ledger.nextSweepAt() ?? Infinity);
+      await this.arm(this.env.MAIL_SWEEP_ENABLED === 'on' ? due : Math.max(due, now + DISABLED_RECHECK_MS));
+      return ledger.holdProvisional(target, holder, now);
+    });
+  }
+  // Only adds protection, so it needs no wake-up.
+  async confirm(entries: ConfirmEntry[]): Promise<ConfirmAnswer[]> { return this.ledger().confirm(entries, Date.now()); }
   async release(key: string, holder: string): Promise<void> {
     const ledger = this.ledger();
     await this.alarms.run(async () => {
@@ -63,6 +75,7 @@ export class Sweeper extends DurableObject<Env> {
     }
     const ledger = this.ledger();
     if (this.env.MAIL_SWEEP_ENABLED !== 'on') {
+      // Provisional expiry runs with the sweep, so while deletes are off no holder loses protection.
       await this.alarms.run(async () => {
         const next = ledger.nextSweepAt();
         if (next === null) await this.ctx.storage.deleteAlarm();

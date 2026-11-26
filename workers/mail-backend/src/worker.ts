@@ -1,6 +1,7 @@
 import { ulid } from 'ulid';
 import { mailAlert, type AlertBinding } from './alerts.ts';
 import type { ObjectKind } from './object-key.ts';
+import type { ConfirmAnswer, ConfirmEntry, HoldTarget } from './sweep-ledger.ts';
 import { deliver, dlq } from './deliver.ts';
 import { lookupRecipient } from './directory.ts';
 import { receive, type InboundMail } from './inbound.ts';
@@ -13,6 +14,12 @@ export type ObjectReferences = {
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
   hold(key: string, holder: string): Promise<void>;
   release(key: string, holder: string): Promise<void>;
+};
+// The Sweeper Durable Object's RPC surface, including provisional holders
+// (docs/m3-outbound-plan.md, section 2.7).
+export type SweeperReferences = ObjectReferences & {
+  holdProvisional(target: HoldTarget, holder: string): Promise<string>;
+  confirm(entries: ConfirmEntry[]): Promise<ConfirmAnswer[]>;
 };
 export type MailboxDelivery = { deliver(id: string): Promise<'indexed' | 'deferred' | 'rejected'> };
 type Namespace<T> = { getByName(name: string): T };
@@ -27,7 +34,7 @@ export type Env = KofraConfig & {
   DELIVERY_QUEUE_NAME: string;
   DEAD_LETTER_QUEUE_NAME: string;
   ALERTS?: AlertBinding;
-  SWEEPER: Namespace<ObjectReferences>;
+  SWEEPER: Namespace<SweeperReferences>;
   MAILBOX: Namespace<MailboxDelivery> & { idFromName(name: string): DurableObjectId };
   MAIL_STATE: R2Bucket;
 };
