@@ -229,6 +229,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **`sendDraft` checks** (each a 422 code, except the subject length, 400 `invalid_request`):
 - 1 to `recipientsPerMessage` recipients, all syntactically valid (`invalid_recipients`, `too_many_recipients`);
+- A local part containing `=?` is refused because RFC 2047 encoded words are not allowed inside an addr-spec.
 - `from` is an identity with `sendAs: 'active'` (`invalid_sender`);
 - file attachments ≤ `attachmentsPerMessage` (`too_many_attachments`);
 - encoded size ≤ `outboundMessageBytes` (`message_too_large`, with `limit`);

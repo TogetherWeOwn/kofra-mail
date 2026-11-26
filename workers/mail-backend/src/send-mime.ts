@@ -79,7 +79,7 @@ function checkAddress({ name, email }: Readonly<AddressInput>, field: string, co
   // A bare ASCII dot-atom and DNS domain, matching the mail-core send contract.
   const [local, domain, extra] = email.split('@');
   const labels = domain?.split('.');
-  if (extra !== undefined || local.length > 64 || email.length > LIMITS.addressBytes || !labels || labels.length < 2 ||
+  if (extra !== undefined || local.includes('=?') || local.length > 64 || email.length > LIMITS.addressBytes || !labels || labels.length < 2 ||
       !/^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local) ||
       !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) fail(code);
 }

@@ -146,6 +146,16 @@ test('the first send response stays pending if the send releases before the resp
   assert.equal((await mail.getSend(send.id)).state, 'sent');
 });
 
+test('the fake rejects encoded-word local parts when sending', async () => {
+  const mail = createFakeMailHarness().as('member');
+  const { defaultFrom } = await mail.getSettings();
+  const encodedWordLocal = '=?utf-8?q?evil=40attacker.test=3e=2c?=';
+  const draft = await mail.createDraft({
+    from: defaultFrom, to: [{ email: `${encodedWordLocal}@example.net` }], cc: [], bcc: [], subject: 'Encoded recipient', body: '', attachments: [],
+  }, { idempotencyKey: 'draft' });
+  await assert.rejects(mail.sendDraft(draft.id, { idempotencyKey: 'send', ifMatch: draft.revision }), { code: 'invalid_recipients' });
+});
+
 test('a replacement can keep an expired reply target but cannot name a foreign message', async () => {
   const harness = createFakeMailHarness();
   const mail = harness.as('member');

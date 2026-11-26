@@ -126,7 +126,7 @@ function validDomain(name: string): boolean {
 }
 function validEmail(email: string): boolean {
   const [local, domain, extra] = email.split('@');
-  return extra === undefined && local.length <= 64 && email.length <= 254 && !!domain && validDomain(domain)
+  return extra === undefined && !local.includes('=?') && local.length <= 64 && email.length <= 254 && !!domain && validDomain(domain)
     && /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local);
 }
 

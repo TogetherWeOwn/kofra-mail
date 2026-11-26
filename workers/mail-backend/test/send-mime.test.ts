@@ -186,6 +186,16 @@ test('builders enforce recipient syntax and count across To, Cc and Bcc', async 
   }
 });
 
+test('builders refuse encoded-word local parts but allow standalone equals and question marks', async () => {
+  const { buildSentCopy, buildSendRequest } = await builders();
+  const encodedWordLocal = '=?utf-8?q?evil=40attacker.test=3e=2c?=';
+  for (const build of [buildSentCopy, buildSendRequest]) {
+    assert.throws(() => build({ ...frozen, to: [{ email: `${encodedWordLocal}@example.net` }] }), { message: 'invalid_recipients' });
+    assert.throws(() => build({ ...frozen, frozenReplyTo: { email: `${encodedWordLocal}@example.net` } }), { message: 'invalid_header' });
+    for (const local of ['a=b', 'a?b']) assert.doesNotThrow(() => build({ ...frozen, to: [{ email: `${local}@example.net` }] }));
+  }
+});
+
 test('builders bound display names by UTF-8 bytes before serialization', async () => {
   const { buildSentCopy, buildSendRequest } = await builders();
   const name = 'é'.repeat(LIMITS.displayNameBytes / 2);
