@@ -207,6 +207,7 @@ Cache-Control: private, no-store
    - status 200 only;
    - `Content-Type` must be `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/avif`, `image/bmp` or `image/x-icon`, and the first bytes must match that type. **SVG is refused.**
    - The body is read into memory, at most `remoteImageBytes` (5 MiB), **before** the response starts: an image that turns out larger, or a fetch that times out, still answers 404 with an empty body, and nothing is cached. A response with no declared length is handled the same way.
+   - Concurrent image reads in one isolate share an in-flight budget (32 MiB); a read that cannot reserve its bytes fails as too large.
    - Outgoing headers are rebuilt from scratch: the normalised `Content-Type`, `Content-Length` when known, and the security headers of section 3.1. No upstream header is passed through.
 5. **Failures:** anything else answers 404 with an empty body, so the browser shows a broken image.
 6. **Caching, behind the verifier only:** the Worker may keep the upstream image in its own fetch cache, keyed by the remote URL, for up to a day. Senders then see fewer opens; they never see who opened.
