@@ -144,8 +144,8 @@ test('a tombstone is never revived and is deleted with its generation', async ()
 
   assert.match(await ledger.failure('holdProvisional', { key }, 'send:scope:s1', 110), /holder retired/);
   assert.match(await ledger.failure('holdProvisional', { kind: 'raw', digest: digest('7') }, 'send:scope:s1', 110), /holder retired/);
-  assert.match(await ledger.failure('hold', key, 'send:scope:s1', 110), /holder retired/);
-  assert.match(await ledger.failure('register', 'raw', digest('7'), 'send:scope:s1', 110), /holder retired/);
+  await ledger.hold(key, 'send:scope:s1', 110);
+  assert.equal(await ledger.register('raw', digest('7'), 'send:scope:s1', 110), key, 'a repeated hold is a no-op');
   assert.deepEqual(await ledger.confirm([{ key, holder: 'send:scope:s1' }], 110), ['released']);
   await ledger.release(key, 'send:scope:s1', 110);
   assert.deepEqual(await ledger.holders(key), tombstone, 'release keeps a tombstone');

@@ -190,8 +190,8 @@ export class SweepLedger {
 
   private addHolder(key: string, holder: string, now: number): void {
     const state = this.holderState(key, holder);
-    if (state === 'tombstone') throw new Error('Mail object holder retired');
-    if (state === 'held') return;
+    // A repeated hold after a tombstoning release adds nothing (plan section 2.4).
+    if (state === 'held' || state === 'tombstone') return;
     if (state === undefined) this.sql.exec('INSERT INTO generation_holders(key, holder) VALUES (?, ?)', key, holder);
     else this.sql.exec(`UPDATE generation_holders SET state = 'held', expires_at = NULL WHERE key = ? AND holder = ?`, key, holder);
     if (state !== 'provisional') this.count(key, 1, now);
@@ -221,7 +221,7 @@ export class SweepLedger {
       ORDER BY retry_at, key LIMIT 1`).toArray()[0];
     const expiry = this.sql.exec<{ expires_at: number }>(`SELECT expires_at FROM generation_holders
       WHERE state = 'provisional' ORDER BY expires_at, key, holder LIMIT 1`).toArray()[0];
-    const due = [first && first.last_ref_at + RETENTION_MS, retry?.retry_at, expiry?.expires_at]
+    const due = [first ? first.last_ref_at + RETENTION_MS : undefined, retry?.retry_at, expiry?.expires_at]
       .filter((at): at is number => at !== undefined);
     return due.length ? Math.min(...due) : null;
   }
