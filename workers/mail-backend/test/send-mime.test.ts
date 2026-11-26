@@ -192,6 +192,7 @@ test('builders refuse encoded-word local parts but allow standalone equals and q
   for (const build of [buildSentCopy, buildSendRequest]) {
     assert.throws(() => build({ ...frozen, to: [{ email: `${encodedWordLocal}@example.net` }] }), { message: 'invalid_recipients' });
     assert.throws(() => build({ ...frozen, frozenReplyTo: { email: `${encodedWordLocal}@example.net` } }), { message: 'invalid_header' });
+    assert.throws(() => build({ ...frozen, from: { ...frozen.from, email: `${encodedWordLocal}@example.net` } }), { message: 'invalid_sender' });
     for (const local of ['a=b', 'a?b']) assert.doesNotThrow(() => build({ ...frozen, to: [{ email: `${local}@example.net` }] }));
   }
 });

@@ -741,6 +741,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const current = directory.items.find(({ id }) => id === mailbox.id);
       assert.ok(current && current.aliases.length < limits.aliasesPerMailbox);
       const aliasInput = { mailboxId: mailbox.id, sendAs: true };
+      // RFC 2047 encoded words are not allowed in an addr-spec, so such a local part is never a directory address.
+      await rejects(admin.createMailbox({ ...input, primaryAddress: `=?conformance@${primaryDomain}` }, key('encoded-mailbox')), 'invalid_request');
+      await rejects(admin.createAlias({ ...aliasInput, address: `a=?b@${primaryDomain}` }, key('encoded-alias')), 'invalid_request');
       const alias = await admin.createAlias({ ...aliasInput, address: `conformance-alias-0@${primaryDomain}` }, key('alias-0'));
       const identity = (await mail.listIdentities()).items.find(({ email }) => email === alias.address);
       assert.equal(identity?.kind, 'alias');

@@ -298,6 +298,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 
 **Aliases:**
 - `createAlias` adds an address on a primary or secondary domain. An address on an alias domain is implicit: `x@alias.example` reaches `x@primary.example`.
+- A mailbox or alias address whose local part contains `=?` is refused with `invalid_request` (RFC 2047 encoded words are not allowed in an addr-spec, and sending refuses them).
 - At most `aliasesPerMailbox` per mailbox, otherwise 422 `limit_reached`.
 - With `sendAs: true`, the alias shows as `pending` in the owner's identities until the sending allow-list is redeployed through CI.
 - `deleteAlias` stops delivery to that address at once.

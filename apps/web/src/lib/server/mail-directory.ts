@@ -34,7 +34,8 @@ function text(value: unknown, field: string, max: number): string {
 function address(value: unknown, field: string): string {
   const result = text(value, field, LIMITS.addressBytes).toLowerCase();
   // Inbound strips plus tags for routing, so a tag cannot be a separate directory address.
-  if (!/^[a-z0-9.!#$%&'*\/=?^_`{|}~-]+@[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$/.test(result)) return fail('invalid_request', { errors: [{ field, code: 'invalid' }] });
+  // RFC 2047 encoded words are not allowed in an addr-spec; sends refuse them too.
+  if (!/^[a-z0-9.!#$%&'*\/=?^_`{|}~-]+@[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$/.test(result) || result.split('@')[0].includes('=?')) return fail('invalid_request', { errors: [{ field, code: 'invalid' }] });
   return result;
 }
 function domainName(value: unknown, field: string): string {
