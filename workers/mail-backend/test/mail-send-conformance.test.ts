@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath, URL } from 'node:url';
+import { failedTests, passedCases, runChild } from './fixtures/child-tests.ts';
 
 // Conformance cases 13, 14, 22 and 23 (with 23a) against the backend over HTTP
 // in local workerd (docs/m3-outbound-plan.md, section 3, M3-3). The other
@@ -14,21 +14,12 @@ test('conformance cases 13, 14, 22, 23 and 23a pass against the backend with the
   const file = fileURLToPath(new URL('./fixtures/send-conformance.ts', import.meta.url));
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  // The child has its own deadline, inside this test's, and is killed whatever happens.
-  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
-    ...owned.map(id => `--test-name-pattern=^${id.replace('.', '\\.')}\\. `), file],
-  { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 150_000, killSignal: 'SIGKILL' });
-  let output = '';
-  child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
-  child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });
-  let code: number | null;
-  try {
-    code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
-  } finally {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-  }
-  const passed = [...output.matchAll(/^\s+ok \d+ - (\d+a?)\. /gm)].map(match => match[1]).sort();
-  const failed = [...output.matchAll(/^\s+not ok \d+ - (.+)$/gm)].map(match => match[1]);
+  // The child has its own deadline, inside this test's, and its whole process group is killed whatever happens.
+  const { code, output } = await runChild(['--test', '--test-reporter=tap', '--test-concurrency=1',
+    ...owned.map(id => `--test-name-pattern=^${id.replace('.', '\\.')}\\. `), file], { env, timeoutMs: 150_000 });
+  // Only unqualified passes count: a `# SKIP` or `# TODO` line did not run the case.
+  const passed = passedCases(output);
+  const failed = failedTests(output);
   assert.deepEqual(failed, [], output);
   assert.equal(code, 0, output);
   assert.deepEqual(passed, [...owned].sort(), output);
