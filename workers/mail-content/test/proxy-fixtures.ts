@@ -37,7 +37,9 @@ export const images: Record<string, Uint8Array> = {
 export const svg = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
 export const html = new TextEncoder().encode('<!doctype html><html><body><script>alert(1)</script></body></html>');
 
-export interface Recorded { url: string; method?: string; redirect?: string; hasSignal: boolean; headers: [string, string][] }
+export interface Recorded {
+  url: string; method?: string; redirect?: string; cache?: string; cf?: unknown; hasSignal: boolean; headers: [string, string][];
+}
 type Route = (signal: AbortSignal | undefined) => Response | Promise<Response>;
 
 /** A local upstream: a fetch stub that records every request and flags unknown URLs. */
@@ -46,7 +48,8 @@ export function upstream(routes: Record<string, Route>) {
   const unexpected: string[] = [];
   const fetchImpl: FetchLike = async (url, init) => {
     calls.push({
-      url, method: init.method, redirect: init.redirect, hasSignal: init.signal instanceof AbortSignal,
+      url, method: init.method, redirect: init.redirect, cache: init.cache, cf: (init as { cf?: unknown }).cf,
+      hasSignal: init.signal instanceof AbortSignal,
       headers: [...new Headers(init.headers)],
     });
     const route = routes[url];

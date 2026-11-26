@@ -3,13 +3,14 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath, URL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
-import { images } from './proxy-fixtures.ts';
+import { html, images, svg } from './proxy-fixtures.ts';
 
 // The upstream is a Miniflare outbound service: every subrequest the Worker
 // makes lands here, so nothing reaches the real network.
 interface Seen { url: string; method: string; headers: [string, string][] }
 const seen: Seen[] = [];
-const routes = new Map<string, () => Response>();
+const routes = new Map<string, () => Response | Promise<Response>>();
+const logs: Array<{ level: string; message: string }> = [];
 
 let mf: Miniflare;
 before(async () => {
@@ -19,6 +20,7 @@ before(async () => {
   });
   mf = new Miniflare({
     modules: true, script: outputFiles[0].text, compatibilityDate: '2026-07-30',
+    handleStructuredLogs: ({ level, message }: { level: string; message: string }) => { logs.push({ level, message }); },
     outboundService: (request: Request) => {
       seen.push({ url: request.url, method: request.method, headers: [...request.headers] });
       const route = routes.get(request.url);
@@ -35,6 +37,24 @@ const incoming = {
   origin: 'https://mail.suite.example', dnt: '1',
 };
 const forbidden = /^(cookie|cookie2|referer|origin|authorization|forwarded|x-forwarded-.*|x-real-ip|true-client-ip|cf-connecting-ip|via|sec-ch-.*|sec-fetch-.*|dnt|save-data|accept-language)$/;
+
+const tokenHash = 'c0ffee12'.padEnd(64, '3');
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+/** Calls the handler-shaped `/image` path; failures must be an empty-body 404. */
+async function serve(url: string, extra: { timeoutMs?: number } = {}) {
+  const started = Date.now();
+  const response = await mf.dispatchFetch('https://content.content-zone.example/image', {
+    method: 'POST', headers: incoming, body: JSON.stringify({ url, tokenHash, ...extra }),
+  });
+  const body = new Uint8Array(await response.arrayBuffer());
+  return { status: response.status, body, headers: [...response.headers], elapsed: Date.now() - started };
+}
+const assertEmpty404 = (served: { status: number; body: Uint8Array; headers: [string, string][] }) => {
+  assert.equal(served.status, 404);
+  assert.equal(served.body.length, 0);
+  assert.ok(!served.headers.some(([name]) => ['set-cookie', 'location', 'content-type'].includes(name)), JSON.stringify(served.headers));
+};
 
 async function run(url: string) {
   const response = await mf.dispatchFetch('https://content.content-zone.example/fetch', {
@@ -78,6 +98,8 @@ test('workerd: three manual redirects are followed and no hop carries a cookie, 
     for (const leak of ['app-secret', '203.0.113.7', 'ReaderBrowser', 'reader-device', 'Bearer', 'nl-NL', 'mail.suite.example'])
       assert.ok(!values.includes(leak), `${hop.url} leaked ${leak}`);
     assert.equal(hop.headers.find(([n]) => n === 'accept')?.[1], 'image/avif,image/webp,image/png,image/*;q=0.8');
+    // Only our two headers plus what the runtime itself adds (Host, CF-Worker); the cache options add none.
+    assert.deepEqual(names.sort(), ['accept', 'cf-worker', 'host', 'user-agent']);
   }
 });
 
@@ -118,6 +140,56 @@ test('workerd: an endless upstream body with no Content-Length is refused at 5 M
     }), { headers: { 'content-type': 'image/png' } });
   });
   assert.deepEqual(await run('https://big.sender.example/x.png'), { ok: false, reason: 'size' });
+  assertEmpty404(await serve('https://big.sender.example/x.png'));
+});
+
+test('workerd: SVG and an HTML body labelled image/png answer an empty 404', async () => {
+  routes.clear();
+  routes.set('https://img.sender.example/a.svg', () => new Response(svg, { headers: { 'content-type': 'image/svg+xml' } }));
+  routes.set('https://img.sender.example/b.png', () => new Response(svg, { headers: { 'content-type': 'image/png' } }));
+  routes.set('https://img.sender.example/c.png', () => new Response(html, { headers: { 'content-type': 'image/png', 'set-cookie': 'x=1' } }));
+  for (const path of ['a.svg', 'b.png', 'c.png']) assertEmpty404(await serve(`https://img.sender.example/${path}`));
+});
+
+test('workerd: the deadline is total across hops and covers a hanging upstream', async () => {
+  routes.clear();
+  for (let i = 0; i < 3; i++)
+    routes.set(`https://slow.sender.example/${i}`, async () => {
+      await delay(150);
+      return new Response(null, { status: 302, headers: { location: `/${i + 1}` } });
+    });
+  routes.set('https://slow.sender.example/3', () => new Response(images['image/png'], { headers: { 'content-type': 'image/png' } }));
+  // Each hop alone is well inside the limit; together they are not.
+  const chained = await serve('https://slow.sender.example/0', { timeoutMs: 300 });
+  assertEmpty404(chained);
+  assert.ok(chained.elapsed < 2_000, `took ${chained.elapsed} ms`);
+  assert.ok((await serve('https://slow.sender.example/0', { timeoutMs: 5_000 })).status === 200);
+
+  routes.set('https://hang.sender.example/x', () => new Promise<Response>(() => {}));
+  const hung = await serve('https://hang.sender.example/x', { timeoutMs: 250 });
+  assertEmpty404(hung);
+  assert.ok(hung.elapsed < 2_000, `took ${hung.elapsed} ms`);
+});
+
+test('workerd: captured logs hold only purpose, status, bytes and the token-hash prefix; never a URL or token', async () => {
+  routes.clear();
+  logs.length = 0;
+  const secretHost = 'secret-tracker.sender.example';
+  routes.set(`https://${secretHost}/ok?r=recipient-42`, () => new Response(images['image/gif'], { headers: { 'content-type': 'image/gif' } }));
+  routes.set(`https://${secretHost}/svg?r=recipient-42`, () => new Response(svg, { headers: { 'content-type': 'image/svg+xml' } }));
+  routes.set(`https://${secretHost}/hop?r=recipient-42`, () => new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/' } }));
+  const urls = ['ok', 'svg', 'hop'].map(p => `https://${secretHost}/${p}?r=recipient-42`);
+  for (const url of [...urls, `http://localhost/${secretHost}`]) await serve(url);
+  assert.equal(logs.length, 4, JSON.stringify(logs));
+  const lines = logs.map(({ message }) => JSON.parse(message) as Record<string, unknown>);
+  assert.deepEqual(lines, [
+    { purpose: 'img', status: 200, bytes: 64, token: 'c0ffee12' },
+    { purpose: 'img', status: 404, bytes: 0, token: 'c0ffee12' },
+    { purpose: 'img', status: 404, bytes: 0, token: 'c0ffee12' },
+    { purpose: 'img', status: 404, bytes: 0, token: 'c0ffee12' },
+  ]);
+  for (const { message } of logs)
+    for (const leak of [secretHost, 'recipient-42', '://', '127.0.0.1', tokenHash]) assert.ok(!message.includes(leak), message);
 });
 
 test('workerd: a buffered image becomes a response with exactly the rebuilt headers and the same bytes', async () => {

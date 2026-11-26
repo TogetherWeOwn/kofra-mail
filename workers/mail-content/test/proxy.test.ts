@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import {
-  checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageAccept, remoteImageConfig, remoteImageMethodAllowed,
+  checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageAccept, remoteImageCacheOptions, remoteImageConfig,
+  remoteImageMethodAllowed,
   remoteImageLogLine, remoteImageResponseHeaders, remoteImageUserAgent, type RemoteImageResult,
 } from '../src/proxy.ts';
 import { config, endless, html, image, images, origins, ownDomains, redirect, svg, upstream } from './proxy-fixtures.ts';
@@ -117,8 +120,14 @@ test('guard: refuses ports other than 80 and 443', () => {
 
 test('guard: refuses user information in any form', () => {
   for (const url of ['https://user@sender.example/a.png', 'https://user:pass@sender.example/a.png',
-    'https://:pass@sender.example/a.png', 'http://sender.example@evil.example/', 'https://u%40x@sender.example/'])
+    'https://:pass@sender.example/a.png', 'http://sender.example@evil.example/', 'https://u%40x@sender.example/',
+    // Empty user information is dropped by the parser, so it is refused in the raw authority.
+    'https://:@sender.example/a.png', 'https://@sender.example/a.png', 'https://:@@sender.example/', 'HTTPS://:@Sender.example/',
+    'https:\\\\:@sender.example/a.png', 'https:/\\@sender.example/', ' https://:@sender.example/', 'https://\t:@sender.example/',
+    'https://:\n@sender.example/'])
     refused(url);
+  // An at sign outside the authority is not user information.
+  accepted('https://sender.example/a@2x.png?u=a@b#c@d');
 });
 
 test('guard: allows at most 2,048 bytes, counted in UTF-8', () => {
@@ -151,15 +160,22 @@ test('guard: invalid configuration fails closed for every URL', async () => {
     { maxUrlBytes: 1.5 }, { refusedZones: [''] }, { refusedZones: ['local', '1.2.3.4'] },
     // The spec's values are ceilings: configuration may tighten them, never loosen them.
     { maxUrlBytes: 2049 }, { remoteImageBytes: 2 ** 40 }, { remoteImageBytes: 5 * MiB + 1 }, { remoteImageRedirects: 4 },
-    { remoteImageTimeoutMs: 10_001 }, { remoteImageTimeoutMs: 2 ** 31 }])
+    { remoteImageTimeoutMs: 10_001 }, { remoteImageTimeoutMs: 2 ** 31 }, { remoteImageInFlightBytes: 32 * MiB + 1 },
+    { remoteImageInFlightBytes: 0 }])
     refused(good, { ...config, ...limits });
   // An oversized limit is refused as configuration, before any fetch or allocation.
   const { fetchImpl, calls } = upstream({ [good]: image('image/png', images['image/png']) });
   failed(await fetchRemoteImage(good, { ...config, remoteImageBytes: 2 ** 40 }, fetchImpl, now), 'url');
   assert.equal(calls.length, 0);
   assert.ok((await fetchRemoteImage(good, { ...config, remoteImageBytes: 5 * MiB }, fetchImpl, now)).ok);
-  // The configuration is read, not hard-coded: removing a zone changes the verdict.
-  accepted('http://printer.local/', { ...config, refusedZones: ['localhost', 'internal', 'arpa'] });
+  // The required zones always apply: configuration can add zones, never remove them.
+  for (const zones of [[], ['localhost'], ['example-extra.test']]) {
+    for (const url of ['http://a.localhost/', 'http://printer.local/', 'http://metadata.google.internal/',
+      'http://1.0.0.127.in-addr.arpa/', 'http://localhost/'])
+      refused(url, { ...config, refusedZones: zones });
+  }
+  refused('https://cdn.example-extra.test/a.png', { ...config, refusedZones: ['example-extra.test'] });
+  accepted('https://cdn.example-extra.test/a.png', { ...config, refusedZones: [] });
 });
 
 // ---- Rules 3 to 5: the fetch ----
@@ -249,6 +265,19 @@ test('fetch: content types outside the allowlist are refused', async () => {
   failed(await fetchRemoteImage(target, config, noType.fetchImpl, now), 'type');
 });
 
+test('fetch: Content-Type must be exactly one valid media type; combined header fields are refused', async () => {
+  const combined = () => new Response(images['image/png'], {
+    headers: new Headers([['content-type', 'image/png; charset=binary'], ['content-type', 'text/html']]),
+  });
+  const dup = upstream({ [target]: combined });
+  failed(await fetchRemoteImage(target, config, dup.fetchImpl, now), 'type');
+  for (const type of ['image/png; charset=binary, text/html', 'image/png, image/png', 'image/png;', 'image/png; charset',
+    'image/png; =x', 'image /png', 'image/ png', 'image/png; a="unterminated', 'image/png; a=b; c', '"image/png"'])
+    failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now), 'type');
+  for (const type of ['image/png', ' IMAGE/PNG ', 'image/png; charset=binary', 'image/png;q=1', 'image/png ; a="x, y; z"', 'image/png;a=b;c=d'])
+    assert.ok((await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now)).ok, type);
+});
+
 test('fetch: any status other than 200 is refused', async () => {
   for (const status of [201, 203, 204, 206, 226, 300, 304, 305, 400, 401, 403, 404, 410, 451, 500, 502, 503]) {
     const body = [204, 304].includes(status) ? null : images['image/png'];
@@ -299,6 +328,9 @@ test('fetch: a redirect to a refused host, an IP or a bad URL is refused and nev
     'https://bucket.storage.example/k', 'https://api.account.example/', 'https://w.example-acct.workers.dev/',
     'https://sender.example:8080/', 'https://user:pw@sender.example/', 'ftp://sender.example/a', 'javascript:alert(1)',
     'data:image/png;base64,iVBORw0KGgo=', 'http://[::1', `https://sender.example/${'a'.repeat(2048)}`,
+    // Empty user information in a Location, absolute or scheme-relative.
+    'https://:@other.sender.example/a.png', '//:@other.sender.example/a.png', 'https://@other.sender.example/',
+    '\\\\:@other.sender.example/', 'HTTP://:@other.sender.example/',
   ];
   for (const location of locations) {
     const { fetchImpl, calls, unexpected } = upstream({ [target]: redirect(location) });
@@ -332,6 +364,10 @@ test('fetch: every hop sends only the fixed Accept and User-Agent, with GET, man
     assert.equal(call.method, 'GET');
     assert.equal(call.redirect, 'manual');
     assert.ok(call.hasSignal);
+    // Worker-controlled caching is off on every hop, through `cf` (no request header) rather than `cache`.
+    assert.equal(call.cache, undefined);
+    assert.deepEqual(call.cf, { cacheEverything: false, cacheTtlByStatus: { '100-599': -1 } });
+    assert.deepEqual(call.cf, remoteImageCacheOptions);
     assert.deepEqual(call.headers, [['accept', remoteImageAccept], ['user-agent', remoteImageUserAgent]]);
     for (const [name] of call.headers) assert.ok(!forbiddenHeaders.test(name), name);
   }
@@ -466,6 +502,49 @@ test('fetch: a throwing upstream or garbage input yields the failure result, nev
   failed(await fetchRemoteImage(target, config, rejecting, now), 'network');
   failed(await fetchRemoteImage('', config, rejecting, now), 'url');
   failed(await fetchRemoteImage(target, { ...config, remoteImageBytes: -1 }, rejecting, now), 'url');
+});
+
+test('fetch: reading many small chunks keeps no per-chunk abort reaction', { timeout: 60_000 }, async () => {
+  setFlagsFromString('--expose_gc');
+  const gc = runInNewContext('gc') as () => void;
+  const chunks = 100_001;
+  let pulled = 0;
+  let baseline = 0;
+  let grown = 0;
+  let live = 0;
+  let maxLive = 0;
+  const add = EventTarget.prototype.addEventListener;
+  const remove = EventTarget.prototype.removeEventListener;
+  // Patched by hand, not with t.mock.method: mocks record every call (with a stack), which would itself grow the heap.
+  EventTarget.prototype.addEventListener = function (this: EventTarget, type: string, ...rest: unknown[]) {
+    if (this instanceof AbortSignal && type === 'abort') maxLive = Math.max(maxLive, ++live);
+    return Reflect.apply(add, this, [type, ...rest]);
+  } as typeof add;
+  EventTarget.prototype.removeEventListener = function (this: EventTarget, type: string, ...rest: unknown[]) {
+    if (this instanceof AbortSignal && type === 'abort') live--;
+    return Reflect.apply(remove, this, [type, ...rest]);
+  } as typeof remove;
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (pulled === 0) controller.enqueue(images['image/png'].slice());
+      else controller.enqueue(new Uint8Array(1));
+      pulled++;
+      if (pulled === 1_000) { gc(); baseline = process.memoryUsage().heapUsed; }
+      if (pulled === chunks) { gc(); grown = process.memoryUsage().heapUsed - baseline; controller.close(); }
+    },
+  }, { highWaterMark: 0 });
+  let result: RemoteImageResult;
+  try {
+    result = await fetchRemoteImage(target, config, upstream({ [target]: image('image/png', body) }).fetchImpl, now);
+  } finally {
+    EventTarget.prototype.addEventListener = add;
+    EventTarget.prototype.removeEventListener = remove;
+  }
+  assert.ok(result.ok);
+  assert.equal(result.length, 64 + chunks - 1);
+  assert.ok(grown < 8 * MiB, `heap grew ${(grown / MiB).toFixed(1)} MiB over ${chunks} chunks`);
+  assert.equal(live, 0, 'an abort listener was left registered');
+  assert.ok(maxLive <= 2, `${maxLive} abort listeners were live at once`);
 });
 
 // ---- Rule 4: outgoing headers are rebuilt from scratch (section 3.1) ----

@@ -1,8 +1,9 @@
 // Test-only Worker: runs the proxy guard and fetch inside workerd, so URL
 // parsing and the manual-redirect fetch are the runtime's own. The incoming
 // request deliberately carries cookies and forwarding headers; none may reach
-// the upstream.
-import { checkRemoteImageUrl, fetchRemoteImage, remoteImageResponseHeaders } from '../src/proxy.ts';
+// the upstream. `/image` answers the way the `img` handler will: the rebuilt
+// headers and bytes, or 404 with an empty body, plus the rule 7 log line.
+import { checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageResponseHeaders } from '../src/proxy.ts';
 import { config, origins } from './proxy-fixtures.ts';
 
 export default {
@@ -15,11 +16,14 @@ export default {
         return verdict.ok ? verdict.url.href : null;
       }));
     }
-    const { url } = await request.json<{ url: string }>();
-    const result = await fetchRemoteImage(url, config, (input, init) => fetch(input, init), Date.now);
+    const { url, timeoutMs, tokenHash } = await request.json<{ url: string; timeoutMs?: number; tokenHash?: string }>();
+    const effective = timeoutMs === undefined ? config : { ...config, remoteImageTimeoutMs: timeoutMs };
+    const result = await fetchRemoteImage(url, effective, (input, init) => fetch(input, init), Date.now);
+    logRemoteImage(tokenHash ?? '', result);
     if (path === '/image') {
-      // The shape C4 will use: a fresh response from the buffered bytes and rebuilt headers.
-      return result.ok ? new Response(result.bytes, { headers: remoteImageResponseHeaders(result, origins) }) : new Response(null, { status: 404 });
+      return result.ok
+        ? new Response(result.bytes, { headers: remoteImageResponseHeaders(result, origins) })
+        : new Response(null, { status: 404 });
     }
     return Response.json(result.ok
       ? { ok: true, contentType: result.contentType, length: result.length, first: Array.from(result.bytes.slice(0, 8)) }
