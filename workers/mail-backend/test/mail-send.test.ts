@@ -680,3 +680,31 @@ test('a deploy without the frozen builder version holds the send as an invariant
   await h.advance(DRIVE_BACKOFF);
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
 }));
+
+test('a barrier queued behind a publish that covers its commit answers with the send, not 409', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.stallPublish();
+  const lane = h.advance(minute); // The backup lane holds the publish lane, stalled in its first write.
+  await h.sends.publishStalled();
+  const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+  await until(async () => (await h.sends.ids()).length === 1, 'the send commit');
+  // The lane's publish continues through the new commit before the queued barrier runs.
+  await h.sends.resumePublish();
+  const response = await answer;
+  assert.equal(response.status, 202);
+  await lane;
+}));
+
+test('the mailbox state moves when a publish makes a send visible', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.publishFailure(true);
+  assert.equal((await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision)).status, 409);
+  const hidden = await mail.listSends({});
+  assert.deepEqual(hidden.items, []);
+  await h.publishFailure(false);
+  await h.forceSnapshot(); // The backup lane publishes; nothing else changes.
+  const shown = await mail.listSends({});
+  assert.equal(shown.items.length, 1);
+  assert.notEqual(shown.state, hidden.state);
+  assert.equal((await mail.getSession()).state, shown.state);
+}));

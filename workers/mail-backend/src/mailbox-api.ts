@@ -26,6 +26,7 @@ export type MailSource = { workspaceId: string; mailboxId: string; messageId: st
   ({ remoteImages: boolean } | { part: number; name: string; mediaType: string; sizeBytes: number });
 
 type Event = Exclude<JournalEvent, { type: 'message' }>;
+export const mailboxState = (incarnation: string, revision: number, flushed: number) => `${incarnation}-${revision}-${Math.min(flushed, revision)}`;
 export const isIdempotentCreate = (operation: Operation) => operation === 'createLabel' || operation === 'createDraft' || operation === 'createUpload';
 export const mailApiMutation = (operation: Operation) => isIdempotentCreate(operation) ||
   operation === 'replaceDraft' || operation === 'deleteDraft' || operation === 'updateThreads' ||
@@ -37,7 +38,8 @@ export class MailboxApi {
     private readonly timers?: TimerTable, private readonly preparedKey?: PreparedApiKey,
     private readonly clock: () => number = () => now, private readonly uploadsEnabled = false) {}
 
-  private state() { return `${this.incarnation}-${this.index.journal.revision()}`; }
+  // The published position is part of the state: what a send reports changes when a publish covers it.
+  private state() { return mailboxState(this.incarnation, this.index.journal.revision(), this.index.journal.flushed()); }
 
   private label(name: unknown, id?: string): Label {
     if (typeof name !== 'string' || name.length > LIMITS.labelNameChars * 2 + 1024) return invalid('/name');

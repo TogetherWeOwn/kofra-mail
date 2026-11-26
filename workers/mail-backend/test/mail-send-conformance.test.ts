@@ -9,14 +9,15 @@ import { fileURLToPath, URL } from 'node:url';
 // consumer, so a child test run selects only the named cases.
 const owned = ['13', '14', '22', '23', '23a'];
 
-test('conformance cases 13, 14, 22, 23 and 23a pass against the backend with the send path on', { timeout: 600_000 }, async () => {
+// Inside the backend CI job's five minutes, so a hang still reports the captured output.
+test('conformance cases 13, 14, 22, 23 and 23a pass against the backend with the send path on', { timeout: 170_000 }, async () => {
   const file = fileURLToPath(new URL('./fixtures/send-conformance.ts', import.meta.url));
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
   // The child has its own deadline, inside this test's, and is killed whatever happens.
   const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
     ...owned.map(id => `--test-name-pattern=^${id.replace('.', '\\.')}\\. `), file],
-  { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 540_000, killSignal: 'SIGKILL' });
+  { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 150_000, killSignal: 'SIGKILL' });
   let output = '';
   child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
   child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });

@@ -12,6 +12,7 @@ import { draftObjectKeys, draftRef, draftUploadIds, readDraft, readDraftObject, 
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
 import { canonical, cursorPosition, fail, invalid, isId, makeCursor, need, pageLimit, utf8 } from './mailbox-api-input.ts';
 import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
+import { mailboxState } from './mailbox-api.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
 import {
@@ -252,7 +253,7 @@ export class SendApi {
     return {
       items: rows.map(row => wireSend(row, ledger(this.sql, row.id), through, now)),
       nextCursor: more && last ? makeCursor(scope, [last.createdAt, last.id]) : null,
-      state: `${this.incarnation}-${revision(this.sql)}`,
+      state: mailboxState(this.incarnation, revision(this.sql), through),
     };
   }
 }

@@ -178,9 +178,10 @@ export class Mailbox extends DurableObject<Env> {
       let progressed = false;
       try {
         const done = await this.beforeDeadline(deadline, () => this.publishes.run(async () => {
-          if (journal() >= seq) { progressed = true; return; }
+          // The publish this barrier queued behind may already cover it.
+          if (journal() >= seq) { progressed = true; return true; }
           const life = storedLifecycle<Lifecycle>(this.ctx.storage);
-          if (life?.state !== 'ready') return;
+          if (life?.state !== 'ready') return false;
           const index = this.index(life.scope.workspaceId);
           const before = journal();
           await this.recovery(index).publish(life, Date.now(), async () => { throw new Error('Barrier publishes deltas only'); }, undefined,
@@ -188,7 +189,9 @@ export class Mailbox extends DurableObject<Env> {
           progressed = journal() > before;
           return true;
         }));
-        if (!done) return false;
+        // Out of time or not ready: the coverage check below decides, since
+        // the publish ahead may have published this commit before its other work.
+        if (!done) break;
       } catch { return false; }
       if (!progressed) break;
     }
