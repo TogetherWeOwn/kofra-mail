@@ -83,13 +83,8 @@ function dnsName(value: string, minLabels: number): string | undefined {
 const isCount = (value: unknown, min: number, max: number) =>
   Number.isSafeInteger(value) && (value as number) >= min && (value as number) <= max;
 
-/** Ceilings on configured limits; configuration may tighten the spec's values but not exceed these. */
-const ceilings = {
-  maxUrlBytes: 2048, // the `u` claim's own limit
-  remoteImageRedirects: 20, // the Fetch standard's redirect limit
-  remoteImageBytes: 32 * 1024 * 1024, // far below the Workers isolate memory limit
-  remoteImageTimeoutMs: 2 ** 31 - 1, // the largest delay setTimeout honours
-} as const;
+/** The spec's limits are ceilings: configuration may tighten them, never loosen them. */
+const ceilings = remoteImageDefaults;
 
 /** Every refused zone, normalised; undefined if any configured value is invalid (fail closed). */
 function refusedNames(config: RemoteImageConfig): string[] | undefined {

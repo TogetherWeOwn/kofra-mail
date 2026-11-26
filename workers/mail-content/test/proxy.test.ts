@@ -149,15 +149,15 @@ test('guard: invalid configuration fails closed for every URL', async () => {
   for (const own of bad) refused(good, remoteImageConfig(own));
   for (const limits of [{ remoteImageBytes: 0 }, { remoteImageRedirects: -1 }, { remoteImageTimeoutMs: Number.NaN },
     { maxUrlBytes: 1.5 }, { refusedZones: [''] }, { refusedZones: ['local', '1.2.3.4'] },
-    // Upper bounds: the spec's URL limit, a sane buffer ceiling, the fetch redirect ceiling and the timer ceiling.
-    { maxUrlBytes: 2049 }, { remoteImageBytes: 2 ** 40 }, { remoteImageBytes: 32 * MiB + 1 }, { remoteImageRedirects: 21 },
-    { remoteImageTimeoutMs: 2 ** 31 }])
+    // The spec's values are ceilings: configuration may tighten them, never loosen them.
+    { maxUrlBytes: 2049 }, { remoteImageBytes: 2 ** 40 }, { remoteImageBytes: 5 * MiB + 1 }, { remoteImageRedirects: 4 },
+    { remoteImageTimeoutMs: 10_001 }, { remoteImageTimeoutMs: 2 ** 31 }])
     refused(good, { ...config, ...limits });
   // An oversized limit is refused as configuration, before any fetch or allocation.
   const { fetchImpl, calls } = upstream({ [good]: image('image/png', images['image/png']) });
   failed(await fetchRemoteImage(good, { ...config, remoteImageBytes: 2 ** 40 }, fetchImpl, now), 'url');
   assert.equal(calls.length, 0);
-  assert.ok((await fetchRemoteImage(good, { ...config, remoteImageBytes: 32 * MiB }, fetchImpl, now)).ok);
+  assert.ok((await fetchRemoteImage(good, { ...config, remoteImageBytes: 5 * MiB }, fetchImpl, now)).ok);
   // The configuration is read, not hard-coded: removing a zone changes the verdict.
   accepted('http://printer.local/', { ...config, refusedZones: ['localhost', 'internal', 'arpa'] });
 });
