@@ -4,6 +4,8 @@ import { fileURLToPath, URL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response, type Request } from 'miniflare';
 import type { GenerationRow, ProvisionalLedger, ProvisionalSweeper } from './fixtures/sweep-provisional.ts';
+import { holdThenConfirm } from './fixtures/sweeper-consumer.ts';
+import type { Env } from '../src/worker.ts';
 
 const TTL = 7 * 24 * 60 * 60_000;
 const RETENTION = 35 * 24 * 60 * 60_000;
@@ -62,11 +64,15 @@ test('a provisional holder protects its generation until it expires, and the gra
   assert.deepEqual(await ledger.holders(key), [], 'and its expired holder row first');
 });
 
-test('holdProvisional by key follows hold: drafts are created, retired generations are refused', async () => {
+test('holdProvisional by key takes only raw/ and att/ generation keys, and refuses retired generations', async () => {
   const ledger = freshLedger();
   const draft = `drafts/${digest('d')}`;
-  assert.equal(await ledger.holdProvisional({ key: draft }, 'draft:scope:d1:r1', 100), draft);
-  assert.deepEqual(await ledger.holders(draft), [{ key: draft, holder: 'draft:scope:d1:r1', state: 'provisional', expires_at: 100 + TTL }]);
+  assert.match(await ledger.failure('holdProvisional', { key: draft }, 'draft:scope:d1:r1', 100), /Invalid sweeper reference/,
+    'legacy drafts/ keys get no new holders');
+  assert.match(await ledger.failure('holdProvisional', { key: undefined }, 'draft:scope:d1:r1', 100), /Invalid sweeper reference/);
+  assert.match(await ledger.failure('holdProvisional', { key: `raw/${digest('d')}` }, 'draft:scope:d1:r1', 100), /Invalid sweeper reference/);
+  assert.deepEqual(await ledger.holders(), []);
+  assert.equal(await generation(ledger, draft), null, 'a refused key creates no generation row');
 
   const key = await ledger.register('att', digest('e'), 'delivery:1', 100);
   assert.equal(await ledger.holdProvisional({ key }, 'upload:scope:u1', 100), key);
@@ -292,6 +298,24 @@ test('nextSweepAt takes the earliest of retention, retry and provisional expiry'
     'expiry reads the partial index');
 });
 
+test('nextSweepAt takes the earlier of an unconfirmed DELETE retry and a provisional expiry, in both orders', async () => {
+  for (const offset of [-1_000, 1_000]) {
+    const ledger = freshLedger();
+    const key = await ledger.register('raw', digest('1'), 'delivery:1', 100);
+    await ledger.release(key, 'delivery:1', 100);
+    assert.deepEqual(await ledger.sweep(100 + RETENTION, 'fail'), [key]);
+    const retry = (await generation(ledger, key))!.retry_at!;
+    assert.equal(retry, 100 + RETENTION + 60_000);
+    const held = await ledger.holdProvisional({ kind: 'raw', digest: digest('2') }, 'draft:scope:x', retry - TTL + offset);
+    const expiry = retry + offset;
+    assert.equal(await ledger.nextSweepAt(), Math.min(retry, expiry), `offset ${offset}`);
+    const first = Math.min(retry, expiry);
+    assert.deepEqual(await ledger.sweep(first, 'fail'), offset < 0 ? [] : [key], 'the earlier deadline is the one that is due');
+    assert.equal((await ledger.holders(held))[0].state, offset < 0 ? 'expired' : 'provisional');
+    assert.equal(await ledger.nextSweepAt(), offset < 0 ? retry : expiry);
+  }
+});
+
 test('a ledger written by the previous schema migrates its holders to held', async () => {
   const ledger = freshLedger();
   const key = `raw/${digest('a')}/01JZ0000000000000000000000`;
@@ -347,7 +371,7 @@ for (const mode of ['on', 'off'] as const) {
       assert.equal(first.state, 'provisional', 'while deletes are off the alarm only re-arms');
       assert.ok(wake !== null && wake >= Date.now() + DAY - 5_000, 'the off recheck keeps a daily wake-up');
     }
-    assert.deepEqual(deletes, []);
+    assert.ok(!deletes.some(path => path.includes(key)), 'no DELETE for a protected generation');
   });
 }
 
@@ -357,3 +381,37 @@ test('confirm through the Durable Object returns the ledger answers', async () =
   assert.deepEqual(await box.confirm([{ key, holder: 'upload:scope:u1' }, { key, holder: 'upload:scope:u2' }]), ['held', 'released']);
   assert.deepEqual(await box.holders(), [{ key, holder: 'upload:scope:u1', state: 'held', expires_at: null }]);
 });
+
+test('a consumer typed against Env reaches holdProvisional and confirm through the binding', async () => {
+  const name = `workspace-${++sweeperCount}`;
+  const { key, answers } = await holdThenConfirm({ SWEEPER: sweepers as unknown as Env['SWEEPER'] }, name, digest('9'), 'draft:scope:typed');
+  assert.deepEqual(answers, ['held']);
+  assert.deepEqual(await sweepers.getByName(name).holders(), [{ key, holder: 'draft:scope:typed', state: 'held', expires_at: null }]);
+});
+
+for (const mode of ['on', 'off'] as const) {
+  test(`holdProvisional on a ledger with an overdue generation and no alarm arms the earlier deadline (deletes ${mode})`,
+    { timeout: 15_000 }, async () => {
+    const box = freshSweeper();
+    if (mode === 'on') await box.enableSweeping();
+    const overdue = await box.seedOverdue(digest('3'));
+    assert.equal(await box.alarmAt(), null, 'the seeded ledger has no wake-up');
+    const started = Date.now();
+    const hold = () => box.holdProvisional({ kind: 'raw', digest: digest('4') }, 'draft:scope:d1:r1');
+    if (mode === 'on') {
+      // The overdue retention deadline is earlier than the expiry, so the alarm fires at once and sweeps it.
+      await untilAlarm(box, hold);
+      assert.ok(deletes.some(path => path.endsWith(`/${overdue}`)), 'the overdue generation was swept');
+      assert.equal(await box.generation(overdue), null);
+      const [holder] = await box.holders();
+      assert.equal(holder.state, 'provisional');
+      assert.equal(await box.alarmAt(), holder.expires_at, 'then the expiry is the next wake-up');
+    } else {
+      await hold();
+      const finished = Date.now();
+      const armed = await box.alarmAt();
+      assert.ok(armed !== null && armed >= started + DAY && armed <= finished + DAY, 'the off-mode daily floor, before the expiry');
+      assert.ok(!deletes.some(path => path.endsWith(`/${overdue}`)));
+    }
+  });
+}

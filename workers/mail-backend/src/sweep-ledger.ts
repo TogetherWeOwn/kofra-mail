@@ -93,8 +93,12 @@ export class SweepLedger {
     this.validate(holder, now);
     if (!Number.isSafeInteger(now + PROVISIONAL_TTL)) throw new Error('Invalid sweeper time');
     if (typeof target !== 'object' || target === null) throw new Error('Invalid sweeper reference');
+    // Only raw/ and att/ generation keys: legacy drafts/ keys are never swept
+    // and get no new holders (section 2.7).
+    if ('key' in target && (typeof target.key !== 'string' || !parseObjectKey(target.key))) {
+      throw new Error('Invalid sweeper reference');
+    }
     const byKey = 'key' in target ? target.key : undefined;
-    if (byKey !== undefined) this.checkKey(byKey);
     const prefix = 'key' in target ? undefined : this.prefix(target.kind, target.digest);
     return this.storage.transactionSync(() => {
       let key: string;

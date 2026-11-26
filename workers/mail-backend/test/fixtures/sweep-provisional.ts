@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { ObjectKind } from '../../src/object-key.ts';
+import { RETENTION_MS } from '../../src/reconcile.ts';
 import { Sweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry, type HoldTarget } from '../../src/sweep-ledger.ts';
 import type { Env } from '../../src/worker.ts';
@@ -121,6 +122,15 @@ export class ProvisionalSweeper extends Sweeper {
   async alarmAt() { return this.ctx.storage.getAlarm(); }
   async setAlarmAt(at: number) { await this.ctx.storage.setAlarm(at); }
   async nextSweep() { return new SweepLedger(this.ctx.storage).nextSweepAt(); }
+  // A generation past its retention grace, written without arming the alarm
+  // (as a ledger from before off-mode arming could be).
+  async seedOverdue(digest: string) {
+    const ledger = new SweepLedger(this.ctx.storage);
+    const at = Date.now() - RETENTION_MS - 60_000;
+    const key = ledger.register('raw', digest, 'delivery:1', at);
+    ledger.release(key, 'delivery:1', at);
+    return key;
+  }
   async holders(): Promise<HolderRow[]> {
     return this.ctx.storage.sql.exec<HolderRow>('SELECT key, holder, state, expires_at FROM generation_holders ORDER BY key, holder').toArray();
   }
