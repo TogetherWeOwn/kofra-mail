@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setImmediate as next } from 'node:timers/promises';
 
-import { reserveMime } from '../src/mime-budget.ts';
+import { MimeBusy, reserveMime } from '../src/mime-budget.ts';
 const mib = 1024 * 1024;
-const next = () => Promise.resolve();
 
 test('large concurrent MIME reads wait while the current response owns its byte reservation', async () => {
   const controller = new AbortController();
@@ -36,6 +36,22 @@ test('a disconnected request releases a grant it did not claim', async () => {
   assert.throws(() => claim(), { name: 'AbortError' });
   const ready = await reserveMime(25 * mib, new AbortController().signal);
   ready()();
+});
+
+test('a saturated waiter stays pending at 1,999 ms and gets MimeBusy at 2,000 ms', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  const signal = new AbortController().signal;
+  const done = (await reserveMime(25 * mib, signal))();
+  let outcome: unknown = 'pending';
+  const waiter = reserveMime(1, signal).then(claim => { claim()(); outcome = 'granted'; }, error => { outcome = error; });
+  try {
+    t.mock.timers.tick(1_999);
+    await next();
+    assert.equal(outcome, 'pending');
+    t.mock.timers.tick(1);
+    await next();
+    assert.ok((outcome as unknown) instanceof MimeBusy, 'the saturated request must settle at the exact deadline');
+  } finally { done(); await waiter; }
 });
 
 test('a cancelled waiter never takes capacity and cannot strand the next waiter', async () => {

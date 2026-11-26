@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.ts';
 import { sha256 } from '../../mail-backend/src/bytes.ts';
-import { serveImage, type ImageCache } from './image-handler.ts';
+import { serveImage } from './image-handler.ts';
 import { contentUrlKeys, type ContentUrlKeys } from './keys.ts';
 import { MimeBusy } from './mime-budget.ts';
 import { checkedRecord, decodedBytes, EXTERNAL_PART_BYTES, proveAttachment, readOnlyObjects,
@@ -9,7 +9,7 @@ import { checkedRecord, decodedBytes, EXTERNAL_PART_BYTES, proveAttachment, read
 import {
   checkRemoteImageUrl, contentSecurityHeaders, isInlineImage, remoteImageConfig, remoteImageMethodAllowed, type ContentOrigins,
 } from './proxy.ts';
-import { fillRefs, sanitise, sanitisePlainText } from './sanitise.ts';
+import { boundedPlainText, fillRefs, sanitise, sanitisePlainText } from './sanitise.ts';
 import { CONTENT_URL_SECONDS, isPurpose, mintForWeb, type ClaimsByPurpose, type Purpose, type WebPurpose } from './tokens.ts';
 import { attachmentFor, createVerifier, EpochCache, mintFromBody, type MessageAttachment, type Verified } from './verify.ts';
 
@@ -35,6 +35,7 @@ export type ContentEnv = ContentStoreConfig & {
 
 const epochs = new EpochCache();
 const encoder = new TextEncoder();
+const maxBodyHtmlBytes = 8 * 1024 * 1024;
 const urlFor = (origin: string, purpose: Purpose, token: string) => `${origin}/v1/${purpose}/${token}`;
 const originsFor = (env: ContentEnv): ContentOrigins => ({
   contentOrigin: env.CONTENT_ORIGIN ?? '', appOrigin: env.MAIL_APP_ORIGIN ?? '', localLoopback: env.CONTENT_LOCAL_LOOPBACK === 'on',
@@ -89,7 +90,7 @@ async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: Co
   const entry = purpose !== 'body' ? attachmentFor(message, verified.claims.part) : undefined;
   if (purpose !== 'body' && !entry) return null;
   const objects = readOnlyObjects(env, claims.ws, signal);
-  const prepared = await objects.withMime(message.rawKey,
+  const prepared = await objects.withMime(message.rawKey, claims.sub,
     mail => prepareMailbox(verified, entry, mail, env, keys, origins, headers, now));
   if (!prepared) return null;
   if (prepared instanceof Uint8Array) return { response: new Response(prepared, { headers }), bytes: prepared.byteLength };
@@ -105,10 +106,8 @@ async function prepareMailbox(verified: VerifiedMailbox, entry: MessageAttachmen
   const { message, purpose } = verified;
   if (purpose === 'body') {
     const output = mime.html ? await sanitise(mime.html, { ri: verified.claims.ri, verdict: message.verdict }) : null;
-    let body: string;
-    if (!output || output.unsafe === 'ambiguous_markup') {
-      body = sanitisePlainText(mime.text || 'This message cannot be displayed.').html;
-    } else {
+    let body: string | null = null;
+    if (output && output.unsafe !== 'ambiguous_markup') {
       const cidParts = new Map<string, number | null>();
       for (const { part } of message.attachments) {
         const contentId = mimePart(mime.attachments, part)?.contentId?.trim().replace(/^<(.*)>$/, '$1');
@@ -122,8 +121,9 @@ async function prepareMailbox(verified: VerifiedMailbox, entry: MessageAttachmen
         }
         if (!checkRemoteImageUrl(ref.url, config).ok) return null;
         return urlFor(origins.contentOrigin, 'img', await mintFromBody(keys, verified, { purpose: 'img', u: ref.url }, now));
-      });
+      }, maxBodyHtmlBytes);
     }
+    body ??= (mime.text && boundedPlainText(mime.text, maxBodyHtmlBytes)) || sanitisePlainText('This message cannot be displayed.').html;
     headers.set('content-type', 'text/html; charset=utf-8');
     return encoder.encode(body);
   }
@@ -144,11 +144,8 @@ async function prepareMailbox(verified: VerifiedMailbox, entry: MessageAttachmen
   return entry.objectKey ? proveAttachment(entry.objectKey, bytes) : null;
 }
 
-interface Runtime {
-  now: () => number;
-  imageCache: () => Promise<ImageCache>;
-}
-const runtime: Runtime = { now: Date.now, imageCache: () => caches.open('mail-content-images-v1') };
+interface Runtime { now: () => number }
+const runtime: Runtime = { now: Date.now };
 const pathPattern = /^\/v1\/(body|cid|att|img)\/([^/]{1,4173})$/;
 
 async function handleContent(request: Request, env: ContentEnv, io: Runtime): Promise<Response> {
@@ -183,7 +180,7 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
       const verified = await verifier.verify(purpose, token, now);
       if (verified.ok) {
         result = verified.purpose === 'img'
-          ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), io.imageCache, request.signal)
+          ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), request.signal)
           : await serveMailbox(verified, env, keys, origins, headers, now, request.signal);
       }
     } catch (error) {

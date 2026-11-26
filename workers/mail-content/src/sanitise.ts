@@ -24,14 +24,30 @@ const globalAttrs = new Set('align valign bgcolor color width height border cell
 const htmlNamespace = 'http://www.w3.org/1999/xhtml';
 const prefix = '<!doctype html><html><head><meta charset="utf-8"><style>body { font-family: system-ui, sans-serif; overflow-wrap: anywhere; } pre { white-space: pre-wrap; overflow-wrap: anywhere; } img { max-width: 100%; }</style></head><body>';
 const emptyImage = '<span></span>';
+const suffix = '</body></html>';
 
 function wrap(body: string, refs: ContentRef[] = []): SanitisedBody {
-  return { html: `${prefix}${body}</body></html>`, refs, version: SANITIZER_VERSION };
+  return { html: `${prefix}${body}${suffix}`, refs, version: SANITIZER_VERSION };
 }
 
 export function sanitisePlainText(text: string): SanitisedBody {
   // HTML consumes the first LF after a pre start tag.
   return wrap(`<pre>\n${escapeText(text)}</pre>`);
+}
+
+function utf8Cost(char: string): number {
+  const unit = char.charCodeAt(0);
+  return char.length === 2 ? 4 : unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
+}
+
+export function boundedPlainText(text: string, maxBytes: number): string | null {
+  let left = maxBytes - prefix.length - suffix.length - '<pre>\n</pre>'.length;
+  if (text.length > left) return null;
+  for (const char of text) {
+    left -= char === '&' ? 5 : char === '<' || char === '>' ? 4 : char === '\0' ? 3 : utf8Cost(char);
+    if (left < 0) return null;
+  }
+  return sanitisePlainText(text).html;
 }
 
 type RefContext = 'h' | 'a' | 's'; // HTML src attribute, CSS attribute, raw CSS
@@ -183,17 +199,48 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
   return wrap(result.join(''), refs);
 }
 
-/** Fill a trusted sanitiser result with the caller's per-response image URLs. */
-export async function fillRefs(
-  output: SanitisedBody,
-  mint: (ref: ContentRef, index: number) => string | null | Promise<string | null>,
-): Promise<string> {
+type MintRef = (ref: ContentRef, index: number) => string | null | Promise<string | null>;
+
+/** Fill a trusted sanitiser result, with an optional UTF-8 byte ceiling before materialising it. */
+export function fillRefs(output: SanitisedBody, mint: MintRef): Promise<string>;
+export function fillRefs(output: SanitisedBody, mint: MintRef, maxBytes: number): Promise<string | null>;
+export async function fillRefs(output: SanitisedBody, mint: MintRef, maxBytes?: number): Promise<string | null> {
   const urls = await Promise.all(output.refs.map(mint));
-  return output.html.replace(/\0([has])(\d+)\0/g, (_, context: RefContext, index: string) => {
+  function replacement(_: string, context: RefContext, index: string): string {
     const url = urls[Number(index)];
     if (!url || !isWebUrl(url)) return context === 'h' ? '' : 'none';
     if (context === 'h') return ` src="${escapeAttribute(url)}"`;
     const value = cssUrl(url);
     return context === 'a' ? escapeAttribute(value) : value;
-  });
+  }
+  const markers = /\0([has])(\d+)\0/g;
+  if (maxBytes === undefined) return output.html.replace(markers, replacement);
+
+  let left = maxBytes, offset = 0;
+  const substitutions = new Map<string, { text: string; bytes: number }>();
+  function literal(start: number, end: number): boolean {
+    if (end - start > left) return false;
+    for (const char of output.html.slice(start, end)) {
+      left -= utf8Cost(char);
+      if (left < 0) return false;
+    }
+    return true;
+  }
+  // First account for each literal and substitution. The expanded string is
+  // built once, after the whole document (including repeated refs) fits.
+  for (const marker of output.html.matchAll(markers)) {
+    if (!literal(offset, marker.index)) return null;
+    let value = substitutions.get(marker[0]);
+    if (!value) {
+      const text = replacement(marker[0], marker[1] as RefContext, marker[2]);
+      let bytes = 0;
+      for (const char of text) bytes += utf8Cost(char);
+      substitutions.set(marker[0], value = { text, bytes });
+    }
+    left -= value.bytes;
+    if (left < 0) return null;
+    offset = marker.index + marker[0].length;
+  }
+  if (!literal(offset, output.html.length)) return null;
+  return output.html.replace(markers, marker => substitutions.get(marker)!.text);
 }

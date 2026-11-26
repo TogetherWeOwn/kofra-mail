@@ -24,6 +24,7 @@ const ambiguous = '<p>Before</p><select><xmp><img src="cid:hidden"></xmp></selec
 const keysJson = JSON.stringify({ current: 'fixture', keys: { fixture: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64') } });
 const fixtureKeys = await loadContentUrlKeys(keysJson);
 const store = new Map<string, Uint8Array<ArrayBuffer>>();
+const objectResponses = new Map<string, () => Response | Promise<Response>>();
 const reads: string[] = [];
 const logs: { level: string; message: string }[] = [];
 const tokenValues: string[] = [];
@@ -65,7 +66,8 @@ before(async () => {
         if (url.origin !== 'https://objects.example' || request.method !== 'GET' || !request.headers.has('authorization') || !bytes) {
           return new Response(null, { status: 404 });
         }
-        return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+        const override = objectResponses.get(url.pathname);
+        return override ? override() : new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
       },
     }, {
       name: 'account', compatibilityDate: '2026-07-30', modules: true, script: account,
@@ -79,7 +81,6 @@ async function set(name: string, value: unknown) {
   const res = await mf.dispatchFetch(`${origin}/__${name}`, { method: 'POST', body: JSON.stringify(value) });
   assert.equal(res.status, 200);
 }
-async function countCache() { return (await mf.dispatchFetch(`${origin}/__cache`)).json(); }
 async function sign<P extends Purpose>(purpose: P, claims: MintClaims<P>) {
   const token = await mint(fixtureKeys, purpose, claims, Date.now() / 1000);
   tokenValues.push(token);
@@ -119,7 +120,8 @@ test('local Wrangler config has exactly the two named service bindings and no st
     { binding: 'MAIL_LOOKUP', service: 'mail-backend-local', entrypoint: 'ContentLookup' },
     { binding: 'ACCOUNT_EPOCH', service: 'account-local', entrypoint: 'CredentialEpoch' },
   ]);
-  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'preview_urls', 'services', 'vars', 'workers_dev']);
+  assert.equal(config.observability?.logs?.invocation_logs, false, 'signed request URLs must not enter invocation logs');
+  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'observability', 'preview_urls', 'services', 'vars', 'workers_dev']);
   assert.deepEqual(config.compatibility_flags, ['enable_request_signal']);
   assert.equal(config.vars.MAIL_CONTENT_ENABLED, 'off');
   assert.equal(config.workers_dev, false);
@@ -139,7 +141,9 @@ test('named mint RPC signs only body and att with the loaded keys', async () => 
     await status(result.value.url, 200);
   }
   for (const method of ['mint', 'mintFromBody', 'signDerived', 'fetch']) assert.deepEqual(await rpc(method, 'body', { ...alpha, ri: false }), { refused: true });
-  for (const purpose of ['cid', 'img']) assert.deepEqual(await rpc('mintForWeb', purpose, { ...alpha, part: 1 }), { refused: true });
+  for (const [purpose, extra] of [
+    ['cid', { part: 1 }], ['img', { u: remote }], ['lnk', { linkId: 'published-file' }],
+  ] as const) assert.deepEqual(await rpc('mintForWeb', purpose, { ...alpha, ...extra }), { refused: true }, purpose);
 });
 
 test('raised credential epoch invalidates an HTTP body URL at the isolate cache TTL', async () => {
@@ -250,6 +254,57 @@ test('body mints CID only for a real MIME part and serves its matching raster by
   await status(await cidUrl(2)); // MIME claims image/png, bytes are not PNG.
 });
 
+test('oversized CID expansion falls back before emitting a body over 8 MiB', async () => {
+  const ref = '<img src="cid:picture@example">';
+  const raw = withParts(ref.repeat(54_000)).replace('--parts\r\nContent-Type: text/html\r\n\r\n',
+    '--parts\r\nContent-Type: text/plain\r\n\r\n<private>&fallback\r\n--parts\r\nContent-Type: text/html\r\n\r\n');
+  await record(alpha, raw, parts);
+  const res = await get(await bodyUrl());
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(Buffer.byteLength(body) <= 8 * 1024 * 1024, `emitted ${Buffer.byteLength(body)} HTML bytes`);
+  assert.ok(body.includes('&lt;private&gt;&amp;fallback'));
+});
+
+test('one token cannot queue twenty MIME admissions or hold up another mailbox', async () => {
+  const key = await record(alpha, alternative('<p>coalesced MIME</p>'));
+  const betaKey = await record(beta, alternative('<p>independent MIME</p>'));
+  const path = objectPath('alpha', key);
+  const arrived = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const declined = Promise.withResolvers<void>();
+  let refused = 0;
+  objectResponses.set(path, async () => {
+    arrived.resolve();
+    await release.promise;
+    return new Response(store.get(path)!, { headers: { 'content-length': String(store.get(path)!.length) } });
+  });
+  const url = await bodyUrl();
+  const start = reads.length;
+  const wave = Promise.all(Array.from({ length: 20 }, async () => {
+    const res = await get(url);
+    const text = await res.text();
+    if (res.status === 503) {
+      assert.equal(text, '');
+      assert.equal(res.headers.get('retry-after'), '1');
+      if (++refused === 18) declined.resolve();
+    } else {
+      assert.equal(res.status, 200);
+      assert.ok(text.includes('coalesced MIME'));
+    }
+    return res.status;
+  }));
+  const timeout = setTimeout(declined.resolve, 4_000);
+  try {
+    await arrived.promise;
+    await status(await sign('body', { ...beta, ri: false }), 200);
+    await declined.promise;
+  } finally { clearTimeout(timeout); release.resolve(); objectResponses.delete(path); }
+  const results = await wave;
+  assert.deepEqual(results.sort(), [...Array(2).fill(200), ...Array(18).fill(503)]);
+  const rawReads = reads.slice(start).filter(read => read === path || read === objectPath('beta', betaKey));
+  assert.deepEqual(rawReads, [path, objectPath('beta', betaKey)]);
+});
+
 test('six concurrent CID requests respect the raw MIME budget and deferred images can retry', async () => {
   const ids = Array.from({ length: 6 }, (_, i) => `image-${i}@content.example`);
   const images = ids.map(id => `--parts\r\nContent-Type: image/png\r\nContent-ID: <${id}>\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(png).toString('base64')}\r\n`);
@@ -264,17 +319,32 @@ test('six concurrent CID requests respect the raw MIME budget and deferred image
     const urls = [...(await body.text()).matchAll(/src="(https:\/\/content\.example\/v1\/cid\/[^"]+)"/g)].map(match => match[1]);
     assert.equal(urls.length, ids.length);
     for (const url of urls) tokenValues.push(new URL(url).pathname.split('/').at(-1)!);
-    const deferred = await Promise.all(urls.map(async url => {
-      const res = await get(url);
-      if (res.status === 503) {
-        assert.equal(res.headers.get('retry-after'), '1');
-        assert.equal((await res.arrayBuffer()).byteLength, 0);
-        return url;
-      }
-      assert.equal(res.status, 200);
-      assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
-    }));
-    assert.ok(deferred.some(url => url === undefined), 'at least one request obtained a reservation');
+    const path = objectPath('alpha', rawKey);
+    const release = Promise.withResolvers<void>();
+    objectResponses.set(path, async () => {
+      await release.promise;
+      const bytes = store.get(path)!;
+      return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+    });
+    const start = reads.length;
+    let refused = 0;
+    const watchdog = setTimeout(release.resolve, 4_000);
+    let deferred: (string | undefined)[];
+    try {
+      deferred = await Promise.all(urls.map(async url => {
+        const res = await get(url);
+        if (res.status === 503) {
+          assert.equal(res.headers.get('retry-after'), '1');
+          assert.equal((await res.arrayBuffer()).byteLength, 0);
+          if (++refused === 4) release.resolve();
+          return url;
+        }
+        assert.equal(res.status, 200);
+        assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
+      }));
+    } finally { clearTimeout(watchdog); release.resolve(); objectResponses.delete(path); }
+    assert.equal(refused, 4);
+    assert.deepEqual(reads.slice(start).filter(read => read === path), [path]);
     assert.deepEqual(await (await get('/__mime-budget')).json(), { peak: Buffer.byteLength(raw), inFlight: 0 });
     // Admission is capped on slower hosts too. Once the wave has drained,
     // every deferred image must succeed without a concurrent reservation.
@@ -365,6 +435,67 @@ test('downloads decode raw-only parts and stream external objects with safe file
   assert.equal(reads.at(-1), objectPath('alpha', key));
 });
 
+test('workerd completes a verified 1 MiB transfer lasting over 61 seconds with no idle gap over 30 seconds', { timeout: 75_000 }, async () => {
+  const data = encode.encode('L'.repeat(1024 * 1024));
+  data.set(png);
+  const key = `att/${await sha(data)}/${gen}`;
+  const path = objectPath('alpha', key);
+  // ASCII base64 inside MIME, including the raster magic bytes.
+  const raw = withParts(html, 'inline').replace(Buffer.from('download data').toString('base64'), Buffer.from(data).toString('base64'));
+  await record(alpha, raw, [parts[1], { part: 2, objectKey: key }]);
+  store.set(path, data);
+  let offset = 0;
+  objectResponses.set(path, () => new Response(new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (offset) await new Promise(resolve => setTimeout(resolve, 20_500));
+      controller.enqueue(data.slice(offset, offset + 256 * 1024));
+      offset += 256 * 1024;
+      if (offset === data.length) controller.close();
+    },
+  }, { highWaterMark: 0 }), { headers: { 'content-length': String(data.length) } }));
+  try {
+    const started = performance.now();
+    const response = await get(await cidUrl(2));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('content-type'), 'image/png');
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), data);
+    assert.ok(performance.now() - started >= 61_000);
+  } finally { objectResponses.delete(path); store.delete(path); }
+});
+
+test('workerd aborts a verified attachment when the upstream body is idle for 30 seconds', { timeout: 45_000 }, async () => {
+  const plain = 'I'.repeat(1024 * 1024);
+  const data = encode.encode(plain);
+  const key = `att/${await sha(data)}/${gen}`;
+  const path = objectPath('alpha', key);
+  await record(alpha, withParts(html, 'stalled', plain), [parts[1], { part: 2, objectKey: key }]);
+  store.set(path, data);
+  const release = Promise.withResolvers<void>();
+  objectResponses.set(path, () => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(data.slice(0, 256 * 1024));
+      void release.promise.then(() => controller.close()).catch(() => {});
+    },
+  }), { headers: { 'content-length': String(data.length) } }));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await get(await attUrl(2));
+    assert.equal(response.status, 200);
+    const started = performance.now();
+    const result = await Promise.race([
+      response.arrayBuffer().then(() => 'completed', () => 'aborted'),
+      new Promise(resolve => { timer = setTimeout(() => resolve('still stalled'), 36_000); }),
+    ]);
+    assert.equal(result, 'aborted');
+    assert.ok(performance.now() - started >= 29_000);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    release.resolve();
+    objectResponses.delete(path);
+    store.delete(path);
+  }
+});
+
 test('legacy synthetic attachment rows do not name downloadable MIME parts', async () => {
   const raw = 'Content-Type: multipart/mixed; boundary=parts\r\n\r\n'
     + '--parts\r\nContent-Type: text/plain\r\n\r\nbody\r\n'
@@ -389,9 +520,14 @@ test('same-length corruption in external attachment storage is not downloaded', 
   const key = `att/${await sha(clean)}/${gen}`;
   const corrupt = clean.slice();
   corrupt[corrupt.length - 1]++;
-  store.set(objectPath('alpha', key), corrupt);
   await record(alpha, withParts(html, 'file', 'A'.repeat(clean.byteLength)), [parts[1], { part: 2, objectKey: key }]);
   const path = await attUrl(2);
+  const object = objectPath('alpha', key);
+  store.set(object, clean);
+  const control = await get(path);
+  assert.equal(control.status, 200);
+  assert.equal(await sha(new Uint8Array(await control.arrayBuffer())), await sha(clean));
+  store.set(object, corrupt);
   let delivered = false;
   try {
     const response = await get(path);
@@ -400,7 +536,7 @@ test('same-length corruption in external attachment storage is not downloaded', 
   assert.equal(delivered, false);
 });
 
-test('signed image cache is read only after verification; expired or MAC-flipped cache hits are 404', async () => {
+test('every verified image request fetches upstream; expired or MAC-flipped tokens return 404 first', async () => {
   await record(alpha, withParts(html), parts);
   const body = await get(await bodyUrl(true));
   assert.equal(body.status, 200);
@@ -412,15 +548,13 @@ test('signed image cache is read only after verification; expired or MAC-flipped
   const another = await sign('img', { ...alpha, ep: 2, u: remote });
   assert.ok(new URL(img).pathname !== another, 'the second token must differ');
   await status(another, 200); // New token, same remote URL.
-  assert.equal(upstreamReads, before + 1);
-  const cacheReads = await countCache();
+  assert.equal(upstreamReads, before + 2);
   const offset = img.lastIndexOf('.') + 1;
   await status(`${img.slice(0, offset)}${img[offset] === 'A' ? 'B' : 'A'}${img.slice(offset + 1)}`);
   await set('clock', 300_000);
   try { await status(img); }
   finally { await set('clock', 0); }
-  assert.equal(await countCache(), cacheReads);
-  assert.equal(upstreamReads, before + 1);
+  assert.equal(upstreamReads, before + 2);
 });
 
 test('HSTS and every §3.1 header cover successes, empty 404, and img method 405', async () => {

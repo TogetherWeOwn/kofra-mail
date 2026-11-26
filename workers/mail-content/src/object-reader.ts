@@ -5,6 +5,7 @@ import { workspaceMailBucket } from '../../mail-backend/src/directory.ts';
 import { parseObjectKey } from '../../mail-backend/src/object-key.ts';
 import { MAX_RAW_BYTES, readExact, sha256 } from '../../mail-backend/src/bytes.ts';
 import { reserveMime } from './mime-budget.ts';
+import { shareMime } from './mime-flight.ts';
 import type { MessageRecord } from './verify.ts';
 
 const keyOf = (value: unknown, kind: 'raw' | 'att'): value is string =>
@@ -43,11 +44,18 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
   const s3 = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 });
   async function get(key: string, kind: 'raw' | 'att') {
     if (!keyOf(key, kind)) throw new Error('invalid mail object key');
-    const signal = AbortSignal.any([requestSignal, AbortSignal.timeout(60_000)]);
-    const response = await s3.fetch(`${endpointOrigin}/${bucket}/${key}`, {
-      method: 'GET', redirect: 'manual', signal,
-      cf: { cacheTtlByStatus: { '100-599': -1 } },
-    });
+    const headersDeadline = kind === 'att' ? new AbortController() : undefined;
+    const signal = AbortSignal.any([requestSignal, headersDeadline?.signal ?? AbortSignal.timeout(60_000)]);
+    const timer = headersDeadline && setTimeout(() => headersDeadline.abort(new DOMException('object header timeout', 'TimeoutError')), 60_000);
+    let response: Response;
+    try {
+      response = await s3.fetch(`${endpointOrigin}/${bucket}/${key}`, {
+        method: 'GET', redirect: 'manual', signal,
+        cf: { cacheTtlByStatus: { '100-599': -1 } },
+      });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
     const header = response.headers.get('content-length');
     const size = header && /^\d{1,8}$/.test(header) ? Number(header) : NaN;
     if (response.status !== 200 || !response.body || !(size > 0 && size <= MAX_RAW_BYTES)) {
@@ -57,22 +65,22 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
     return { stream: response.body, size, signal };
   }
   return {
-    async withMime<T>(rawKey: string, prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
-      const { stream, size, signal } = await get(rawKey, 'raw');
-      let release: (() => void) | undefined;
-      try {
-        release = (await reserveMime(size, signal))();
-        const raw = await readExact(stream, size, MAX_RAW_BYTES);
-        if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
-        // Same parser version and options as mail-backend's indexed part numbers.
-        const mail = await PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
-        return await prepare(mail);
-      } catch (error) {
-        void stream.cancel().catch(() => {});
-        throw error;
-      } finally {
-        release?.();
-      }
+    withMime<T>(rawKey: string, sub: string, prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
+      // Equal raw keys in different buckets must not share an object read.
+      return shareMime(`${bucket}/${rawKey}`, sub, requestSignal, async install => {
+        const { stream, size, signal } = await get(rawKey, 'raw');
+        try {
+          install((await reserveMime(size, signal))());
+          const raw = await readExact(stream, size, MAX_RAW_BYTES);
+          if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
+          requestSignal.throwIfAborted();
+          // Same parser version and options as mail-backend's indexed part numbers.
+          return await PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
+        } catch (error) {
+          void stream.cancel().catch(() => {});
+          throw error;
+        }
+      }, prepare);
     },
     async attachment(proof: AttachmentProof) {
       const { stream, size } = await get(proof.key, 'att');
@@ -101,14 +109,20 @@ export async function proveAttachment(key: string, bytes: Uint8Array<ArrayBuffer
   return { key, size: bytes.byteLength, blocks };
 }
 
-function verifiedAttachmentStream(stream: ReadableStream<Uint8Array>, proof: AttachmentProof): ReadableStream<Uint8Array> {
+export function verifiedAttachmentStream(stream: ReadableStream<Uint8Array>, proof: AttachmentProof): ReadableStream<Uint8Array> {
   const reader = stream.getReader({ mode: 'byob' });
   let offset = 0;
+  async function read(view: Uint8Array<ArrayBuffer>) {
+    const { promise, reject } = Promise.withResolvers<never>();
+    const timer = setTimeout(() => reject(new DOMException('attachment body idle', 'TimeoutError')), 30_000);
+    try { return await Promise.race([reader.read(view), promise]); }
+    finally { clearTimeout(timer); }
+  }
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         if (offset === proof.size) {
-          if (!(await reader.read(new Uint8Array(1))).done) throw new Error('attachment length mismatch');
+          if (!(await read(new Uint8Array(1))).done) throw new Error('attachment length mismatch');
           controller.close();
           return;
         }
@@ -117,7 +131,7 @@ function verifiedAttachmentStream(stream: ReadableStream<Uint8Array>, proof: Att
         let block = new Uint8Array(length);
         let filled = 0;
         while (filled < length) {
-          const { done, value } = await reader.read(block.subarray(filled));
+          const { done, value } = await read(block.subarray(filled));
           if (done || !value?.byteLength) throw new Error('attachment length mismatch');
           filled += value.byteLength;
           block = new Uint8Array(value.buffer as ArrayBuffer, value.byteOffset + value.byteLength - filled, length);

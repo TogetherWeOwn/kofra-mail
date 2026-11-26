@@ -2,8 +2,8 @@
 //
 // This module decides which remote URLs may be fetched and how. It never logs:
 // the only log output is the line built by `remoteImageLogLine`, which holds no
-// URL and no token. Token verification and the fetch cache (rule 6) belong to
-// the `img` handler, which must call `fetchRemoteImage` only after the token
+// URL and no token. Token verification belongs to the `img` handler,
+// which must call `fetchRemoteImage` only after the token
 // has passed every verification step.
 
 /** The subset of `fetch` the proxy uses. The global `fetch` satisfies it. */
@@ -56,9 +56,8 @@ export const remoteImageAccept = 'image/avif,image/webp,image/png,image/*;q=0.8'
 export const remoteImageUserAgent = 'Mozilla/5.0 (compatible; ImageProxy/1.0)';
 
 /**
- * Turns off Worker-controlled caching of every hop, so an upstream body is
- * never stored before the proxy has judged it (rule 6 caches only behind the
- * verifier). `cf` is used rather than `cache: 'no-store'`, because workerd
+ * Turns off Worker-controlled caching of every hop (rule 6). `cf` is used
+ * rather than `cache: 'no-store'`, because workerd
  * turns `no-store` into `Cache-Control: no-cache` and `Pragma: no-cache`
  * request headers, and rule 3 allows only Accept and User-Agent. A negative
  * `cacheTtlByStatus` means "do not cache at all"; `cacheTtl: 0` would still

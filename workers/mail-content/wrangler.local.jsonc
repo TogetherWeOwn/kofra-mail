@@ -6,6 +6,7 @@
   "compatibility_flags": ["enable_request_signal"],
   "workers_dev": false,
   "preview_urls": false,
+  "observability": { "logs": { "invocation_logs": false } },
   "services": [
     { "binding": "MAIL_LOOKUP", "service": "mail-backend-local", "entrypoint": "ContentLookup" },
     { "binding": "ACCOUNT_EPOCH", "service": "account-local", "entrypoint": "CredentialEpoch" }
