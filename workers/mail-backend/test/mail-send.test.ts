@@ -212,12 +212,14 @@ test('restore matrix: a restore in each driven state releases every accepted sen
       key('alias'))).address;
     await h.sends.activateAlias(alias);
     // releasing (release step 1 committed, then a crash) and queued (released and published).
-    const releasing = await send(mail, primary, 'releasing');
-    const queued = await send(mail, primary, 'queued');
+    const both = [await send(mail, primary, 'one'), await send(mail, primary, 'two')];
     await h.sends.crashAfter('released');
     await h.advance(UNDO);
-    assert.equal((await h.sends.row(releasing.send.id))?.state, 'releasing');
-    assert.equal((await h.sends.row(queued.send.id))?.state, 'queued');
+    // The crash hits whichever drive row ran first; the other released.
+    const states = await Promise.all(both.map(async ({ send: item }) => (await h.sends.row(item.id))?.state));
+    assert.deepEqual([...states].sort(), ['queued', 'releasing']);
+    const releasing = both[states.indexOf('releasing')];
+    const queued = both[states.indexOf('queued')];
     await h.advance(minute); // The lane publishes the releasing commit.
     // cancelled, just after undoSend answered; and a terminal send with finish_pending.
     const cancelled = await send(mail, primary, 'cancelled');
