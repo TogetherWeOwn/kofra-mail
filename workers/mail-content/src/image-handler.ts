@@ -7,7 +7,7 @@ const encoder = new TextEncoder();
 
 /** Called only with the URL from a verified img token. Cache entries are never signed responses. */
 export async function serveImage(url: string, origins: ContentOrigins, config: RemoteImageConfig,
-    openCache: () => Promise<ImageCache>): Promise<{ response: Response; bytes: number } | null> {
+    openCache: () => Promise<ImageCache>, signal: AbortSignal): Promise<{ response: Response; bytes: number } | null> {
   const key = new Request(`${origins.contentOrigin}/__image_cache/v1/${await sha256(new Uint8Array(encoder.encode(url)))}`);
   let cache: ImageCache | undefined;
   let cached = false;
@@ -37,11 +37,13 @@ export async function serveImage(url: string, origins: ContentOrigins, config: R
       } catch { /* The cache is optional. */ }
     }
     const headers = remoteImageResponseHeaders(result, origins);
-    // Preserve the known Content-Length in workerd while backpressuring the
-    // reserved image body; cancellation propagates to that stream.
+    // Preserve the known Content-Length. The transfer deadline starts here,
+    // not during fetching or cache population, and does not depend on pipe cancellation.
     const body = new FixedLengthStream(result.length);
+    const response = new Response(body.readable, { headers });
+    result.startTransfer(signal);
     void result.body.pipeTo(body.writable).catch(() => {});
-    return { response: new Response(body.readable, { headers }), bytes: result.length };
+    return { response, bytes: result.length };
   } catch (error) {
     void result.body.cancel().catch(() => {});
     throw error;

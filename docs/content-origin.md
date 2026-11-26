@@ -112,6 +112,8 @@ An `img` URL skips steps 4 and 5 because it carries no mailbox data: it lets its
 
 ## 3. Responses
 
+The raw MIME is read and parsed under a per-isolate budget that is released before the response starts; a request that cannot reserve within 2 s answers 503 with Retry-After. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
+
 ### 3.1 Headers on every response
 
 ```

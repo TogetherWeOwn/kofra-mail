@@ -1,16 +1,29 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { serveContent, type ContentEnv } from '../src/entry.ts';
-import { mimeInFlight } from '../src/mime-budget.ts';
+import type { ImageCache } from '../src/image-handler.ts';
+import { mimeBudgetUsage, reserveMime } from '../src/mime-budget.ts';
+import { MAX_RAW_BYTES } from '../../mail-backend/src/bytes.ts';
+import { remoteImageInFlight } from '../src/proxy.ts';
 
 let clockOffset = 0;
 let cacheReads = 0;
-let mimeObservedPeak = 0;
+let releaseHeldMime: (() => void) | undefined;
 export default {
   async fetch(req: Request, env: ContentEnv) {
     const path = new URL(req.url).pathname;
     if (path === '/__clock') { clockOffset = Number(await req.text()); return new Response(null); }
     if (path === '/__cache') return Response.json(cacheReads);
-    if (path === '/__mime-budget') return Response.json({ peak: mimeObservedPeak, inFlight: mimeInFlight() });
+    if (path === '/__mime-budget') return Response.json(mimeBudgetUsage());
+    if (path === '/__hold-mime') {
+      releaseHeldMime = (await reserveMime(MAX_RAW_BYTES, req.signal))();
+      return new Response(null);
+    }
+    if (path === '/__release-mime') {
+      releaseHeldMime?.();
+      releaseHeldMime = undefined;
+      return new Response(null);
+    }
+    if (path === '/__image-budget') return Response.json(remoteImageInFlight());
     if (path === '/__owner') { ownerA = await req.json(); return new Response(null); }
     if (path === '/__record') {
       const [key, value] = await req.json<[string, unknown]>();
@@ -22,15 +35,23 @@ export default {
       try { return Response.json({ value: await (env as ContentEnv & BridgeEnv).MINT[method](...args) }); }
       catch { return Response.json({ refused: true }); }
     }
-    const response = await serveContent(req, env, {
+    const io = {
       now: () => Date.now() + clockOffset,
-      imageCache: async () => {
+      imageCache: async (): Promise<ImageCache> => {
         const cache = await caches.open('test-images');
         return { match: (key) => { cacheReads++; return cache.match(key); }, put: (key, res) => cache.put(key, res) };
       },
-    });
-    mimeObservedPeak = Math.max(mimeObservedPeak, mimeInFlight());
-    return response;
+    };
+    if (path === '/__unread-image') {
+      const response = await serveContent(new Request(new URL(await req.text(), req.url)), env, io);
+      const before = remoteImageInFlight();
+      // Keep the invocation alive but leave the returned transfer unread.
+      await new Promise(resolve => setTimeout(resolve, 60_100));
+      const after = remoteImageInFlight();
+      void response.body?.cancel().catch(() => {});
+      return Response.json({ status: response.status, before, after });
+    }
+    return serveContent(req, env, io);
   },
 };
 export { ContentMint } from '../src/entry.ts';

@@ -10,6 +10,9 @@ import { images } from './proxy-fixtures.ts';
 
 const origin = 'https://content.example';
 const remote = 'https://sender.example/pixel.png?private=canary';
+const closeImage = 'https://sender.example/close.png';
+const deadlineImage = 'https://sender.example/deadline.png';
+const deadlineImageBytes = 4 * 1024 * 1024;
 const gen = '01Z00000000000000000000000';
 const alpha = { ws: 'alpha', mb: 'a', sub: 'user-a', msg: 'm', ep: 1 };
 const beta = { ws: 'beta', mb: 'b', sub: 'user-b', msg: 'm', ep: 1 };
@@ -50,9 +53,11 @@ before(async () => {
         MINT: { name: 'content', entrypoint: 'ContentMint' },
       },
       outboundService(request: Request) {
-        if (request.url === remote) {
+        if (request.url === remote || request.url === closeImage || request.url === deadlineImage) {
           upstreamReads++;
-          return new Response(png, { headers: { 'content-type': 'image/png', 'set-cookie': 'not-forwarded=true' } });
+          const bytes = request.url === deadlineImage ? new Uint8Array(deadlineImageBytes) : png;
+          if (bytes !== png) bytes.set(png);
+          return new Response(bytes, { headers: { 'content-type': 'image/png', 'set-cookie': 'not-forwarded=true' } });
         }
         const url = new URL(request.url);
         reads.push(url.pathname);
@@ -269,6 +274,62 @@ test('one large body can open six inline images concurrently without exceeding t
   } finally { store.delete(objectPath('alpha', rawKey)); }
 });
 
+test('an unread large CID has no MIME charge and does not delay another mailbox', async () => {
+  const large = new Uint8Array(17 * 1024 * 1024);
+  large.set(png);
+  const key = `att/${await sha(large)}/${gen}`;
+  const raw = `Content-Type: multipart/mixed; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/plain\r\n\r\nbody\r\n`
+    + `--parts\r\nContent-Type: image/png\r\nContent-ID: <large@content.example>\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(large).toString('base64')}\r\n--parts--\r\n`;
+  const rawKey = await record(alpha, raw, [{ part: 1, objectKey: key }]);
+  const otherKey = await record(beta, alternative('<p>other mailbox</p>', 'x'.repeat(8 * 1024 * 1024)));
+  store.set(objectPath('alpha', key), large);
+  assert.ok(store.get(objectPath('alpha', rawKey))!.byteLength + store.get(objectPath('beta', otherKey))!.byteLength > 25 * 1024 * 1024);
+  const start = reads.length;
+  const image = await get(await cidUrl(1));
+  try {
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get('content-type'), 'image/png');
+    const budget = await (await get('/__mime-budget')).json() as { inFlight: number };
+    assert.equal(budget.inFlight, 0, 'returning response headers ends the raw MIME reservation');
+    assert.deepEqual(reads.slice(start), [objectPath('alpha', rawKey), objectPath('alpha', key)]);
+    await status(await sign('body', { ...beta, ri: false }), 200);
+  } finally {
+    // Drain the first stream rather than testing cancel propagation by accident.
+    await image.arrayBuffer();
+    for (const path of [objectPath('alpha', rawKey), objectPath('alpha', key), objectPath('beta', otherKey)]) store.delete(path);
+  }
+});
+
+test('saturated raw MIME admission returns 503 with Retry-After and the complete security headers', async () => {
+  await record(alpha, alternative('queued'));
+  await set('hold-mime', null);
+  const started = performance.now();
+  const request = get(await bodyUrl());
+  const watchdog = setTimeout(() => { void set('release-mime', null); }, 4_000);
+  try {
+    const res = await request;
+    assert.equal(res.status, 503);
+    assert.ok(performance.now() - started < 4_000, 'admission must finish before the watchdog');
+    assert.equal((await res.arrayBuffer()).byteLength, 0);
+    assert.equal(res.headers.get('retry-after'), '1');
+    assert.equal(res.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
+    assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(res.headers.get('cache-control'), 'private, no-store');
+    assert.equal(res.headers.get('content-security-policy'),
+      "default-src 'none'; img-src https://content.example data:; style-src 'unsafe-inline'; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors https://mail.example; sandbox allow-popups allow-popups-to-escape-sandbox");
+  } finally {
+    clearTimeout(watchdog);
+    await set('release-mime', null);
+  }
+  await status(await bodyUrl(), 200);
+});
+
+test('a normally consumed proxy image releases its transfer reservation', async () => {
+  await status(await sign('img', { ...alpha, u: closeImage }), 200);
+  assert.equal(await (await get('/__image-budget')).json(), 0);
+});
+
 test('downloads decode raw-only parts and stream external objects with safe filename parameters', async () => {
   const path = await attUrl(2);
   await record(alpha, withParts(html), parts);
@@ -369,6 +430,12 @@ test('HSTS and every §3.1 header cover successes, empty 404, and img method 405
     assert.equal(res.headers.get('set-cookie'), null);
     assert.equal(res.headers.get('access-control-allow-origin'), null);
   }
+});
+
+test('an unread proxy response in workerd releases at its transfer deadline', { timeout: 70_000 }, async () => {
+  const body = await sign('img', { ...alpha, u: deadlineImage });
+  const probe = await mf.dispatchFetch(`${origin}/__unread-image`, { method: 'POST', body });
+  assert.deepEqual(await probe.json(), { status: 200, before: deadlineImageBytes, after: 0 });
 });
 
 test('content logs contain only purpose, status, byte count and an eight-character SHA-256 prefix', async () => {

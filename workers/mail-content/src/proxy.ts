@@ -71,7 +71,10 @@ export const remoteImageCacheOptions = Object.freeze({
 
 export type RemoteImageFailure = 'url' | 'redirect' | 'status' | 'type' | 'magic' | 'size' | 'timeout' | 'network';
 export interface RemoteImage { ok: true; contentType: string; bytes: Uint8Array; length: number }
-export interface StreamingRemoteImage extends RemoteImage { body: ReadableStream<Uint8Array> }
+export interface StreamingRemoteImage extends RemoteImage {
+  body: ReadableStream<Uint8Array>;
+  startTransfer(signal?: AbortSignal): void;
+}
 type ImageRefusal = { ok: false; reason: RemoteImageFailure };
 export type RemoteImageResult = RemoteImage | ImageRefusal;
 export type RemoteImageUrlVerdict = { ok: true; url: URL } | { ok: false };
@@ -257,6 +260,8 @@ function snapshotConfig(config: RemoteImageConfig): RemoteImageConfig {
 
 // Rule 4: concurrent body reads in one isolate share an in-flight budget.
 let inFlightBytes = 0;
+const transferDeadlineMs = 60_000;
+const transferDeadlines = new Map<() => void, number>();
 
 /** Bytes currently reserved by body reads in this isolate. */
 export function remoteImageInFlight(): number {
@@ -319,6 +324,10 @@ export async function fetchRemoteImage(
   });
   let reserved = 0;
   const reserve = (bytes: number): boolean => {
+    // If a disconnected request's timer was discarded by the runtime, reclaim
+    // its expired charge before admitting new work. Do not use its stream here.
+    const current = Date.now();
+    for (const [drop, until] of transferDeadlines) if (current >= until) drop();
     if (inFlightBytes + bytes > config.remoteImageInFlightBytes) return false;
     inFlightBytes += bytes;
     reserved += bytes;
@@ -387,9 +396,9 @@ export async function fetchRemoteImage(
     if (!imageTypes.get(contentType)!(bytes)) return fail('magic');
     const image: RemoteImage = { ok: true, contentType, bytes, length };
     if (lifetime !== 'response') return image;
-    const body = reservedImageBody(bytes, () => { inFlightBytes -= length; });
-    reserved -= length; // The stream owns this portion until it closes or is cancelled.
-    return { ...image, body };
+    const transfer = reservedImageBody(bytes, () => { inFlightBytes -= length; });
+    reserved -= length; // The transfer now owns this portion of the reservation.
+    return { ...image, ...transfer };
   } catch (error) {
     return fail(error instanceof Deadline || controller.signal.aborted ? 'timeout' : 'network');
   } finally {
@@ -401,27 +410,56 @@ export async function fetchRemoteImage(
   }
 }
 
-function reservedImageBody(bytes: Uint8Array, release: () => void): ReadableStream<Uint8Array> {
+function reservedImageBody(bytes: Uint8Array, release: () => void) {
   let offset = 0;
   let buffer: Uint8Array | undefined = bytes;
-  const finish = () => {
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let requestSignal: AbortSignal | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const drop = () => {
     if (!buffer) return;
     buffer = undefined;
+    transferDeadlines.delete(drop);
     release();
   };
-  return new ReadableStream<Uint8Array>({
-    pull(controller) {
-      if (!buffer || offset === buffer.length) {
-        controller.close();
+  const finish = () => {
+    if (timer !== undefined) clearTimeout(timer);
+    requestSignal?.removeEventListener('abort', abort);
+    drop();
+  };
+  const fail = (reason: unknown) => {
+    const output = controller;
+    controller = undefined;
+    finish();
+    output?.error(reason);
+  };
+  const abort = () => fail(requestSignal?.reason);
+  const timeout = () => fail(new DOMException('image transfer deadline exceeded', 'TimeoutError'));
+  const body = new ReadableStream<Uint8Array>({
+    start(value) { controller = value; },
+    pull(output) {
+      if (!buffer) { timeout(); return; }
+      if (offset === buffer.length) {
+        output.close();
+        controller = undefined;
         finish();
-      } else {
-        const chunk = buffer.subarray(offset, offset + 64 * 1024);
-        offset += chunk.length;
-        controller.enqueue(chunk);
+        return;
       }
+      // A queued chunk cannot pin the complete image after the deadline.
+      const chunk = buffer.slice(offset, offset + 64 * 1024);
+      offset += chunk.length;
+      output.enqueue(chunk);
     },
-    cancel: finish,
+    cancel() { controller = undefined; finish(); },
   }, { highWaterMark: 0 });
+  return { body, startTransfer(signal?: AbortSignal) {
+    if (!buffer || timer !== undefined) return;
+    requestSignal = signal;
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener('abort', abort, { once: true });
+    transferDeadlines.set(drop, Date.now() + transferDeadlineMs);
+    timer = setTimeout(timeout, transferDeadlineMs);
+  } };
 }
 
 // ---- Rule 4 and section 3.1: outgoing headers, rebuilt from scratch ----

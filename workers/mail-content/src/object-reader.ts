@@ -57,7 +57,7 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
     return { stream: response.body, size, signal };
   }
   return {
-    async mime(rawKey: string) {
+    async withMime<T>(rawKey: string, prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
       const { stream, size, signal } = await get(rawKey, 'raw');
       let release: (() => void) | undefined;
       try {
@@ -66,35 +66,72 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
         if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
         // Same parser version and options as mail-backend's indexed part numbers.
         const mail = await PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
-        return { mail, release };
+        return await prepare(mail);
       } catch (error) {
-        release?.();
         void stream.cancel().catch(() => {});
         throw error;
+      } finally {
+        release?.();
       }
     },
-    async attachment(key: string, expected: Uint8Array<ArrayBuffer>) {
-      if (await sha256(expected) !== parseObjectKey(key)?.digest) throw new Error('attachment digest mismatch');
-      const { stream, size } = await get(key, 'att');
-      if (size !== expected.byteLength) {
+    async attachment(proof: AttachmentProof) {
+      const { stream, size } = await get(proof.key, 'att');
+      if (size !== proof.size) {
         void stream.cancel().catch(() => {});
         throw new Error('attachment length mismatch');
       }
-      // Authenticate the streamed copy against the part already decoded from
-      // digest-verified MIME. Never emit a corrupt chunk, or finish a short body.
-      let offset = 0;
-      return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-        transform(chunk, controller) {
-          if (offset + chunk.byteLength > size || !chunk.every((byte, i) => byte === expected[offset + i])) {
-            throw new Error('attachment bytes mismatch');
-          }
-          offset += chunk.byteLength;
-          controller.enqueue(chunk);
-        },
-        flush() { if (offset !== size) throw new Error('attachment length mismatch'); },
-      }));
+      return verifiedAttachmentStream(stream, proof);
     },
   };
+}
+
+export type MailMime = Awaited<ReturnType<typeof PostalMime.parse>>;
+export const EXTERNAL_PART_BYTES = 256 * 1024;
+const proofBlockBytes = 64 * 1024;
+
+export type AttachmentProof = { key: string; size: number; blocks: readonly string[] };
+
+/** Keep only digests, not the decoded MIME part, for the response transfer. */
+export async function proveAttachment(key: string, bytes: Uint8Array<ArrayBuffer>): Promise<AttachmentProof> {
+  if (await sha256(bytes) !== parseObjectKey(key)?.digest) throw new Error('attachment digest mismatch');
+  const blocks: string[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += proofBlockBytes) {
+    blocks.push(await sha256(bytes.subarray(offset, offset + proofBlockBytes)));
+  }
+  return { key, size: bytes.byteLength, blocks };
+}
+
+function verifiedAttachmentStream(stream: ReadableStream<Uint8Array>, proof: AttachmentProof): ReadableStream<Uint8Array> {
+  const reader = stream.getReader({ mode: 'byob' });
+  let offset = 0;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        if (offset === proof.size) {
+          if (!(await reader.read(new Uint8Array(1))).done) throw new Error('attachment length mismatch');
+          controller.close();
+          return;
+        }
+        // Read no more than one bounded block before authenticating and emitting it.
+        const length = Math.min(proofBlockBytes, proof.size - offset);
+        let block = new Uint8Array(length);
+        let filled = 0;
+        while (filled < length) {
+          const { done, value } = await reader.read(block.subarray(filled));
+          if (done || !value?.byteLength) throw new Error('attachment length mismatch');
+          filled += value.byteLength;
+          block = new Uint8Array(value.buffer as ArrayBuffer, value.byteOffset + value.byteLength - filled, length);
+        }
+        if (await sha256(block) !== proof.blocks[offset / proofBlockBytes]) throw new Error('attachment bytes mismatch');
+        offset += length;
+        controller.enqueue(block);
+      } catch (error) {
+        void reader.cancel().catch(() => {});
+        throw error;
+      }
+    },
+    cancel() { return reader.cancel(); },
+  }, { highWaterMark: 0 });
 }
 
 export function decodedBytes(value: unknown): Uint8Array<ArrayBuffer> {

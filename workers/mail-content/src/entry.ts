@@ -3,7 +3,9 @@ import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.t
 import { sha256 } from '../../mail-backend/src/bytes.ts';
 import { serveImage, type ImageCache } from './image-handler.ts';
 import { contentUrlKeys, type ContentUrlKeys } from './keys.ts';
-import { checkedRecord, decodedBytes, readOnlyObjects, type ContentStoreConfig } from './object-reader.ts';
+import { MimeBusy } from './mime-budget.ts';
+import { checkedRecord, decodedBytes, EXTERNAL_PART_BYTES, proveAttachment, readOnlyObjects,
+  type AttachmentProof, type ContentStoreConfig, type MailMime } from './object-reader.ts';
 import {
   checkRemoteImageUrl, contentSecurityHeaders, isInlineImage, remoteImageConfig, remoteImageMethodAllowed, type ContentOrigins,
 } from './proxy.ts';
@@ -79,8 +81,6 @@ function mimePart<T>(parts: readonly T[], part: number): T | undefined {
 }
 
 type VerifiedMailbox = Exclude<Verified, { purpose: 'img' }>;
-type MailObjects = ReturnType<typeof readOnlyObjects>;
-type MailMime = Awaited<ReturnType<MailObjects['mime']>>['mail'];
 type Served = { response: Response; bytes: number };
 
 async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: ContentUrlKeys,
@@ -89,23 +89,19 @@ async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: Co
   const entry = purpose !== 'body' ? attachmentFor(message, verified.claims.part) : undefined;
   if (purpose !== 'body' && !entry) return null;
   const objects = readOnlyObjects(env, claims.ws, signal);
-  const { mail, release } = await objects.mime(message.rawKey);
-  let streaming = false;
-  try {
-    const rendered = await renderMailbox(verified, entry, mail, objects, env, keys, origins, headers, now);
-    if (!rendered?.response.body || !rendered.bytes) return rendered;
-    const output = new FixedLengthStream(rendered.bytes);
-    const response = new Response(output.readable, rendered.response);
-    void rendered.response.body.pipeTo(output.writable).then(release, release);
-    streaming = true;
-    return { response, bytes: rendered.bytes };
-  } finally {
-    if (!streaming) release();
-  }
+  const prepared = await objects.withMime(message.rawKey,
+    mail => prepareMailbox(verified, entry, mail, env, keys, origins, headers, now));
+  if (!prepared) return null;
+  if (prepared instanceof Uint8Array) return { response: new Response(prepared, { headers }), bytes: prepared.byteLength };
+  // The parsed mail and its reservation are gone before opening a transfer.
+  const stream = await objects.attachment(prepared);
+  const output = new FixedLengthStream(prepared.size);
+  void stream.pipeTo(output.writable).catch(() => {});
+  return { response: new Response(output.readable, { headers }), bytes: prepared.size };
 }
 
-async function renderMailbox(verified: VerifiedMailbox, entry: MessageAttachment | undefined, mime: MailMime,
-    objects: MailObjects, env: ContentEnv, keys: ContentUrlKeys, origins: ContentOrigins, headers: Headers, now: number): Promise<Served | null> {
+async function prepareMailbox(verified: VerifiedMailbox, entry: MessageAttachment | undefined, mime: MailMime,
+    env: ContentEnv, keys: ContentUrlKeys, origins: ContentOrigins, headers: Headers, now: number): Promise<Uint8Array | AttachmentProof | null> {
   const { message, purpose } = verified;
   if (purpose === 'body') {
     const output = mime.html ? await sanitise(mime.html, { ri: verified.claims.ri, verdict: message.verdict }) : null;
@@ -128,9 +124,8 @@ async function renderMailbox(verified: VerifiedMailbox, entry: MessageAttachment
         return urlFor(origins.contentOrigin, 'img', await mintFromBody(keys, verified, { purpose: 'img', u: ref.url }, now));
       });
     }
-    const bytes = encoder.encode(body);
     headers.set('content-type', 'text/html; charset=utf-8');
-    return { response: new Response(bytes, { headers }), bytes: bytes.byteLength };
+    return encoder.encode(body);
   }
   if (!entry) return null;
   const attachment = mimePart(mime.attachments, entry.part);
@@ -141,12 +136,12 @@ async function renderMailbox(verified: VerifiedMailbox, entry: MessageAttachment
     if (!isInlineImage(type, bytes)) return null;
     headers.set('content-type', type);
     headers.set('content-disposition', 'inline');
-    return { response: new Response(bytes, { headers }), bytes: bytes.byteLength };
+  } else {
+    headers.set('content-type', 'application/octet-stream');
+    headers.set('content-disposition', attachmentDisposition(attachment.filename ?? ''));
   }
-  headers.set('content-type', 'application/octet-stream');
-  headers.set('content-disposition', attachmentDisposition(attachment.filename ?? ''));
-  const content = entry.objectKey ? await objects.attachment(entry.objectKey, bytes) : bytes;
-  return { response: new Response(content, { headers }), bytes: bytes.byteLength };
+  if (bytes.byteLength < EXTERNAL_PART_BYTES) return bytes.slice();
+  return entry.objectKey ? proveAttachment(entry.objectKey, bytes) : null;
 }
 
 interface Runtime {
@@ -188,10 +183,16 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
       const verified = await verifier.verify(purpose, token, now);
       if (verified.ok) {
         result = verified.purpose === 'img'
-          ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), io.imageCache)
+          ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), io.imageCache, request.signal)
           : await serveMailbox(verified, env, keys, origins, headers, now, request.signal);
       }
-    } catch { /* Fail closed; do not expose or log errors from ports, parsers or keys. */ }
+    } catch (error) {
+      if (error instanceof MimeBusy) {
+        headers.set('retry-after', '1');
+        result = { response: new Response(null, { status: 503, headers }), bytes: 0 };
+      }
+      // Other failures are closed; do not expose errors from ports, parsers or keys.
+    }
   }
   const status = result?.response.status ?? 404;
   console.log(JSON.stringify({ purpose, status, bytes: result?.bytes ?? 0, token: tokenHash }));
