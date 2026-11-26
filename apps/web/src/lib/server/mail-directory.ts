@@ -31,11 +31,12 @@ function text(value: unknown, field: string, max: number): string {
   if (!value || new TextEncoder().encode(value).byteLength > max) return fail('invalid_request', { errors: [{ field, code: value ? 'too_long' : 'required' }] });
   return value;
 }
-function address(value: unknown, field: string): string {
+function address(value: unknown, field: string, { existing = false } = {}): string {
   const result = text(value, field, LIMITS.addressBytes).toLowerCase();
   // Inbound strips plus tags for routing, so a tag cannot be a separate directory address.
-  // RFC 2047 encoded words are not allowed in an addr-spec; sends refuse them too.
-  if (!/^[a-z0-9.!#$%&'*\/=?^_`{|}~-]+@[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$/.test(result) || result.split('@')[0].includes('=?')) return fail('invalid_request', { errors: [{ field, code: 'invalid' }] });
+  // RFC 2047 encoded words are not allowed in an addr-spec; sends refuse them too. A
+  // lookup of an existing address (delete) still accepts one stored before this rule.
+  if (!/^[a-z0-9.!#$%&'*\/=?^_`{|}~-]+@[a-z0-9][a-z0-9.-]*\.[a-z0-9]+$/.test(result) || (!existing && result.split('@')[0].includes('=?'))) return fail('invalid_request', { errors: [{ field, code: 'invalid' }] });
   return result;
 }
 function domainName(value: unknown, field: string): string {
@@ -233,7 +234,7 @@ export class Directory {
         return { body: await this.asMailbox((await this.byId(prior.id)) ?? prior) };
       }
       case 'deleteAlias':
-        await this.db.batch([this.prep(`DELETE FROM addresses WHERE workspace_id = ? AND address_norm = ? AND kind = 'alias'`, this.ws, address(params.address, '/address'))]);
+        await this.db.batch([this.prep(`DELETE FROM addresses WHERE workspace_id = ? AND address_norm = ? AND kind = 'alias'`, this.ws, address(params.address, '/address', { existing: true }))]);
         return {};
       default: return fail('not_found');
     }

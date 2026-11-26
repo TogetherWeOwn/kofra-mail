@@ -7,6 +7,21 @@ import { startMailHttpFixture } from './fixtures/mail-http.ts';
 
 defineConformance('mail API over HTTP in local workerd (M2-W)', startMailHttpFixture);
 
+test('an existing alias whose local part contains =? can still be deleted', async () => {
+  const fixture = await startMailHttpFixture();
+  try {
+    const admin = fixture.as('admin');
+    const [mailbox] = (await admin.listMailboxes({})).items;
+    assert.ok(mailbox);
+    // Stored before the directory refused encoded-word local parts.
+    const legacy = `a=?b@${mailbox.primaryAddress.split('@')[1]}`;
+    await fixture.directoryDb.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')")
+      .bind(legacy, 'w1', mailbox.id).run();
+    await admin.deleteAlias(legacy);
+    assert.equal((await fixture.directoryDb.prepare('SELECT 1 FROM addresses WHERE address_norm = ?').bind(legacy).all()).results.length, 0);
+  } finally { await fixture.close(); }
+});
+
 test('search phrases match within a filename, not across filenames', async () => {
   const fixture = await startMailHttpFixture();
   try {
