@@ -1,0 +1,45 @@
+From: =?UTF-8?B?Q2Fmw6k=?= <sender@example.com>
+To: "Reader" <reader@example.net>
+Subject: =?UTF-8?B?UsOpc3Vtw6k=?=
+Date: Fri, 02 Jan 2026 03:04:05 +0000
+Message-ID: <send_001@example.com>
+Reply-To: replies@example.com
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="=_km_send_001"
+
+--=_km_send_001
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: quoted-printable
+
+Hello, reader! This is a sent copy.
+--=_km_send_001
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename=a_b.txt;
+ filename*=UTF-8''a%22b.txt
+
+AP8Q
+--=_km_send_001
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename=a_b.txt;
+ filename*=UTF-8''a%3Bb.txt
+
+AP8Q
+--=_km_send_001
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment;
+ filename=caf_.txt;
+ filename*=UTF-8''caf%C3%A9.txt
+
+AP8Q
+--=_km_send_001
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename=plain.txt
+
+
+--=_km_send_001--

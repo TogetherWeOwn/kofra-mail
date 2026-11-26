@@ -229,6 +229,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **`sendDraft` checks** (each a 422 code, except the subject length, 400 `invalid_request`):
 - 1 to `recipientsPerMessage` recipients, all syntactically valid (`invalid_recipients`, `too_many_recipients`);
+- A local part containing `=?` is refused because RFC 2047 encoded words are not allowed inside an addr-spec.
 - `from` is an identity with `sendAs: 'active'` (`invalid_sender`);
 - file attachments ≤ `attachmentsPerMessage` (`too_many_attachments`);
 - encoded size ≤ `outboundMessageBytes` (`message_too_large`, with `limit`);
@@ -239,7 +240,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `In-Reply-To` is the parent's `Message-ID`.
 - `References` keeps the parent's id, then the first id, then the most recent ids, newest first, at most 10 after the first, while its unfolded value fits `headerValueBytes` (2,048). With long legal ids it keeps fewer than 11.
 - An id that alone exceeds `headerValueBytes`, or `MESSAGE_ID_MAX` (one RFC 5322 line), is never sent. `References` folds between ids, so every physical line fits 998 octets.
-- The provider request sets at most three headers of its own (`In-Reply-To`, `References`, `Reply-To`), each within `headerValueBytes`, well under the platform's limit on custom headers. Every other header comes from the request's structured fields.
+- The provider request sets at most two headers of its own (`In-Reply-To`, `References`), each within `headerValueBytes`. The frozen `Reply-To` goes in the structured `replyTo` field and the sent-copy MIME, not in the provider request's `headers`.
 
 **If the checks pass:**
 - The draft becomes a `pending` send and leaves the draft list.
@@ -267,7 +268,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 
 **Downloads:** `getAttachmentUrl` returns a content-origin URL valid for `contentUrlSeconds` (5 minutes). It always downloads as `application/octet-stream` with `Content-Disposition: attachment`, and is never rendered by the app.
 
-**The client's size check:** `attachmentBudget(limits, bodyBytes)` is an estimate that reserves 16 KiB for headers and MIME structure: files within it pass unless the headers are unusually large (for example 50 recipients with long encoded names and many long file names). Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
+**The client's size check:** `attachmentBudget(limits, body)` estimates the encoded size using the UTF-8 byte count of the body with CRLF line endings. It also accepts a precomputed canonical byte count. The estimate reserves 16 KiB for headers and MIME structure: files within it pass unless the headers are unusually large (for example 50 recipients with long encoded names and many long file names). Above it the client warns, and the server's encoded-size check decides. Files the server refuses can go as a Drive link.
 
 ### 8.5 Drive
 
@@ -297,6 +298,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 
 **Aliases:**
 - `createAlias` adds an address on a primary or secondary domain. An address on an alias domain is implicit: `x@alias.example` reaches `x@primary.example`.
+- A mailbox or alias address whose local part contains `=?` is refused with `invalid_request` (RFC 2047 encoded words are not allowed in an addr-spec, and sending refuses them).
 - At most `aliasesPerMailbox` per mailbox, otherwise 422 `limit_reached`.
 - With `sendAs: true`, the alias shows as `pending` in the owner's identities until the sending allow-list is redeployed through CI.
 - `deleteAlias` stops delivery to that address at once.
@@ -393,7 +395,7 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
 13. **Send checks:**
     - 0 recipients or a malformed address answers `invalid_recipients`; 51 recipients answers `too_many_recipients`.
     - 33 file attachments answers `too_many_attachments`.
-    - A file of exactly `attachmentBudget(limits, bodyBytes)` bytes passes the size check; a file whose base64 alone exceeds `outboundMessageBytes` answers `message_too_large` with `limit`.
+    - A file of exactly `attachmentBudget(limits, body)` bytes passes the size check; a file whose base64 alone exceeds `outboundMessageBytes` answers `message_too_large` with `limit`.
     - A stale `If-Match` answers `revision_mismatch`.
 14. **Send and undo:**
     - `sendDraft` returns `state: 'pending'`, `undoUntil` equal to now plus `undoSeconds`, and the draft leaves `listDrafts`.
