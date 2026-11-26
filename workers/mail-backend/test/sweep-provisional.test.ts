@@ -110,6 +110,26 @@ test('confirm answers held before expiry, rehold after expiry and lost after ret
   assert.deepEqual(await ledger.sweep(confirmedAt + RETENTION), [gone], 'the reheld generation is kept');
 });
 
+test('confirm answers lost after the expired generation was deleted, and released while a released generation lives', async () => {
+  const ledger = freshLedger();
+  const deleted = await ledger.holdProvisional({ kind: 'raw', digest: digest('d') }, 'draft:scope:gone', 100);
+  await ledger.sweep(100 + TTL);
+  assert.deepEqual(await ledger.sweep(100 + TTL + RETENTION), [deleted]);
+  assert.equal(await generation(ledger, deleted), null, 'the confirmed DELETE dropped the generation and its expired row');
+  assert.deepEqual(await ledger.confirm([{ key: deleted, holder: 'draft:scope:gone' }], 200 + TTL + RETENTION), ['lost']);
+  assert.deepEqual(await ledger.holders(), [], 'lost re-creates nothing');
+  assert.equal(await generation(ledger, deleted), null);
+
+  const live = await ledger.holdProvisional({ kind: 'att', digest: digest('e') }, 'upload:scope:u1', 300 + TTL + RETENTION);
+  await ledger.release(live, 'upload:scope:u1', 310 + TTL + RETENTION);
+  assert.deepEqual(await ledger.confirm([{ key: live, holder: 'upload:scope:u1' }], 320 + TTL + RETENTION), ['released']);
+  assert.deepEqual(await ledger.holders(), []);
+
+  const draft = `drafts/${digest('f')}`;
+  assert.deepEqual(await ledger.confirm([{ key: draft, holder: 'draft:scope:legacy' }], 330 + TTL + RETENTION), ['released'],
+    'a legacy drafts/ key is not a generation key');
+});
+
 test('release then confirm is a no-op that answers released', async () => {
   const ledger = freshLedger();
   const key = await ledger.holdProvisional({ kind: 'att', digest: digest('4') }, 'upload:scope:u1', 100);
