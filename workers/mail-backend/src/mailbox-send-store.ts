@@ -2,7 +2,7 @@ import { hasHeaderControl } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { RecipientStatus, Send, SendState, SendSummaryState } from '../../../contracts/mail-api/src/wire.ts';
 import { iso } from './mailbox-api-input.ts';
-import type { SendFailure, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import type { SendFailure, SendPart, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 
@@ -103,10 +103,16 @@ function validAddress(value: unknown, field?: boolean): boolean {
 
 export function validSendId(id: unknown): id is string { return isSendId(id); }
 
+function validPart(value: unknown): boolean {
+  const entry = (value ?? {}) as Partial<SendPart>;
+  return !!value && typeof value === 'object' && bounded(entry.messageId, 64) && count(entry.part) && entry.part >= 1 &&
+    typeof entry.digest === 'string' && /^[0-9a-f]{64}$/.test(entry.digest) && count(entry.size);
+}
+
 // Refuses a malformed record before it can enter the state or a replay.
 export function checkSendRecord(record: SendRecord): void {
   const r = record as Partial<SendRecord>;
-  const keys = r.attachmentKeys, uploads = r.uploadIds, recipients = r.recipients;
+  const keys = r.attachmentKeys, uploads = r.uploadIds, recipients = r.recipients, parts = r.parts;
   if (!isSendId(r.id) || !bounded(r.draftId, 64) || !epochMs(r.createdAt) || !epochMs(r.undoUntil) || !epochMs(r.dateAt) ||
       r.dateAt !== r.undoUntil || !count(r.undoSeconds) || !bounded(r.ownerUserId, 256) || !validAddress(r.from) ||
       typeof r.from?.name !== 'string' || !Array.isArray(r.replyTo) || r.replyTo.length > LIMITS.recipientsPerMessage ||
@@ -115,7 +121,8 @@ export function checkSendRecord(record: SendRecord): void {
       !epochMs(r.draft.updatedAt) || !Array.isArray(keys) || keys.length > LIMITS.attachmentsPerMessage ||
       keys.some(key => typeof key !== 'string' || !parseObjectKey(key)) || !Array.isArray(uploads) ||
       uploads.length > LIMITS.attachmentsPerMessage || uploads.some(id => !bounded(id, 64)) || !Array.isArray(recipients) ||
-      !recipients.length || recipients.length > LIMITS.recipientsPerMessage || !recipients.every(value => validAddress(value, true))) {
+      !recipients.length || recipients.length > LIMITS.recipientsPerMessage || !recipients.every(value => validAddress(value, true)) ||
+      !Array.isArray(parts) || parts.length > LIMITS.attachmentsPerMessage || !parts.every(validPart)) {
     throw new Error('Invalid send record');
   }
 }

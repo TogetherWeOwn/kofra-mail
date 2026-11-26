@@ -8,7 +8,10 @@ import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Draft, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { normalizeAddress } from './directory.ts';
-import { draftObjectKeys, draftRef, draftUploadIds, readDraft, readDraftObject, type DraftObject, type DraftObjectRef } from './mailbox-api-drafts.ts';
+import {
+  draftObjectKeys, draftRef, draftUploadIds, encodeDraftObject, fingerprintParts, forwardedParts, inlinePart, readDraft, readDraftObject,
+  type DraftObject, type DraftObjectRef,
+} from './mailbox-api-drafts.ts';
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
 import { canonical, cursorPosition, fail, invalid, isId, makeCursor, need, pageLimit, utf8 } from './mailbox-api-input.ts';
 import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
@@ -21,9 +24,9 @@ import {
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
-import type { JournalEvent, JournalResult, SendAddress, SendFailure, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import type { JournalEvent, JournalResult, SendAddress, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
-import { decodedAttachment, parseMail, readMailMime } from './parse-mail.ts';
+import { parseMail } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
 import { ulid } from 'ulid';
 
@@ -180,6 +183,10 @@ export class SendApi {
       'SELECT display_name FROM mailbox_profiles WHERE workspace_id = ? AND mailbox_id = ?')
       .bind(this.scope.workspaceId, this.scope.mailboxId).first<{ display_name: string }>();
     const name = profile?.display_name && !hasHeaderControl(profile.display_name) ? profile.display_name : '';
+    // A draft saved before parts were fingerprinted gets its fingerprints now.
+    const parts = (await fingerprintParts(this.index, draft.attachments ?? [])).flatMap(attachment =>
+      attachment.wire.kind === 'message' && 'part' in attachment && attachment.part
+        ? [{ messageId: attachment.wire.messageId, part: attachment.wire.part, ...attachment.part }] : []);
     const committedAt = this.clock();
     const undoSeconds = settingsUndoSeconds(this.sql);
     const undoUntil = committedAt + undoSeconds * 1000;
@@ -187,11 +194,19 @@ export class SendApi {
       id: ulid(committedAt), draftId: ref.id, createdAt: committedAt, undoUntil, dateAt: undoUntil, undoSeconds,
       ownerUserId: options.userId, from: { email: from, name }, replyTo: replyToFromSettings(this.sql), builderVersion: this.mime.current,
       draft: { rawKey: ref.rawKey, holder: ref.holder, revision: ref.revision, updatedAt: ref.updatedAt },
-      attachmentKeys: draftObjectKeys(draft), uploadIds, recipients,
+      attachmentKeys: draftObjectKeys(draft), uploadIds, recipients, parts,
     };
     const builder = this.mime.get(record.builderVersion)!;
     if (builder.encodedSize(mimeMessage(record, draft)) > LIMITS.outboundMessageBytes) {
       return fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
+    }
+    // A legacy prefix-less `drafts/` revision is first stored as a raw/ generation,
+    // as replaceDraft writes one (section 2.7), so the send refers to a swept generation.
+    if (parseObjectKey(ref.rawKey)?.kind !== 'raw') {
+      const upgraded = await this.index.prepareApiDraft(ref.id, encodeDraftObject(draft), committedAt, record.attachmentKeys);
+      try { this.index.changeMany([{ type: 'draft', ...upgraded, attachmentKeys: record.attachmentKeys, uploadIds }]); }
+      catch (error) { await this.index.releaseDraft(upgraded, record.attachmentKeys); throw error; }
+      record.draft = { rawKey: upgraded.rawKey, holder: upgraded.holder, revision: upgraded.revision, updatedAt: upgraded.updatedAt };
     }
     const result = resultOf('sendDraft', key, fingerprint, 202, { send: record.id }, committedAt);
     let seq = 0;
@@ -228,8 +243,9 @@ export class SendApi {
     let seq = 0;
     this.index.changeMany([{ type: 'send_undo', id: row.id, revision: ref.revision, updatedAt, result }], () => {
       seq = revision(this.sql);
-      // The drive row finishes the cancelled send now; the draft takes over its uploads.
+      // The drive row finishes the cancelled send now, at the normal retry; the draft takes over its uploads.
       this.timers.set(SEND_DRIVE, row.id, updatedAt);
+      this.sql.exec('UPDATE mailbox_send_drivers SET backoff = 0 WHERE send_id = ?', row.id);
       for (const id of row.record.uploadIds) this.timers.delete(UPLOAD_EXPIRY, id);
       scheduleResult(this.timers, { type: 'api_result', ...result });
       this.journalDue(this.timers);
@@ -375,16 +391,23 @@ export class SendDriver {
     const kinds = await this.classify(start.scope, record);
     let failure: SendFailure | null = null;
     let draft: DraftObject | undefined;
+    let forwarded: Map<number, Uint8Array<ArrayBuffer>> | null = new Map();
     // A deploy that dropped the frozen builder version is our invariant breach, never the sender's failure.
     if (!ports.mime.get(record.builderVersion)) return this.breach(start);
     if (!await this.senderValid(start.scope, record)) failure = 'invalid_sender';
     // A lost source is never read: its object may be gone.
     else if (await this.sourceLost(record)) failure = 'delivery_error';
     else if (!this.withinLimits(record, draft = await this.draftOf(start, record))) failure = 'message_too_large';
-    if (failure || !draft) {
+    // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
+    else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
+    if (failure || !draft || !forwarded) {
       const reason = failure ?? 'delivery_error';
-      const failed = await this.commit(start, ['releasing'], (timers, _row, index) => {
-        index.commitEvents([{ type: 'send_fail', id: this.ref, reason, kinds }]);
+      const unusable = !forwarded;
+      const failed = await this.commit(start, ['releasing'], (timers, row, index) => {
+        index.commitEvents([
+          ...(unusable ? [{ type: 'api_source_lost' as const, kind: 'send' as const, id: this.ref, holder: row.holder }] : []),
+          { type: 'send_fail', id: this.ref, reason, kinds },
+        ]);
         timers.set(SEND_DRIVE, this.ref, this.timer.now);
         this.resetBackoff();
         ports.journalDue(timers);
@@ -396,7 +419,7 @@ export class SendDriver {
     // Step 3: build, register (holders before PUT), then PUT.
     const builder = ports.mime.get(record.builderVersion);
     if (!builder) return this.breach(start);
-    const bytes = await builder.build(mimeMessage(record, draft), this.parts(start, draft));
+    const bytes = await builder.build(mimeMessage(record, draft), this.parts(start, draft, forwarded));
     const digest = await sha256(bytes);
     const registration = await ports.sweeper(start.scope.workspaceId).registerSend(start.scope.mailboxId, record.id, digest,
       { raw: sendRawHolder(start.scope.holderScope, record.id), index: `message:${start.scope.holderScope}:${sentCopyId(record.id)}` });
@@ -410,6 +433,8 @@ export class SendDriver {
     const queued = await this.commit(start, ['releasing'], (_timers, _row, index) => {
       index.commitSentCopy(this.ref, registration.key, record.dateAt, parsed, SENT_COPY_FLAGS, kinds);
       this.resetBackoff();
+      // Step 3 passed: an earlier run's invariant breach, and with it its alert, is over.
+      ports.sql.exec('DELETE FROM mailbox_send_breaches WHERE send_id = ?', this.ref);
       return sendRow(ports.sql, this.ref)!;
     });
     if (queued === STALE) return;
@@ -451,6 +476,7 @@ export class SendDriver {
         if (upload && !uploadReferenced(ports.sql, id)) timers.set(UPLOAD_EXPIRY, id, Math.max(1, upload.expiresAt));
       }
       ports.sql.exec('DELETE FROM mailbox_send_drivers WHERE send_id = ?', this.ref);
+      ports.sql.exec('DELETE FROM mailbox_send_breaches WHERE send_id = ?', this.ref);
       ports.journalDue(timers);
     });
   }
@@ -469,29 +495,45 @@ export class SendDriver {
     return readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
   }
 
-  private parts(start: Start, draft: DraftObject): SendMimeParts {
+  // Reads every small forwarded part once and checks it against the digest and
+  // size frozen in the record; null on a mismatch or a part that no longer exists.
+  private async forwardedParts(start: Start, record: SendRecord, draft: DraftObject): Promise<Map<number, Uint8Array<ArrayBuffer>> | null> {
+    const decode = forwardedParts(key => {
+      const ready = this.ports.ready();
+      if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
+      return ready.index.readObject(key);
+    });
+    const verified = new Map<number, Uint8Array<ArrayBuffer>>();
+    for (const [index, { wire, key }] of files(draft).entries()) {
+      if (wire.kind !== 'message' || !inlinePart(key)) continue;
+      const frozen: SendPart | undefined = record.parts.find(entry => entry.messageId === wire.messageId && entry.part === wire.part);
+      const bytes = frozen && await decode(key, wire.part);
+      if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return null;
+      verified.set(index, bytes);
+    }
+    return verified;
+  }
+
+  private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
     const list = files(draft);
     return async index => {
+      // A small forwarded part was read and verified before the build.
+      const verified = forwarded.get(index);
+      if (verified) return verified;
       const ready = this.ports.ready();
       if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
       const { wire, key } = list[index];
       const parsed = parseObjectKey(key);
+      // Uploads and large forwarded parts are att/ objects, verified against their content-addressed key.
+      if (parsed?.kind !== 'att') throw new Error('Invalid send attachment reference');
       // Object reads refuse a declared empty body, but an empty upload is a valid file.
-      if (parsed?.kind === 'att' && wire.size === 0) {
+      if (wire.size === 0) {
         if (parsed.digest !== EMPTY_DIGEST) throw new Error('Send attachment digest mismatch');
         return new Uint8Array(0);
       }
       const raw = await ready.index.readObject(key);
-      if (parsed?.kind === 'att') {
-        if (await sha256(raw) !== parsed.digest) throw new Error('Send attachment digest mismatch');
-        return raw;
-      }
-      // A forwarded part kept inside its source message.
-      if (parsed?.kind !== 'raw' || wire.kind !== 'message') throw new Error('Invalid send attachment reference');
-      const message = await readMailMime(raw, key);
-      const attachment = message.attachments[wire.part - 1];
-      if (!attachment) throw new Error('Forwarded part missing');
-      return decodedAttachment(attachment.content);
+      if (await sha256(raw) !== parsed.digest) throw new Error('Send attachment digest mismatch');
+      return raw;
     };
   }
 

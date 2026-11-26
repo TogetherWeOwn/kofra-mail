@@ -22,7 +22,7 @@ const record = (patch: Partial<SendRecord> = {}): SendRecord => ({
   id: '01KBN8ZJ7G0000000000000000', draftId: 'draft-1', createdAt: at, undoUntil: at + 10_000, dateAt: at + 10_000, undoSeconds: 10,
   ownerUserId: 'member', from: { email: 'member@example.com', name: '' }, replyTo: [], builderVersion: 1,
   draft: { rawKey: `raw/${'a'.repeat(64)}/01KBN8ZJ7G0000000000000001`, holder: 'draft:scope:draft-1:1', revision: 'revision-1', updatedAt: at },
-  attachmentKeys: [], uploadIds: [], recipients: [{ field: 'to', email: 'friend@example.net' }], ...patch,
+  attachmentKeys: [], uploadIds: [], recipients: [{ field: 'to', email: 'friend@example.net' }], parts: [], ...patch,
 });
 
 test('a send record with every time inside the Date range is accepted and renders', () => {

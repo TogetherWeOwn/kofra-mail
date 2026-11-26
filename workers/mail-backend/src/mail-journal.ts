@@ -14,7 +14,10 @@ export type SendRecord = {
   ownerUserId: string; from: { email: string; name: string }; replyTo: SendAddress[]; builderVersion: number;
   draft: { rawKey: string; holder: string; revision: string; updatedAt: number };
   attachmentKeys: string[]; uploadIds: string[]; recipients: SendRecipient[];
+  // Each small forwarded part's decoded digest and size, fixed when it was attached.
+  parts: SendPart[];
 };
+export type SendPart = { messageId: string; part: number; digest: string; size: number };
 // The sent copy's non-derived index state, as a message event carries it.
 export type SentCopy = { id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
   subjectKey: string; auth: string; attKeys: string[]; flags: number };

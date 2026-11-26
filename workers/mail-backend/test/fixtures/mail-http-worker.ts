@@ -19,6 +19,8 @@ import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../sr
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
 import { builds, fixtureBuilders } from './send-mime.ts';
+import { legacyFixtureObjects } from './legacy-draft.ts';
+import { sha256 } from '../../src/bytes.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -191,6 +193,25 @@ export class HttpMailbox extends Mailbox {
   async driveIdle() { while (this.driveRuns.size) await Promise.allSettled([...this.driveRuns]); }
   sendDriver(id: string) {
     return this.ctx.storage.sql.exec('SELECT * FROM mailbox_send_drivers WHERE send_id = ?', id).toArray()[0] ?? null;
+  }
+  activeAlerts() { return this.ctx.storage.sql.exec<{ code: string }>('SELECT code FROM mailbox_alerts ORDER BY code').toArray().map(row => row.code); }
+  sendBreaches() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT send_id AS id FROM mailbox_send_breaches').toArray().map(row => row.id); }
+  // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
+  changePartDigest(sendId: string) {
+    this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.parts[0].digest', ?) WHERE id = ?`, '0'.repeat(64), sendId);
+  }
+  // A draft revision as the M2 API wrote it, under a prefix-less drafts/<sha256> key.
+  async seedLegacyApiDraft(ws: string, mb: string, draft: unknown) {
+    const bytes = new Uint8Array(encoder.encode(JSON.stringify(draft)));
+    const rawKey = `drafts/${await sha256(bytes)}`;
+    const id = crypto.randomUUID(), revision = crypto.randomUUID(), holder = `draft:${crypto.randomUUID()}`;
+    const objects = legacyFixtureObjects(this.env, ws);
+    await objects.hold(rawKey, holder);
+    await objects.put(rawKey, bytes);
+    await this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => {
+      index.changeMany([{ type: 'draft', id, rawKey, holder, revision, updatedAt: this.mailApiNow(), attachmentKeys: [], uploadIds: [] }]);
+    });
+    return { id, revision, rawKey, holder };
   }
   async changeSendSwitch(enabled: boolean) {
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_send_switch (id INTEGER PRIMARY KEY, flag TEXT NOT NULL)');
@@ -595,6 +616,10 @@ export default {
           case '/__fixture/publish-through-paused': await box.publishThroughPaused(); break;
           case '/__fixture/resume-publish-through': await box.resumePublishThrough(); break;
           case '/__fixture/drive-idle': await box.driveIdle(); break;
+          case '/__fixture/active-alerts': return Response.json(await box.activeAlerts());
+          case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
+          case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
+          case '/__fixture/seed-legacy-api-draft': return Response.json(await box.seedLegacyApiDraft(ws, mailboxId!, await req.json()));
           case '/__fixture/send-switch': {
             const enabled = await req.text() === 'true';
             try { await box.changeSendSwitch(enabled); }

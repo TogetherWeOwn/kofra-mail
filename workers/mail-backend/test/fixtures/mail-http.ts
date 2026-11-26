@@ -279,6 +279,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       driveIdle: () => controlAction('drive-idle'),
       // Persists MAIL_SEND_ENABLED for the mailbox and restarts it, like a deploy that changes the flag.
       switchPath: (enabled: boolean) => controlAction('send-switch', String(enabled)),
+      activeAlerts: () => readControl<string[]>('active-alerts'),
+      breaches: () => readControl<string[]>('send-breaches'),
+      changePartDigest: (sendId: string) => controlAction('change-part-digest', sendId),
+      seedLegacyDraft: (draft: unknown) => readControl<{ id: string; revision: string; rawKey: string; holder: string }>('seed-legacy-api-draft',
+        JSON.stringify(draft)),
     };
     if (draftsUploads) inspectPut = async (pathname) => {
       const path = /^\/mail-([^/]+)\/(.+)$/.exec(pathname);

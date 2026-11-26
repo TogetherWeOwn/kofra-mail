@@ -861,3 +861,103 @@ test('undo of a send whose source the sweeper confirmed lost answers send_not_pe
     assert.deepEqual(await sentCopies(mail), []);
     assert.equal(await h.sends.emailCalls(), 0);
   }));
+
+// A delivered message with one small attachment, kept inside its raw object, and a draft forwarding it.
+async function forwardDraft(h: Fixture, mail: MailService, from: string) {
+  const bytes = new TextEncoder().encode('forwarded file contents');
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Forward this',
+    text: 'See attached', attachments: [{ name: 'notes.txt', type: 'text/plain', bytes }] });
+  const { messages: [delivered] } = await mail.getThread(source.threadId);
+  const attachment = { kind: 'message' as const, messageId: source.messageId, part: delivered.attachments[0].part };
+  const draft = await mail.createDraft(draftInput(from, { forwardOf: source.messageId, attachments: [attachment] }), key('draft'));
+  const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+  return { bytes, attachment, pending };
+}
+
+test('a small forwarded part is fingerprinted when attached, frozen in the send record and released when its bytes match', () => withSend(async (h, mail, from) => {
+  const { bytes, attachment, pending } = await forwardDraft(h, mail, from);
+  const record = JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[]; parts?: unknown };
+  assert.match(record.attachmentKeys[0], /^raw\//, 'the part stays inside its source message');
+  assert.deepEqual(record.parts, [{ messageId: attachment.messageId, part: attachment.part, digest: sha256(bytes.buffer as ArrayBuffer), size: bytes.byteLength }]);
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  const [copy] = await sentCopies(mail);
+  assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: 'notes.txt', size: bytes.byteLength }]);
+}));
+
+test('a forwarded part that no longer decodes to its frozen digest fails the send with delivery_error, an alert and no MIME', () => withSend(async (h, mail, from) => {
+  const { pending } = await forwardDraft(h, mail, from);
+  await h.sends.changePartDigest(pending.id);
+  const builds = (await h.sends.builds()).length;
+  await h.advance(UNDO);
+  const failed = await mail.getSend(pending.id);
+  assert.equal(failed.state, 'failed');
+  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+  assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+  assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+  assert.deepEqual(await h.sends.queue(), []);
+  assert.deepEqual(await sentCopies(mail), []);
+  await h.advance(minute);
+  assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+  assert.equal(await h.sends.emailCalls(), 0);
+}));
+
+test('an invariant breach followed by recovery leaves no breach row and no active alert', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await h.sends.dropBuilder(true);
+  await h.advance(UNDO);
+  assert.deepEqual(await h.sends.breaches(), [pending.id]);
+  await h.advance(minute);
+  assert.ok((await h.sends.activeAlerts()).includes('send_invariant'));
+  await h.sends.dropBuilder(false);
+  await h.advance(DRIVE_BACKOFF);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  assert.deepEqual(await h.sends.breaches(), [], 'release step 3 passed, so the breach is over');
+  await h.advance(minute);
+  assert.ok(!(await h.sends.activeAlerts()).includes('send_invariant'), 'and its alert is no longer active');
+}));
+
+test('an undo resets the drive backoff: after failed publishes raised it, the cancelled send\'s finish is re-armed at the normal retry',
+  () => withSend(async (h, mail, from) => {
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    let elapsed = 0;
+    const step = async (ms: number) => { await h.advance(ms); elapsed += ms; };
+    await h.publishFailure(true);
+    assert.equal((await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision)).status, 409);
+    const [id] = await h.sends.ids();
+    // Each firing fails its publish and doubles the backoff: 5, 10, then 20 minutes.
+    await step(UNDO);
+    await step(DRIVE_BACKOFF);
+    await step(2 * DRIVE_BACKOFF);
+    assert.ok((await h.sends.driver(id))!.backoff > 2 * DRIVE_BACKOFF);
+    await h.publishFailure(false);
+    await h.sends.releaseFailure(true);
+    await mail.undoSend(id, key('undo'));
+    // The finish publishes, then its release fails: the row waits for the normal retry.
+    await step(second);
+    const [row] = (await driveRows(h)).filter(({ ref }) => ref === id);
+    assert.equal(row?.due_at, h.startedAt + elapsed + DRIVE_BACKOFF);
+    await h.sends.releaseFailure(false);
+    await step(DRIVE_BACKOFF);
+    assert.deepEqual(await driveRows(h), [], 'the cancelled send finished at the normal retry');
+    assert.equal((await mail.getSend(id)).state, 'cancelled');
+  }));
+
+test('sendDraft of a legacy drafts/ revision first stores it as a raw/ generation, then sends it', () => withSend(async (h, mail, from) => {
+  const legacy = await h.sends.seedLegacyDraft({ version: 1,
+    fields: { from, to: [{ email: 'friend@example.net' }], cc: [], bcc: [], subject: 'Legacy draft', body: 'Written before M3-2' } });
+  assert.equal((await mail.getDraft(legacy.id)).revision, legacy.revision);
+  const pending = await mail.sendDraft(legacy.id, { ...key('send'), ifMatch: legacy.revision });
+  assert.equal(pending.state, 'pending');
+  assert.equal(pending.draftId, legacy.id);
+  const record = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string; holder: string } };
+  assert.match(record.draft.rawKey, /^raw\/[0-9a-f]{64}\//);
+  assert.notEqual(record.draft.holder, legacy.holder);
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  assert.deepEqual((await sentCopies(mail)).map(({ subject }) => subject), ['Legacy draft']);
+  assert.equal((await h.sends.queue()).length, 1);
+  await h.advance(minute);
+  assert.ok(!(await h.holderDetails(legacy.rawKey)).some(({ holder, state }) => holder === legacy.holder && state === 'held'),
+    'the legacy revision\'s holder is released after the publish, like any replaced revision');
+}));

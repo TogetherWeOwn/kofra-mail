@@ -37,6 +37,21 @@ before(async () => {
 after(() => runtime.dispose());
 
 const freshLedger = () => ledgers.getByName(`workspace-${++ledgerCount}`);
+// The ledger's time arguments, by method; a wrapped ledger refuses a call earlier than the one before it.
+const TIME_ARG = { confirm: 1, sweep: 0, holdProvisional: 2, release: 2 } as const;
+function forwardOnly(ledger: ProvisionalLedger): ProvisionalLedger {
+  let last = -Infinity;
+  return new Proxy(ledger, { get(target, property) {
+    const value = Reflect.get(target, property) as unknown;
+    if (typeof value !== 'function' || !(property in TIME_ARG)) return value;
+    return (...args: unknown[]) => {
+      const at = args[TIME_ARG[property as keyof typeof TIME_ARG]] as number;
+      assert.ok(at >= last, `${String(property)} at ${at} moves the clock back from ${last}`);
+      last = at;
+      return (value as (...values: unknown[]) => unknown).apply(target, args);
+    };
+  } });
+}
 const freshSweeper = () => sweepers.getByName(`workspace-${++sweeperCount}`);
 const generation = async (ledger: ProvisionalLedger, key: string): Promise<GenerationRow | null> =>
   JSON.parse(await ledger.generation(key));
@@ -118,23 +133,23 @@ test('confirm answers held before expiry, rehold after expiry and lost after ret
 });
 
 test('confirm answers lost after the expired generation was deleted, and released while a released generation lives', async () => {
-  const ledger = freshLedger();
+  const ledger = forwardOnly(freshLedger());
   const deleted = await ledger.holdProvisional({ kind: 'raw', digest: digest('d') }, 'draft:scope:gone', 100);
   await ledger.sweep(100 + TTL);
   assert.deepEqual(await ledger.sweep(100 + TTL + RETENTION), [deleted]);
   assert.deepEqual(await ledger.sweep(100 + TTL + RETENTION + DAY), [deleted], 'the second delete, a day after the first');
   assert.equal(await generation(ledger, deleted), null, 'the confirmed DELETE dropped the generation and its expired row');
-  assert.deepEqual(await ledger.confirm([{ key: deleted, holder: 'draft:scope:gone' }], 200 + TTL + RETENTION), ['lost']);
+  assert.deepEqual(await ledger.confirm([{ key: deleted, holder: 'draft:scope:gone' }], 200 + TTL + RETENTION + DAY), ['lost']);
   assert.deepEqual(await ledger.holders(), [], 'lost re-creates nothing');
   assert.equal(await generation(ledger, deleted), null);
 
-  const live = await ledger.holdProvisional({ kind: 'att', digest: digest('e') }, 'upload:scope:u1', 300 + TTL + RETENTION);
-  await ledger.release(live, 'upload:scope:u1', 310 + TTL + RETENTION);
-  assert.deepEqual(await ledger.confirm([{ key: live, holder: 'upload:scope:u1' }], 320 + TTL + RETENTION), ['released']);
+  const live = await ledger.holdProvisional({ kind: 'att', digest: digest('e') }, 'upload:scope:u1', 300 + TTL + RETENTION + DAY);
+  await ledger.release(live, 'upload:scope:u1', 310 + TTL + RETENTION + DAY);
+  assert.deepEqual(await ledger.confirm([{ key: live, holder: 'upload:scope:u1' }], 320 + TTL + RETENTION + DAY), ['released']);
   assert.deepEqual(await ledger.holders(), []);
 
   const draft = `drafts/${digest('f')}`;
-  assert.deepEqual(await ledger.confirm([{ key: draft, holder: 'draft:scope:legacy' }], 330 + TTL + RETENTION), ['released'],
+  assert.deepEqual(await ledger.confirm([{ key: draft, holder: 'draft:scope:legacy' }], 330 + TTL + RETENTION + DAY), ['released'],
     'a legacy drafts/ key is not a generation key');
 });
 
