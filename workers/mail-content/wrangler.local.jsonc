@@ -1,0 +1,22 @@
+{
+  // Local emulation only. Account RPC is supplied by the test fixture.
+  "name": "mail-content-local",
+  "main": "src/entry.ts",
+  "compatibility_date": "2026-07-30",
+  "workers_dev": false,
+  "preview_urls": false,
+  "services": [
+    { "binding": "MAIL_LOOKUP", "service": "mail-backend-local", "entrypoint": "ContentLookup" },
+    { "binding": "ACCOUNT_EPOCH", "service": "account-local", "entrypoint": "CredentialEpoch" }
+  ],
+  "vars": {
+    "MAIL_CONTENT_ENABLED": "off",
+    "CONTENT_ORIGIN": "https://content.example",
+    "MAIL_APP_ORIGIN": "https://mail.example",
+    "CONTENT_ZONE": "content.example",
+    "CONTENT_SUITE_DOMAIN": "mail.example",
+    "CONTENT_STORAGE_DOMAIN": "objects.example",
+    "CONTENT_ACCOUNT_DOMAIN": "account.example",
+    "CONTENT_WORKERS_DEV_DOMAIN": "account-example.workers.dev"
+  }
+}

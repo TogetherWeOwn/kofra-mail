@@ -8,6 +8,10 @@
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "aws4fetch": "1.0.20",
+    "postal-mime": "2.7.6"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261121.1",
     "@types/node": "24.13.2",

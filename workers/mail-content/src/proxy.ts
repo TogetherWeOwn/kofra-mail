@@ -226,6 +226,11 @@ function mediaType(header: string | null): string | undefined {
   return type !== undefined && imageTypes.has(type) ? type : undefined;
 }
 
+const inlineImageTypes = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+export function isInlineImage(type: string, bytes: Uint8Array): boolean {
+  return inlineImageTypes.has(type) && imageTypes.get(type)!(bytes);
+}
+
 class Deadline extends Error {}
 
 const copyList = (list: unknown) => (Array.isArray(list) ? Object.freeze([...list]) : list) as readonly string[];
