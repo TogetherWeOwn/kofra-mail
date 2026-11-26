@@ -569,3 +569,40 @@ test('undo with the limiter on: with the send bucket and other sends\' undo buck
   assert.deepEqual(await h.sends.queue(), []);
   assert.equal(await h.sends.emailCalls(), 0);
 }));
+
+test('after a restore, undo works at once while restored messages still wait for reindexing', () => withSend(async (h, mail, from) => {
+  const { send: released } = await send(mail, from, 'released');
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(released.id)).state, 'sending');
+  const { send: pending } = await send(mail, from, 'pending');
+  await h.restore();
+  await rejects(mail.listThreads({ view: 'sent' }), 'mailbox_restoring');
+  assert.equal((await mail.getSend(pending.id)).state, 'pending');
+  const draft = await mail.undoSend(pending.id, key('undo'));
+  assert.equal(draft.id, pending.draftId);
+  assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
+}));
+
+test('a send with an empty uploaded file is released and enqueued', () => withSend(async (h, mail, from) => {
+  const empty = await mail.createUpload({ name: 'empty.txt', type: 'text/plain', bytes: new Blob([]) }, key('empty'));
+  assert.equal(empty.size, 0);
+  const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: empty.id }] });
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  assert.equal((await h.sends.queue()).length, 1);
+  const [copy] = await sentCopies(mail);
+  assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: 'empty.txt', size: 0 }]);
+}));
+
+test('same-key replays wait only for their own publish, not for later unrelated changes', () => withSend(async (h, mail, from) => {
+  const { draft, send: pending } = await send(mail, from, 'one');
+  const other = await send(mail, from, 'two');
+  const undone = await mail.undoSend(other.send.id, key('undo'));
+  await h.publishFailure(true);
+  // An unrelated change that cannot be published while the outage lasts.
+  await mail.createLabel({ name: 'Unpublished' }, key('label'));
+  const replay = await mail.sendDraft(draft.id, { ...key('send-one'), ifMatch: draft.revision });
+  assert.equal(replay.id, pending.id);
+  assert.deepEqual(await mail.undoSend(other.send.id, key('undo')), undone);
+  await h.publishFailure(false);
+}));

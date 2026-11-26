@@ -203,7 +203,12 @@ export class Mailbox extends DurableObject<Env> {
     const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit }> => {
       if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
       const life = index.lifecycle<Lifecycle>();
-      if (life?.state !== 'ready' || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      // Undo and send reads use only send rows, never the message index, so they
+      // serve as soon as a restore is ready: the restored send's fresh undo
+      // window must not run out while restored messages are still reindexed.
+      if (life?.state !== 'ready' || (operation === 'sendDraft' && index.unindexed('', 1).length)) {
+        return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      }
       const write = operation === 'sendDraft' || operation === 'undoSend';
       if (write) await this.armFor(SETTINGS_FLUSH_MS);
       const timers = this.timerTable();

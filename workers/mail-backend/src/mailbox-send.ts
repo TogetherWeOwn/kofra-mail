@@ -156,7 +156,9 @@ export class SendApi {
     if (replay) {
       const id = replay.send;
       if (!validSendId(id)) throw new Error('Invalid stored send result');
-      return { seq: revision(this.sql), answer: async () => ({ body: this.getSendBody(id), status: 202, replayed: true }) };
+      // Wait for the publish of the original commit only, not of later unrelated changes.
+      const original = sendRow(this.sql, id)?.createdSeq ?? revision(this.sql);
+      return { seq: original, answer: async () => ({ body: this.getSendBody(id), status: 202, replayed: true }) };
     }
     if (!options.ifMatch) return fail('precondition_required');
     const ref = need(draftRef(this.sql, params.draftId));
@@ -206,7 +208,10 @@ export class SendApi {
     if (replay) {
       const ref = replay.draft;
       if (!ref || !isId(ref.id)) throw new Error('Invalid stored undo result');
-      return { seq: revision(this.sql), answer: async () => ({ body: await readDraft(this.index, ref), status: 200, replayed: true }) };
+      // The undo's own event set the send's terminal seq.
+      const undone = validSendId(params.sendId) ? sendRow(this.sql, params.sendId) : undefined;
+      const original = undone?.state === 'cancelled' && undone.terminalSeq !== null ? undone.terminalSeq : revision(this.sql);
+      return { seq: original, answer: async () => ({ body: await readDraft(this.index, ref), status: 200, replayed: true }) };
     }
     const row = need(validSendId(params.sendId) ? sendRow(this.sql, params.sendId) : undefined);
     if (row.state !== 'pending') return fail('send_not_pending');
@@ -249,6 +254,7 @@ export class SendApi {
 }
 
 const STALE = Symbol('stale');
+const EMPTY_DIGEST = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
 type Stale = typeof STALE;
 type Start = { token: string; incarnation: string; scope: SendScope; row: SendRow };
 
@@ -446,6 +452,11 @@ export class SendDriver {
       if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
       const { wire, key } = list[index];
       const parsed = parseObjectKey(key);
+      // Object reads refuse a declared empty body, but an empty upload is a valid file.
+      if (parsed?.kind === 'att' && wire.size === 0) {
+        if (parsed.digest !== EMPTY_DIGEST) throw new Error('Send attachment digest mismatch');
+        return new Uint8Array(0);
+      }
       const raw = await ready.index.readObject(key);
       if (parsed?.kind === 'att') {
         if (await sha256(raw) !== parsed.digest) throw new Error('Send attachment digest mismatch');
