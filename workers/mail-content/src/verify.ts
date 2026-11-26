@@ -13,10 +13,19 @@ import {
 /** The credential-epoch answer is cached for at most this long, as the app does. */
 export const EPOCH_CACHE_SECONDS = 60;
 
+export interface MessageAttachment {
+  part: number;
+  objectKey: string | null;
+}
+
 export interface MessageRecord {
   rawKey: string;
-  attachmentKeys: readonly string[];
+  attachments: readonly MessageAttachment[];
   verdict: string;
+}
+
+export function attachmentFor(_message: MessageRecord, _part: number): MessageAttachment | undefined {
+  throw new Error('not implemented');
 }
 
 export interface ContentPorts {

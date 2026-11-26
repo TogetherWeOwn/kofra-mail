@@ -2,9 +2,9 @@
 // tokens.test.ts runs each one in Node and again inside workerd (token-fixture-worker.ts).
 // Keys are generated per scenario with crypto.getRandomValues; nothing secret-looking is committed.
 import { ContentKeysError, contentUrlKeys, loadContentUrlKeys, type ContentUrlKeys } from '../src/keys.ts';
-import { CONTENT_URL_SECONDS, checkToken, mint, type Purpose } from '../src/tokens.ts';
+import { CONTENT_URL_SECONDS, checkToken, mint, mintForWeb, type Purpose } from '../src/tokens.ts';
 import {
-  createVerifier, EpochCache, mintFromBody, REFUSED,
+  attachmentFor, createVerifier, EpochCache, mintFromBody, REFUSED,
   type ContentPorts, type MessageRecord, type Verified, type VerifiedBody,
 } from '../src/verify.ts';
 
@@ -85,7 +85,9 @@ class World implements ContentPorts {
   add(ids: Ids, ep = 1) {
     this.epochs.set(ids.sub, ep);
     this.owners.set(`${ids.ws}/${ids.mb}`, ids.sub);
-    this.messages.set(`${ids.ws}/${ids.mb}/${ids.msg}`, { rawKey: `raw/${hex(32)}/1`, attachmentKeys: [`att/${hex(32)}/1`], verdict: 'pass' });
+    this.messages.set(`${ids.ws}/${ids.mb}/${ids.msg}`, {
+      rawKey: `raw/${hex(32)}/1`, attachments: [{ part: 1, objectKey: null }, { part: 2, objectKey: `att/${hex(32)}/1` }], verdict: 'pass',
+    });
   }
   record(ids: Ids) { return this.messages.get(`${ids.ws}/${ids.mb}/${ids.msg}`); }
   async credentialEpoch(sub: string) {
@@ -224,7 +226,7 @@ s('tokens: exp - iat = 301 fails at mint and at verify; 300 passes', async (ctx)
   await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: NOW, exp: NOW }, NOW - 10), 'mint exp = iat');
 });
 
-s('tokens: iat 31 s in the future fails, 30 and 29 s pass, and exp is exclusive', async (ctx) => {
+s('tokens: iat 31 s ahead fails at verify (30 and 29 s pass), exp is exclusive, and mint refuses a future iat', async (ctx) => {
   const { k, ids, verifier, issue } = await setup(ctx);
   const token = await issue('body', { ri: false });
   await refused(verifier.verify('body', token, NOW - 31), 'iat 31 s ahead');
@@ -234,7 +236,16 @@ s('tokens: iat 31 s in the future fails, 30 and 29 s pass, and exp is exclusive'
   await refused(verifier.verify('body', token, NOW + 300), 'now = exp');
   await refused(verifier.verify('body', token, NOW + 100_000), 'long expired');
   await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: NOW + 31 }, NOW), 'mint iat 31 s ahead');
-  await issue('body', { ri: false, iat: NOW + 29, exp: NOW + 29 + 300 });
+  await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: NOW + 29, exp: NOW + 29 + 300 }, NOW), 'mint iat 29 s ahead');
+  await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: NOW + 1 }, NOW), 'mint iat 1 s ahead');
+  const floored = decodeClaims(await issue('body', { ri: false }, NOW + 0.7));
+  check(floored.iat === NOW && floored.exp === NOW + 300, 'iat is floor(now)');
+  await issue('body', { ri: false, iat: NOW - 10 });
+  for (const value of [null, '1', Number.NaN]) {
+    await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: value }, NOW), `mint iat ${String(value)}`);
+    await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, exp: value }, NOW), `mint exp ${String(value)}`);
+  }
+  await issue('body', { ri: false, iat: undefined, exp: undefined });
   await throws(() => mintAny(k.keys, 'body', { ...ids, ep: 1, ri: false, iat: NOW - 300, exp: NOW }, NOW), 'mint an expired token');
 });
 
@@ -438,12 +449,72 @@ s('authorisation: a reassigned mailbox fails at once', async (ctx) => {
   const { world, ids, verifier, issue } = await setup(ctx);
   const token = await issue('body', { ri: false });
   const att = await issue('att', { part: 1 });
+  const cid = await issue('cid', { part: 1 });
   await accepted(verifier.verify('body', token, NOW), 'owner');
+  await accepted(verifier.verify('cid', cid, NOW), 'owner, cid');
   world.owners.set(`${ids.ws}/${ids.mb}`, `usr-${hex(6)}`);
   await refused(verifier.verify('body', token, NOW + 1), 'reassigned, body');
   await refused(verifier.verify('att', att, NOW + 1), 'reassigned, att');
+  await refused(verifier.verify('cid', cid, NOW + 1), 'reassigned, cid');
+  check(world.epochs.get(ids.sub) === 1 && world.calls.filter(([op]) => op === 'credentialEpoch').length === 1, 'the epoch is unchanged and cached');
   world.owners.delete(`${ids.ws}/${ids.mb}`);
   await refused(verifier.verify('body', token, NOW + 1), 'mailbox gone');
+});
+
+s('authorisation: an expired, correctly signed token reaches the MAC check but no port', async (ctx) => {
+  const { world, verifier, issue } = await setup(ctx);
+  const tokens = [await issue('body', { ri: false }), await issue('cid', { part: 1 }), await issue('att', { part: 2 })];
+  const subtle = crypto.subtle;
+  const realVerify = subtle.verify;
+  let macChecks = 0;
+  subtle.verify = async function (...args: Parameters<SubtleCrypto['verify']>) {
+    macChecks++;
+    return realVerify.apply(subtle, args);
+  } as SubtleCrypto['verify'];
+  try {
+    for (const [i, purpose] of (['body', 'cid', 'att'] as const).entries()) {
+      await refused(verifier.verify(purpose, tokens[i], NOW + 300), `${purpose} expired`);
+      await refused(verifier.verify(purpose, tokens[i], NOW - 31), `${purpose} not yet valid`);
+    }
+  } finally {
+    subtle.verify = realVerify;
+  }
+  check(macChecks === 6, 'each refusal ran the MAC check first');
+  check(world.calls.length === 0, 'time is checked before any port');
+});
+
+s('authorisation: the message record keeps each signed part number with its object key', async (ctx) => {
+  const { world, ids, verifier, issue } = await setup(ctx);
+  const stored = `att/${hex(32)}/3`;
+  const record: MessageRecord = { rawKey: `raw/${hex(32)}/1`, attachments: [{ part: 2, objectKey: stored }, { part: 1, objectKey: null }], verdict: 'pass' };
+  world.messages.set(`${ids.ws}/${ids.mb}/${ids.msg}`, record);
+  ctx.sensitive(stored);
+  const two = await accepted(verifier.verify('att', await issue('att', { part: 2 }), NOW), 'stored part 2');
+  check(two.purpose === 'att' && two.claims.part === 2, 'att claims');
+  check(two.message === record && attachmentFor(two.message, two.claims.part)?.objectKey === stored, 'part 2 resolves to its stored object');
+  const one = await accepted(verifier.verify('att', await issue('att', { part: 1 }), NOW), 'raw-only part 1');
+  check(one.purpose === 'att' && attachmentFor(one.message, one.claims.part)?.objectKey === null, 'part 1 is served from the raw message');
+  check(attachmentFor(record, 3) === undefined && attachmentFor(record, 0) === undefined, 'no part 3, and no index lookup');
+  check(attachmentFor({ ...record, attachments: [{ part: 1, objectKey: null }, { part: 1, objectKey: stored }] }, 1) === undefined, 'a duplicated part resolves to nothing');
+});
+
+s('tokens: mintForWeb mints only body and att, with its own five-minute lifetime', async (ctx) => {
+  const { k, ids, verifier } = await setup(ctx);
+  const web = (purpose: string, claims: Record<string, unknown>, now = NOW) => mintForWeb(k.keys, purpose as 'body', claims as never, now);
+  const body = await web('body', { ...ids, ep: 1, ri: true }, NOW + 0.4);
+  const att = await web('att', { ...ids, ep: 1, part: 2 });
+  ctx.sensitive(body, att);
+  check(canon(decodeClaims(body)) === canon(full(ids, { ri: true })), 'body claims with iat = floor(now) and exp = iat + 300');
+  check(canon(decodeClaims(att)) === canon(full(ids, { part: 2 })), 'att claims');
+  await accepted(verifier.verify('body', body, NOW), 'body verifies');
+  await accepted(verifier.verify('att', att, NOW), 'att verifies');
+  await throws(() => web('cid', { ...ids, ep: 1, part: 1 }), 'cid through mintForWeb');
+  await throws(() => web('img', { ...ids, ep: 1, u: 'https://sender.example/' }), 'img through mintForWeb');
+  await throws(() => web('lnk', { ...ids, ep: 1, part: 1 }), 'lnk through mintForWeb');
+  for (const extra of [{ iat: NOW }, { exp: NOW + 60 }, { iat: undefined }, { exp: null }, { v: 1 }]) {
+    await throws(() => web('body', { ...ids, ep: 1, ri: false, ...extra }), `caller-supplied ${Object.keys(extra)[0]}`);
+  }
+  await throws(() => web('att', { ...ids, ep: 1, part: 2, u: 'https://sender.example/' }), 'a claim of another purpose');
 });
 
 s('authorisation: a deleted message fails at once', async (ctx) => {

@@ -122,6 +122,13 @@ export async function mint<P extends Purpose>(
   return `${keys.current}.${payload}.${mac}`;
 }
 
+export type WebPurpose = 'body' | 'att';
+export async function mintForWeb<P extends WebPurpose>(
+  _keys: ContentUrlKeys, _purpose: P, _claims: Omit<ClaimsByPurpose[P], 'v' | 'iat' | 'exp'>, _now: number,
+): Promise<string> {
+  throw new Error('not implemented');
+}
+
 /**
  * Verification steps 1-3 for a token presented on the `purpose` path. Returns the claims, or
  * undefined for every failure alike. Steps run in order and the MAC is checked only by
