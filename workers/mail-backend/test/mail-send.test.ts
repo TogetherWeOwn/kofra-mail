@@ -987,13 +987,15 @@ test('a send whose frozen part size differs from the size it lays out fails with
   const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Forward this',
     text: 'See attached', attachments: [{ name: 'notes.txt', type: 'text/plain', bytes: new TextEncoder().encode('forwarded file contents') }] });
   const { messages: [delivered] } = await mail.getThread(source.threadId);
-  const draft = await h.sends.seedForwardDraft({ from, messageId: source.messageId, part: delivered.attachments[0].part, delta: 1 });
+  const draft = await h.sends.seedForwardDraft({ from, messageId: source.messageId, part: delivered.attachments[0].part, delta: 1,
+    to: ['friend@example.net', 'other@example.com'] });
   const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
   const builds = (await h.sends.builds()).length;
   await h.advance(UNDO);
   const failed = await mail.getSend(pending.id);
   assert.equal(failed.state, 'failed');
-  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+  // One external and one internal recipient, both failed with the same reason.
+  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), Array(2).fill({ state: 'failed', reason: 'delivery_error' }));
   assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
   assert.deepEqual(await h.sends.queue(), []);
   await h.advance(minute);
@@ -1017,3 +1019,39 @@ test('converting a legacy draft does not shorten the undo window', () => withSen
   await moving;
   assert.equal(pending.undoRemainingMs, UNDO, 'the window starts once the send is committed');
 }));
+
+// 514 files where the last two are empty: the synthetic row for parts 512 to 514 then has the size of the real 512th file.
+async function emptyTail(h: Fixture, from: string) {
+  const files = Array.from({ length: 514 }, (_, i) => ({ name: `f${i}.txt`, type: 'text/plain', bytes: new TextEncoder().encode(i < 512 ? 'tiny' : '') }));
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Many files',
+    text: 'Attached', attachments: files });
+  await h.sends.dropSyntheticMark(source.messageId);
+  return source;
+}
+
+test('the synthetic row cannot be forwarded even when its size matches the real file it covers', { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
+  const source = await emptyTail(h, from);
+  await rejects(mail.createDraft(draftInput(from, { attachments: [{ kind: 'message', messageId: source.messageId, part: 512 }] }), key('draft')),
+    'not_found');
+}));
+
+test('a send already fingerprinted on the synthetic row fails with delivery_error for internal and external recipients', { timeout: 60_000 },
+  () => withSend(async (h, mail, from) => {
+    const source = await emptyTail(h, from);
+    const draft = await h.sends.seedForwardDraft({ from, messageId: source.messageId, part: 512, delta: 0,
+      to: ['friend@example.net', 'other@example.com'] });
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    const builds = (await h.sends.builds()).length;
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ email, state, reason }) => ({ email, state, reason })), [
+      { email: 'friend@example.net', state: 'failed', reason: 'delivery_error' },
+      { email: 'other@example.com', state: 'failed', reason: 'delivery_error' },
+    ]);
+    assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.deepEqual(await sentCopies(mail), []);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+  }));

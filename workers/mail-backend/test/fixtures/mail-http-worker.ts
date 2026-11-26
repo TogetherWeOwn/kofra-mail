@@ -212,7 +212,7 @@ export class HttpMailbox extends Mailbox {
   }
   // A draft revision forwarding a small part whose stored fingerprint is what the parser decodes,
   // while its laid-out size differs by `delta`: the state a draft saved before the size check could hold.
-  async seedForwardDraft(ws: string, mb: string, input: { from: string; messageId: string; part: number; delta: number }) {
+  async seedForwardDraft(ws: string, mb: string, input: { from: string; messageId: string; part: number; delta: number; to?: string[] }) {
     const sql = this.ctx.storage.sql;
     const message = sql.exec<{ raw: string }>('SELECT raw_key AS raw FROM messages WHERE id = ?', input.messageId).one();
     const row = sql.exec<{ name: string; type: string; size: number }>(
@@ -221,7 +221,8 @@ export class HttpMailbox extends Mailbox {
       const parsed = await readMailMime(await index.readObject(message.raw), message.raw);
       const bytes = decodedAttachment(parsed.attachments[input.part - 1].content);
       const draft = { version: 1 as const,
-        fields: { from: input.from, to: [{ email: 'friend@example.net' }], cc: [], bcc: [], subject: 'Forwarded', body: 'See attached', forwardOf: input.messageId },
+        fields: { from: input.from, to: (input.to ?? ['friend@example.net']).map(email => ({ email })), cc: [], bcc: [], subject: 'Forwarded', body: 'See attached',
+          forwardOf: input.messageId },
         attachments: [{ wire: { kind: 'message' as const, messageId: input.messageId, part: input.part, name: row.name, type: row.type, size: row.size + input.delta },
           key: message.raw, part: { digest: await sha256(bytes), size: bytes.byteLength } }] };
       const ref = await index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.mailApiNow(), [message.raw]);

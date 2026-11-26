@@ -5,7 +5,7 @@ import { sha256 } from './bytes.ts';
 import { attachmentRow, displayOf, messageRow, partNumber } from './mailbox-api-messages.ts';
 import { fail, invalid, isId, iso, need, object, requireId, text, utf8 } from './mailbox-api-input.ts';
 import type { ApiDraftRef, MailboxIndex } from './mailbox-index.ts';
-import { decodedAttachment, parseMail, readMailMime } from './parse-mail.ts';
+import { decodedAttachment, MAX_INDEXED_ATTACHMENTS, parseMail, readMailMime } from './parse-mail.ts';
 import { unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
 import { parseObjectKey } from './object-key.ts';
 
@@ -92,7 +92,11 @@ export async function eachForwardedPart<T extends { key: string; part: number }>
   for (const [key, items] of sources) {
     const copies = await (async () => {
       const parsed = await readMailMime(await read(key), key);
+      const { length } = parsed.attachments;
       return items.map(({ part }) => {
+        // As the content endpoint does: past the indexed limit, the last indexed part
+        // is the synthetic "(N more attachments)" row, never a real file.
+        if (length > MAX_INDEXED_ATTACHMENTS && part >= MAX_INDEXED_ATTACHMENTS) return undefined;
         const attachment = parsed.attachments[part - 1];
         return attachment && decodedAttachment(attachment.content).slice();
       });

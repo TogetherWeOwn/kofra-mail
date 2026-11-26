@@ -287,7 +287,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       dropSyntheticMark: (messageId: string) => controlAction('drop-synthetic-mark', messageId),
       // The fixture's clock as API calls read it; an advance moves it before its alarms run.
       now: () => readControl<number>('now'),
-      seedForwardDraft: (input: { from: string; messageId: string; part: number; delta: number }) =>
+      seedForwardDraft: (input: { from: string; messageId: string; part: number; delta: number; to?: string[] }) =>
         readControl<{ id: string; revision: string }>('seed-forward-draft', JSON.stringify(input)),
       seedLegacyDraft: (draft: unknown) => readControl<{ id: string; revision: string; rawKey: string; holder: string }>('seed-legacy-api-draft',
         JSON.stringify(draft)),

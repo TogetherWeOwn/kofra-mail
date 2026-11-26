@@ -8,7 +8,7 @@ import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Address as WireAddress } from '../../../contracts/mail-api/src/wire.ts';
 
 const EXTERNAL_ATTACHMENT_BYTES = 256 * 1024;
-const MAX_INDEXED_ATTACHMENTS = 512;
+export const MAX_INDEXED_ATTACHMENTS = 512;
 
 export function decodedAttachment(content: unknown): Uint8Array<ArrayBuffer> {
   if (content instanceof ArrayBuffer) return new Uint8Array(content);
