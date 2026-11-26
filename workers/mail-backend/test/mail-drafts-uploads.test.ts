@@ -68,6 +68,33 @@ test('case 11: keys replay labels, deleted drafts and uploads, but not changed b
   assert.equal(h.writes.filter(write => write.key.startsWith('att/')).length, 1);
 }));
 
+test('a fresh invalid filename is rejected before the upload body finishes', () => withMail(async (h) => {
+  const { csrfToken } = await h.as('member').getSession();
+  const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array([1])); } });
+  const options: RequestInit & { duplex: 'half' } = {
+    method: 'POST', duplex: 'half', body, signal: AbortSignal.timeout(2_000),
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken,
+      'idempotency-key': 'bad-name', 'content-type': 'application/octet-stream' },
+  };
+  const response = await fetch(`${h.origin}/api/v1/uploads?name=invalid%2Ffile`, options);
+  assert.equal(response.status, 400);
+  assert.equal((await response.json<{ code: string }>()).code, 'invalid_request');
+  assert.deepEqual(h.writes, []);
+}));
+
+test('an upload whose key lease expires during the PUT cannot commit', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const gate = h.pauseNextPut();
+  const first = mail.createUpload(upload(), key('lease'));
+  try {
+    await Promise.race([gate.started, first.then(() => assert.fail('PUT did not reach the gate'))]);
+    await h.expireUploadLease('lease');
+  } finally { gate.release(); }
+  await assert.rejects(first, e => isMailApiError(e, 'idempotency_in_progress'));
+  assert.equal(await h.hasIdempotency('lease'), false);
+  assert.equal(await h.eventCount('api_upload'), 0);
+}));
+
 test('case 12: only one tab replaces the stored draft revision', () => withMail(async (h) => {
   const mail = h.as('member');
   const { mailbox } = await mail.getSession();
@@ -109,7 +136,7 @@ test('case 15: an expired upload is unavailable unless a draft still refers to i
   const withUpload = (uploadId: string) => draftInput(mailbox.primaryAddress, { attachments: [{ kind: 'upload', uploadId }] });
   const [uploaded] = h.writes;
   assert.match(uploaded.key, new RegExp(`^att/${loose.sha256}/[A-Z0-9]{26}$`));
-  assert.ok(uploaded.holders.some(holder => holder.startsWith('upload:')), 'hold precedes PUT');
+  assert.ok(uploaded.holders.some(holder => uploadHolderFor(holder, loose.id)), 'this upload holder precedes its PUT');
   assert.equal(new TextDecoder().decode(h.objects.get(`/mail-w1/${uploaded.key}`)), 'example attachment');
   assert.ok((await h.timers()).some(row => row.kind === 'upload_expiry' && row.ref === loose.id && row.due_at === Date.parse(loose.expiresAt)));
   const draft = await mail.createDraft(withUpload(retained.id), key('draft'));
@@ -157,7 +184,8 @@ test('idem_expiry is scheduled for 24 hours and frees the key on the deadline', 
   const label = await mail.createLabel({ name: 'First' }, key('once'));
   const [timer] = (await h.timers()).filter(row => row.kind === 'idem_expiry');
   assert.equal(timer?.ref, 'once');
-  await h.advance(ttl - 1);
+  assert.equal(timer.due_at, h.startedAt + day);
+  await h.advance(day - 1);
   assert.deepEqual(await mail.createLabel({ name: 'First' }, key('once')), label);
   await h.advance(1);
   assert.ok(!(await h.timers()).some(row => row.kind === 'idem_expiry' && row.ref === 'once'));
@@ -292,7 +320,9 @@ test('snapshot restores upload references before drafts and retains pending hold
   assert.deepEqual(await h.pendingReleases(), pending);
   assert.deepEqual((await h.timers()).filter(row => row.kind === 'upload_expiry').map(row => row.ref), [loose.id]);
   await h.releaseFailure(false);
-  await h.advance(60_000);
+  // A platform alarm can retry just after restore, before we advance the fixture clock.
+  const retryAt = await h.releaseRetryAt();
+  await h.advance(Math.max(60_000, (retryAt ?? 0) - h.startedAt));
   assert.deepEqual(await h.pendingReleases(), []);
   assert.deepEqual(await mail.getDraft(edited.id), edited);
 }));
@@ -335,6 +365,18 @@ test('overlapping upload_expiry runs commit only one deletion and holder release
   assert.equal((await h.acknowledgedReleases()).filter(row => uploadHolderFor(row.holder, uploaded.id)).length, 1);
 }));
 
+test('a second expiry pause waits for its own handler', () => withMail(async (h) => {
+  const mail = h.as('member');
+  for (const [i, name] of ['First', 'Second'].entries()) {
+    await mail.createLabel({ name }, key(`pause-${i}`));
+    await h.pauseExpiry('idem_expiry');
+    await h.advance(day);
+    assert.equal(await h.eventCount('api_result_expire'), i, 'the current expiry remains paused');
+    await h.finishExpiry();
+    assert.equal(await h.eventCount('api_result_expire'), i + 1);
+  }
+}));
+
 test('overlapping idem_expiry runs cannot delete the reused key or its timer', () => withMail(async (h) => {
   const mail = h.as('member');
   await mail.createLabel({ name: 'First' }, key('same'));
@@ -348,6 +390,38 @@ test('overlapping idem_expiry runs cannot delete the reused key or its timer', (
   assert.equal(await h.eventCount('api_result_expire'), 1);
   assert.deepEqual(await mail.createLabel({ name: 'Second' }, key('same')), replacement);
   assert.ok((await h.timers()).some(row => row.kind === 'idem_expiry' && row.ref === 'same'));
+}));
+
+test('a stalled release does not lose sibling acknowledgements or starve later rows', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  for (let i = 0; i < 8; i++) {
+    const draft = await mail.createDraft(draftInput(mailbox.primaryAddress, { subject: `Draft ${i}` }), key(`draft-${i}`));
+    await mail.deleteDraft(draft.id);
+  }
+  const [, ...otherHolds] = h.writes.map(write => write.holders[0]);
+  const stuck = h.writes[0].holders[0];
+  await h.stallRelease(stuck);
+  await h.advance(60_000);
+  assert.equal((await h.pendingReleases()).length, 3, 'the first five independent successes were acknowledged');
+  assert.equal((await h.acknowledgedReleases()).length, 5);
+  await h.advance(60_500);
+  assert.deepEqual((await h.pendingReleases()).map(row => row.holder), [stuck]);
+  assert.deepEqual((await h.acknowledgedReleases()).map(row => row.holder).sort(), otherHolds.sort());
+}));
+
+test('stalled confirmation leaves time for a published release', () => withMail(async (h) => {
+  const mail = h.as('member');
+  const { mailbox } = await mail.getSession();
+  assert.ok(mailbox);
+  const draft = await mail.createDraft(draftInput(mailbox.primaryAddress), key('draft'));
+  await mail.deleteDraft(draft.id);
+  await h.stallConfirmation();
+  await h.advance(60_000);
+  assert.equal((await h.confirmations()).length, 1);
+  assert.deepEqual(await h.pendingReleases(), []);
+  assert.deepEqual(await h.holders(h.writes[0].key), []);
 }));
 
 test('the draft-only path defers old holders even when uploads are disabled', () => withMail(async (h) => {
@@ -368,7 +442,7 @@ test('the draft-only path defers old holders even when uploads are disabled', ()
 
 test('a crash after the draft PUT leaves a provisional holder that expires', () => withMail(async (h) => {
   const mail = h.as('member');
-  await h.stageAndCrash();
+  assert.equal(await h.stageAndCrash(), true);
   assert.equal(h.writes.length, 1);
   const { key: objectKey } = h.writes[0];
   const [holder] = await h.holderDetails(objectKey);
@@ -416,7 +490,7 @@ test('a direct release before confirmation never resurrects the holder', () => w
 
 test('holders include each mailbox scope and the full sweeper bound is accepted', () => withMail(async (h) => {
   const draftIds: Draft[] = [];
-  for (const principal of ['member', 'other'] as const) {
+  for (const principal of ['member', 'other', 'foreignAdmin'] as const) {
     const mail = h.as(principal);
     const { mailbox } = await mail.getSession();
     assert.ok(mailbox);
@@ -429,7 +503,7 @@ test('holders include each mailbox scope and the full sweeper bound is accepted'
     assert.equal(revision, draftIds[i].revision);
     return scope;
   });
-  assert.notEqual(scopes[0], scopes[1]);
+  assert.equal(new Set(scopes).size, 3);
   const full = await h.persistMaximumHolder(h.writes[0].key);
   assert.equal(full.length, 256);
   assert.ok((await h.pendingReleases()).some(row => row.holder === full));

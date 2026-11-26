@@ -50,8 +50,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   const objects = new Map<string, ArrayBuffer>();
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
+  let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
   const control = crypto.randomUUID();
-  let now = Math.floor(startedAt / 1000) * 1000;
+  const startTime = Math.floor(startedAt / 1000) * 1000;
+  let now = startTime;
   const mf = new Miniflare({
     host: '127.0.0.1', port: 0,
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
@@ -69,6 +71,9 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       switch (req.method) {
         case 'PUT': {
           await inspectPut?.(pathname);
+          const held = nextPut;
+          nextPut = undefined;
+          if (held) { held.start.resolve(); await held.resume.promise; }
           objects.set(pathname, await req.arrayBuffer());
           return new LocalResponse(null, { status: 201 });
         }
@@ -104,8 +109,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     const call = (name: string, body: string, extra: Record<string, string> = {}) => fetch(`${origin}/__fixture/${name}`, {
       method: 'POST', headers: { 'x-fixture-control': control, ...extra }, body,
     });
-    const holders = async (key: string): Promise<string[]> => {
-      const res = await call('holders', JSON.stringify({ workspace: accounts.member.ws, key }));
+    const holders = async (key: string, workspace = accounts.member.ws): Promise<string[]> => {
+      const res = await call('holders', JSON.stringify({ workspace, key }));
       assert.equal(res.status, 200);
       return res.json() as Promise<string[]>;
     };
@@ -116,6 +121,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     };
     const timers = () => readControl<{ kind: string; ref: string; due_at: number }[]>('timers');
     const pendingReleases = () => readControl<{ seq: number; object_key: string; holder: string }[]>('pending-releases');
+    const releaseRetryAt = () => readControl<number | null>('release-retry-at');
     const controlAction = async (path: string, body = '') => {
       const res = await call(path, body);
       assert.equal(res.status, 204, res.status === 204 ? undefined : await res.text());
@@ -124,12 +130,19 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     const confirmations = () => readControl<{ seq: number; object_key: string; holder: string }[]>('confirmations');
     const holderDetails = (key: string) => readControl<{ holder: string; state: string; expires_at: number | null }[]>('holder-details', key);
     const confirmFailure = (failing: boolean) => controlAction('confirm-failure', String(failing));
+    const stallConfirmation = () => controlAction('stall-confirmation');
+    const stallRelease = (holder: string) => controlAction('stall-release', holder);
+    const expireUploadLease = (key: string) => controlAction('expire-upload-lease', key);
+    const pauseNextPut = () => {
+      const gate = nextPut = { start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+      return { started: gate.start.promise, release: gate.resume.resolve };
+    };
     const confirmBatches = () => readControl<number[]>('confirm-batches');
     const releaseHolder = (key: string, holder: string) => controlAction('release-holder', JSON.stringify({ key, holder }));
     const sweepAt = (time: number) => controlAction('sweep-at', String(time));
     const alerts = () => readControl<string[]>('alerts');
     const alertFailure = (failing: boolean) => controlAction('alert-failure', String(failing));
-    const stageAndCrash = () => controlAction('stage-crash');
+    const stageAndCrash = () => readControl<boolean>('stage-crash');
     const persistMaximumHolder = (key: string) => readControl<string>('maximum-holder', key);
     const restore = () => controlAction('restore');
     const forceSnapshot = () => readControl<boolean>('snapshot');
@@ -143,8 +156,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     const eventCount = (kind: string) => readControl<number>('events', kind);
     const finishExpiry = () => controlAction('finish-expiry');
     if (draftsUploads) inspectPut = async (pathname) => {
-      const key = pathname.replace(/^\/[^/]+\//, '');
-      writes.push({ key, holders: await holders(key) });
+      const path = /^\/mail-([^/]+)\/(.+)$/.exec(pathname);
+      assert.ok(path, 'expected a workspace-scoped PUT');
+      const [, workspace, key] = path;
+      writes.push({ key, holders: await holders(key, workspace) });
     };
     const ids = new Map<string, string>();
     const clients = new Map<string, ReturnType<typeof createHttpMailService>>();
@@ -197,9 +212,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, restore, forceSnapshot, uploadSwitch,
+    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, releaseRetryAt, restore, forceSnapshot, uploadSwitch,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
-      hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
+      startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
+      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
       m3: false, credentialEpoch: async () => 1,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {

@@ -8,7 +8,8 @@ import { receive } from '../../src/inbound.ts';
 import { kofra } from '../../src/kofra.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
-import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
+import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TIMER_HANDLER_BUDGET_MS, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
+import { journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
@@ -48,6 +49,7 @@ export class HttpMailbox extends Mailbox {
   private startedExpiry = 0;
   private failPublish = false;
   private failAlert = false;
+  private realtimeHolderClock = false;
   private readonly emittedAlerts: string[] = [];
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
@@ -73,12 +75,23 @@ export class HttpMailbox extends Mailbox {
     mailbox = this;
   }
   publishFailure(failing: boolean) { this.failPublish = failing; }
-  pauseExpiry(kind: string) { this.pauseKind = kind; this.timerHandlerBudgetMs = 25; this.startedExpiry = 0; }
+  pauseExpiry(kind: string) {
+    if (this.pauseKind) throw new Error('An expiry pause is already armed');
+    this.pauseKind = kind;
+    this.timerHandlerBudgetMs = 25;
+    this.startedExpiry = 0;
+  }
   expiryStarts() { return this.startedExpiry; }
   async finishExpiry() {
     if (!this.resumeExpiry) throw new Error('No expiry handler paused');
     this.resumeExpiry.resolve();
-    await this.expiryCompletion?.promise;
+    try { await this.expiryCompletion?.promise; }
+    finally {
+      this.resumeExpiry = undefined;
+      this.expiryCompletion = undefined;
+      this.pauseKind = undefined;
+      this.timerHandlerBudgetMs = TIMER_HANDLER_BUDGET_MS;
+    }
   }
   protected override registerTimerKind(kind: string, handler: TimerKind) {
     super.registerTimerKind(kind, { ...handler, run: async timer => {
@@ -108,7 +121,7 @@ export class HttpMailbox extends Mailbox {
   async testAlarm(runs = 1) {
     const actual = Date.now;
     const start = actual(), simulated = this.mailApiNow();
-    Date.now = this.pauseKind ? () => simulated + actual() - start : () => simulated;
+    Date.now = this.pauseKind || this.realtimeHolderClock ? () => simulated + actual() - start : () => simulated;
     try { await Promise.all(Array.from({ length: runs }, () => this.alarm())); }
     finally { Date.now = actual; }
   }
@@ -117,6 +130,13 @@ export class HttpMailbox extends Mailbox {
   }
   pendingReleases() {
     return this.ctx.storage.sql.exec('SELECT seq, object_key, holder FROM mailbox_pending_releases ORDER BY seq, object_key, holder').toArray();
+  }
+  releaseRetryAt() {
+    return this.ctx.storage.sql.exec<{ at: number | null }>('SELECT max(retry_at) AS at FROM mailbox_pending_releases').one().at;
+  }
+  shortenHolderBudget() { this.holderIoBudgetMs = 200; this.realtimeHolderClock = true; }
+  expireUploadLease(key: string) {
+    this.ctx.storage.sql.exec('UPDATE mailbox_api_in_progress SET expires_at = 0 WHERE key = ?', key);
   }
   hasIdempotency(key: string) {
     return this.ctx.storage.sql.exec('SELECT 1 FROM mailbox_api_idempotency WHERE key = ?', key).toArray().length === 1;
@@ -134,10 +154,13 @@ export class HttpMailbox extends Mailbox {
       hold: (key: string, holder: string) => refs.hold(key, holder), release: (key: string, holder: string) => refs.release(key, holder) };
     return new MailboxIndex(this.ctx.storage, objects, this.ctx.id.toString(), true);
   }
-  async stageAndCrash(ws: string) {
+  async stageAndCrash(ws: string, marker: string) {
     await this.fixtureIndex(ws).prepareApiDraft(crypto.randomUUID(), new Uint8Array(encoder.encode('uncommitted fixture')), this.mailApiNow());
+    await this.ctx.storage.put('fixtureStageCrash', marker);
+    await this.ctx.storage.sync();
     this.ctx.abort();
   }
+  async reachedStageCrash(marker: string) { return await this.ctx.storage.get('fixtureStageCrash') === marker; }
   async persistMaximumHolder(ws: string, draftKey: string) {
     const id = crypto.randomUUID();
     const holder = `draft:${'x'.repeat(250)}`;
@@ -172,9 +195,7 @@ export class HttpMailbox extends Mailbox {
       new TimerTable(this.ctx.storage.sql).lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, this.mailApiNow());
     });
     await this.testAlarm();
-    const { objects } = await this.env.MAIL_STATE.list({ limit: 20 });
-    const manifest = objects.find(row => row.key.endsWith('/manifest.json'));
-    const stored = manifest && await this.env.MAIL_STATE.get(manifest.key);
+    const stored = await this.env.MAIL_STATE.get(`${journalPrefix(this.ctx.id.toString())}manifest.json`);
     const backup = stored && await stored.json<{ snapshot_key: string | null; delta_keys: string[] }>();
     return !!backup && backup.snapshot_key !== null && backup.delta_keys.length === 0;
   }
@@ -192,12 +213,18 @@ export class HttpMailbox extends Mailbox {
 export class Sweeper extends MailSweeper {
   private failRelease = false;
   private failConfirm = false;
+  private slowConfirm = false;
+  private slowRelease?: string;
+  stallConfirmation() { this.slowConfirm = true; }
+  stallRelease(holder: string) { this.slowRelease = holder; }
+  private async stalled() { await new Promise<void>(resolve => setTimeout(resolve, 16_000)); }
   private readonly confirmationBatches: number[] = [];
   private readonly releases: { key: string; holder: string }[] = [];
   setConfirmFailure(failing: boolean) { this.failConfirm = failing; }
   confirmBatches() { return this.confirmationBatches; }
   async confirm(entries: ConfirmEntry[]) {
     if (this.failConfirm) throw new Error('Fixture confirmation outage');
+    if (this.slowConfirm) await this.stalled();
     this.confirmationBatches.push(entries.length);
     return super.confirm(entries);
   }
@@ -211,6 +238,7 @@ export class Sweeper extends MailSweeper {
   acknowledgedReleases() { return this.releases; }
   async release(key: string, holder: string) {
     if (this.failRelease) throw new Error('Fixture sweeper outage');
+    if (holder === this.slowRelease) await this.stalled();
     await super.release(key, holder);
     this.releases.push({ key, holder });
   }
@@ -313,9 +341,13 @@ export default {
           case '/__fixture/pause-expiry': await box.pauseExpiry(await req.text()); break;
           case '/__fixture/finish-expiry': await box.finishExpiry(); break;
           case '/__fixture/pending-releases': return Response.json(await box.pendingReleases());
+          case '/__fixture/release-retry-at': return Response.json(await box.releaseRetryAt());
           case '/__fixture/confirmations': return Response.json(await box.confirmations());
           case '/__fixture/confirm-batches': return Response.json(await refs.confirmBatches());
           case '/__fixture/confirm-failure': await refs.setConfirmFailure(await req.text() === 'true'); break;
+          case '/__fixture/stall-confirmation': await box.shortenHolderBudget(); await refs.stallConfirmation(); break;
+          case '/__fixture/stall-release': await box.shortenHolderBudget(); await refs.stallRelease(await req.text()); break;
+          case '/__fixture/expire-upload-lease': await box.expireUploadLease(await req.text()); break;
           case '/__fixture/holder-details': return Response.json(await refs.holderDetails(await req.text()));
           case '/__fixture/sweep-at': await refs.sweepAt(ws, Number(await req.text())); break;
           case '/__fixture/alerts': return Response.json(await box.alerts());
@@ -325,10 +357,16 @@ export default {
             await refs.release(key, holder);
             break;
           }
-          case '/__fixture/stage-crash':
-            try { await box.stageAndCrash(ws); }
-            catch { /* the fixture deliberately aborts after a prepared PUT, without committing */ }
-            break;
+          case '/__fixture/stage-crash': {
+            const marker = crypto.randomUUID();
+            try { await box.stageAndCrash(ws, marker); }
+            catch (error) {
+              const restarted = env.MAILBOX.getByName(mailboxName(ws, mailboxId!));
+              if (await restarted.reachedStageCrash(marker)) return Response.json(true);
+              throw error;
+            }
+            throw new Error('Fixture returned without aborting');
+          }
           case '/__fixture/maximum-holder': return Response.json(await box.persistMaximumHolder(ws, await req.text()));
           case '/__fixture/acknowledged-releases': return Response.json(await refs.acknowledgedReleases());
           case '/__fixture/release-failure': await refs.setReleaseFailure(await req.text() === 'true'); break;
