@@ -18,7 +18,7 @@ export interface Limits {
   /** One uploaded file. */
   uploadBytes: number;
   /**
-   * UTF-8 bytes of one header value we set (In-Reply-To, References, Reply-To),
+   * UTF-8 bytes of one provider custom header value (In-Reply-To, References),
    * unfolded. `threadingHeaders` trims References to it.
    */
   headerValueBytes: number;

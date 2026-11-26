@@ -239,7 +239,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `In-Reply-To` is the parent's `Message-ID`.
 - `References` keeps the parent's id, then the first id, then the most recent ids, newest first, at most 10 after the first, while its unfolded value fits `headerValueBytes` (2,048). With long legal ids it keeps fewer than 11.
 - An id that alone exceeds `headerValueBytes`, or `MESSAGE_ID_MAX` (one RFC 5322 line), is never sent. `References` folds between ids, so every physical line fits 998 octets.
-- The provider request sets at most three headers of its own (`In-Reply-To`, `References`, `Reply-To`), each within `headerValueBytes`, well under the platform's limit on custom headers. Every other header comes from the request's structured fields.
+- The provider request sets at most two headers of its own (`In-Reply-To`, `References`), each within `headerValueBytes`. The frozen `Reply-To` goes in the structured `replyTo` field and the sent-copy MIME, not in the provider request's `headers`.
 
 **If the checks pass:**
 - The draft becomes a `pending` send and leaves the draft list.

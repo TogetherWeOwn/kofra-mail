@@ -105,28 +105,34 @@ test('threading drops unsafe and overlong ids without promoting an ancestor to I
   const mime = decoder.decode(buildSentCopy(input).bytes);
   assert.equal(header(mime, 'In-Reply-To'), undefined);
   assert.equal(unfold(header(mime, 'References')), max);
-  assert.deepEqual(buildSendRequest(input).headers, { References: max, 'Reply-To': 'replies@example.com' });
+  assert.deepEqual(buildSendRequest(input).headers, { References: max });
   const legalParent = decoder.decode(buildSentCopy({ ...frozen, threading: { inReplyTo: max } }).bytes);
   assert.equal(header(legalParent, 'In-Reply-To')?.length, 998);
 });
 
-test('structured request allows only the three named headers and uses only the frozen Reply-To', async () => {
+test('structured request sets only two threading headers and shares the frozen Reply-To with stored MIME', async () => {
   const { buildSendRequest, buildSentCopy } = await builders();
-  const headers = Object.fromEntries(['Bcc', 'Sender', 'From', 'Return-Path', 'Reply-To'].map(key => [key, 'ignored@example.org']));
+  const headers = Object.fromEntries(['Reply-To', 'Bcc', 'Sender', 'From', 'Return-Path', 'Date', 'Message-ID']
+    .map(key => [key, 'ignored@example.org']));
   const attachment = file('report.txt');
   const parent = '<parent@example.net>';
-  const input = { ...frozen, headers, replyTo: 'ignored@example.org', attachments: [attachment],
+  const frozenReplyTo = { email: 'replies@example.com', name: 'Réponses' };
+  const input = { ...frozen, headers, replyTo: 'ignored@example.org', frozenReplyTo, attachments: [attachment],
     from: { ...frozen.from, headers, replyTo: 'ignored@example.org' },
     bcc: [{ email: 'hidden@example.net', headers }] };
   const request = buildSendRequest({ ...input, threading: { inReplyTo: parent, references: parent } });
-  assert.deepEqual(Object.keys(request.headers), ['In-Reply-To', 'References', 'Reply-To']);
+  assert.deepEqual(Object.keys(request.headers), ['In-Reply-To', 'References']);
   assert.deepEqual(request, {
-    from: frozen.from, to: frozen.to, bcc: ['hidden@example.net'], subject: frozen.subject, text: frozen.text,
+    from: frozen.from, to: frozen.to, bcc: ['hidden@example.net'], subject: frozen.subject, text: frozen.text, replyTo: frozenReplyTo,
     attachments: [{ disposition: 'attachment', filename: attachment.name, type: attachment.type, content: attachment.bytes }],
-    headers: { 'In-Reply-To': parent, References: parent, 'Reply-To': 'replies@example.com' },
+    headers: { 'In-Reply-To': parent, References: parent },
   });
+  const parsed = await PostalMime.parse(buildSentCopy(input).bytes);
+  assert.deepEqual(parsed.replyTo, [{ address: frozenReplyTo.email, name: frozenReplyTo.name }]);
   for (const value of Object.values(request.headers)) assert.ok(Buffer.byteLength(value) <= LIMITS.headerValueBytes);
-  assert.deepEqual(Object.keys(buildSendRequest({ ...input, frozenReplyTo: undefined }).headers), []);
+  const withoutFrozen = buildSendRequest({ ...input, frozenReplyTo: undefined });
+  assert.deepEqual(Object.keys(withoutFrozen.headers), []);
+  assert.equal(withoutFrozen.replyTo, undefined);
   const bccOnly = { ...frozen, to: [] };
   assert.equal(header(decoder.decode(buildSentCopy(bccOnly).bytes), 'Bcc'), undefined);
   assert.deepEqual(buildSendRequest(bccOnly).bcc, ['hidden@example.net']);

@@ -56,7 +56,7 @@ export interface SentCopy {
   encodedSize: number;
 }
 
-export type SendRequestHeaders = Partial<Record<'In-Reply-To' | 'References' | 'Reply-To', string>>;
+export type SendRequestHeaders = Partial<Record<'In-Reply-To' | 'References', string>>;
 export type SendRequest = EmailMessageBuilder & { headers: SendRequestHeaders };
 
 const CRLF = '\r\n';
@@ -213,12 +213,9 @@ function requestHeaders(input: SendMimeInput): SendRequestHeaders {
   // slot when the parent is unknown so no ancestor becomes In-Reply-To.
   if (chain.at(-1) !== parent) chain.push(parent);
   const thread = threadingHeaders(chain, LIMITS);
-  const replyTo = input.frozenReplyTo && addressWords(input.frozenReplyTo).join(' ');
-  if (replyTo && replyTo.length > LIMITS.headerValueBytes) fail('invalid_header', { limit: LIMITS.headerValueBytes });
   return {
     ...(thread.inReplyTo && { 'In-Reply-To': thread.inReplyTo }),
     ...(thread.references && { References: thread.references }),
-    ...(replyTo && { 'Reply-To': replyTo }),
   };
 }
 
@@ -277,10 +274,11 @@ function planV1(input: SendMimeInput) {
     `Date: ${date.toUTCString().replace('GMT', '+0000')}${CRLF}`,
     `Message-ID: <${sendId}@${from.email.split('@')[1]}>${CRLF}`,
   ];
-  for (const name of ['In-Reply-To', 'References', 'Reply-To'] as const) {
+  for (const name of ['In-Reply-To', 'References'] as const) {
     const value = headers[name];
-    if (value) pieces.push(fold(name, name === 'Reply-To' ? addressWords(input.frozenReplyTo!) : value.split(' ')));
+    if (value) pieces.push(fold(name, value.split(' ')));
   }
+  if (input.frozenReplyTo) pieces.push(fold('Reply-To', addressWords(input.frozenReplyTo)));
   pieces.push(`MIME-Version: 1.0${CRLF}`);
   if (files.length) pieces.push(`Content-Type: multipart/mixed; boundary="${boundary}"${CRLF}${CRLF}--${boundary}${CRLF}`);
   const [textHeader, textBody] = textPart(input.text);
@@ -322,6 +320,7 @@ export function buildSendRequest(input: SendMimeInput): SendRequest {
   const to = input.to.map(destination), cc = input.cc.map(destination), bcc = input.bcc.map(destination);
   const message = {
     from: destination(input.from), subject: input.subject, text: input.text, attachments: files, headers,
+    ...(input.frozenReplyTo && { replyTo: destination(input.frozenReplyTo) }),
     ...(cc.length && { cc }), ...(bcc.length && { bcc }),
   };
   // Plan validation guarantees at least one non-empty destination list.
