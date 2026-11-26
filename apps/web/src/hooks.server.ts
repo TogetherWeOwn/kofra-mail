@@ -11,6 +11,7 @@ export const handle: Handle = async ({ event, resolve }) => {
   event.locals.mailContentOrigin = origin;
   const response = await resolve(event);
   const headers = new Headers(response.headers);
+  headers.set('referrer-policy', 'no-referrer');
   headers.append('content-security-policy', `frame-src ${origin ?? "'none'"}; object-src 'none'`);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 };

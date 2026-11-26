@@ -9,10 +9,12 @@ function isOrigins(value: unknown): value is Origins {
     && typeof value.appOrigin === 'string' && typeof value.contentOrigin === 'string';
 }
 
-export const test = playwright.extend<{ origins: Origins; contentOriginEnabled: boolean }>({
+export const test = playwright.extend<{ origins: Origins; contentOriginEnabled: boolean; realContent: boolean }>({
   contentOriginEnabled: [true, { option: true }],
-  origins: async ({ contentOriginEnabled }, use) => {
-    const child = fork(fileURLToPath(new URL('./mail-app.mjs', import.meta.url)), contentOriginEnabled ? [] : ['--plain'], {
+  realContent: [false, { option: true }],
+  origins: async ({ contentOriginEnabled, realContent }, use) => {
+    const flags = [...(contentOriginEnabled ? [] : ['--plain']), ...(realContent ? ['--real-content'] : [])];
+    const child = fork(fileURLToPath(new URL('./mail-app.mjs', import.meta.url)), flags, {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
     });
     const exited = once(child, 'exit');

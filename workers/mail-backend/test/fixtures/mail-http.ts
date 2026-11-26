@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { build } from 'esbuild';
-import { Miniflare, Response as LocalResponse, type Request as LocalRequest } from 'miniflare';
+import { Miniflare, Response as LocalResponse, type Request as LocalRequest, type WorkerOptions } from 'miniflare';
 import { createHttpMailService } from '../../../../contracts/mail-api/src/http-client.ts';
 import type { Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
@@ -10,8 +10,12 @@ import { migrateDirectory } from './directory-db.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
 
 const entry = fileURLToPath(new NodeURL('./mail-http-worker.ts', import.meta.url));
-const compiled = () => build({ entryPoints: [entry], bundle: true, platform: 'browser', format: 'esm', external: ['cloudflare:workers'], write: false });
+const contentEntry = fileURLToPath(new NodeURL('../../../mail-content/src/entry.ts', import.meta.url));
+const accountEntry = fileURLToPath(new NodeURL('../../../mail-content/test/account-worker.ts', import.meta.url));
+const compiled = (entryPoint = entry) => build({ entryPoints: [entryPoint], bundle: true, platform: 'browser', format: 'esm', external: ['cloudflare:workers'], write: false });
 let bundle: ReturnType<typeof compiled> | undefined;
+let contentBundle: ReturnType<typeof compiled> | undefined;
+let accountBundle: ReturnType<typeof compiled> | undefined;
 const accounts: Record<Principal | 'invited' | 'demo', FixturePrincipal> = {
   member: { userId: 'member', name: 'Jordan Member', ws: 'w1', role: 'member', mailboxId: 'mailbox-a', address: 'member@example.com' },
   other: { userId: 'other', name: 'Casey Other', ws: 'w1', role: 'member', mailboxId: 'mailbox-b', address: 'other@example.com' },
@@ -43,8 +47,14 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, parent?:
   return [...header, `Content-Type: multipart/mixed; boundary="${boundary}"`, '', ...[html ?? plain, ...parts].flatMap((part) => [`--${boundary}`, part]), `--${boundary}--`, ''].join(CRLF);
 }
 
-export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now() }:
-  { demo?: boolean; draftsUploads?: boolean; startedAt?: number } = {}) {
+interface FixtureOptions {
+  demo?: boolean;
+  draftsUploads?: boolean;
+  startedAt?: number;
+  realContent?: { appOrigin: string; contentOrigin: string };
+}
+
+export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now(), realContent }: FixtureOptions = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
@@ -55,8 +65,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   const control = crypto.randomUUID();
   const startTime = Math.floor(startedAt / 1000) * 1000;
   let now = startTime;
-  const mf = new Miniflare({
-    host: '127.0.0.1', port: 0,
+  const backend: WorkerOptions = {
+    name: 'mail-backend',
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
     compatibilityDate: '2026-06-25',
     durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true } },
@@ -65,7 +75,9 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
-      KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture' },
+      KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
+      ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },
+    ...(realContent && { serviceBindings: { MAIL_CONTENT: { name: 'mail-content', entrypoint: 'ContentMint' } } }),
     outboundService: async (req: LocalRequest) => {
       const { host, pathname } = new NodeURL(req.url);
       assert.equal(host, 'object-store.example.test');
@@ -91,12 +103,46 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
         default: throw new Error('Unexpected fixture object method');
       }
     },
-  });
+  };
+  const workers = [backend];
+  if (realContent) {
+    const [content, account] = await Promise.all([contentBundle ??= compiled(contentEntry), accountBundle ??= compiled(accountEntry)]);
+    workers.push({
+      name: 'account', compatibilityDate: '2026-07-30',
+      modules: [{ type: 'ESModule', path: 'account.mjs', contents: account.outputFiles[0].text }],
+      bindings: { USERS: [...new Set(Object.values(accounts).map(({ userId }) => userId))] },
+    }, {
+      name: 'mail-content', compatibilityDate: '2026-07-30',
+      modules: [{ type: 'ESModule', path: 'mail-content.mjs', contents: content.outputFiles[0].text }],
+      bindings: {
+        MAIL_CONTENT_ENABLED: 'on', CONTENT_LOCAL_LOOPBACK: 'on', CONTENT_ORIGIN: realContent.contentOrigin,
+        MAIL_APP_ORIGIN: realContent.appOrigin,
+        CONTENT_URL_KEYS: JSON.stringify({ current: 'browser', keys: { browser: Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64') } }),
+        CONTENT_S3_ENDPOINT: 'https://object-store.example.test', CONTENT_S3_ACCESS_KEY_ID: crypto.randomUUID(), CONTENT_S3_SECRET_ACCESS_KEY: crypto.randomUUID(),
+        CONTENT_ZONE: 'content.example', CONTENT_SUITE_DOMAIN: 'mail.example', CONTENT_ACCOUNT_DOMAIN: 'account.example',
+        CONTENT_STORAGE_DOMAIN: 'object-store.example.test', CONTENT_WORKERS_DEV_DOMAIN: 'account-example.workers.dev',
+      },
+      serviceBindings: {
+        MAIL_LOOKUP: { name: 'mail-backend', entrypoint: 'ContentLookup' },
+        ACCOUNT_EPOCH: { name: 'account', entrypoint: 'CredentialEpoch' },
+      },
+      outboundService: (req: LocalRequest) => {
+        const { host, pathname } = new NodeURL(req.url);
+        if (req.method !== 'GET' || host !== 'object-store.example.test' || !req.headers.has('authorization')) {
+          return new LocalResponse(null, { status: 404 });
+        }
+        const bytes = objects.get(pathname);
+        return bytes ? new LocalResponse(bytes, { headers: { 'content-length': String(bytes.byteLength) } }) : new LocalResponse(null, { status: 404 });
+      },
+    });
+  }
+  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers });
   try {
     const ready = await mf.ready;
     const origin = ready.origin;
-    const contentOrigin = `http://localhost:${ready.port}`;
-    const db = await mf.getD1Database('DIRECTORY') as unknown as D1Database;
+    const contentOrigin = realContent?.contentOrigin ?? `http://localhost:${ready.port}`;
+    const contentWorker = realContent && await mf.getWorker('mail-content');
+    const db = await mf.getD1Database('DIRECTORY', 'mail-backend') as unknown as D1Database;
     await migrateDirectory(db);
     const sql = await readFile(new NodeURL('../../migrations/0008_local_mail_api.sql', import.meta.url), 'utf8');
     await db.batch(sql.split(/;\s*\n(?=\s*(?:CREATE |--|$))/).filter((s) => s.trim()).map((s) => db.prepare(s)));
@@ -202,7 +248,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       for (const name of ['Finance', 'Projects']) await mail.createLabel({ name }, { idempotencyKey: crypto.randomUUID() });
       const message: TestMessage = { from: { name: 'Mira Chen', email: 'mira@example.net' }, to: [{ name: 'Alex Morgan', email: 'hello@example.com' }],
         subject: 'Floor plan revisions', text: 'I’ve attached the latest floor plan. Can you review it before Tuesday?',
-        html: '<p>Kitchen measurements revised.</p><p>Can you review it before Tuesday?</p><img src="https://fixture.test/demo-floor-plan">',
+        html: '<p>Kitchen measurements revised.</p><p>Can you review it before Tuesday?</p><img src="https://fixture.test/demo-floor-plan">'
+          + (realContent ? '<script>globalThis.messageScriptRan = true;</script>' : ''),
         attachments: [{ name: 'floor-plan-notes.txt', type: 'text/plain', bytes: new TextEncoder().encode('Kitchen measurements revised.') }],
       };
       const { threadId } = await deliver(message, 'demo');
@@ -227,6 +274,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
       seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
       m3: false, credentialEpoch: async () => 1,
+      fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {
     await mf.dispose();
