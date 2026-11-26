@@ -32,7 +32,28 @@ CREATE TABLE IF NOT EXISTS generation_holders (
 );
 CREATE TABLE IF NOT EXISTS generation_clock (id INTEGER PRIMARY KEY CHECK (id = 1), stamp INTEGER NOT NULL);
 INSERT OR IGNORE INTO generation_clock VALUES (1, 0);
+-- One registration per send (docs/m3-outbound-plan.md, section 2.4, release
+-- step 3), outside the mailbox journal so a restore cannot rewind it. A row
+-- with released set and no key is the tombstone of a send released before it
+-- registered; a registration is never reused.
+CREATE TABLE IF NOT EXISTS send_registrations (
+  mailbox TEXT NOT NULL,
+  send_id TEXT NOT NULL,
+  digest TEXT,
+  key TEXT,
+  raw_holder TEXT,
+  index_holder TEXT,
+  released TEXT CHECK (released IS NULL OR released IN ('raw', 'all')),
+  PRIMARY KEY (mailbox, send_id),
+  CHECK ((key IS NULL) = (digest IS NULL) AND (key IS NULL) = (raw_holder IS NULL) AND (key IS NULL) = (index_holder IS NULL)),
+  CHECK (key IS NOT NULL OR released IS NOT NULL)
+);
 `;
+// A retired generation is deleted twice, the second time this long after the
+// first, and its row is dropped only after the second delete. An object that a
+// late PUT recreated in between is removed by it (section 2.4, release step 3).
+export const SECOND_DELETE_MS = 24 * 60 * 60 * 1000;
+const GENERATION_COLUMNS = [['deleted_at', 'deleted_at INTEGER']] as const;
 // Holder states, added after the first ledgers were written. New and existing
 // ledgers both gain these columns by ALTER TABLE, so they share one schema and
 // existing rows become held. Only held and provisional count in holder_count.
@@ -51,6 +72,14 @@ export type ConfirmEntry = { key: string; holder: string };
 // generation. lost: expired on a retired generation, or absent from a deleted
 // raw/ or att/ generation. released: otherwise absent, or a tombstone.
 export type ConfirmAnswer = 'held' | 'rehold' | 'lost' | 'released';
+export type SendHolders = { raw: string; index: string };
+// registered: the generation holds both holders. released: the send was
+// released before (or instead of) this registration; nothing was added.
+// mismatch: the send registered other bytes; nothing was added. Both refusals
+// are invariant breaches for the caller, which must not PUT.
+export type SendRegistration = { state: 'registered'; key: string } | { state: 'released' } | { state: 'mismatch' };
+export type SendReleaseMode = 'all' | 'raw';
+const SEND_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
 export class SweepLedger {
   private readonly sql: SqlStorage;
@@ -62,6 +91,11 @@ export class SweepLedger {
         .toArray().map(row => row.name));
       for (const [name, definition] of HOLDER_COLUMNS) {
         if (!columns.has(name)) this.sql.exec(`ALTER TABLE generation_holders ADD COLUMN ${definition}`);
+      }
+      const generationColumns = new Set(this.sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('generations')`)
+        .toArray().map(row => row.name));
+      for (const [name, definition] of GENERATION_COLUMNS) {
+        if (!generationColumns.has(name)) this.sql.exec(`ALTER TABLE generations ADD COLUMN ${definition}`);
       }
       this.sql.exec(HOLDER_INDEX);
     });
@@ -153,6 +187,84 @@ export class SweepLedger {
         && !this.sql.exec('SELECT 1 FROM generations WHERE key = ?', key).toArray().length) return 'lost';
       return 'released';
     }));
+  }
+
+  // One transaction: chooses the generation of raw/<digest> as register does,
+  // adds both of the send's holders and persists the registration. A repeat
+  // with the same digest returns the record unchanged; a repeat with another
+  // digest, or any call after releaseSend tombstoned the send, adds nothing.
+  registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders, now: number): SendRegistration {
+    this.checkSend(mailbox, sendId);
+    if (typeof holders !== 'object' || holders === null || holders.raw === holders.index) throw new Error('Invalid sweeper reference');
+    this.validate(holders.raw, now);
+    this.validate(holders.index, now);
+    const prefix = this.prefix('raw', digest);
+    return this.storage.transactionSync((): SendRegistration => {
+      const row = this.registration(mailbox, sendId);
+      if (row?.released) return { state: 'released' };
+      if (row) return row.digest === digest && row.raw_holder === holders.raw && row.index_holder === holders.index
+        ? { state: 'registered', key: row.key! } : { state: 'mismatch' };
+      const key = this.liveGeneration(prefix, now);
+      this.addHolder(key, holders.raw, now);
+      this.addHolder(key, holders.index, now);
+      // Holder ids are send-specific, so a tombstone here would mean a reused id.
+      if (this.holderState(key, holders.raw) !== 'held' || this.holderState(key, holders.index) !== 'held') {
+        throw new Error('Mail object holder retired');
+      }
+      this.sql.exec(`INSERT INTO send_registrations(mailbox, send_id, digest, key, raw_holder, index_holder, released)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)`, mailbox, sendId, digest, key, holders.raw, holders.index);
+      return { state: 'registered', key };
+    });
+  }
+
+  // One transaction: tombstones the send's raw holder, and with `all` its
+  // sent-copy index holder too, and leaves a released tombstone for the send,
+  // also when it never registered. Idempotent.
+  releaseSend(mailbox: string, sendId: string, mode: SendReleaseMode, now: number): void {
+    this.checkSend(mailbox, sendId);
+    if (mode !== 'all' && mode !== 'raw') throw new Error('Invalid sweeper reference');
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error('Invalid sweeper time');
+    this.storage.transactionSync(() => {
+      const row = this.registration(mailbox, sendId);
+      if (!row) {
+        this.sql.exec(`INSERT INTO send_registrations(mailbox, send_id, released) VALUES (?, ?, ?)`, mailbox, sendId, mode);
+        return;
+      }
+      const released = row.released === 'all' || mode === 'all' ? 'all' : 'raw';
+      if (row.key) {
+        this.tombstone(row.key, row.raw_holder!, now);
+        if (released === 'all') this.tombstone(row.key, row.index_holder!, now);
+      }
+      this.sql.exec('UPDATE send_registrations SET released = ? WHERE mailbox = ? AND send_id = ?', released, mailbox, sendId);
+    });
+  }
+
+  private registration(mailbox: string, sendId: string) {
+    return this.sql.exec<{ digest: string | null; key: string | null; raw_holder: string | null; index_holder: string | null;
+      released: SendReleaseMode | null }>(`SELECT digest, key, raw_holder, index_holder, released FROM send_registrations
+      WHERE mailbox = ? AND send_id = ?`, mailbox, sendId).toArray()[0];
+  }
+
+  private checkSend(mailbox: string, sendId: string): void {
+    if (typeof mailbox !== 'string' || mailbox.length < 1 || mailbox.length > 256 || typeof sendId !== 'string' || !SEND_ID.test(sendId)) {
+      throw new Error('Invalid sweeper reference');
+    }
+  }
+
+  // A released send holder stays as a tombstone, so a late hold or register adds nothing.
+  private tombstone(key: string, holder: string, now: number): void {
+    const state = this.holderState(key, holder);
+    if (state === 'tombstone') return;
+    if (state === undefined) {
+      // A generation already dropped after its deletes needs no tombstone: a
+      // late hold finds no live generation, and a register mints a new one.
+      if (this.sql.exec('SELECT 1 FROM generations WHERE key = ?', key).toArray().length) {
+        this.sql.exec(`INSERT INTO generation_holders(key, holder, state) VALUES (?, ?, 'tombstone')`, key, holder);
+      }
+      return;
+    }
+    this.sql.exec(`UPDATE generation_holders SET state = 'tombstone', expires_at = NULL WHERE key = ? AND holder = ?`, key, holder);
+    if (state === 'held' || state === 'provisional') this.count(key, -1, now);
   }
 
   private prefix(kind: ObjectKind, digest: string): string {
@@ -268,7 +380,15 @@ export class SweepLedger {
       try { await remove(key); }
       catch { return; } // Unknown outcome; keep the retired row for its next attempt.
       this.storage.transactionSync(() => {
-        if (!this.sql.exec('SELECT 1 FROM generations WHERE key = ? AND retry_at IS NOT NULL', key).toArray().length) return;
+        const row = this.sql.exec<{ deleted_at: number | null }>('SELECT deleted_at FROM generations WHERE key = ? AND retry_at IS NOT NULL', key)
+          .toArray()[0];
+        if (!row) return;
+        if (row.deleted_at === null) {
+          // The first confirmed delete: delete once more a day later, for an
+          // object that a late PUT may recreate meanwhile. The row stays retired.
+          this.sql.exec('UPDATE generations SET deleted_at = ?, retry_at = ?, attempts = 0 WHERE key = ?', now, now + SECOND_DELETE_MS, key);
+          return;
+        }
         // A retired generation has no counted holders; drop the rows that remain first.
         this.sql.exec(`DELETE FROM generation_holders WHERE key = ? AND state IN ('expired', 'tombstone')`, key);
         this.sql.exec('DELETE FROM generations WHERE key = ? AND retry_at IS NOT NULL', key);

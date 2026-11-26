@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { ObjectKind } from '../../src/object-key.ts';
 import { RETENTION_MS } from '../../src/reconcile.ts';
 import { Sweeper } from '../../src/sweeper-do.ts';
-import { SweepLedger, type ConfirmEntry, type HoldTarget } from '../../src/sweep-ledger.ts';
+import { SweepLedger, type ConfirmEntry, type HoldTarget, type SendHolders, type SendReleaseMode } from '../../src/sweep-ledger.ts';
 import type { Env } from '../../src/worker.ts';
 
 export type HolderRow = { key: string; holder: string; state: string; expires_at: number | null };
@@ -42,6 +42,28 @@ export class ProvisionalLedger extends DurableObject {
   async confirm(entries: ConfirmEntry[], now: number) { return this.ledger().confirm(entries, now); }
   async release(key: string, holder: string, now: number) { this.ledger().release(key, holder, now); }
   async candidates(now: number) { return this.ledger().candidates(now); }
+  async registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders, now: number) {
+    return JSON.stringify(this.ledger().registerSend(mailbox, sendId, digest, holders, now));
+  }
+  async releaseSend(mailbox: string, sendId: string, mode: SendReleaseMode, now: number) { this.ledger().releaseSend(mailbox, sendId, mode, now); }
+  async registration(mailbox: string, sendId: string) {
+    this.ledger();
+    return JSON.stringify(this.ctx.storage.sql.exec('SELECT digest, key, raw_holder, index_holder, released FROM send_registrations WHERE mailbox = ? AND send_id = ?',
+      mailbox, sendId).toArray()[0] ?? null);
+  }
+  // A stand-in object store, so a test can recreate an object between the two deletes.
+  private readonly stored = new Set<string>();
+  async putObject(key: string) { this.stored.add(key); }
+  async hasObject(key: string) { return this.stored.has(key); }
+  async sweepStore(now: number) {
+    const removed: string[] = [];
+    await this.ledger().sweep(now, async key => { removed.push(key); this.stored.delete(key); });
+    return removed.sort();
+  }
+  async deletedAt(key: string) {
+    this.ledger();
+    return this.ctx.storage.sql.exec<{ deleted_at: number | null }>('SELECT deleted_at FROM generations WHERE key = ?', key).toArray()[0]?.deleted_at ?? null;
+  }
 
   // The test proxy does not carry rejections, so report the error message instead.
   async failure(method: 'register' | 'hold' | 'holdProvisional' | 'confirm', ...args: unknown[]): Promise<string> {
