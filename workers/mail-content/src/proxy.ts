@@ -155,7 +155,8 @@ const imageTypes: ReadonlyMap<string, (bytes: Uint8Array) => boolean> = new Map(
   ['image/webp', b => startsWith(b, ascii('RIFF')) && startsWith(b, ascii('WEBP'), 8)],
   ['image/avif', isAvif],
   ['image/bmp', b => b.length >= 14 && startsWith(b, ascii('BM'))],
-  ['image/x-icon', b => startsWith(b, [0, 0, 1, 0]) && (b[4] | b[5]) !== 0],
+  // ICONDIR (6 bytes) with a nonzero image count, then at least one 16-byte directory entry.
+  ['image/x-icon', b => b.length >= 22 && startsWith(b, [0, 0, 1, 0]) && (b[4] | b[5]) !== 0],
 ]);
 
 function mediaType(header: string | null): string | undefined {
@@ -227,7 +228,9 @@ export async function fetchRemoteImage(
     const declared = response.headers.get('content-length');
     if (declared !== null && (!/^\d{1,16}$/.test(declared) || Number(declared) > config.remoteImageBytes)) return fail('size');
 
-    const chunks: Uint8Array[] = [];
+    // One resizable buffer grows in place up to the limit, so a full-size image
+    // is held once rather than as a chunk list plus a copy.
+    const buffer = new ArrayBuffer(0, { maxByteLength: config.remoteImageBytes });
     let length = 0;
     if (response.body !== null) {
       const reader = response.body.getReader();
@@ -236,10 +239,11 @@ export async function fetchRemoteImage(
           const { done, value } = await bounded(reader.read());
           if (done) break;
           if (!(value instanceof Uint8Array)) return fail('network');
-          length += value.byteLength;
           // The declared length is only an early refusal; the count of bytes read is what binds.
-          if (length > config.remoteImageBytes) return fail('size');
-          chunks.push(value);
+          if (length + value.byteLength > config.remoteImageBytes) return fail('size');
+          buffer.resize(length + value.byteLength);
+          new Uint8Array(buffer, length, value.byteLength).set(value);
+          length += value.byteLength;
         }
       } finally {
         reader.cancel().catch(() => {});
@@ -247,12 +251,8 @@ export async function fetchRemoteImage(
     }
     response = undefined;
 
-    const bytes = new Uint8Array(length);
-    let offset = 0;
-    for (const chunk of chunks) {
-      bytes.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
+    // A fixed-length buffer for callers (Response bodies, the cache); V8 can move the backing store without copying.
+    const bytes = new Uint8Array(buffer.transferToFixedLength());
     if (!imageTypes.get(contentType)!(bytes)) return fail('magic');
     return { ok: true, contentType, bytes, length };
   } catch (error) {

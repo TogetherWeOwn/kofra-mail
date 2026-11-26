@@ -119,3 +119,26 @@ test('workerd: an endless upstream body with no Content-Length is refused at 5 M
   });
   assert.deepEqual(await run('https://big.sender.example/x.png'), { ok: false, reason: 'size' });
 });
+
+test('workerd: a buffered image becomes a response with exactly the rebuilt headers and the same bytes', async () => {
+  seen.length = 0;
+  routes.clear();
+  const whole = new Uint8Array(5 * 1024 * 1024);
+  whole.set(images['image/jpeg']);
+  for (let i = images['image/jpeg'].length; i < whole.length; i++) whole[i] = (i * 7) & 0xff;
+  routes.set('https://img.sender.example/big.jpg', () => new Response(new ReadableStream({
+    start(controller) {
+      for (let at = 0; at < whole.length; at += 300_001) controller.enqueue(whole.slice(at, at + 300_001));
+      controller.close();
+    },
+  }), { headers: { 'content-type': 'image/jpeg', 'set-cookie': 'tracker=1', 'access-control-allow-origin': '*' } }));
+  const response = await mf.dispatchFetch('https://content.content-zone.example/image', {
+    method: 'POST', headers: incoming, body: JSON.stringify({ url: 'https://img.sender.example/big.jpg' }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual([...response.headers.keys()].sort(), ['cache-control', 'content-length', 'content-security-policy',
+    'content-type', 'referrer-policy', 'x-content-type-options']);
+  assert.equal(response.headers.get('content-length'), String(whole.length));
+  assert.equal(response.headers.get('cache-control'), 'private, no-store');
+  assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(whole)));
+});

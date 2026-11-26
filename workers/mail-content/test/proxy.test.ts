@@ -195,6 +195,32 @@ test('fetch: AVIF needs an avif or avis brand in its ftyp box', async () => {
   assert.ok((await fetchRemoteImage(target, config, upstream({ [target]: image('image/avif', compatible) }).fetchImpl, now)).ok);
 });
 
+test('fetch: a truncated header is refused even when its first bytes match', async () => {
+  for (const [type, length] of [['image/x-icon', 21], ['image/x-icon', 5], ['image/bmp', 13], ['image/webp', 11], ['image/avif', 15]] as const)
+    failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, images[type].slice(0, length)) }).fetchImpl, now), 'magic');
+  assert.ok((await fetchRemoteImage(target, config, upstream({ [target]: image('image/x-icon', images['image/x-icon'].slice(0, 22)) }).fetchImpl, now)).ok);
+});
+
+test('fetch: a body in uneven chunks is assembled exactly, in one buffer with no slack', async () => {
+  const whole = new Uint8Array(3 * MiB + 7);
+  whole.set(images['image/png']);
+  for (let i = images['image/png'].length; i < whole.length; i++) whole[i] = (i * 31) & 0xff;
+  const sizes = [1, 7, 4096, 65_537, 1 << 20, 3, 2 * MiB];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let at = 0;
+      for (const size of sizes) { controller.enqueue(whole.slice(at, Math.min(at + size, whole.length))); at += size; }
+      controller.close();
+    },
+  });
+  const result = await fetchRemoteImage(target, config, upstream({ [target]: image('image/png', body) }).fetchImpl, now);
+  assert.ok(result.ok);
+  assert.equal(result.length, whole.length);
+  assert.equal(result.bytes.byteLength, whole.length);
+  assert.equal(result.bytes.buffer.byteLength, whole.length);
+  assert.ok(Buffer.from(result.bytes).equals(Buffer.from(whole)));
+});
+
 test('fetch: SVG is refused under any label, including image/png', async () => {
   for (const type of ['image/svg+xml', 'IMAGE/SVG+XML; charset=utf-8', 'image/svg'])
     failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, svg) }).fetchImpl, now), 'type');
