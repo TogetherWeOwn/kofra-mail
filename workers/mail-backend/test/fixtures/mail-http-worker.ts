@@ -7,8 +7,10 @@ import { lookupRecipient } from '../../src/directory.ts';
 import { receive } from '../../src/inbound.ts';
 import { kofra } from '../../src/kofra.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
+import { MailboxIndex } from '../../src/mailbox-index.ts';
+import type { TimerKind, TimerRun } from '../../src/mailbox-timers.ts';
 import { Outbox } from '../../src/outbox.ts';
-import { Sweeper } from '../../src/sweeper-do.ts';
+import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { mailboxName, type Env as BackendEnv } from '../../src/worker.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
@@ -18,12 +20,14 @@ export interface FixturePrincipal {
 }
 interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   MAILBOX: DurableObjectNamespace<HttpMailbox>;
+  SWEEPER: DurableObjectNamespace<Sweeper>;
   ACCOUNTS: Record<string, FixturePrincipal>;
   DEFAULT_ACCOUNT?: string;
   CSRF_KEY: string;
   INITIAL_TIME: number;
   CONTROL_KEY: string;
   CONTENT_PORT?: string;
+  MAIL_DRAFT_UPLOADS_ENABLED?: string;
 }
 
 const encoder = new TextEncoder();
@@ -37,15 +41,112 @@ const de64 = (value: string) => Uint8Array.from(atob(value.replaceAll('-', '+').
 function now(env: FixtureEnv) { return time ?? (env.DEFAULT_ACCOUNT ? Date.now() : env.INITIAL_TIME); }
 
 export class HttpMailbox extends Mailbox {
+  private pauseKind?: string;
+  private resumeExpiry?: PromiseWithResolvers<void>;
+  private expiryCompletion?: PromiseWithResolvers<void>;
+  private startedExpiry = 0;
+  private failPublish = false;
+
+  constructor(ctx: DurableObjectState, env: FixtureEnv) {
+    let mailbox: HttpMailbox;
+    const state = new Proxy(env.MAIL_STATE, { get(target, property) {
+      const value: unknown = Reflect.get(target, property);
+      if (property === 'put') return (...args: Parameters<R2Bucket['put']>) => {
+        if (mailbox.failPublish) throw new Error('Fixture publish failure');
+        return target.put(...args);
+      };
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    super(ctx, { ...env, MAIL_STATE: state });
+    mailbox = this;
+  }
+  publishFailure(failing: boolean) { this.failPublish = failing; }
+  pauseExpiry(kind: string) { this.pauseKind = kind; this.timerHandlerBudgetMs = 25; this.startedExpiry = 0; }
+  expiryStarts() { return this.startedExpiry; }
+  async finishExpiry() {
+    if (!this.resumeExpiry) throw new Error('No expiry handler paused');
+    this.resumeExpiry.resolve();
+    await this.expiryCompletion?.promise;
+  }
+  protected override registerTimerKind(kind: string, handler: TimerKind) {
+    super.registerTimerKind(kind, { ...handler, run: async timer => {
+      if (kind === this.pauseKind) this.startedExpiry++;
+      if (kind !== this.pauseKind || this.resumeExpiry) return handler.run(timer);
+      const resume = this.resumeExpiry = Promise.withResolvers<void>();
+      const done = this.expiryCompletion = Promise.withResolvers<void>();
+      let first = true;
+      const local = (async (step: Parameters<TimerRun['local']>[0]) => {
+        const value = await timer.local(step);
+        if (first) { first = false; await resume.promise; }
+        return value;
+      }) as TimerRun['local'];
+      try { await handler.run({ ...timer, local }); }
+      finally { done.resolve(); }
+    } });
+  }
+  eventCount(type: string) {
+    return this.ctx.storage.sql.exec<{ n: number }>("SELECT count(*) AS n FROM journal WHERE json_extract(event, '$.type') = ?", type).one().n;
+  }
   protected mailApiNow() { return now(this.env as FixtureEnv); }
-  advanceClock(value: number) { time = value; }
+  async advanceClock(value: number, alarms = 0) {
+    time = value;
+    if (alarms) await this.testAlarm(alarms);
+  }
+  async testAlarm(runs = 1) {
+    const actual = Date.now;
+    const start = actual(), simulated = this.mailApiNow();
+    Date.now = this.pauseKind ? () => simulated + actual() - start : () => simulated;
+    try { await Promise.all(Array.from({ length: runs }, () => this.alarm())); }
+    finally { Date.now = actual; }
+  }
+  timers() {
+    return this.ctx.storage.sql.exec('SELECT kind, ref, due_at FROM timers ORDER BY kind, ref').toArray();
+  }
+  pendingReleases() {
+    return this.ctx.storage.sql.exec('SELECT seq, object_key, holder FROM mailbox_pending_releases ORDER BY seq, object_key, holder').toArray();
+  }
+  async purgeTrash(ws: string) {
+    const refs = this.env.SWEEPER.getByName(ws);
+    const objects: ConstructorParameters<typeof MailboxIndex>[1] = { ...kofra(this.env, ws),
+      register: (kind, digest, holder) => refs.register(kind, digest, holder),
+      hold: (key, holder) => refs.hold(key, holder), release: (key, holder) => refs.release(key, holder) };
+    return this.workLane(async () => {
+      const index = new MailboxIndex(this.ctx.storage, objects, this.ctx.id.toString(), true);
+      // M2 expiry hides rows by timestamp; the existing physical purge selects
+      // the legacy Trash label. Mark only the expired fixture rows for purge.
+      index.setLabel('trash', 'Trash');
+      const expired = this.ctx.storage.sql.exec<{ id: string; flags: number }>(`SELECT m.id, m.flags FROM messages m
+        JOIN mailbox_api_expiry e ON e.id = m.id WHERE e.expires_at <= ?`, this.mailApiNow()).toArray();
+      for (const { id, flags } of expired) index.setFlags(id, flags, ['trash']);
+      return index.emptyTrash();
+    });
+  }
+  async restoreFixture(ws: string, mb: string) {
+    await this.ctx.storage.deleteAll();
+    await this.restoreFromBackup(ws, mb);
+    await this.testAlarm();
+  }
   delivered(id: string) {
     const row = this.ctx.storage.sql.exec<{ thread_id: string }>('SELECT thread_id FROM messages WHERE id = ?', id).toArray()[0];
     if (!row) throw new Error('Fixture message was not indexed');
     return { threadId: row.thread_id, messageId: id };
   }
 }
-export { Sweeper };
+export class Sweeper extends MailSweeper {
+  private failRelease = false;
+  private readonly releases: { key: string; holder: string }[] = [];
+  setReleaseFailure(failing: boolean) { this.failRelease = failing; }
+  acknowledgedReleases() { return this.releases; }
+  async release(key: string, holder: string) {
+    if (this.failRelease) throw new Error('Fixture sweeper outage');
+    await super.release(key, holder);
+    this.releases.push({ key, holder });
+  }
+  holders(key: string) {
+    return this.ctx.storage.sql.exec<{ holder: string }>('SELECT holder FROM generation_holders WHERE key = ? ORDER BY holder', key)
+      .toArray().map(row => row.holder);
+  }
+}
 
 const signedBytes = (purpose: string, payload: string) => encoder.encode(`kofra-mail-content/v1\n${purpose}\n${payload}`);
 function contentOrigin(url: URL, env: FixtureEnv) { return `http://localhost:${env.CONTENT_PORT || url.port}`; }
@@ -124,12 +225,38 @@ export default {
     if (url.pathname.startsWith('/__fixture/')) {
       if (req.method !== 'POST' || req.headers.get('x-fixture-control') !== env.CONTROL_KEY) return missing();
       if (url.pathname === '/__fixture/deliver') return incoming(req, env, req.headers.get('x-fixture-to')!, req.headers.get('x-fixture-from')!);
+      if (url.pathname === '/__fixture/holders') {
+        const { workspace, key } = await req.json<{ workspace: string; key: string }>();
+        return Response.json(await env.SWEEPER.getByName(workspace).holders(key));
+      }
+      if (url.pathname !== '/__fixture/advance') {
+        const { ws, mailboxId } = env.ACCOUNTS.member;
+        const box = env.MAILBOX.getByName(mailboxName(ws, mailboxId!));
+        const refs = env.SWEEPER.getByName(ws);
+        switch (url.pathname) {
+          case '/__fixture/timers': return Response.json(await box.timers());
+          case '/__fixture/events': return Response.json(await box.eventCount(await req.text()));
+          case '/__fixture/expiry-starts': return Response.json(await box.expiryStarts());
+          case '/__fixture/pause-expiry': await box.pauseExpiry(await req.text()); break;
+          case '/__fixture/finish-expiry': await box.finishExpiry(); break;
+          case '/__fixture/pending-releases': return Response.json(await box.pendingReleases());
+          case '/__fixture/acknowledged-releases': return Response.json(await refs.acknowledgedReleases());
+          case '/__fixture/release-failure': await refs.setReleaseFailure(await req.text() === 'true'); break;
+          case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;
+          case '/__fixture/purge-trash': return Response.json(await box.purgeTrash(ws));
+          case '/__fixture/restore': await box.restoreFixture(ws, mailboxId!); break;
+          default: return missing();
+        }
+        return new Response(null, { status: 204 });
+      }
       if (url.pathname === '/__fixture/advance') {
         const delta = Number(await req.text());
         if (!Number.isSafeInteger(delta) || delta < 0) return new Response(null, { status: 400 });
         time = now(env) + delta;
         const { results } = await env.DIRECTORY.prepare('SELECT id, workspace_id FROM mailboxes').all<{ id: string; workspace_id: string }>();
-        await Promise.all(results.map(({ workspace_id, id }) => env.MAILBOX.getByName(mailboxName(workspace_id, id)).advanceClock(time!)));
+        const alarms = req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
+        await Promise.all(results.map(({ workspace_id, id }) => env.MAILBOX.getByName(mailboxName(workspace_id, id)).advanceClock(time!,
+          env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && workspace_id === env.ACCOUNTS.member.ws && id === env.ACCOUNTS.member.mailboxId ? alarms : 0)));
         return new Response(null, { status: 204 });
       }
       return missing();
@@ -144,7 +271,7 @@ export default {
         csrfToken: b64(new Uint8Array(await crypto.subtle.sign('HMAC', authKey, encoder.encode(account!)))), };
     };
     const port: MailApiEnvironment = {
-      MAIL_LOCAL_API: 'on', MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
+      MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
       MAIL_CONTENT_ORIGIN: contentOrigin(url, env),
