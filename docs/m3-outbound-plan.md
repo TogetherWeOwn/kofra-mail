@@ -268,11 +268,31 @@ The sweeper never selects a generation that has a holder, so such an object woul
 
 **Not changed.** Inbound holders, index-row holders, `register` for inbound deliveries, and M3-3's `registerSend` keep their current rules. The retention grace, the generation choice, retirement (`retry_at` is never cleared) and the 35-day sweep are unchanged.
 
+### 2.8 Request rate limits
+
+Contract section 5 runs rate limits in the first step of every request, before the idempotency lookup, and answers 429 `rate_limited` with `Retry-After` and `retryAfterSeconds`. Nothing in M1 to M3 enforces them yet, so **package R1 must merge before `MAIL_SEND_ENABLED` or `MAIL_DRAFT_UPLOADS_ENABLED` is turned on anywhere**.
+
+- **Where:** in `mail-web`, after authentication, CSRF, `access`, re-authentication and feature availability, and before the missing-header check (428), the idempotency lookup and any body read. So a rate-limited request, including a same-key retry of a committed request, answers 429 and never replays a stored result or reserves a key.
+- **Mechanism:** the Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration), one namespace per bucket. Its counters are per location and approximate, which is enough for abuse control. It is not a quota: the account quota gate (M3-6) stays the authority for sends. R1 checks the binding's current pricing and records it in its PR before adding it; it expects no new spend.
+- **Buckets** (configuration, never code constants; the starting values below are sized from the M2 UI, where autosave writes about once every 5 s per open draft):
+
+| Bucket | Key | Starting limit |
+|---|---|---|
+| Reads (`GET`) | account user | 600 per 60 s |
+| Writes (other methods, except below) | account user | 120 per 60 s |
+| Uploads (`createUpload`) | account user | 30 per 60 s |
+| Sends and undo (`sendDraft`, `undoSend`) | mailbox | 20 per 60 s |
+| Admin writes | workspace | 60 per 60 s |
+
+- **Answer:** 429 `rate_limited` with `Retry-After` and `retryAfterSeconds` equal to the bucket's period, the usual problem body, and no state change. A 429 is never stored as an idempotency result.
+- **Logs:** the bucket name and a count only, never the user, mailbox or address.
+
 ## 3. Packages
 
 | # | Package | Builder | Tier | Depends on | Size (est) |
 |---|---|---|---|---|---|
 | M3-0 | Measurements on the approved test route | Sol | T1 | an approved test route | 0.5 to 1 day |
+| R1 | Request rate limits (section 2.8); gates enabling any M3 flag | Sol, Opus review | T1 | M3-2 | 0.5 day |
 | M3-1 | Timers table and one multiplexed alarm | **Opus** | T0 | inbound mailbox PRs merged | 0.5 to 1 day |
 | P0 | Provisional holders in the sweeper (section 2.7) | **Opus** | T0 | none | 0.5 to 1 day |
 | M3-2 | Drafts, uploads and idempotency in the mailbox | Sol, Opus review | T0 | M3-1, P0 | 1 to 1.5 days |
@@ -289,6 +309,19 @@ The sweeper never selects a generation that has a holder, so such an object woul
 | M3-13 | Revocable file links for outside recipients (`/f/<token>`) | **Opus** (token and authorisation), Sol (UI) | T0 | M3-2, a contract revision | 1 to 1.5 days |
 
 **Critical path:** M3-1 → M3-2 → M3-3 → M3-5 → M3-8 → M3-12, about 6.5 to 9 working days. M3-0 runs in parallel as soon as a test route is approved. M3-4, M3-6, M3-7 and M3-9 overlap the path.
+
+### R1 Request rate limits (Sol, Opus review)
+
+**Change:** section 2.8 in `mail-web`: the buckets as configuration, the limiter call in the first step of the request, and the 429 answer.
+
+**Acceptance:**
+- With a fake limiter binding in local workerd, each bucket answers 429 with `Retry-After` and `retryAfterSeconds` once its limit is reached, and other users' and mailboxes' buckets are unaffected.
+- A same-key retry of a committed `createDraft` that is rate-limited answers 429 and does not replay; after the period it replays the stored result.
+- A rate-limited request reads no body, reserves no key and writes nothing.
+- A 429 is never stored as an idempotency result.
+- The Wrangler configuration stays local-only; the limits are plain configuration values.
+
+**Stop rule:** if the binding's pricing adds recurring spend, stop and report the measured cost before adding it.
 
 ### M3-0 Measurements (Sol)
 
@@ -586,7 +619,7 @@ The sweeper never selects a generation that has a holder, so such an object woul
 ## 4. Done
 
 M3 is done when all of the following hold:
-- M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
+- R1, M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
 - the conformance suite passes against the backend;
 - the end-to-end matrix shows zero lost messages.
 
