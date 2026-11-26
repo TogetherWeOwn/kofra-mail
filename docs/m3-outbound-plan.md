@@ -282,10 +282,11 @@ Contract section 5 runs rate limits in the first step of every request, before t
 | Writes (other methods, except below) | account user | 120 per 60 s |
 | Uploads (`createUpload`) | account user | 64 per 60 s (two full 32-attachment drafts) |
 | Sends (`sendDraft`) | mailbox | 20 per 60 s |
-| Undo (`undoSend`) | mailbox | 60 per 60 s, a bucket of its own that sends never consume |
+| Undo (`undoSend`) | mailbox and send id | 10 per 60 s per send, a bucket of its own that sends never consume |
+| Undo flood guard | account user | 600 per 60 s across all undo requests |
 | Admin writes | workspace | 60 per 60 s |
 
-- **Undo is never starved by sends:** its separate bucket means the last admitted send can always be undone within its window.
+- **Undo is never starved by sends or by other sends' undos:** each send has its own undo bucket, so a timely undo of a pending send (one request plus its same-key retries) always fits, whatever happens to other sends. The flood guard only stops one user's clients from sending hundreds of undo requests a minute for random ids; only that mailbox owner's own clients can reach it, so the only way to starve an undo is self-inflicted flooding, which is an accepted limit.
 - **Answer:** 429 `rate_limited` with `Retry-After` and `retryAfterSeconds` equal to the bucket's period, the usual problem body, and no state change. A 429 is never stored as an idempotency result.
 - **Logs:** the bucket name and a count only, never the user, mailbox or address.
 
@@ -298,7 +299,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 | M3-1 | Timers table and one multiplexed alarm | **Opus** | T0 | inbound mailbox PRs merged | 0.5 to 1 day |
 | P0 | Provisional holders in the sweeper (section 2.7) | **Opus** | T0 | none | 0.5 to 1 day |
 | M3-2 | Drafts, uploads and idempotency in the mailbox | Sol, Opus review | T0 | M3-1, P0 | 1 to 1.5 days |
-| M3-3 | Send state machine: `pending_send`, undo, release | **Opus** | T0 | M3-1, M3-2 | 1.5 to 2 days |
+| M3-3 | Send state machine: `pending_send`, undo, release | **Opus** | T0 | M3-1, M3-2, R1 | 1.5 to 2 days |
 | M3-4 | MIME builder and sent copy | Sol, Opus review | T1 | M3-3 | 0.5 to 1 day |
 | M3-5 | Send consumer, per-recipient ledger, DLQ | **Opus** | T0 | M3-3, M3-4 | 1.5 to 2 days |
 | M3-6 | Account quota gate | Sol, Opus review | T0 | M3-5 | 0.5 day |
@@ -319,7 +320,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 **Acceptance:**
 - With a fake limiter binding in local workerd, each bucket answers 429 `rate_limited` once its limit is reached, with `Retry-After` and `retryAfterSeconds` both equal to the period, and other users', mailboxes' and workspaces' buckets are unaffected.
 - **Order:** authentication, CSRF, access, re-authentication and availability failures (501, including the content dependency) never call the limiter; a denied request with missing headers answers 429, not 428; denied `createDraft` and raw `createUpload` requests read no body and look up no key.
-- **Undo under saturation:** with the send bucket exhausted, the last admitted send is undone in time and nothing is delivered.
+- **Undo under saturation** (a gateway fixture standing in for the mailbox): with the send bucket exhausted, and with other sends' undo buckets exhausted, an undo for a different pending send still reaches the handler.
 - A 32-attachment compose with the limiter on uploads every file.
 - A missing binding answers 503 and admits nothing.
 - A same-key retry of a committed `createDraft` that is rate-limited answers 429 and does not replay; after the period it replays the stored result.
@@ -425,6 +426,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 - **Second delete:** an object recreated under a retired generation between the sweeper's two deletes is gone after the second, and the ledger row is dropped only then.
 - **Late PUT after release:** an overtaken run's PUT completes after the send was cancelled and `releaseSend` ran: the object is under an unheld ledger generation and is swept after the grace; no object exists without a ledger row.
 - **Overtaken handler:** a release handler stalls 10 minutes in its PUT while the next firing releases and finishes the send; when the stalled PUT returns, that handler commits nothing and the send stays finished with no drive row.
+- **Undo with the limiter on (R1):** with the send bucket and other sends' undo buckets exhausted, the user undoes a pending send within its window: it ends `cancelled`, and no queue message and no `EMAIL` call happen.
 - **Undo racing the alarm:** either `cancelled` with no queue message ever, or released with undo answering `send_not_pending`. Never both.
 
 **Stop rule:** if the Durable Object's single-threaded ordering cannot give the undo-or-release guarantee without a lock, stop and redesign. Do not add a timer guess.
@@ -652,7 +654,7 @@ The security review of R1, M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks a
    - **Dispatch fencing:** every remote wait after Mark finishes before `authorizeDispatch`; no `send()` starts after its authorization deadline; no deadline is later than the published `lease_until`; a claim never sends to a recipient `attempting` under an unexpired lease of any epoch.
    - **Internal handoffs:** every holder is taken before the row it protects, in the sweeper, and handoff and child-delivery holders are tombstoned on release; child deliveries are single-mailbox rows that replay after a recipient's restore; a send finishes only after its handoff row exists; the send's own holders, its raw holder included, are released only then, and the sent copy's index holder only with its index row. The handoff's owner and send-as check is a condition of its insert, in the same commit. The destination mailbox is resolved at delivery from the current directory, never from a mapping journalled at release.
 5. **Quota and cost:** one mailbox cannot exhaust the account's daily quota beyond the gate, and the monthly ceiling cannot be passed by concurrency. A retry never releases a kept charge (an authorized or older-epoch fence), and every never-authorized charge on a release list is released before the next fence can send, or by the finish rule when the send ends. The newest fence is tracked across quota days.
-6. **Request rate limits (R1):** bucket keys come only from verified session identities and isolate users, mailboxes and workspaces; the limiter runs before any key lookup or body read and after every availability check; a missing binding fails closed; undo is never starved by sends.
+6. **Request rate limits (R1):** bucket keys come only from verified session identities and the request's own path ids, and isolate users, mailboxes, workspaces and, for undo, sends; the limiter runs before any key lookup or body read and after every availability check; a missing binding fails closed; undo is never starved by sends.
 7. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
 8. **Secrets and privacy:**
    - No message content, subject, address or token in logs, alerts or errors.
