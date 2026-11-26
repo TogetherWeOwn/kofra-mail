@@ -546,6 +546,8 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Stop rule:** the production deploy job is a workflow change (T0). It runs only after review, and the first production run needs explicit operator approval.
 
+**Split:** M3-7 lands in two PRs. **M3-7a** is the check and the header rule (the mailbox's own sender check on `sendDraft` and at release; the claim and `authorizeDispatch` checks arrive with M3-5, which calls the same statement). **M3-7b** (Sol, T0) is the allow-list: the CI job that generates `allowed_sender_addresses`, the matching plain variable, the dry run that prints counts only, and the rule that an identity stays `pending` until the deployed list contains it. M3-7b must merge before M3-12 and before any M3 flag turns on in a deployed environment.
+
 ### M3-8 Internal delivery (Opus)
 
 **Change:** a recipient in the same workspace (a directory point lookup at release) gets the sent copy through release step 6: the hold, the conditional `internal_handoffs` row and the `sent` ledger commit; then the pipeline's expansion into single-mailbox child `deliveries` rows (`source = 'internal'`, deterministic ids, each holder taken before its row), including `file_sent` rows for the sender's own mailbox and non-delivery notices. Child rows reuse the inbound fence, completion cursor, replay and pruning unchanged. It makes no `send()` call and uses no quota.
