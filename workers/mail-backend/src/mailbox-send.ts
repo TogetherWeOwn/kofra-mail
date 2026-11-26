@@ -220,6 +220,8 @@ export class SendApi {
     }
     const row = need(validSendId(params.sendId) ? sendRow(this.sql, params.sendId) : undefined);
     if (row.state !== 'pending') return fail('send_not_pending');
+    // A source the sweeper confirmed lost cannot be restored as a draft; release fails the send instead.
+    if (sendSourceLost(this.sql, row.record)) return fail('send_not_pending');
     const updatedAt = this.clock();
     const ref: DraftObjectRef = { id: row.draftId, rawKey: row.record.draft.rawKey, revision: crypto.randomUUID(), updatedAt };
     const result = resultOf('undoSend', key, fingerprint, 200, { draft: ref }, updatedAt);
@@ -309,6 +311,17 @@ export class SendDriver {
       timers.delete(SEND_DRIVE, this.ref);
       return null;
     }
+    // A send held while the path was off could not be undone then: it gets a
+    // fresh undo window, as in the restore epilogue, and is not released now.
+    const held = sql.exec<{ held: number }>('SELECT held FROM mailbox_send_drivers WHERE send_id = ?', row.id).toArray()[0]?.held === 1;
+    if (row.state === 'pending' && held) {
+      const undoUntil = Math.max(row.undoUntil, this.timer.now + row.record.undoSeconds * 1000);
+      if (undoUntil > row.undoUntil) ready.index.commitEvents([{ type: 'send_window', id: row.id, undoUntil }]);
+      sql.exec('UPDATE mailbox_send_drivers SET held = 0, token = ? WHERE send_id = ?', crypto.randomUUID(), row.id);
+      timers.set(SEND_DRIVE, row.id, undoUntil);
+      this.ports.journalDue(timers);
+      return null;
+    }
     if (row.state === 'pending' && this.timer.now < row.undoUntil) {
       timers.set(SEND_DRIVE, this.ref, row.undoUntil);
       return null;
@@ -317,7 +330,8 @@ export class SendDriver {
     const wait = Math.min(DRIVE_BACKOFF_MAX_MS, Math.max(DRIVE_BACKOFF_MS, stored));
     timers.set(SEND_DRIVE, row.id, this.timer.now + wait);
     const token = crypto.randomUUID();
-    sql.exec(`INSERT INTO mailbox_send_drivers VALUES (?, ?, ?) ON CONFLICT(send_id) DO UPDATE SET token = excluded.token, backoff = excluded.backoff`,
+    sql.exec(`INSERT INTO mailbox_send_drivers (send_id, token, backoff) VALUES (?, ?, ?)
+      ON CONFLICT(send_id) DO UPDATE SET token = excluded.token, backoff = excluded.backoff`,
       row.id, token, Math.min(DRIVE_BACKOFF_MAX_MS, wait * 2));
     return { token, incarnation: ready.incarnation, scope: ready.scope, row };
   }
@@ -424,6 +438,9 @@ export class SendDriver {
     if (row.terminalSeq === null || !await ports.publishThrough(row.terminalSeq)) return;
     // `raw` only if release step 4 committed in the published state; never from the index row now.
     const mode = row.queuedSeq !== null && row.queuedSeq <= row.terminalSeq ? 'raw' : 'all';
+    // A restore can reuse `terminalSeq` for other events, so a run overtaken by
+    // a restore or a later run must not release a send it no longer drives.
+    if (!await ports.local(() => this.current(start) && ports.ready()?.incarnation === start.incarnation)) return;
     await ports.sweeper(start.scope.workspaceId).releaseSend(start.scope.mailboxId, row.id, mode);
     await this.commit(start, TERMINAL, (timers, current, index) => {
       if (!current.finishPending) return;
@@ -504,13 +521,23 @@ export class SendDriver {
       !!builder && builder.encodedSize(mimeMessage(record, draft)) <= LIMITS.outboundMessageBytes;
   }
 
-  // Only a sweeper `confirm` answer of `lost` marks a source unusable (section 2.7).
   private sourceLost(record: SendRecord): Promise<boolean> {
-    return this.ports.local(() => {
-      const { sql } = this.ports;
-      return unusableSource(sql, 'send', record.id) || record.uploadIds.some(id => unusableSource(sql, 'upload', id));
-    });
+    return this.ports.local(() => sendSourceLost(this.ports.sql, record));
   }
+}
+
+// Only a sweeper `confirm` answer of `lost` marks a source unusable (section 2.7):
+// the send's draft revision, a forwarded part or an upload.
+export function sendSourceLost(sql: SqlStorage, record: SendRecord): boolean {
+  return unusableSource(sql, 'send', record.id) || record.uploadIds.some(id => unusableSource(sql, 'upload', id));
+}
+
+// While the send path is off, its held handler marks a due `pending` send, so
+// the first firing with the path on gives it a fresh undo window (section 2.5).
+export function markSendHeld(sql: SqlStorage, id: string): void {
+  if (!validSendId(id) || sendRow(sql, id)?.state !== 'pending') return;
+  sql.exec(`INSERT INTO mailbox_send_drivers (send_id, token, held) VALUES (?, ?, 1)
+    ON CONFLICT(send_id) DO UPDATE SET held = 1`, id, crypto.randomUUID());
 }
 
 // The restore epilogue (section 2.5), inside the transaction that sets the

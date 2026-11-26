@@ -270,6 +270,15 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       rateCap: (binding: 'MAIL_RATE_SENDS' | 'MAIL_RATE_UNDO' | 'MAIL_RATE_UNDO_FLOOD', cap: number) =>
         controlAction('rate-cap', JSON.stringify({ binding, cap })),
       releaseFailure: (failing: boolean) => controlAction('send-release-failure', String(failing)),
+      driver: (id: string) => readControl<{ send_id: string; backoff: number; held: number } | null>('send-driver', id),
+      // Holds the next publishThrough(seq) of a send run before it starts.
+      pausePublishThrough: (seq: number) => controlAction('pause-publish-through', String(seq)),
+      publishThroughPaused: () => controlAction('publish-through-paused'),
+      resumePublishThrough: () => controlAction('resume-publish-through'),
+      // Waits for every send_drive run in the mailbox's isolate, also one the alarm returned from.
+      driveIdle: () => controlAction('drive-idle'),
+      // Persists MAIL_SEND_ENABLED for the mailbox and restarts it, like a deploy that changes the flag.
+      switchPath: (enabled: boolean) => controlAction('send-switch', String(enabled)),
     };
     if (draftsUploads) inspectPut = async (pathname) => {
       const path = /^\/mail-([^/]+)\/(.+)$/.exec(pathname);

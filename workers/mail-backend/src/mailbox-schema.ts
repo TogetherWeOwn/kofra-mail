@@ -19,7 +19,8 @@ CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
 // columns hold the journal seq of the event that set them, so whether a step
 // is published is a comparison with the journal's flushed position.
 // mailbox_send_drivers and mailbox_send_breaches are local scheduling state,
-// cleared by a restore like the timer rows.
+// cleared by a restore like the timer rows. `held` marks a pending send whose
+// due drive row was held while the send path was off (section 2.5).
 export const SEND_SCHEMA = `
 CREATE TABLE IF NOT EXISTS mailbox_sends (
   id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, undo_until INTEGER NOT NULL,
@@ -37,7 +38,9 @@ CREATE TABLE IF NOT EXISTS mailbox_send_uploads (
   send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY (send_id, upload_id)
 );
 CREATE INDEX IF NOT EXISTS mailbox_send_upload_refs ON mailbox_send_uploads(upload_id, send_id);
-CREATE TABLE IF NOT EXISTS mailbox_send_drivers (send_id TEXT PRIMARY KEY, token TEXT NOT NULL, backoff INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS mailbox_send_drivers (
+  send_id TEXT PRIMARY KEY, token TEXT NOT NULL, backoff INTEGER NOT NULL DEFAULT 0, held INTEGER NOT NULL DEFAULT 0 CHECK (held IN (0, 1))
+);
 CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
 `;
 

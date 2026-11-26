@@ -90,6 +90,8 @@ export function summaryState(row: SendRow, flushed: number): SendSummaryState {
 const bounded = (value: unknown, limit: number): value is string => typeof value === 'string' && value.length > 0 && value.length <= limit;
 const count = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const isSendId = (value: unknown): value is string => typeof value === 'string' && isDeliveryId(value);
+// An epoch-ms time that a Date can hold, so every stored time renders with `iso`.
+export const epochMs = (value: unknown): value is number => count(value) && value <= 8.64e15;
 
 function validAddress(value: unknown, field?: boolean): boolean {
   if (!value || typeof value !== 'object') return false;
@@ -105,12 +107,12 @@ export function validSendId(id: unknown): id is string { return isSendId(id); }
 export function checkSendRecord(record: SendRecord): void {
   const r = record as Partial<SendRecord>;
   const keys = r.attachmentKeys, uploads = r.uploadIds, recipients = r.recipients;
-  if (!isSendId(r.id) || !bounded(r.draftId, 64) || !count(r.createdAt) || !count(r.undoUntil) || !count(r.dateAt) ||
+  if (!isSendId(r.id) || !bounded(r.draftId, 64) || !epochMs(r.createdAt) || !epochMs(r.undoUntil) || !epochMs(r.dateAt) ||
       r.dateAt !== r.undoUntil || !count(r.undoSeconds) || !bounded(r.ownerUserId, 256) || !validAddress(r.from) ||
       typeof r.from?.name !== 'string' || !Array.isArray(r.replyTo) || r.replyTo.length > LIMITS.recipientsPerMessage ||
       !r.replyTo.every(value => validAddress(value)) || !count(r.builderVersion) || r.builderVersion < 1 ||
       !r.draft || parseObjectKey(r.draft.rawKey)?.kind !== 'raw' || !bounded(r.draft.holder, 256) || !bounded(r.draft.revision, 64) ||
-      !count(r.draft.updatedAt) || !Array.isArray(keys) || keys.length > LIMITS.attachmentsPerMessage ||
+      !epochMs(r.draft.updatedAt) || !Array.isArray(keys) || keys.length > LIMITS.attachmentsPerMessage ||
       keys.some(key => typeof key !== 'string' || !parseObjectKey(key)) || !Array.isArray(uploads) ||
       uploads.length > LIMITS.attachmentsPerMessage || uploads.some(id => !bounded(id, 64)) || !Array.isArray(recipients) ||
       !recipients.length || recipients.length > LIMITS.recipientsPerMessage || !recipients.every(value => validAddress(value, true))) {

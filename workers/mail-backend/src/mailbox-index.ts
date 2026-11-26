@@ -3,7 +3,7 @@ import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow, type SendRecipientKind, type SentCopy } from './mail-journal.ts';
-import { checkKinds, checkSendRecord, SEND_FAILURES, sendRow, sentCopyId, TERMINAL, validSendId } from './mailbox-send-store.ts';
+import { checkKinds, checkSendRecord, epochMs, SEND_FAILURES, sendRow, sentCopyId, TERMINAL, validSendId } from './mailbox-send-store.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { JOURNAL_FLUSH } from './mailbox-timers.ts';
 import { IDEM_EXPIRY } from './mailbox-upload.ts';
@@ -644,7 +644,7 @@ export class MailboxIndex {
       }
       case 'send_undo': {
         const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
-        if (!row || row.state !== 'pending' || !bounded(event.revision, 64) || !count(event.updatedAt)) throw new Error('Invalid send undo');
+        if (!row || row.state !== 'pending' || !bounded(event.revision, 64) || !epochMs(event.updatedAt)) throw new Error('Invalid send undo');
         const seq = this.journal.revision() + 1;
         this.sql.exec(`UPDATE mailbox_sends SET state = 'cancelled', finish_pending = 1, terminal_seq = ? WHERE id = ?`, seq, row.id);
         const { draft, attachmentKeys, uploadIds } = row.record;
@@ -706,7 +706,7 @@ export class MailboxIndex {
       }
       case 'send_window': {
         const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
-        if (!row || row.state !== 'pending' || !count(event.undoUntil) || event.undoUntil < row.undoUntil) throw new Error('Invalid send window');
+        if (!row || row.state !== 'pending' || !epochMs(event.undoUntil) || event.undoUntil < row.undoUntil) throw new Error('Invalid send window');
         this.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', event.undoUntil, row.id);
         break;
       }
@@ -877,7 +877,7 @@ export class MailboxIndex {
       const seqs = [send.releaseSeq, send.queuedSeq, send.terminalSeq];
       if (send.id !== send.record.id || send.draftId !== send.record.draftId || send.holder !== send.record.draft.holder ||
           !['pending', 'releasing', 'queued', 'sending', 'delayed', ...TERMINAL].includes(send.state) || !count(send.createdSeq) ||
-          !count(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
+          !epochMs(send.createdAt) || !epochMs(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
           (send.messageId !== null && send.messageId !== sentCopyId(send.id)) ||
           (send.reason !== null && !SEND_FAILURES.includes(send.reason as never))) throw new Error('Invalid snapshot send');
       this.sql.exec('INSERT INTO mailbox_sends VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, send.draftId, send.state,

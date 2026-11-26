@@ -21,7 +21,7 @@ import {
 } from './mailbox-timers.ts';
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
-import { SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
+import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
 import { SEND_DRIVE } from './mailbox-send-store.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
@@ -98,7 +98,8 @@ export class Mailbox extends DurableObject<Env> {
     });
     register(UPLOAD_EXPIRY, uploadExpiry(ports));
     this.registerTimerKind(IDEM_EXPIRY, idemExpiry(ports, outbound, HELD_RECHECK_MS));
-    // The send path holds its due drive rows, like other outbound kinds, while it is off.
+    // The send path holds its due drive rows, like other outbound kinds, while it is off,
+    // and marks a held pending send for a fresh undo window when the path is on again.
     const sending = env.MAIL_SEND_ENABLED === 'on';
     const drive = sendDrive(this.sendPorts());
     this.registerTimerKind(SEND_DRIVE, {
@@ -107,6 +108,7 @@ export class Mailbox extends DurableObject<Env> {
         const due = timers.due(SEND_DRIVE, timer.ref);
         if (this.lifecycleState() === 'ready' && due !== null && due <= timer.now + this.timerRetryMs) {
           timers.set(SEND_DRIVE, timer.ref, timer.now + HELD_RECHECK_MS);
+          markSendHeld(ctx.storage.sql, timer.ref);
         }
       }),
     });

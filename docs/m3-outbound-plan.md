@@ -93,6 +93,8 @@ Each send has **exactly one timer row, `send_drive`**, keyed by `sendId`, from `
 2. Restore the draft under its old id with a new revision (one journal event with step 1).
 3. Store the idempotency result, so a retry after a lost response returns the restored draft.
 
+If the sweeper's `confirm` answered `lost` for a source of the send (its draft revision, a forwarded part or an upload; section 2.7), `undoSend` answers `send_not_pending` and commits nothing, because that draft cannot be restored; release then fails the send with `delivery_error`.
+
 ### 2.4 Release, the consumer and finishing
 
 **Release** (run by the drive handler), in order:
@@ -213,6 +215,7 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
   - for `pending`, at `max(undoUntil, now + undoSeconds)`, with `undoUntil` (not `dateAt`) moved to match. An undo that committed but whose publish failed (the client got 409 and retries the same key) may have been lost with the unpublished delta; the fresh window lets that retry undo the send again before it goes out;
   - at `delayedUntil` for `delayed`, or at now if an internal row is still `pending` (its handoff never waits for a quota reset);
   - at now for everything else, including terminal sends with `finish_pending`. Their queue messages may already be acknowledged.
+- **Send path switched off:** while `MAIL_SEND_ENABLED` is off, the drive handler holds the due row of a `pending` send and marks it held in local state (`undoSend` answers `not_implemented` meanwhile), and the first firing with the path on again gives a held `pending` send a fresh window exactly as this epilogue does, without releasing it on that firing; `dateAt` never moves, and a restore drops the mark because its epilogue gives the fresh window.
 - **Attempting recipients:** recipients restored as `attempting` stay `attempting`, with their published `lease_until`. The next claim waits until `lease_until + clockSkew` and then treats them as ambiguous; it never sends to them while an authorization from before the restore could still be used.
 - **Internal recipients:** rows restored as `pending` are handed off again; the deterministic handoff key makes the repeat a no-op, and the destination is resolved at expansion as usual.
 - **Reset:** the restore's reset of local state also clears every table this plan adds (`sends`, the ledger, attempt history, authorization records, release lists and every timer row except `journal_flush`), so a restore that restarts from another manifest starts clean.

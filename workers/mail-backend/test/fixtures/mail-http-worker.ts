@@ -91,11 +91,15 @@ export class HttpMailbox extends Mailbox {
     let flag: string | undefined;
     try { flag = ctx.storage.sql.exec<{ flag: string }>('SELECT flag FROM fixture_upload_switch').toArray()[0]?.flag; }
     catch { /* no fixture override before the first toggle */ }
+    let sendFlag: string | undefined;
+    try { sendFlag = ctx.storage.sql.exec<{ flag: string }>('SELECT flag FROM fixture_send_switch').toArray()[0]?.flag; }
+    catch { /* no fixture override before the first toggle */ }
     const record = (table: string, body: unknown) => {
       ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS ${table} (n INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
       ctx.storage.sql.exec(`INSERT INTO ${table} (body) VALUES (?)`, JSON.stringify(body));
     };
     super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED,
+      MAIL_SEND_ENABLED: sendFlag ?? env.MAIL_SEND_ENABLED,
       SEND: { send: async (body: SendDispatch) => { record('fixture_send_queue', body); } },
       ...{ EMAIL: { send: async (message: unknown) => { record('fixture_email', { kind: typeof message }); return {}; } } },
       ALERTS: { fetch: async (input, init) => {
@@ -161,6 +165,39 @@ export class HttpMailbox extends Mailbox {
       index.changeMany([{ type: 'api_settings', definition: JSON.stringify(settings) }]);
     });
   }
+  // Holds the next publishThrough(seq) call before it starts, until resumed.
+  private publishGate?: { seq: number; armed: boolean; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pausePublishThrough(seq: number) {
+    this.publishGate = { seq, armed: true, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+  }
+  async publishThroughPaused() { await this.publishGate!.reached.promise; }
+  resumePublishThrough() { this.publishGate?.resume.resolve(); }
+  protected override sendPorts() {
+    const ports = super.sendPorts();
+    const publishThrough = ports.publishThrough;
+    ports.publishThrough = async seq => {
+      const gate = this.publishGate;
+      if (gate?.armed && gate.seq === seq) {
+        gate.armed = false;
+        gate.reached.resolve();
+        await gate.resume.promise;
+      }
+      return publishThrough(seq);
+    };
+    return ports;
+  }
+  // Every send_drive run still running in this isolate, including one the alarm returned from.
+  private readonly driveRuns = new Set<Promise<unknown>>();
+  async driveIdle() { while (this.driveRuns.size) await Promise.allSettled([...this.driveRuns]); }
+  sendDriver(id: string) {
+    return this.ctx.storage.sql.exec('SELECT * FROM mailbox_send_drivers WHERE send_id = ?', id).toArray()[0] ?? null;
+  }
+  async changeSendSwitch(enabled: boolean) {
+    this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_send_switch (id INTEGER PRIMARY KEY, flag TEXT NOT NULL)');
+    this.ctx.storage.sql.exec('INSERT OR REPLACE INTO fixture_send_switch VALUES (1, ?)', enabled ? 'on' : 'off');
+    await this.ctx.storage.sync();
+    this.ctx.abort();
+  }
   protected override async sendCheckpoint(step: SendStep) {
     if (step !== this.crashStep) return;
     this.crashStep = undefined;
@@ -198,6 +235,11 @@ export class HttpMailbox extends Mailbox {
       return rebuild(timers, now);
     } };
     super.registerTimerKind(kind, { ...handler, run: async timer => {
+      if (kind === SEND_DRIVE) {
+        const run = handler.run(timer);
+        this.driveRuns.add(run);
+        try { return await run; } finally { this.driveRuns.delete(run); }
+      }
       if (kind === this.pauseKind) this.startedExpiry++;
       if (kind !== this.pauseKind || this.resumeExpiry) return handler.run(timer);
       const resume = this.resumeExpiry = Promise.withResolvers<void>();
@@ -548,6 +590,17 @@ export default {
           case '/__fixture/send-ids': return Response.json(await box.sendIds());
           case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
           case '/__fixture/send-row': return Response.json(await box.sendRow(await req.text()));
+          case '/__fixture/send-driver': return Response.json(await box.sendDriver(await req.text()));
+          case '/__fixture/pause-publish-through': await box.pausePublishThrough(Number(await req.text())); break;
+          case '/__fixture/publish-through-paused': await box.publishThroughPaused(); break;
+          case '/__fixture/resume-publish-through': await box.resumePublishThrough(); break;
+          case '/__fixture/drive-idle': await box.driveIdle(); break;
+          case '/__fixture/send-switch': {
+            const enabled = await req.text() === 'true';
+            try { await box.changeSendSwitch(enabled); }
+            catch { /* the fixture deliberately aborts the isolate after persisting the override */ }
+            break;
+          }
           case '/__fixture/lifecycle': return Response.json(await box.lifecycle());
           case '/__fixture/set-reply-to': await box.setReplyTo(ws, mailboxId!, await req.json()); break;
           case '/__fixture/send-registration': return Response.json(await refs.registration(mailboxId!, await req.text()));

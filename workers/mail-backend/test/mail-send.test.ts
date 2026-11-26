@@ -197,14 +197,15 @@ for (const step of ['released', 'stored', 'queued', 'enqueued'] as const) {
   }));
 }
 
-// Runs the lane until restored messages are reindexed and the mailbox serves reads again.
+// Runs the lane until restored messages are reindexed and the mailbox serves
+// reads again. Send reads serve before reindexing; the Sent view waits for it.
 async function settle(h: Fixture, mail: MailService) {
-  for (let i = 0; i < 5; i++) {
-    try { await mail.listSends({}); return; }
+  for (let advances = 0; ; advances++) {
+    try { await mail.listThreads({ view: 'sent' }); return; }
     catch (error) { if (!isMailApiError(error, 'mailbox_restoring')) throw error; }
+    if (advances === 5) throw new Error('Mailbox did not settle after its restore');
     await h.advance(minute);
   }
-  throw new Error('Mailbox did not settle after its restore');
 }
 
 test('restore matrix: a restore in each driven state releases every accepted send, never an undone one, and re-drives after an epilogue crash',
@@ -334,7 +335,8 @@ test('undo racing the alarm: either cancelled with no queue message, or released
   for (let i = 0; i < 6; i++) {
     const { send: pending } = await send(mail, from, `race-${i}`);
     await h.advance(UNDO - second);
-    const [undo] = await Promise.allSettled([mail.undoSend(pending.id, key(`undo-${i}`)), h.advance(second)]);
+    const [undo, alarm] = await Promise.allSettled([mail.undoSend(pending.id, key(`undo-${i}`)), h.advance(second)]);
+    assert.equal(alarm.status, 'fulfilled', alarm.status === 'rejected' ? String(alarm.reason) : undefined);
     await h.advance(DRIVE_BACKOFF);
     const state = (await mail.getSend(pending.id)).state;
     const enqueued = (await h.sends.queue()).some(({ sendId }) => sendId === pending.id);
@@ -361,12 +363,15 @@ async function within<T>(promise: Promise<T>, ms: number, what: string): Promise
     return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took over ${ms} ms`)), ms); })]);
   } finally { clearTimeout(timer); }
 }
-async function until(check: () => boolean | Promise<boolean>, what: string) {
-  for (let i = 0; i < 200; i++) {
-    if (await check()) return;
-    await new Promise(resolve => setTimeout(resolve, 10));
-  }
-  throw new Error(`Timed out waiting for ${what}`);
+// Polls `check` until it holds. The whole poll has one deadline, so a check
+// that never settles fails the wait instead of blocking it.
+async function until(check: () => boolean | Promise<boolean>, what: string, ms = 10_000) {
+  let stopped = false;
+  const poll = async () => {
+    while (!stopped && !(await check())) await new Promise(resolve => setTimeout(resolve, 10));
+  };
+  try { await within(poll(), ms, `waiting for ${what}`); }
+  finally { stopped = true; }
 }
 
 test('late PUT after release: an overtaken PUT lands after the send was cancelled and released; its object sits under an unheld ledger generation and is swept',
@@ -374,20 +379,24 @@ test('late PUT after release: an overtaken PUT lands after the send was cancelle
     const { send: pending } = await send(mail, from, 'one');
     await h.sends.shortHandlerBudget();
     const put = h.pauseNextPut();
-    const running = h.advance(UNDO);
-    await put.started;
-    await running;
-    const registration = await h.sends.registration(pending.id);
+    let registration: Awaited<ReturnType<typeof h.sends.registration>>;
+    // The paused PUT is released before the fixture closes, whatever fails.
+    try {
+      const running = h.advance(UNDO);
+      await put.started;
+      await running;
+      registration = await h.sends.registration(pending.id);
+      assert.ok(registration?.key);
+      // The release commit was never published, so a restore rewinds it, and the user undoes the send.
+      await h.restore();
+      assert.equal((await mail.getSend(pending.id)).state, 'pending');
+      await mail.undoSend(pending.id, key('undo'));
+      // The stalled call still holds its ref in this isolate for one timer lease.
+      await h.advance(DRIVE_BACKOFF + second);
+      assert.equal((await h.sends.registration(pending.id))?.released, 'all');
+      assert.deepEqual((await h.holderDetails(registration.key)).map(({ state }) => state), ['tombstone', 'tombstone']);
+    } finally { put.release(); }
     assert.ok(registration?.key);
-    // The release commit was never published, so a restore rewinds it, and the user undoes the send.
-    await h.restore();
-    assert.equal((await mail.getSend(pending.id)).state, 'pending');
-    await mail.undoSend(pending.id, key('undo'));
-    // The stalled call still holds its ref in this isolate for one timer lease.
-    await h.advance(DRIVE_BACKOFF + second);
-    assert.equal((await h.sends.registration(pending.id))?.released, 'all');
-    assert.deepEqual((await h.holderDetails(registration.key)).map(({ state }) => state), ['tombstone', 'tombstone']);
-    put.release();
     await until(() => h.objects.has(objectPath(registration.key!)), 'the late PUT');
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
@@ -410,16 +419,23 @@ for (const next of ['finishes', 'releases'] as const) {
     const { send: pending } = await send(mail, from, 'one');
     await h.sends.shortHandlerBudget();
     const put = h.pauseNextPut();
-    const running = h.advance(UNDO);
-    await put.started;
-    await running;
-    const { mailbox } = await mail.getSession();
     const owner = next === 'finishes' ? h.as('newAdmin') : mail;
-    if (next === 'finishes') await h.as('admin').updateMailbox(mailbox!.id, { ownerUserId: (await owner.getSession()).user.id });
-    await h.advance(10 * minute);
-    const settled = await owner.getSend(pending.id);
-    assert.equal(settled.state, next === 'finishes' ? 'failed' : 'sending');
-    put.release();
+    let settled: Send;
+    // The paused PUT is released before the fixture closes, whatever fails.
+    try {
+      const running = h.advance(UNDO);
+      await put.started;
+      await running;
+      const { mailbox } = await mail.getSession();
+      if (next === 'finishes') await h.as('admin').updateMailbox(mailbox!.id, { ownerUserId: (await owner.getSession()).user.id });
+      await h.advance(10 * minute);
+      // The short handler budget lets the alarm return while the next firing
+      // still runs: wait until it has finished, or published and enqueued.
+      if (next === 'finishes') await until(async () => (await h.sends.row(pending.id))?.finish_pending === 0, 'the finish');
+      else await until(async () => (await h.sends.queue()).length === 1 && !!(await owner.getSend(pending.id)).messageId, 'the publish and enqueue');
+      settled = await owner.getSend(pending.id);
+      assert.equal(settled.state, next === 'finishes' ? 'failed' : 'sending');
+    } finally { put.release(); }
     const registration = await h.sends.registration(pending.id);
     await until(() => h.objects.has(objectPath(registration!.key!)), 'the stalled PUT');
     await new Promise(resolve => setTimeout(resolve, 200));
@@ -739,3 +755,109 @@ test('a barrier that times out after the publish holding the lane already covere
   assert.equal(response.status, 202);
   assert.equal((await response.json() as Send).state, 'pending');
 }));
+
+test('a finish run overtaken by a restore releases nothing: the restored pending send keeps its registration free and goes out after its fresh window',
+  () => withSend(async (h, mail, from) => {
+    const { send: pending } = await send(mail, from, 'one');
+    // The undo commits, but its publish fails, so a restore loses it with its delta.
+    await h.publishFailure(true);
+    assert.equal((await post(h, mail, `/sends/${pending.id}/undo`, 'undo')).status, 409);
+    await h.publishFailure(false);
+    const terminalSeq = (await h.sends.row(pending.id))?.terminal_seq;
+    assert.ok(terminalSeq);
+    await h.sends.shortHandlerBudget();
+    // The finish run of the cancelled send stops just before its publish.
+    await h.sends.pausePublishThrough(terminalSeq);
+    try {
+      await h.advance(second);
+      await h.sends.publishThroughPaused();
+      await h.restore();
+      const restored = await mail.getSend(pending.id);
+      assert.equal(restored.state, 'pending', 'the restore lost the unpublished undo');
+      assert.ok(restored.undoRemainingMs > 0, 'with a fresh window');
+    } finally { await h.sends.resumePublishThrough(); }
+    // The overtaken run now publishes through its old seq, which the restored journal reused.
+    await h.sends.driveIdle();
+    assert.equal(await h.sends.registration(pending.id), null, 'the overtaken run released nothing');
+    assert.equal((await h.sends.row(pending.id))?.state, 'pending');
+    // The short handler budget's real-time clock set the window a few milliseconds later.
+    await h.advance(UNDO + second);
+    await h.sends.driveIdle();
+    assert.equal((await mail.getSend(pending.id)).state, 'sending');
+    assert.ok((await h.sends.registration(pending.id))?.key, 'the restored send registered and stored its copy');
+    assert.equal((await h.sends.queue()).length, 1);
+  }));
+
+const HELD_RECHECK = 15 * minute;
+// The send path is switched off with a pending send, its undo window passes, and the path is switched on again.
+async function heldWhileOff(h: Fixture, mail: MailService, from: string) {
+  const { send: pending } = await send(mail, from, 'one');
+  const dateAt = (JSON.parse((await h.sends.row(pending.id))!.record) as { dateAt: number }).dateAt;
+  await h.sends.switchPath(false);
+  await h.advance(UNDO);
+  assert.equal((await h.sends.row(pending.id))?.state, 'pending');
+  await rejects(mail.undoSend(pending.id, key('undo-off')), 'not_implemented');
+  await h.sends.switchPath(true);
+  await h.advance(HELD_RECHECK);
+  const fresh = await mail.getSend(pending.id);
+  assert.equal(fresh.state, 'pending', 'not released on the first firing with the path on');
+  assert.equal(fresh.undoRemainingMs, UNDO, 'a fresh undo window from now');
+  assert.ok(Date.parse(fresh.undoUntil) > Date.parse(pending.undoUntil));
+  const row = await h.sends.row(pending.id);
+  assert.equal(row?.undo_until, Date.parse(fresh.undoUntil));
+  assert.equal((JSON.parse(row!.record) as { dateAt: number }).dateAt, dateAt, 'dateAt never moves');
+  assert.equal((await h.sends.driver(pending.id))?.held, 0, 'the mark is cleared');
+  assert.equal(await h.sends.registration(pending.id), null);
+  assert.deepEqual(await h.sends.queue(), []);
+  return { pending, fresh };
+}
+
+test('send path off: a held pending send gets a fresh undo window when the path is on again, and an undo in it cancels with nothing sent',
+  () => withSend(async (h, mail, from) => {
+    const { pending } = await heldWhileOff(h, mail, from);
+    const draft = await mail.undoSend(pending.id, key('undo'));
+    assert.equal(draft.id, pending.draftId);
+    await h.advance(UNDO);
+    await h.advance(DRIVE_BACKOFF);
+    assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.deepEqual(await sentCopies(mail), []);
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+
+test('send path off: a held pending send that is not undone is released after its fresh window', () => withSend(async (h, mail, from) => {
+  const { pending, fresh } = await heldWhileOff(h, mail, from);
+  await h.advance(Date.parse(fresh.undoUntil) - Date.parse(pending.undoUntil) - HELD_RECHECK - second);
+  assert.equal((await mail.getSend(pending.id)).state, 'pending', 'still inside the fresh window');
+  await h.advance(second);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  assert.deepEqual(await h.sends.queue(), [{ kind: 'dispatch', ws: 'w1', mb: 'mailbox-a', sendId: pending.id }]);
+  assert.deepEqual((await sentCopies(mail)).map(({ send: item }) => item?.id), [pending.id]);
+  assert.equal(await h.sends.emailCalls(), 0);
+}));
+
+test('undo of a send whose source the sweeper confirmed lost answers send_not_pending and commits nothing; release fails it with delivery_error',
+  () => withSend(async (h, mail, from) => {
+    await h.confirmFailure(true);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    await h.advance(minute);
+    const [confirmation] = await h.confirmations();
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    // The sweeper deleted the revision's generation: its object is gone and confirm answers lost.
+    h.objects.delete(objectPath(confirmation.object_key));
+    await h.sends.forceLost(confirmation.holder);
+    await h.confirmFailure(false);
+    await h.forceSnapshot();
+    const events = await h.eventCount('send_undo');
+    for (const attempt of ['undo', 'undo']) await rejects(mail.undoSend(pending.id, key(attempt)), 'send_not_pending');
+    assert.equal(await h.eventCount('send_undo'), events, 'the undo committed nothing');
+    await rejects(mail.getDraft(draft.id), 'not_found');
+    assert.equal((await mail.getSend(pending.id)).state, 'pending');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.deepEqual(await sentCopies(mail), []);
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
