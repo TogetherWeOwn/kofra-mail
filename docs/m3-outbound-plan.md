@@ -330,6 +330,8 @@ The sweeper never selects a generation that has a holder, so such an object woul
 
 **Open question:** the sweep drops a retired generation's rows, its `expired` holders included, as soon as the DELETE is confirmed, usually seconds after retirement. A `confirm` after that finds no holder and answers `released`, not `lost`, so the `lost` alert covers only that short window. One option is for `confirm` to answer `lost` for an absent holder whose `raw/` or `att/` generation row no longer exists, since that row is dropped only after a confirmed DELETE. It needs a design decision before M3-2 relies on `lost`.
 
+**Open question:** `drafts/<sha256>` generations are never sweep candidates (they have no prefix), and P0 keeps that rule. A provisional holder on a draft object therefore expires, but the object and its `expired` row are never deleted. Section 2.7 stops the leak for `raw/` and `att/` objects only; draft revision objects need their own rule before M3-2 depends on expiry for them.
+
 **Acceptance:**
 - A provisional holder protects its generation from the sweep; expiry makes it `expired`, and the grace counts from the expiry.
 - `confirm` before expiry answers `held`, after expiry `rehold`, and after retirement `lost`.
