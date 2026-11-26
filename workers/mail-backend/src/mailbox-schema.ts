@@ -55,6 +55,22 @@ CREATE TABLE IF NOT EXISTS mailbox_api_idempotency (
 CREATE INDEX IF NOT EXISTS mailbox_api_idempotency_expiry ON mailbox_api_idempotency(expires_at, key);
 CREATE TABLE IF NOT EXISTS mailbox_api_in_progress (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS mailbox_api_progress_expiry ON mailbox_api_in_progress(expires_at, key);
+CREATE TABLE IF NOT EXISTS mailbox_api_uploads (
+  id TEXT PRIMARY KEY, object_key TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL,
+  size INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mailbox_api_draft_uploads (
+  draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+  upload_id TEXT NOT NULL REFERENCES mailbox_api_uploads(id), PRIMARY KEY (draft_id, upload_id)
+);
+CREATE INDEX IF NOT EXISTS mailbox_api_upload_refs ON mailbox_api_draft_uploads(upload_id, draft_id);
+CREATE TABLE IF NOT EXISTS mailbox_api_draft_objects (
+  draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE, object_key TEXT NOT NULL,
+  PRIMARY KEY (draft_id, object_key)
+);
+CREATE TABLE IF NOT EXISTS mailbox_pending_releases (
+  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, PRIMARY KEY (seq, object_key, holder)
+);
 CREATE TABLE IF NOT EXISTS mailbox_api_settings (id INTEGER PRIMARY KEY CHECK(id=1), definition TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mailbox_api_expiry (id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS mailbox_api_expiry_time ON mailbox_api_expiry(expires_at, id);
