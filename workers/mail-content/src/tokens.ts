@@ -95,13 +95,9 @@ function inTime(claims: CommonClaims, now: number): boolean {
     && claims.exp > claims.iat && claims.exp - claims.iat <= CONTENT_URL_SECONDS;
 }
 
-/**
- * Signs claims for `purpose` under the current key. Refuses (throws ContentClaimsError) anything
- * the verifier would refuse at `now`, so a minting bug cannot issue an unusable or long-lived URL.
- * Callers set ws, mb and sub from an authenticated session, never from request input.
- */
-export async function mint<P extends Purpose>(
-  keys: ContentUrlKeys, purpose: P, claims: MintClaims<P>, now: number,
+/** Signs claims, refusing (ContentClaimsError) anything the verifier would refuse at `now`, or an iat after `latestIat`. */
+async function sign(
+  keys: ContentUrlKeys, purpose: Purpose, claims: unknown, now: number, latestIat: number,
 ): Promise<string> {
   if (!isPurpose(purpose) || typeof now !== 'number' || !Number.isFinite(now)) throw new ContentClaimsError();
   if (typeof claims !== 'object' || claims === null) throw new ContentClaimsError();
@@ -109,12 +105,13 @@ export async function mint<P extends Purpose>(
   const extra = EXTRA_CLAIM[purpose];
   const allowed = ['ws', 'mb', 'msg', 'sub', 'ep', extra, 'iat', 'exp'];
   if (!Object.keys(input).every((name) => allowed.includes(name))) throw new ContentClaimsError();
-  const iat = input.iat ?? Math.floor(now);
-  const exp = input.exp ?? (typeof iat === 'number' ? iat + CONTENT_URL_SECONDS : undefined);
+  // Only an omitted timestamp takes its default; null or any other non-number is refused below.
+  const iat = input.iat === undefined ? Math.floor(now) : input.iat;
+  const exp = input.exp === undefined ? (typeof iat === 'number' ? iat + CONTENT_URL_SECONDS : undefined) : input.exp;
   const full = {
     v: 1, ws: input.ws, mb: input.mb, msg: input.msg, [extra]: input[extra], sub: input.sub, ep: input.ep, iat, exp,
   };
-  if (!validClaims(purpose, full) || !inTime(full, now)) throw new ContentClaimsError();
+  if (!validClaims(purpose, full) || !inTime(full, now) || !(full.iat <= latestIat)) throw new ContentClaimsError();
   const payload = encode(encoder.encode(JSON.stringify(full)));
   const key = keys.keys.get(keys.current);
   if (payload.length > MAX_PAYLOAD_BYTES || !key) throw new ContentClaimsError();
@@ -122,11 +119,41 @@ export async function mint<P extends Purpose>(
   return `${keys.current}.${payload}.${mac}`;
 }
 
+/**
+ * Signs claims for `purpose` under the current key. Refuses (throws ContentClaimsError) anything the
+ * verifier would refuse at `now`, and any iat after floor(now), so no URL outlives 300 s from minting.
+ * Callers set ws, mb and sub from an authenticated session, never from request input.
+ * Not for the service-binding RPC: expose mintForWeb there; cid and img come from mintFromBody.
+ */
+export function mint<P extends Purpose>(keys: ContentUrlKeys, purpose: P, claims: MintClaims<P>, now: number): Promise<string> {
+  return sign(keys, purpose, claims, now, Math.floor(now));
+}
+
 export type WebPurpose = 'body' | 'att';
-export async function mintForWeb<P extends WebPurpose>(
-  _keys: ContentUrlKeys, _purpose: P, _claims: Omit<ClaimsByPurpose[P], 'v' | 'iat' | 'exp'>, _now: number,
+
+/**
+ * The only mint for the service-binding RPC that `mail-web` calls. It signs body and att tokens
+ * only, refuses caller-supplied iat and exp, and sets iat = floor(now) and exp = iat + 300.
+ */
+export function mintForWeb<P extends WebPurpose>(
+  keys: ContentUrlKeys, purpose: P, claims: Omit<ClaimsByPurpose[P], 'v' | 'iat' | 'exp'>, now: number,
 ): Promise<string> {
-  throw new Error('not implemented');
+  if ((purpose !== 'body' && purpose !== 'att') || typeof claims !== 'object' || claims === null
+    || 'iat' in claims || 'exp' in claims) {
+    return Promise.reject(new ContentClaimsError());
+  }
+  return sign(keys, purpose, claims, now, Math.floor(now));
+}
+
+/**
+ * Internal to this package: mintFromBody's signer. A derived iat may equal a body iat that leads
+ * the clock (still within the 30 s verify skew), so exp - iat stays within the body's span.
+ */
+export function signDerived(
+  keys: ContentUrlKeys, purpose: 'cid' | 'img', claims: Omit<ClaimsByPurpose['cid'], 'v'> | Omit<ClaimsByPurpose['img'], 'v'>, now: number,
+): Promise<string> {
+  if (purpose !== 'cid' && purpose !== 'img') return Promise.reject(new ContentClaimsError());
+  return sign(keys, purpose, claims, now, Number.POSITIVE_INFINITY);
 }
 
 /**

@@ -73,7 +73,7 @@ Every step must pass. Any failure answers 404 with an empty body, and the reason
 
 1. **Format:** exactly three parts, a known `kid`, `v = 1`, a payload of at most 4 KiB, and the token's purpose equal to the path segment.
 2. **MAC:** `crypto.subtle.verify` (constant time).
-3. **Time:** `iat - 30 s ≤ now < exp`, and `exp - iat ≤ 300`.
+3. **Time:** `iat - 30 s ≤ now < exp`, `iat < exp`, and `exp - iat ≤ 300`.
 4. **For `body`, `cid` and `att`, still authorised:**
    - The account service confirms the credential epoch of `sub` is still `ep`. The answer is cached for at most 60 seconds, as the app does.
    - A point lookup in the directory confirms that mailbox `mb` is still owned by `sub`.

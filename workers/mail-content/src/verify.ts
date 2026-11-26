@@ -6,7 +6,7 @@
 // including a port that throws, returns the one frozen REFUSED value; nothing is logged.
 import type { ContentUrlKeys } from './keys.ts';
 import {
-  checkToken, ContentClaimsError, isPurpose, mint,
+  checkToken, ContentClaimsError, isPurpose, signDerived,
   type BodyClaims, type ImageClaims, type PartClaims,
 } from './tokens.ts';
 
@@ -24,8 +24,13 @@ export interface MessageRecord {
   verdict: string;
 }
 
-export function attachmentFor(_message: MessageRecord, _part: number): MessageAttachment | undefined {
-  throw new Error('not implemented');
+/**
+ * The attachment with this signed part number, found by its explicit `part`, never by array position.
+ * `objectKey` is null for a part served from the raw message. A missing or duplicated part gives undefined.
+ */
+export function attachmentFor(message: MessageRecord, part: number): MessageAttachment | undefined {
+  const matches = message.attachments.filter((attachment) => attachment.part === part);
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 export interface ContentPorts {
@@ -33,7 +38,7 @@ export interface ContentPorts {
   credentialEpoch(sub: string): Promise<number | null>;
   /** A directory point lookup: the user id owning mailbox `mb` of workspace `ws`, or null. */
   mailboxOwner(ws: string, mb: string): Promise<string | null>;
-  /** The mailbox Durable Object (ws, mb): the message's object keys and verdict, or null once deleted or expired. */
+  /** The mailbox Durable Object (ws, mb): the raw key, each attachment part with its object key, and the verdict; null once deleted or expired. */
   message(ws: string, mb: string, msg: string): Promise<MessageRecord | null>;
 }
 
@@ -133,8 +138,8 @@ export type DerivedRef = { purpose: 'cid'; part: number } | { purpose: 'img'; u:
 export async function mintFromBody(keys: ContentUrlKeys, body: VerifiedBody, ref: DerivedRef, now: number): Promise<string> {
   if (!verifiedBodies.has(body) || body.purpose !== 'body') throw new ContentClaimsError();
   const { ws, mb, msg, sub, ep, iat: bodyIat, exp, ri } = body.claims;
-  const iat = Math.max(Math.floor(now), bodyIat);
-  if (ref?.purpose === 'cid') return mint(keys, 'cid', { ws, mb, msg, sub, ep, part: ref.part, iat, exp }, now);
-  if (ref?.purpose === 'img' && ri === true) return mint(keys, 'img', { ws, mb, msg, sub, ep, u: ref.u, iat, exp }, now);
+  const iat = Math.min(Math.max(Math.floor(now), bodyIat), exp - 1);
+  if (ref?.purpose === 'cid') return signDerived(keys, 'cid', { ws, mb, msg, sub, ep, part: ref.part, iat, exp }, now);
+  if (ref?.purpose === 'img' && ri === true) return signDerived(keys, 'img', { ws, mb, msg, sub, ep, u: ref.u, iat, exp }, now);
   throw new ContentClaimsError();
 }
