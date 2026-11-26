@@ -26,7 +26,8 @@ async function setup(t: TestContext, getRaw?: (path: string) => Response | Promi
   const alerts: unknown[] = [];
   const draftObjects = new Map<string, ArrayBuffer>();
   const runtime = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: bundle.outputFiles[0].text }],
-    compatibilityDate: '2025-06-01', durableObjects: { MAILBOX: { className: 'RegressionMailbox', useSQLite: true } },
+    compatibilityDate: '2025-06-01', durableObjects: { MAILBOX: { className: 'RegressionMailbox', useSQLite: true },
+      SWEEPER: { className: 'Sweeper', useSQLite: true } },
     bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on', KOFRA_S3_ENDPOINT: 'https://object-store.example.test',
       KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture' },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
@@ -45,7 +46,7 @@ async function setup(t: TestContext, getRaw?: (path: string) => Response | Promi
         return getRaw(pathname);
       }
       assert.equal(request.method, 'PUT');
-      assert.match(pathname, /\/drafts\/[a-f0-9]{64}$/);
+      assert.match(pathname, /\/(?:drafts\/[a-f0-9]{64}|raw\/[a-f0-9]{64}\/[A-Z0-9]{26})$/);
       const bytes = await request.arrayBuffer();
       await beforeDraftPut?.();
       draftObjects.set(pathname, bytes);

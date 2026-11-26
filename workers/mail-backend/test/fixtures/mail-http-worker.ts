@@ -11,6 +11,7 @@ import { MailboxIndex } from '../../src/mailbox-index.ts';
 import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
+import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
 import { mailboxName, type Env as BackendEnv } from '../../src/worker.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
@@ -46,6 +47,8 @@ export class HttpMailbox extends Mailbox {
   private expiryCompletion?: PromiseWithResolvers<void>;
   private startedExpiry = 0;
   private failPublish = false;
+  private failAlert = false;
+  private readonly emittedAlerts: string[] = [];
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
     let mailbox: HttpMailbox;
@@ -60,7 +63,13 @@ export class HttpMailbox extends Mailbox {
     let flag: string | undefined;
     try { flag = ctx.storage.sql.exec<{ flag: string }>('SELECT flag FROM fixture_upload_switch').toArray()[0]?.flag; }
     catch { /* no fixture override before the first toggle */ }
-    super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED });
+    super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED,
+      ALERTS: { fetch: async (input, init) => {
+        const { source } = await new Request(input, init).json<{ source: string }>();
+        if (mailbox.failAlert) return new Response(null, { status: 503 });
+        mailbox.emittedAlerts.push(source);
+        return new Response(null, { status: 204 });
+      } } });
     mailbox = this;
   }
   publishFailure(failing: boolean) { this.failPublish = failing; }
@@ -109,13 +118,39 @@ export class HttpMailbox extends Mailbox {
   pendingReleases() {
     return this.ctx.storage.sql.exec('SELECT seq, object_key, holder FROM mailbox_pending_releases ORDER BY seq, object_key, holder').toArray();
   }
-  async purgeTrash(ws: string) {
+  hasIdempotency(key: string) {
+    return this.ctx.storage.sql.exec('SELECT 1 FROM mailbox_api_idempotency WHERE key = ?', key).toArray().length === 1;
+  }
+  alerts() { return this.emittedAlerts; }
+  alertFailure(failing: boolean) { this.failAlert = failing; }
+  confirmations() {
+    return this.ctx.storage.sql.exec('SELECT seq, object_key, holder FROM mailbox_pending_confirmations ORDER BY seq, object_key, holder').toArray();
+  }
+  private fixtureIndex(ws: string) {
     const refs = this.env.SWEEPER.getByName(ws);
-    const objects: ConstructorParameters<typeof MailboxIndex>[1] = { ...kofra(this.env, ws),
-      register: (kind, digest, holder) => refs.register(kind, digest, holder),
-      hold: (key, holder) => refs.hold(key, holder), release: (key, holder) => refs.release(key, holder) };
+    const objects = { ...kofra(this.env, ws),
+      register: (kind: 'raw' | 'att', digest: string, holder: string) => refs.register(kind, digest, holder),
+      holdProvisional: (...args: Parameters<MailSweeper['holdProvisional']>) => refs.holdProvisional(...args),
+      hold: (key: string, holder: string) => refs.hold(key, holder), release: (key: string, holder: string) => refs.release(key, holder) };
+    return new MailboxIndex(this.ctx.storage, objects, this.ctx.id.toString(), true);
+  }
+  async stageAndCrash(ws: string) {
+    await this.fixtureIndex(ws).prepareApiDraft(crypto.randomUUID(), new Uint8Array(encoder.encode('uncommitted fixture')), this.mailApiNow());
+    this.ctx.abort();
+  }
+  async persistMaximumHolder(ws: string, draftKey: string) {
+    const id = crypto.randomUUID();
+    const holder = `draft:${'x'.repeat(250)}`;
+    await this.env.SWEEPER.getByName(ws).holdProvisional({ key: draftKey }, holder);
+    const index = this.fixtureIndex(ws);
+    index.changeMany([{ type: 'draft', id, rawKey: draftKey, holder, revision: crypto.randomUUID(), updatedAt: this.mailApiNow(),
+      uploadIds: [], attachmentKeys: [] }]);
+    index.changeMany([{ type: 'draft_delete', id, deferRelease: true }]);
+    return holder;
+  }
+  async purgeTrash(ws: string) {
     return this.workLane(async () => {
-      const index = new MailboxIndex(this.ctx.storage, objects, this.ctx.id.toString(), true);
+      const index = this.fixtureIndex(ws);
       // M2 expiry hides rows by timestamp; the existing physical purge selects
       // the legacy Trash label. Mark only the expired fixture rows for purge.
       index.setLabel('trash', 'Trash');
@@ -156,7 +191,22 @@ export class HttpMailbox extends Mailbox {
 }
 export class Sweeper extends MailSweeper {
   private failRelease = false;
+  private failConfirm = false;
+  private readonly confirmationBatches: number[] = [];
   private readonly releases: { key: string; holder: string }[] = [];
+  setConfirmFailure(failing: boolean) { this.failConfirm = failing; }
+  confirmBatches() { return this.confirmationBatches; }
+  async confirm(entries: ConfirmEntry[]) {
+    if (this.failConfirm) throw new Error('Fixture confirmation outage');
+    this.confirmationBatches.push(entries.length);
+    return super.confirm(entries);
+  }
+  holderDetails(key: string) {
+    return this.ctx.storage.sql.exec('SELECT holder, state, expires_at FROM generation_holders WHERE key = ? ORDER BY holder', key).toArray();
+  }
+  async sweepAt(ws: string, now: number) {
+    await new SweepLedger(this.ctx.storage).sweep(now, kofra(this.env, ws).deleteGeneration);
+  }
   setReleaseFailure(failing: boolean) { this.failRelease = failing; }
   acknowledgedReleases() { return this.releases; }
   async release(key: string, holder: string) {
@@ -257,11 +307,29 @@ export default {
         const refs = env.SWEEPER.getByName(ws);
         switch (url.pathname) {
           case '/__fixture/timers': return Response.json(await box.timers());
+          case '/__fixture/has-idempotency': return Response.json(await box.hasIdempotency(await req.text()));
           case '/__fixture/events': return Response.json(await box.eventCount(await req.text()));
           case '/__fixture/expiry-starts': return Response.json(await box.expiryStarts());
           case '/__fixture/pause-expiry': await box.pauseExpiry(await req.text()); break;
           case '/__fixture/finish-expiry': await box.finishExpiry(); break;
           case '/__fixture/pending-releases': return Response.json(await box.pendingReleases());
+          case '/__fixture/confirmations': return Response.json(await box.confirmations());
+          case '/__fixture/confirm-batches': return Response.json(await refs.confirmBatches());
+          case '/__fixture/confirm-failure': await refs.setConfirmFailure(await req.text() === 'true'); break;
+          case '/__fixture/holder-details': return Response.json(await refs.holderDetails(await req.text()));
+          case '/__fixture/sweep-at': await refs.sweepAt(ws, Number(await req.text())); break;
+          case '/__fixture/alerts': return Response.json(await box.alerts());
+          case '/__fixture/alert-failure': await box.alertFailure(await req.text() === 'true'); break;
+          case '/__fixture/release-holder': {
+            const { key, holder } = await req.json<ConfirmEntry>();
+            await refs.release(key, holder);
+            break;
+          }
+          case '/__fixture/stage-crash':
+            try { await box.stageAndCrash(ws); }
+            catch { /* the fixture deliberately aborts after a prepared PUT, without committing */ }
+            break;
+          case '/__fixture/maximum-holder': return Response.json(await box.persistMaximumHolder(ws, await req.text()));
           case '/__fixture/acknowledged-releases': return Response.json(await refs.acknowledgedReleases());
           case '/__fixture/release-failure': await refs.setReleaseFailure(await req.text() === 'true'); break;
           case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;

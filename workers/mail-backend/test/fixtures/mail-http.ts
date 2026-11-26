@@ -120,6 +120,17 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       const res = await call(path, body);
       assert.equal(res.status, 204, res.status === 204 ? undefined : await res.text());
     };
+    const hasIdempotency = (key: string) => readControl<boolean>('has-idempotency', key);
+    const confirmations = () => readControl<{ seq: number; object_key: string; holder: string }[]>('confirmations');
+    const holderDetails = (key: string) => readControl<{ holder: string; state: string; expires_at: number | null }[]>('holder-details', key);
+    const confirmFailure = (failing: boolean) => controlAction('confirm-failure', String(failing));
+    const confirmBatches = () => readControl<number[]>('confirm-batches');
+    const releaseHolder = (key: string, holder: string) => controlAction('release-holder', JSON.stringify({ key, holder }));
+    const sweepAt = (time: number) => controlAction('sweep-at', String(time));
+    const alerts = () => readControl<string[]>('alerts');
+    const alertFailure = (failing: boolean) => controlAction('alert-failure', String(failing));
+    const stageAndCrash = () => controlAction('stage-crash');
+    const persistMaximumHolder = (key: string) => readControl<string>('maximum-holder', key);
     const restore = () => controlAction('restore');
     const forceSnapshot = () => readControl<boolean>('snapshot');
     const uploadSwitch = (enabled: boolean) => controlAction('upload-switch', String(enabled));
@@ -188,6 +199,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
     }
     return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, restore, forceSnapshot, uploadSwitch,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
+      hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
       m3: false, credentialEpoch: async () => 1,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {
