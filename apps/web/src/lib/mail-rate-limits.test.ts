@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { API_PREFIX, LIMITS, ROUTES, createHttpMailService } from '@kofra/mail-contract';
 import type { Draft, DraftInput, Operation, Upload } from '@kofra/mail-contract';
@@ -294,6 +295,33 @@ test('a full 32-attachment compose workload uploads each file and saves every re
     attachments.map(({ uploadId }) => uploadId));
   assert.deepEqual(uploaded, new Map(files));
   assert.equal(hits.filter(({ binding }) => binding === 'MAIL_RATE_UPLOADS').length, files.length);
+});
+
+test('local workerd enforces each configured threshold through the gateway', { timeout: 30_000 }, async () => {
+  const { unstable_readConfig, unstable_defaultWranglerConfig, unstable_startWorker } = await import('wrangler');
+  const configPath = fileURLToPath(new URL('../../wrangler.local.jsonc', import.meta.url));
+  const { compatibility_date, ratelimits } = unstable_readConfig({ config: configPath });
+  const worker = await unstable_startWorker({
+    name: 'mail-rate-limit-test', entrypoint: fileURLToPath(new URL('../../tests/fixtures/rate-limit-worker.ts', import.meta.url)),
+    // Include the real limiter settings, not the app's build artifacts or other bindings.
+    config: { ...unstable_defaultWranglerConfig, compatibility_date, ratelimits },
+    sendMetrics: false, envFiles: [],
+    dev: { remote: false, persist: false, watch: false, logLevel: 'error', server: { hostname: '127.0.0.1', port: 0 } },
+  });
+  try {
+    for (const [binding, op, admitted] of bucketCases) {
+      const { method, path } = ROUTES[op];
+      const reply = await worker.fetch('http://127.0.0.1/', { method: 'POST', body: JSON.stringify({ method,
+        path: path.replace(/\{\w+\}/g, '{id}'), limit: limits[binding], admitted, distinct: binding === 'MAIL_RATE_UNDO_FLOOD', actor: binding,
+      }) });
+      assert.equal(reply.status, 200, binding);
+      const result = await reply.json() as { index: number; status: number; retryAfter: string; body: { code: string; retryAfterSeconds: number } };
+      assert.deepEqual([result.index, result.status, result.retryAfter, result.body.code, result.body.retryAfterSeconds],
+        [limits[binding], 429, String(period), 'rate_limited', period], binding);
+    }
+  } finally {
+    await worker.dispose();
+  }
 });
 
 test('only the local Wrangler config declares all seven namespaces and no config has an off switch', () => {
