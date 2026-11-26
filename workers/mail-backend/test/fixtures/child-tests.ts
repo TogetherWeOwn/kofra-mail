@@ -3,8 +3,9 @@ import { spawn } from 'node:child_process';
 export type ChildRun = { code: number | null; signal: NodeJS.Signals | null; output: string };
 
 // Runs a child `node` process in its own process group. At the deadline, when
-// it exits, and if this runner exits first, the whole group is killed, so no
-// grandchild (a test file's process, a local workerd) outlives the run.
+// it exits, and if this runner exits or is stopped by SIGINT or SIGTERM first,
+// the whole group is killed, so no grandchild (a test file's process, a local
+// workerd) outlives the run.
 export async function runChild(args: string[], options: { timeoutMs: number; env?: NodeJS.ProcessEnv }): Promise<ChildRun> {
   const child = spawn(process.execPath, args, { env: options.env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
   const killGroup = () => {
@@ -13,6 +14,15 @@ export async function runChild(args: string[], options: { timeoutMs: number; env
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
   };
   process.once('exit', killGroup);
+  // A signal skips the exit event: kill the group, then stop as the signal would have.
+  const onSignal = (signal: NodeJS.Signals) => {
+    killGroup();
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    process.kill(process.pid, signal);
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
   const timer = setTimeout(killGroup, options.timeoutMs);
   let output = '';
   child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
@@ -31,6 +41,8 @@ export async function runChild(args: string[], options: { timeoutMs: number; env
     clearTimeout(timer);
     killGroup();
     process.removeListener('exit', killGroup);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
   }
 }
 

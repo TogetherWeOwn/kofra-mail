@@ -21,6 +21,8 @@ import type { SendStep } from '../../src/mailbox-send.ts';
 import { builds, fixtureBuilders } from './send-mime.ts';
 import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
+import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
+import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -199,6 +201,33 @@ export class HttpMailbox extends Mailbox {
   // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
   changePartDigest(sendId: string) {
     this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.parts[0].digest', ?) WHERE id = ?`, '0'.repeat(64), sendId);
+  }
+  // Stands in for an index row whose size no longer matches what the parser decodes.
+  changeAttachmentSize(messageId: string, part: number, delta: number) {
+    this.ctx.storage.sql.exec('UPDATE attachments SET size = size + ? WHERE message_id = ? AND part = ?', delta, messageId, part);
+  }
+  // A message indexed before its display recorded which part is the synthetic "(N more attachments)" row.
+  dropSyntheticMark(messageId: string) {
+    this.ctx.storage.sql.exec("UPDATE mailbox_api_display SET data = json_remove(data, '$.syntheticPart') WHERE id = ?", messageId);
+  }
+  // A draft revision forwarding a small part whose stored fingerprint is what the parser decodes,
+  // while its laid-out size differs by `delta`: the state a draft saved before the size check could hold.
+  async seedForwardDraft(ws: string, mb: string, input: { from: string; messageId: string; part: number; delta: number }) {
+    const sql = this.ctx.storage.sql;
+    const message = sql.exec<{ raw: string }>('SELECT raw_key AS raw FROM messages WHERE id = ?', input.messageId).one();
+    const row = sql.exec<{ name: string; type: string; size: number }>(
+      'SELECT name, mime_type AS type, size FROM attachments WHERE message_id = ? AND part = ?', input.messageId, input.part).one();
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, async index => {
+      const parsed = await readMailMime(await index.readObject(message.raw), message.raw);
+      const bytes = decodedAttachment(parsed.attachments[input.part - 1].content);
+      const draft = { version: 1 as const,
+        fields: { from: input.from, to: [{ email: 'friend@example.net' }], cc: [], bcc: [], subject: 'Forwarded', body: 'See attached', forwardOf: input.messageId },
+        attachments: [{ wire: { kind: 'message' as const, messageId: input.messageId, part: input.part, name: row.name, type: row.type, size: row.size + input.delta },
+          key: message.raw, part: { digest: await sha256(bytes), size: bytes.byteLength } }] };
+      const ref = await index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.mailApiNow(), [message.raw]);
+      index.changeMany([{ type: 'draft', ...ref, attachmentKeys: [message.raw], uploadIds: [] }]);
+      return { id: ref.id, revision: ref.revision };
+    });
   }
   // A draft revision as the M2 API wrote it, under a prefix-less drafts/<sha256> key.
   async seedLegacyApiDraft(ws: string, mb: string, draft: unknown) {
@@ -537,6 +566,7 @@ export default {
     if (url.pathname.startsWith('/__fixture/')) {
       if (req.method !== 'POST' || req.headers.get('x-fixture-control') !== env.CONTROL_KEY) return missing();
       if (url.pathname === '/__fixture/deliver') return incoming(req, env, req.headers.get('x-fixture-to')!, req.headers.get('x-fixture-from')!);
+      if (url.pathname === '/__fixture/now') return Response.json(now(env));
       if (url.pathname === '/__fixture/rate-cap') {
         const { binding, cap } = await req.json<{ binding: string; cap: number }>();
         rateCaps.set(binding, cap);
@@ -619,6 +649,13 @@ export default {
           case '/__fixture/active-alerts': return Response.json(await box.activeAlerts());
           case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
           case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
+          case '/__fixture/change-attachment-size': {
+            const { messageId, part, delta } = await req.json<{ messageId: string; part: number; delta: number }>();
+            await box.changeAttachmentSize(messageId, part, delta);
+            break;
+          }
+          case '/__fixture/drop-synthetic-mark': await box.dropSyntheticMark(await req.text()); break;
+          case '/__fixture/seed-forward-draft': return Response.json(await box.seedForwardDraft(ws, mailboxId!, await req.json()));
           case '/__fixture/seed-legacy-api-draft': return Response.json(await box.seedLegacyApiDraft(ws, mailboxId!, await req.json()));
           case '/__fixture/send-switch': {
             const enabled = await req.text() === 'true';

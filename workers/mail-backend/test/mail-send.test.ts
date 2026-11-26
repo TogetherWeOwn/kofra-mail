@@ -961,3 +961,59 @@ test('sendDraft of a legacy drafts/ revision first stores it as a raw/ generatio
   assert.ok(!(await h.holderDetails(legacy.rawKey)).some(({ holder, state }) => holder === legacy.holder && state === 'held'),
     'the legacy revision\'s holder is released after the publish, like any replaced revision');
 }));
+
+test('a forwarded part whose decoded size differs from its indexed size is refused when attached', () => withSend(async (h, mail, from) => {
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Forward this',
+    text: 'See attached', attachments: [{ name: 'notes.txt', type: 'text/plain', bytes: new TextEncoder().encode('forwarded file contents') }] });
+  const { messages: [delivered] } = await mail.getThread(source.threadId);
+  const { part } = delivered.attachments[0];
+  await h.sends.changeAttachmentSize(source.messageId, part, 1);
+  await rejects(mail.createDraft(draftInput(from, { attachments: [{ kind: 'message', messageId: source.messageId, part }] }), key('draft')), 'not_found');
+}));
+
+test('the synthetic "(N more attachments)" row of a message without its display mark cannot be forwarded', { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
+  const bytes = new TextEncoder().encode('tiny');
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Many files',
+    text: 'Attached', attachments: Array.from({ length: 514 }, (_, i) => ({ name: `f${i}.txt`, type: 'text/plain', bytes })) });
+  // Part 512 stands for the last three attachments; the parser decodes it as the 512th file alone.
+  await h.sends.dropSyntheticMark(source.messageId);
+  await rejects(mail.createDraft(draftInput(from, { attachments: [{ kind: 'message', messageId: source.messageId, part: 512 }] }), key('draft')),
+    'not_found');
+  const kept = await mail.createDraft(draftInput(from, { attachments: [{ kind: 'message', messageId: source.messageId, part: 511 }] }), key('kept'));
+  assert.equal(kept.attachments.length, 1, 'a real part of the same message still attaches');
+}));
+
+test('a send whose frozen part size differs from the size it lays out fails with delivery_error instead of retrying forever', () => withSend(async (h, mail, from) => {
+  const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Forward this',
+    text: 'See attached', attachments: [{ name: 'notes.txt', type: 'text/plain', bytes: new TextEncoder().encode('forwarded file contents') }] });
+  const { messages: [delivered] } = await mail.getThread(source.threadId);
+  const draft = await h.sends.seedForwardDraft({ from, messageId: source.messageId, part: delivered.attachments[0].part, delta: 1 });
+  const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+  const builds = (await h.sends.builds()).length;
+  await h.advance(UNDO);
+  const failed = await mail.getSend(pending.id);
+  assert.equal(failed.state, 'failed');
+  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+  assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+  assert.deepEqual(await h.sends.queue(), []);
+  await h.advance(minute);
+  assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+}));
+
+test('converting a legacy draft does not shorten the undo window', () => withSend(async (h, mail, from) => {
+  const legacy = await h.sends.seedLegacyDraft({ version: 1,
+    fields: { from, to: [{ email: 'friend@example.net' }], cc: [], bcc: [], subject: 'Legacy draft', body: 'Written before M3-2' } });
+  const put = h.pauseNextPut();
+  let sending: Promise<Send> | undefined, moving: Promise<void> | undefined;
+  try {
+    sending = mail.sendDraft(legacy.id, { ...key('send'), ifMatch: legacy.revision });
+    await within(put.started, 10 * second, 'the conversion PUT');
+    // The conversion's storage takes two seconds.
+    const before = await h.sends.now();
+    moving = h.advance(2 * second);
+    await until(async () => await h.sends.now() === before + 2 * second, 'the clock to move');
+  } finally { put.release(); }
+  const pending = await sending!;
+  await moving;
+  assert.equal(pending.undoRemainingMs, UNDO, 'the window starts once the send is committed');
+}));

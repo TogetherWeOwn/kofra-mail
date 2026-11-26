@@ -80,27 +80,40 @@ export async function readDraftPage(index: MailboxIndex, refs: ApiDraftRef[], li
   }
   return { items, last: refs[items.length - 1], more: refs.length > items.length };
 }
-// Small forwarded parts kept inside their source message, decoded as the
-// deployed parser reads them; each source raw message is read and parsed once.
-export function forwardedParts(read: (key: string) => Promise<Uint8Array<ArrayBuffer>>) {
-  const sources = new Map<string, Promise<Awaited<ReturnType<typeof readMailMime>>>>();
-  return async (key: string, part: number): Promise<Uint8Array<ArrayBuffer> | undefined> => {
-    let source = sources.get(key);
-    if (!source) sources.set(key, source = read(key).then(raw => readMailMime(raw, key)));
-    const attachment = (await source).attachments[part - 1];
-    return attachment && decodedAttachment(attachment.content);
-  };
+// Decodes small forwarded parts kept inside their source raw messages, as the
+// deployed parser reads them. A source can be large, so sources are processed
+// one at a time: each is read and parsed once, only the wanted parts' bytes are
+// copied out, and the parse is dropped before the next source is read. `visit`
+// returning false stops the walk.
+export async function eachForwardedPart<T extends { key: string; part: number }>(read: (key: string) => Promise<Uint8Array<ArrayBuffer>>,
+  wanted: readonly T[], visit: (item: T, bytes: Uint8Array<ArrayBuffer> | undefined) => Promise<boolean | void>): Promise<void> {
+  const sources = new Map<string, T[]>();
+  for (const item of wanted) sources.set(item.key, [...sources.get(item.key) ?? [], item]);
+  for (const [key, items] of sources) {
+    const copies = await (async () => {
+      const parsed = await readMailMime(await read(key), key);
+      return items.map(({ part }) => {
+        const attachment = parsed.attachments[part - 1];
+        return attachment && decodedAttachment(attachment.content).slice();
+      });
+    })();
+    for (const [i, item] of items.entries()) if (await visit(item, copies[i]) === false) return;
+  }
 }
 export const inlinePart = (key: string) => parseObjectKey(key)?.kind === 'raw';
 
 // Fingerprints the small forwarded parts of a draft that do not carry one yet.
 export async function fingerprintParts(index: MailboxIndex, attachments: StoredAttachment[]): Promise<StoredAttachment[]> {
-  const decode = forwardedParts(key => index.readObject(key));
-  return Promise.all(attachments.map(async attachment => {
-    if (attachment.wire.kind !== 'message' || !('key' in attachment) || attachment.part || !inlinePart(attachment.key)) return attachment;
-    const bytes = need(await decode(attachment.key, attachment.wire.part));
-    return { ...attachment, part: { digest: await sha256(bytes), size: bytes.byteLength } };
-  }));
+  const result = [...attachments];
+  const wanted = attachments.flatMap((attachment, at) => attachment.wire.kind === 'message' && 'key' in attachment && !attachment.part &&
+    inlinePart(attachment.key) ? [{ at, key: attachment.key, part: attachment.wire.part, size: attachment.wire.size }] : []);
+  await eachForwardedPart(key => index.readObject(key), wanted, async (item, bytes) => {
+    // The builder lays out the indexed size. A part that decodes to another size,
+    // such as a synthetic "(N more attachments)" row, cannot be sent.
+    if (!bytes || bytes.byteLength !== item.size) return fail('not_found');
+    result[item.at] = { ...attachments[item.at], part: { digest: await sha256(bytes), size: bytes.byteLength } } as StoredAttachment;
+  });
+  return result;
 }
 
 export function wireDraft(ref: DraftObjectRef, draft: DraftObject): Draft {

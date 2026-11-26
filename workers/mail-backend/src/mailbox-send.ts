@@ -9,7 +9,7 @@ import type { Draft, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { normalizeAddress } from './directory.ts';
 import {
-  draftObjectKeys, draftRef, draftUploadIds, encodeDraftObject, fingerprintParts, forwardedParts, inlinePart, readDraft, readDraftObject,
+  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject,
   type DraftObject, type DraftObjectRef,
 } from './mailbox-api-drafts.ts';
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
@@ -187,36 +187,39 @@ export class SendApi {
     const parts = (await fingerprintParts(this.index, draft.attachments ?? [])).flatMap(attachment =>
       attachment.wire.kind === 'message' && 'part' in attachment && attachment.part
         ? [{ messageId: attachment.wire.messageId, part: attachment.wire.part, ...attachment.part }] : []);
-    const committedAt = this.clock();
-    const undoSeconds = settingsUndoSeconds(this.sql);
-    const undoUntil = committedAt + undoSeconds * 1000;
-    const record: SendRecord = {
-      id: ulid(committedAt), draftId: ref.id, createdAt: committedAt, undoUntil, dateAt: undoUntil, undoSeconds,
-      ownerUserId: options.userId, from: { email: from, name }, replyTo: replyToFromSettings(this.sql), builderVersion: this.mime.current,
-      draft: { rawKey: ref.rawKey, holder: ref.holder, revision: ref.revision, updatedAt: ref.updatedAt },
-      attachmentKeys: draftObjectKeys(draft), uploadIds, recipients, parts,
-    };
-    const builder = this.mime.get(record.builderVersion)!;
-    if (builder.encodedSize(mimeMessage(record, draft)) > LIMITS.outboundMessageBytes) {
-      return fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
-    }
+    const undoSeconds = settingsUndoSeconds(this.sql), replyTo = replyToFromSettings(this.sql), attachmentKeys = draftObjectKeys(draft);
+    const builder = this.mime.get(this.mime.current)!;
+    const frozen = (at: number, source: Pick<DraftObjectRef, 'rawKey' | 'revision' | 'updatedAt'> & { holder: string }): SendRecord => ({
+      id: ulid(at), draftId: ref.id, createdAt: at, undoUntil: at + undoSeconds * 1000, dateAt: at + undoSeconds * 1000, undoSeconds,
+      ownerUserId: options.userId!, from: { email: from, name }, replyTo, builderVersion: this.mime.current,
+      draft: { rawKey: source.rawKey, holder: source.holder, revision: source.revision, updatedAt: source.updatedAt },
+      attachmentKeys, uploadIds, recipients, parts,
+    });
+    const tooLarge = (record: SendRecord) => builder.encodedSize(mimeMessage(record, draft)) > LIMITS.outboundMessageBytes;
+    if (tooLarge(frozen(this.clock(), ref))) return fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
     // A legacy prefix-less `drafts/` revision is first stored as a raw/ generation,
-    // as replaceDraft writes one (section 2.7), so the send refers to a swept generation.
-    if (parseObjectKey(ref.rawKey)?.kind !== 'raw') {
-      const upgraded = await this.index.prepareApiDraft(ref.id, encodeDraftObject(draft), committedAt, record.attachmentKeys);
-      try { this.index.changeMany([{ type: 'draft', ...upgraded, attachmentKeys: record.attachmentKeys, uploadIds }]); }
-      catch (error) { await this.index.releaseDraft(upgraded, record.attachmentKeys); throw error; }
-      record.draft = { rawKey: upgraded.rawKey, holder: upgraded.holder, revision: upgraded.revision, updatedAt: upgraded.updatedAt };
-    }
+    // as replaceDraft writes one (section 2.7), and committed with the send.
+    const staged = parseObjectKey(ref.rawKey)?.kind === 'raw' ? undefined
+      : await this.index.prepareApiDraft(ref.id, encodeDraftObject(draft), this.clock(), attachmentKeys);
+    // The undo window starts at the commit, after any storage above.
+    const committedAt = this.clock();
+    const record = frozen(committedAt, staged ?? ref);
     const result = resultOf('sendDraft', key, fingerprint, 202, { send: record.id }, committedAt);
     let seq = 0;
-    // The pending send, the draft's removal and the idempotency result are one event.
-    this.index.changeMany([{ type: 'send_create', send: record, result }], () => {
-      seq = revision(this.sql);
-      this.timers.set(SEND_DRIVE, record.id, undoUntil);
-      scheduleResult(this.timers, { type: 'api_result', ...result });
-      this.journalDue(this.timers);
-    });
+    try {
+      if (tooLarge(record)) return fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
+      // The pending send, the draft's removal and the idempotency result are one event.
+      this.index.changeMany([...(staged ? [{ type: 'draft' as const, ...staged, attachmentKeys, uploadIds }] : []),
+        { type: 'send_create', send: record, result }], () => {
+        seq = revision(this.sql);
+        this.timers.set(SEND_DRIVE, record.id, record.undoUntil);
+        scheduleResult(this.timers, { type: 'api_result', ...result });
+        this.journalDue(this.timers);
+      });
+    } catch (error) {
+      if (staged) await this.index.releaseDraft(staged, attachmentKeys);
+      throw error;
+    }
     return { seq, answer: async () => ({ body: this.getSendBody(record.id), status: 202 }) };
   }
 
@@ -495,23 +498,28 @@ export class SendDriver {
     return readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
   }
 
-  // Reads every small forwarded part once and checks it against the digest and
-  // size frozen in the record; null on a mismatch or a part that no longer exists.
+  // Reads the small forwarded parts, one source at a time, and checks each against
+  // the digest and size frozen in the record and the size the builder lays out;
+  // null on a mismatch or a part that no longer exists.
   private async forwardedParts(start: Start, record: SendRecord, draft: DraftObject): Promise<Map<number, Uint8Array<ArrayBuffer>> | null> {
-    const decode = forwardedParts(key => {
+    const wanted: { index: number; key: string; part: number; frozen: SendPart }[] = [];
+    for (const [index, { wire, key }] of files(draft).entries()) {
+      if (wire.kind !== 'message' || !inlinePart(key)) continue;
+      const frozen = record.parts.find(entry => entry.messageId === wire.messageId && entry.part === wire.part);
+      if (!frozen || frozen.size !== wire.size) return null;
+      wanted.push({ index, key, part: wire.part, frozen });
+    }
+    const verified = new Map<number, Uint8Array<ArrayBuffer>>();
+    let matched = true;
+    await eachForwardedPart(key => {
       const ready = this.ports.ready();
       if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
       return ready.index.readObject(key);
-    });
-    const verified = new Map<number, Uint8Array<ArrayBuffer>>();
-    for (const [index, { wire, key }] of files(draft).entries()) {
-      if (wire.kind !== 'message' || !inlinePart(key)) continue;
-      const frozen: SendPart | undefined = record.parts.find(entry => entry.messageId === wire.messageId && entry.part === wire.part);
-      const bytes = frozen && await decode(key, wire.part);
-      if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return null;
+    }, wanted, async ({ index, frozen }, bytes) => {
+      if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return matched = false;
       verified.set(index, bytes);
-    }
-    return verified;
+    });
+    return matched ? verified : null;
   }
 
   private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {

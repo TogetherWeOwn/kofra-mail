@@ -31,3 +31,40 @@ test('a child run past its deadline is killed with its whole process group', asy
     if (alive()) process.kill(pid, 'SIGKILL');
   }
 });
+
+test('a runner stopped by SIGTERM or SIGINT kills its child group before it exits', async () => {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { spawn } = await import('node:child_process');
+  const helper = new URL('./fixtures/child-tests.ts', import.meta.url).href;
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    const dir = await mkdtemp(join(tmpdir(), 'child-tests-'));
+    const pidFile = join(dir, 'pid');
+    // The runner's child starts a grandchild, records its pid and hangs.
+    const child = `const { spawn } = require('node:child_process'); const { writeFileSync } = require('node:fs');
+      const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(grandchild.pid)); setInterval(() => {}, 1000);`;
+    const runner = spawn(process.execPath, ['--input-type=module', '-e',
+      `const { runChild } = await import(${JSON.stringify(helper)}); await runChild(['-e', ${JSON.stringify(child)}], { timeoutMs: 60_000 });`],
+    { stdio: 'ignore' });
+    let pid = 0;
+    const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      for (let i = 0; i < 250 && !pid; i++) {
+        pid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
+        if (!pid) await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      assert.ok(pid > 0, 'the grandchild started');
+      const exited = new Promise(resolve => runner.on('exit', resolve));
+      runner.kill(signal);
+      await exited;
+      for (let i = 0; i < 100 && alive(); i++) await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal(alive(), false, `the grandchild outlived a runner stopped by ${signal}`);
+    } finally {
+      if (pid && alive()) process.kill(pid, 'SIGKILL');
+      if (runner.exitCode === null && runner.signalCode === null) runner.kill('SIGKILL');
+      await rm(dir, { recursive: true });
+    }
+  }
+});
