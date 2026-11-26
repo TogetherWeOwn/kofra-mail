@@ -18,8 +18,8 @@ Status: design, version 1. It pairs with the [Mail API contract](../contracts/ma
 
 **The `mail-content` Worker:**
 - It runs on `content.<content-domain>` and holds the URL-signing keys.
-- It has read-only object-store credentials covering only the workspaces' mail buckets (`mail-<workspace_id>`, one per workspace). It derives the bucket from the verified `ws` claim, never from other input, and reads only keys of the form `raw/<sha256>/<gen>` or `att/<sha256>/<gen>` that the mailbox Durable Object returned. If storage keys cannot be scoped to the `mail-` buckets, it holds one read-only key per workspace bucket, selected by `ws`.
-- It has a binding to the mailbox Durable Objects and a service binding to the account service.
+- It has read-only object-store credentials covering only the workspaces' mail buckets (`mail-<workspace_id>`, one per workspace). It derives the bucket from the verified `ws` claim, never from other input, and reads only keys of the form `raw/<sha256>/<gen>` or `att/<sha256>/<gen>` that the mailbox Durable Object returned. If storage keys cannot be scoped to the `mail-` buckets, it holds one read-only key per workspace bucket, selected by `ws`. Its object-store key is a separate, read-only key with one grant per workspace mail bucket; checking those grants is an operator acceptance step at deploy, and provisioning a workspace adds its grant.
+- It has two service bindings and no storage bindings: `MAIL_LOOKUP` to a read-only named entrypoint of the mail backend (`ContentLookup`: the mailbox owner and the owner-checked message record, nothing else) and a named account entrypoint that exposes only `credentialEpoch`. It has no D1, Durable Object, queue, KV or R2 binding, so it can write nothing even if its code is wrong. A lookup on a cold mailbox still runs the Durable Object constructor's existing schema and alarm self-repair; the lookup method itself only reads.
 - It has no write access to anything, and no VPC, Tunnel or other binding into a private network.
 
 **The app:**
@@ -61,7 +61,7 @@ https://content.<content-domain>/v1/<purpose>/<kid>.<payload>.<mac>
 
 ### 2.2 Minting
 
-- **Bodies and attachments:** `mail-web` authenticates the session and resolves its mailbox. It then calls `mint(claims)` on the `mail-content` Worker over a service binding: an RPC entrypoint that is not reachable from the internet.
+- **Bodies and attachments:** `mail-web` authenticates the session and resolves its mailbox. It then calls `mintForWeb(purpose, claims)` on the `mail-content` Worker over a service binding: an RPC entrypoint that is not reachable from the internet.
   - Only `mail-content` holds the keys.
   - `mail-web` sets `ws`, `mb` and `sub` from the session, never from request input.
 - **`cid` and `img` URLs** are minted by `mail-content` itself, while it sanitises a body it has already authorised. They copy that body token's `ws`, `mb`, `msg`, `sub`, `ep` and `exp`, so a body's images expire with the body.
