@@ -20,6 +20,7 @@ export type ContentEnv = ContentStoreConfig & {
   MAIL_LOOKUP: MailLookupPort;
   ACCOUNT_EPOCH: AccountEpochPort;
   MAIL_CONTENT_ENABLED?: string;
+  CONTENT_LOCAL_LOOPBACK?: string;
   CONTENT_URL_KEYS?: string;
   CONTENT_ORIGIN?: string;
   MAIL_APP_ORIGIN?: string;
@@ -33,13 +34,18 @@ export type ContentEnv = ContentStoreConfig & {
 const epochs = new EpochCache();
 const encoder = new TextEncoder();
 const urlFor = (origin: string, purpose: Purpose, token: string) => `${origin}/v1/${purpose}/${token}`;
-const originsFor = (env: ContentEnv): ContentOrigins => ({ contentOrigin: env.CONTENT_ORIGIN ?? '', appOrigin: env.MAIL_APP_ORIGIN ?? '' });
+const originsFor = (env: ContentEnv): ContentOrigins => ({
+  contentOrigin: env.CONTENT_ORIGIN ?? '', appOrigin: env.MAIL_APP_ORIGIN ?? '', localLoopback: env.CONTENT_LOCAL_LOOPBACK === 'on',
+});
 
 function proxyConfig(env: ContentEnv, origins: ContentOrigins) {
   return remoteImageConfig({
     suiteDomain: env.CONTENT_SUITE_DOMAIN ?? '', contentDomain: env.CONTENT_ZONE ?? '',
     storageDomains: [env.CONTENT_STORAGE_DOMAIN ?? '', URL.parse(env.CONTENT_S3_ENDPOINT ?? '')?.hostname ?? ''],
-    accountDomains: [env.CONTENT_ACCOUNT_DOMAIN ?? '', new URL(origins.appOrigin).hostname, new URL(origins.contentOrigin).hostname],
+    accountDomains: [env.CONTENT_ACCOUNT_DOMAIN ?? '', ...[origins.appOrigin, origins.contentOrigin].flatMap(origin => {
+      const url = new URL(origin);
+      return url.protocol === 'https:' ? [url.hostname] : []; // The proxy rejects loopback unconditionally.
+    })],
     workersDevSubdomain: env.CONTENT_WORKERS_DEV_DOMAIN ?? '',
   });
 }
@@ -66,6 +72,12 @@ function attachmentDisposition(filename: string) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
+function mimePart<T>(parts: readonly T[], part: number): T | undefined {
+  // The index replaces slot 512 with an overflow summary, including in legacy
+  // rows without display metadata. It never denotes an actual MIME part.
+  return parts.length > 512 && part >= 512 ? undefined : parts[part - 1];
+}
+
 async function serveMailbox(verified: Exclude<Verified, { purpose: 'img' }>, env: ContentEnv, keys: ContentUrlKeys,
     origins: ContentOrigins, headers: Headers, now: number): Promise<{ response: Response; bytes: number } | null> {
   const { claims, message, purpose } = verified;
@@ -81,7 +93,7 @@ async function serveMailbox(verified: Exclude<Verified, { purpose: 'img' }>, env
     } else {
       const cidParts = new Map<string, number | null>();
       for (const { part } of message.attachments) {
-        const contentId = mime.attachments[part - 1]?.contentId?.trim().replace(/^<(.*)>$/, '$1');
+        const contentId = mimePart(mime.attachments, part)?.contentId?.trim().replace(/^<(.*)>$/, '$1');
         if (contentId) cidParts.set(contentId, cidParts.has(contentId) ? null : part);
       }
       const config = proxyConfig(env, origins);
@@ -99,7 +111,7 @@ async function serveMailbox(verified: Exclude<Verified, { purpose: 'img' }>, env
     return { response: new Response(bytes, { headers }), bytes: bytes.byteLength };
   }
   if (!entry) return null;
-  const attachment = mime.attachments[entry.part - 1];
+  const attachment = mimePart(mime.attachments, entry.part);
   if (!attachment) return null;
   const bytes = decodedBytes(attachment.content);
   if (purpose === 'cid') {
@@ -111,7 +123,7 @@ async function serveMailbox(verified: Exclude<Verified, { purpose: 'img' }>, env
   }
   headers.set('content-type', 'application/octet-stream');
   headers.set('content-disposition', attachmentDisposition(attachment.filename ?? ''));
-  const content = entry.objectKey ? await objects.attachment(entry.objectKey, bytes.byteLength) : bytes;
+  const content = entry.objectKey ? await objects.attachment(entry.objectKey, bytes) : bytes;
   return { response: new Response(content, { headers }), bytes: bytes.byteLength };
 }
 
@@ -137,6 +149,7 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
     return new Response(null, { status: 404, headers });
   }
   const purpose = match[1], token = match[2];
+  const tokenHash = (await sha256(new Uint8Array(encoder.encode(token)))).slice(0, 8);
   let result: { response: Response; bytes: number } | null = null;
   if (purpose === 'img' && !remoteImageMethodAllowed(request.method)) {
     headers.set('allow', 'GET');
@@ -159,7 +172,7 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
     } catch { /* Fail closed; do not expose or log errors from ports, parsers or keys. */ }
   }
   const status = result?.response.status ?? 404;
-  console.log(JSON.stringify({ purpose, status, bytes: result?.bytes ?? 0, token: (await sha256(new Uint8Array(encoder.encode(token)))).slice(0, 8) }));
+  console.log(JSON.stringify({ purpose, status, bytes: result?.bytes ?? 0, token: tokenHash }));
   return result?.response ?? new Response(null, { status, headers: contentSecurityHeaders(origins) });
 }
 

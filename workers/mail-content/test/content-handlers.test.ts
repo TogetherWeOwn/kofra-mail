@@ -22,44 +22,50 @@ const keysJson = JSON.stringify({ current: 'fixture', keys: { fixture: Buffer.fr
 const fixtureKeys = await loadContentUrlKeys(keysJson);
 const store = new Map<string, Uint8Array<ArrayBuffer>>();
 const reads: string[] = [];
-const logs: string[] = [];
+const logs: { level: string; message: string }[] = [];
 const tokenValues: string[] = [];
 let upstreamReads = 0;
 let mf: Miniflare;
+const control = crypto.randomUUID();
+const bundle = (name: string) => build({
+  entryPoints: [fileURLToPath(new URL(name, import.meta.url))], bundle: true, write: false, format: 'esm', external: ['cloudflare:workers'],
+}).then(({ outputFiles }) => outputFiles[0].text);
 
 before(async () => {
-  const { outputFiles } = await build({
-    entryPoints: [fileURLToPath(new URL('./content-worker-fixture.ts', import.meta.url))],
-    bundle: true, write: false, format: 'esm', external: ['cloudflare:workers'],
-  });
+  const [content, account] = await Promise.all([bundle('./content-worker-fixture.ts'), bundle('./account-worker.ts')]);
   mf = new Miniflare({
-    name: 'content', compatibilityDate: '2026-07-30', modules: true, script: outputFiles[0].text,
-    bindings: {
-      MAIL_CONTENT_ENABLED: 'on', CONTENT_ORIGIN: origin, MAIL_APP_ORIGIN: 'https://mail.example',
-      CONTENT_URL_KEYS: keysJson, CONTENT_S3_ENDPOINT: 'https://objects.example',
-      CONTENT_S3_ACCESS_KEY_ID: crypto.randomUUID(), CONTENT_S3_SECRET_ACCESS_KEY: crypto.randomUUID(),
-      CONTENT_WORKERS_DEV_DOMAIN: 'account-example.workers.dev', CONTENT_ACCOUNT_DOMAIN: 'account.example',
-      CONTENT_ZONE: 'content.example', CONTENT_SUITE_DOMAIN: 'mail.example', CONTENT_STORAGE_DOMAIN: 'objects.example',
-    },
-    serviceBindings: {
-      MAIL_LOOKUP: { name: 'content', entrypoint: 'ContentLookup' },
-      ACCOUNT_EPOCH: { name: 'content', entrypoint: 'CredentialEpoch' },
-      MINT: { name: 'content', entrypoint: 'ContentMint' },
-    },
-    handleStructuredLogs: ({ message }: { message: string }) => { logs.push(message); },
-    outboundService(request: Request) {
-      if (request.url === remote) {
-        upstreamReads++;
-        return new Response(png, { headers: { 'content-type': 'image/png', 'set-cookie': 'not-forwarded=true' } });
-      }
-      const url = new URL(request.url);
-      reads.push(url.pathname);
-      const bytes = store.get(url.pathname);
-      if (url.origin !== 'https://objects.example' || request.method !== 'GET' || !request.headers.has('authorization') || !bytes) {
-        return new Response(null, { status: 404 });
-      }
-      return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
-    },
+    handleStructuredLogs: ({ level, message }: { level: string; message: string }) => { logs.push({ level, message }); },
+    workers: [{
+      name: 'content', compatibilityDate: '2026-07-30', modules: true, script: content,
+      bindings: {
+        MAIL_CONTENT_ENABLED: 'on', CONTENT_ORIGIN: origin, MAIL_APP_ORIGIN: 'https://mail.example',
+        CONTENT_URL_KEYS: keysJson, CONTENT_S3_ENDPOINT: 'https://objects.example',
+        CONTENT_S3_ACCESS_KEY_ID: crypto.randomUUID(), CONTENT_S3_SECRET_ACCESS_KEY: crypto.randomUUID(),
+        CONTENT_WORKERS_DEV_DOMAIN: 'account-example.workers.dev', CONTENT_ACCOUNT_DOMAIN: 'account.example',
+        CONTENT_ZONE: 'content.example', CONTENT_SUITE_DOMAIN: 'mail.example', CONTENT_STORAGE_DOMAIN: 'objects.example',
+      },
+      serviceBindings: {
+        MAIL_LOOKUP: { name: 'content', entrypoint: 'ContentLookup' },
+        ACCOUNT_EPOCH: { name: 'account', entrypoint: 'CredentialEpoch' },
+        MINT: { name: 'content', entrypoint: 'ContentMint' },
+      },
+      outboundService(request: Request) {
+        if (request.url === remote) {
+          upstreamReads++;
+          return new Response(png, { headers: { 'content-type': 'image/png', 'set-cookie': 'not-forwarded=true' } });
+        }
+        const url = new URL(request.url);
+        reads.push(url.pathname);
+        const bytes = store.get(url.pathname);
+        if (url.origin !== 'https://objects.example' || request.method !== 'GET' || !request.headers.has('authorization') || !bytes) {
+          return new Response(null, { status: 404 });
+        }
+        return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+      },
+    }, {
+      name: 'account', compatibilityDate: '2026-07-30', modules: true, script: account,
+      bindings: { USERS: ['user-a', 'user-b', 'user-epoch'], CONTROL: control },
+    }],
   });
 });
 after(() => mf?.dispose());
@@ -123,6 +129,7 @@ test('named mint RPC signs only body and att with the loaded keys', async () => 
     const result = await rpc('mintForWeb', purpose, { ...alpha, ...extra });
     assert.ok(result.value);
     assert.ok(result.value.url.startsWith(`${origin}/v1/${purpose}/`));
+    tokenValues.push(new URL(result.value.url).pathname.split('/').at(-1)!);
     await status(result.value.url, 200);
   }
   for (const method of ['mint', 'mintFromBody', 'signDerived', 'fetch']) assert.deepEqual(await rpc(method, 'body', { ...alpha, ri: false }), { refused: true });
@@ -136,7 +143,11 @@ test('raised credential epoch invalidates an HTTP body URL at the isolate cache 
   const path = await sign('body', { ...alpha, sub, ri: false });
   try {
     await status(path, 200);
-    await set('epoch', [sub, 2]);
+    const account = await mf.getWorker('account');
+    const changed = await account.fetch('https://account.example/__epoch', {
+      method: 'POST', headers: { 'x-fixture-control': control }, body: JSON.stringify([sub, 2]),
+    });
+    assert.equal(changed.status, 204);
     await set('clock', 60_000);
     await status(path);
   } finally { await set('owner', 'user-a'); await set('clock', 0); }
@@ -254,6 +265,41 @@ test('downloads decode raw-only parts and stream external objects with safe file
   assert.equal(reads.at(-1), objectPath('alpha', key));
 });
 
+test('legacy synthetic attachment rows do not name downloadable MIME parts', async () => {
+  const raw = 'Content-Type: multipart/mixed; boundary=parts\r\n\r\n'
+    + '--parts\r\nContent-Type: text/plain\r\n\r\nbody\r\n'
+    + '--parts\r\nContent-Type: image/png\r\nContent-Disposition: attachment\r\n\r\npart\r\n'.repeat(513)
+    + '--parts--\r\n';
+  await record(alpha, raw, [{ part: 512, objectKey: null }]);
+  await status(await attUrl(512));
+});
+
+test('external attachment key must be the digest of the corresponding raw MIME part', async () => {
+  const bytes = encode.encode('B'.repeat(256 * 1024));
+  const differentKey = `att/${await sha(bytes)}/${gen}`;
+  store.set(objectPath('alpha', differentKey), bytes);
+  await record(alpha, withParts(html, 'file', 'A'.repeat(bytes.byteLength)), [parts[1], { part: 2, objectKey: differentKey }]);
+  reads.length = 0;
+  await status(await attUrl(2));
+  assert.ok(!reads.includes(objectPath('alpha', differentKey)));
+});
+
+test('same-length corruption in external attachment storage is not downloaded', async () => {
+  const clean = encode.encode('A'.repeat(256 * 1024));
+  const key = `att/${await sha(clean)}/${gen}`;
+  const corrupt = clean.slice();
+  corrupt[corrupt.length - 1]++;
+  store.set(objectPath('alpha', key), corrupt);
+  await record(alpha, withParts(html, 'file', 'A'.repeat(clean.byteLength)), [parts[1], { part: 2, objectKey: key }]);
+  const path = await attUrl(2);
+  let delivered = false;
+  try {
+    const response = await get(path);
+    if (response.ok) delivered = (await response.arrayBuffer()).byteLength === clean.byteLength;
+  } catch { /* workerd aborts a truncated fixed-length HTTP body */ }
+  assert.equal(delivered, false);
+});
+
 test('signed image cache is read only after verification; expired or MAC-flipped cache hits are 404', async () => {
   await record(alpha, withParts(html), parts);
   const body = await get(await bodyUrl(true));
@@ -263,7 +309,9 @@ test('signed image cache is read only after verification; expired or MAC-flipped
   tokenValues.push(img.split('/').at(-1)!);
   const before = upstreamReads;
   await status(img, 200);
-  await status(await imageUrl(), 200); // New token, same remote URL.
+  const another = await sign('img', { ...alpha, ep: 2, u: remote });
+  assert.ok(new URL(img).pathname !== another, 'the second token must differ');
+  await status(another, 200); // New token, same remote URL.
   assert.equal(upstreamReads, before + 1);
   const cacheReads = await countCache();
   const offset = img.lastIndexOf('.') + 1;
@@ -286,6 +334,7 @@ test('HSTS and every §3.1 header cover successes, empty 404, and img method 405
     assert.equal(res.status, wanted);
     if (wanted !== 200) assert.equal(bytes, 0);
     if (wanted === 405) assert.equal(res.headers.get('allow'), 'GET');
+    if (wanted === 200 && path.startsWith('/v1/img/')) assert.equal(res.headers.get('content-length'), String(png.byteLength));
     assert.equal(res.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
     assert.equal(res.headers.get('referrer-policy'), 'no-referrer');
     assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
@@ -302,14 +351,15 @@ test('content logs contain only purpose, status, byte count and an eight-charact
   const path = await bodyUrl();
   await status(path, 200);
   const hash = (await sha(encode.encode(path.split('/').at(-1)!))).slice(0, 8);
-  assert.ok(logs.some(line => {
-    try { const value = JSON.parse(line); return value.purpose === 'body' && value.token === hash && value.bytes > 0 && value.status === 200; }
-    catch { return false; }
-  }));
-  for (const line of logs) {
-    for (const value of [...tokenValues, keysJson, remote, 'picture@example', 'safe body']) assert.ok(!line.includes(value), 'sensitive data reached logs');
-    const parsed = JSON.parse(line);
+  let wroteBody = false;
+  for (const { level, message } of logs) {
+    for (const value of [...tokenValues, keysJson, remote, 'picture@example', 'safe body']) assert.ok(!message.includes(value), 'sensitive data reached logs');
+    // A transport abort is reported by workerd, not by our application logger.
+    if (level === 'error' && message.startsWith('Uncaught exception:')) continue;
+    const parsed = JSON.parse(message);
     assert.deepEqual(Object.keys(parsed).sort(), ['bytes', 'purpose', 'status', 'token']);
     assert.match(parsed.token, /^[\da-f]{8}$/);
+    if (parsed.purpose === 'body' && parsed.token === hash && parsed.bytes > 0 && parsed.status === 200) wroteBody = true;
   }
+  assert.ok(wroteBody);
 });

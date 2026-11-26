@@ -37,11 +37,12 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string) {
   if (!origin || origin.protocol !== 'https:' || origin.href !== `${origin.origin}/` || !accessKeyId || !secretAccessKey) {
     throw new Error('content store is not configured');
   }
+  const endpointOrigin = origin.origin;
   const bucket = workspaceMailBucket(ws);
   const s3 = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 });
   async function get(key: string, kind: 'raw' | 'att') {
     if (!keyOf(key, kind)) throw new Error('invalid mail object key');
-    const response = await s3.fetch(`${origin!.origin}/${bucket}/${key}`, {
+    const response = await s3.fetch(`${endpointOrigin}/${bucket}/${key}`, {
       method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(60_000),
       cf: { cacheTtlByStatus: { '100-599': -1 } },
     });
@@ -61,13 +62,29 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string) {
       // Same parser version and options as mail-backend's indexed part numbers.
       return PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
     },
-    async attachment(key: string, expectedSize: number) {
+    async attachment(key: string, expected: Uint8Array<ArrayBuffer>) {
+      if (await sha256(expected) !== parseObjectKey(key)?.digest) throw new Error('attachment digest mismatch');
       const { stream, size } = await get(key, 'att');
-      if (size !== expectedSize) {
+      if (size !== expected.byteLength) {
         void stream.cancel().catch(() => {});
         throw new Error('attachment length mismatch');
       }
-      return stream;
+      // Authenticate the streamed copy against the part already decoded from
+      // digest-verified MIME. Never emit a corrupt chunk, or finish a short body.
+      let offset = 0;
+      const checked = stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        transform(chunk, controller) {
+          if (offset + chunk.byteLength > size || !chunk.every((byte, i) => byte === expected[offset + i])) {
+            throw new Error('attachment bytes mismatch');
+          }
+          offset += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+        flush() { if (offset !== size) throw new Error('attachment length mismatch'); },
+      }));
+      const output = new FixedLengthStream(size);
+      void checked.pipeTo(output.writable).catch(() => {});
+      return output.readable;
     },
   };
 }

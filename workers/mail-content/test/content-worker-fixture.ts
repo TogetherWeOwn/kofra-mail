@@ -8,11 +8,6 @@ export default {
     const path = new URL(req.url).pathname;
     if (path === '/__clock') { clockOffset = Number(await req.text()); return new Response(null); }
     if (path === '/__cache') return Response.json(cacheReads);
-    if (path === '/__epoch') {
-      const [sub, ep] = await req.json<[string, number]>();
-      epochs.set(sub, ep);
-      return new Response(null);
-    }
     if (path === '/__owner') { ownerA = await req.json(); return new Response(null); }
     if (path === '/__record') {
       const [key, value] = await req.json<[string, unknown]>();
@@ -34,11 +29,6 @@ export default {
   },
 };
 export { ContentMint } from '../src/entry.ts';
-
-const epochs = new Map<string, number>();
-export class CredentialEpoch extends WorkerEntrypoint {
-  credentialEpoch(sub: string) { return sub.startsWith('user-') ? epochs.get(sub) ?? 1 : null; }
-}
 
 let ownerA: string | null = 'user-a';
 const records = new Map<string, unknown>();

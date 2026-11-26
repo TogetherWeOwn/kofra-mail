@@ -431,26 +431,32 @@ export interface ContentOrigins {
   contentOrigin: string;
   /** `https://mail.<suite-domain>` */
   appOrigin: string;
+  /** Local HTTP fixtures only; both origins must be different loopback hosts. */
+  localLoopback?: boolean;
 }
 
-function bareHttpsOrigin(value: string): string {
+function bareOrigin(value: string, localLoopback: boolean): URL {
   let url: URL | undefined;
   try {
     url = new URL(value);
   } catch {
     url = undefined;
   }
-  if (url === undefined || url.protocol !== 'https:' || url.origin !== value) throw new TypeError('invalid content or app origin');
-  return url.origin;
+  const loopback = url?.hostname === 'localhost' || url?.hostname === '127.0.0.1';
+  if (!url || url.origin !== value || (url.protocol !== 'https:' && !(localLoopback && loopback && url.protocol === 'http:'))) {
+    throw new TypeError('invalid content or app origin');
+  }
+  return url;
 }
 
 /** The section 3.1 headers that every content-origin response carries. */
 export function contentSecurityHeaders(origins: ContentOrigins): Headers {
-  const content = bareHttpsOrigin(origins.contentOrigin);
-  const app = bareHttpsOrigin(origins.appOrigin);
+  const content = bareOrigin(origins.contentOrigin, origins.localLoopback === true);
+  const app = bareOrigin(origins.appOrigin, origins.localLoopback === true);
+  if (content.protocol !== app.protocol || content.hostname === app.hostname) throw new TypeError('content and app origins must be separate');
   return new Headers({
-    'content-security-policy': `default-src 'none'; img-src ${content} data:; style-src 'unsafe-inline'; font-src data:; `
-      + `base-uri 'none'; form-action 'none'; frame-ancestors ${app}; sandbox allow-popups allow-popups-to-escape-sandbox`,
+    'content-security-policy': `default-src 'none'; img-src ${content.origin} data:; style-src 'unsafe-inline'; font-src data:; `
+      + `base-uri 'none'; form-action 'none'; frame-ancestors ${app.origin}; sandbox allow-popups allow-popups-to-escape-sandbox`,
     'referrer-policy': 'no-referrer',
     'x-content-type-options': 'nosniff',
     'cache-control': 'private, no-store',
