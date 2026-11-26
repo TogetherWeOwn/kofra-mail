@@ -555,6 +555,28 @@ const limiter = (binding: string) => ({ async limit({ key }: { key: string }) {
   return { success: counted <= cap };
 } });
 
+// A directory change that commits after the API layer read the session's
+// mailbox and identities and before the mailbox runs sendDraft: the window in
+// which only the mailbox's own sender check can see it.
+let beforeMailboxSend: { statement: string; binds: unknown[] } | undefined;
+type MailboxPort = NonNullable<MailApiEnvironment['MAILBOX']>;
+type MailApiCall = ReturnType<MailboxPort['getByName']>['mailApi'];
+const mailboxPort = (env: FixtureEnv): MailboxPort => ({
+  getByName(name: string) {
+    const stub: ReturnType<MailboxPort['getByName']> = env.MAILBOX.getByName(name);
+    return {
+      async mailApi(...args: Parameters<MailApiCall>) {
+        const change = args[2] === 'sendDraft' ? beforeMailboxSend : undefined;
+        if (change) {
+          beforeMailboxSend = undefined;
+          await env.DIRECTORY.prepare(change.statement).bind(...change.binds).run();
+        }
+        return stub.mailApi(...args);
+      },
+    };
+  },
+});
+
 const signedBytes = (purpose: string, payload: string) => encoder.encode(`kofra-mail-content/v1\n${purpose}\n${payload}`);
 function contentOrigin(url: URL, env: FixtureEnv) { return `http://localhost:${env.CONTENT_PORT || url.port}`; }
 async function mint(origin: string, purpose: 'body' | 'att', claims: ContentClaims, env: FixtureEnv) {
@@ -636,6 +658,15 @@ export default {
       if (url.pathname === '/__fixture/rate-cap') {
         const { binding, cap } = await req.json<{ binding: string; cap: number }>();
         rateCaps.set(binding, cap);
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/__fixture/before-mailbox-send') {
+        beforeMailboxSend = await req.json<{ statement: string; binds: unknown[] }>();
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/__fixture/directory-change') {
+        const { statement, binds } = await req.json<{ statement: string; binds: unknown[] }>();
+        await env.DIRECTORY.prepare(statement).bind(...binds).run();
         return new Response(null, { status: 204 });
       }
       if (url.pathname === '/__fixture/holders') {
@@ -802,7 +833,7 @@ export default {
       MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow, MAIL_RATE_UPLOADS: allow, MAIL_RATE_SENDS: limiter('MAIL_RATE_SENDS'),
       MAIL_RATE_UNDO: limiter('MAIL_RATE_UNDO'), MAIL_RATE_UNDO_FLOOD: limiter('MAIL_RATE_UNDO_FLOOD'), MAIL_RATE_ADMIN_WRITES: allow,
       MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAIL_SEND_ENABLED: env.MAIL_SEND_ENABLED,
-      MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
+      MAILBOX: mailboxPort(env), DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
       MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: env.REAL_CONTENT_ORIGIN ?? contentOrigin(url, env),
