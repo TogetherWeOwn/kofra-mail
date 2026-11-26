@@ -50,11 +50,16 @@ try {
   if (!address || typeof address === 'string') throw new Error('Mail fixture app did not obtain a port.');
   const appOrigin = `http://127.0.0.1:${address.port}`;
   let realContent;
+  const inlineCids = process.argv.includes('--inline-cids');
   if (process.argv.includes('--real-content')) {
     // Browser HTTP bridge only: the content response and its security headers
     // are owned by the Worker. No local certificate, DNS, or upstream network.
     contentHttp = createHttpServer(async (req, res) => {
       try {
+        if (inlineCids && req.url === '/__fixture/raw-reads') {
+          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(backend?.contentRawReads()));
+          return;
+        }
         const reply = await backend?.fetchContent?.(req.url, req.method);
         if (!reply) { res.writeHead(503).end(); return; }
         res.writeHead(reply.status, Object.fromEntries(reply.headers));
@@ -67,7 +72,7 @@ try {
     if (!addr || typeof addr === 'string') throw new Error('Content fixture did not obtain a port.');
     realContent = { appOrigin, contentOrigin: `http://localhost:${addr.port}` };
   }
-  backend = await startMailHttpFixture({ demo: true, realContent });
+  backend = await startMailHttpFixture({ demo: true, realContent, inlineCids });
   process.env.MAIL_DEV_API_ORIGIN = backend.origin;
   process.env.MAIL_DEMO_CONTENT_ORIGIN = process.argv.includes('--plain') ? '' : backend.contentOrigin;
 

@@ -266,13 +266,23 @@ test('oversized CID expansion falls back before emitting a body over 8 MiB', asy
   assert.ok(body.includes('&lt;private&gt;&amp;fallback'));
 });
 
+test('oversized kept markup without CID references falls back to escaped text', async () => {
+  const paragraph = `<p title='${'"'.repeat(8 * 1024)}'>large attribute</p>`;
+  await record(alpha, alternative(paragraph.repeat(175), '<private>&fallback'));
+  const res = await get(await bodyUrl());
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(body.includes('&lt;private&gt;&amp;fallback'));
+  assert.ok(!body.includes('large attribute'));
+});
+
 test('one token cannot queue twenty MIME admissions or hold up another mailbox', async () => {
   const key = await record(alpha, alternative('<p>coalesced MIME</p>'));
   const betaKey = await record(beta, alternative('<p>independent MIME</p>'));
   const path = objectPath('alpha', key);
   const arrived = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
   const declined = Promise.withResolvers<void>();
-  let refused = 0;
+  const refusalMs: number[] = [];
   objectResponses.set(path, async () => {
     arrived.resolve();
     await release.promise;
@@ -281,12 +291,14 @@ test('one token cannot queue twenty MIME admissions or hold up another mailbox',
   const url = await bodyUrl();
   const start = reads.length;
   const wave = Promise.all(Array.from({ length: 20 }, async () => {
+    const started = performance.now();
     const res = await get(url);
     const text = await res.text();
     if (res.status === 503) {
       assert.equal(text, '');
       assert.equal(res.headers.get('retry-after'), '1');
-      if (++refused === 18) declined.resolve();
+      refusalMs.push(performance.now() - started);
+      if (refusalMs.length === 18) declined.resolve();
     } else {
       assert.equal(res.status, 200);
       assert.ok(text.includes('coalesced MIME'));
@@ -301,61 +313,45 @@ test('one token cannot queue twenty MIME admissions or hold up another mailbox',
   } finally { clearTimeout(timeout); release.resolve(); objectResponses.delete(path); }
   const results = await wave;
   assert.deepEqual(results.sort(), [...Array(2).fill(200), ...Array(18).fill(503)]);
+  assert.ok(refusalMs.every(ms => ms >= 1_950), 'overflow waited for the two-second admission deadline');
   const rawReads = reads.slice(start).filter(read => read === path || read === objectPath('beta', betaKey));
   assert.deepEqual(rawReads, [path, objectPath('beta', betaKey)]);
 });
 
-test('six concurrent CID requests respect the raw MIME budget and deferred images can retry', async () => {
-  const ids = Array.from({ length: 6 }, (_, i) => `image-${i}@content.example`);
+for (const count of [6, 3]) test(`${count} concurrent CIDs all succeed on one ${count === 3 ? 'small' : 'large'} raw read`, async () => {
+  const ids = Array.from({ length: count }, (_, i) => `image-${i}@content.example`);
   const images = ids.map(id => `--parts\r\nContent-Type: image/png\r\nContent-ID: <${id}>\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(png).toString('base64')}\r\n`);
-  const encodedAttachment = Buffer.alloc(17 * 1024 * 1024, 65).toString('base64');
+  const filler = count === 6 ? `--parts\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.alloc(17 * 1024 * 1024, 65).toString('base64')}\r\n` : '';
   const raw = `Content-Type: multipart/mixed; boundary=parts\r\n\r\n--parts\r\nContent-Type: text/html\r\n\r\n${ids.map(id => `<img src="cid:${id}">`).join('')}\r\n`
-    + images.join('') + `--parts\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\n${encodedAttachment}\r\n--parts--\r\n`;
+    + images.join('') + filler + '--parts--\r\n';
   const rawKey = await record(alpha, raw, ids.map((_, i) => ({ part: i + 1, objectKey: null })));
   try {
-    assert.ok(Buffer.byteLength(raw) * ids.length > 128 * 1024 * 1024, 'simultaneously buffered raw copies alone would exceed the Worker limit');
+    if (count === 6) assert.ok(Buffer.byteLength(raw) * count > 128 * 1024 * 1024, 'independent raw copies would exceed the Worker limit');
     const body = await get(await bodyUrl());
     assert.equal(body.status, 200);
     const urls = [...(await body.text()).matchAll(/src="(https:\/\/content\.example\/v1\/cid\/[^"]+)"/g)].map(match => match[1]);
     assert.equal(urls.length, ids.length);
     for (const url of urls) tokenValues.push(new URL(url).pathname.split('/').at(-1)!);
     const path = objectPath('alpha', rawKey);
-    const release = Promise.withResolvers<void>();
+    // Hold the storage response briefly so the HTTP requests overlap the load.
     objectResponses.set(path, async () => {
-      await release.promise;
+      await new Promise(resolve => setTimeout(resolve, 250));
       const bytes = store.get(path)!;
       return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
     });
     const start = reads.length;
-    let refused = 0;
-    const watchdog = setTimeout(release.resolve, 4_000);
-    let deferred: (string | undefined)[];
-    try {
-      deferred = await Promise.all(urls.map(async url => {
-        const res = await get(url);
-        if (res.status === 503) {
-          assert.equal(res.headers.get('retry-after'), '1');
-          assert.equal((await res.arrayBuffer()).byteLength, 0);
-          if (++refused === 4) release.resolve();
-          return url;
-        }
-        assert.equal(res.status, 200);
-        assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
-      }));
-    } finally { clearTimeout(watchdog); release.resolve(); objectResponses.delete(path); }
-    assert.equal(refused, 4);
-    assert.deepEqual(reads.slice(start).filter(read => read === path), [path]);
-    assert.deepEqual(await (await get('/__mime-budget')).json(), { peak: Buffer.byteLength(raw), inFlight: 0 });
-    // Admission is capped on slower hosts too. Once the wave has drained,
-    // every deferred image must succeed without a concurrent reservation.
-    for (const url of deferred) {
-      if (url === undefined) continue;
+    const statuses = await Promise.all(urls.map(async url => {
       const res = await get(url);
-      assert.equal(res.status, 200);
-      assert.deepEqual(new Uint8Array(await res.arrayBuffer()), png);
-    }
-    assert.deepEqual(await (await get('/__mime-budget')).json(), { peak: Buffer.byteLength(raw), inFlight: 0 });
-  } finally { store.delete(objectPath('alpha', rawKey)); }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (res.ok) assert.deepEqual(bytes, png);
+      return res.status;
+    }));
+    assert.deepEqual(statuses, Array(count).fill(200));
+    assert.deepEqual(reads.slice(start).filter(read => read === path), [path]);
+    const budget = await (await get('/__mime-budget')).json() as { peak: number; inFlight: number };
+    assert.equal(budget.inFlight, 0);
+    assert.ok(budget.peak >= Buffer.byteLength(raw) && budget.peak <= 25 * 1024 * 1024);
+  } finally { objectResponses.delete(objectPath('alpha', rawKey)); store.delete(objectPath('alpha', rawKey)); }
 });
 
 test('an unread large CID has no MIME charge and does not delay another mailbox', async () => {

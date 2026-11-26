@@ -3,7 +3,7 @@ import { MAX_RAW_BYTES } from '../../mail-backend/src/bytes.ts';
 type Release = () => void;
 type Claim = () => Release;
 type Waiter = { bytes: number; until: number; grant(release: Release): void; fail(reason: unknown): void };
-const admissionMs = 2_000;
+export const mimeAdmissionMs = 2_000;
 const waiting: Waiter[] = [];
 let held = 0;
 let peak = 0;
@@ -39,18 +39,22 @@ function drain() {
 }
 
 /** Grants queue space only; it never transfers a stream or I/O across requests. Claim immediately before reading. */
-export async function reserveMime(bytes: number, signal: AbortSignal): Promise<Claim> {
+export async function reserveMime(bytes: number, signal: AbortSignal, waitMs = mimeAdmissionMs): Promise<Claim> {
   if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_RAW_BYTES) throw new Error('invalid MIME size');
   signal.throwIfAborted();
+  // A caller that already used its wait budget may still take immediately free bytes.
+  if (waitMs === 0 && (waiting.length || held + bytes > MAX_RAW_BYTES)) throw new MimeBusy();
   const { promise, resolve, reject } = Promise.withResolvers<Claim>();
+  let granted: Release | undefined;
   const waiter: Waiter = {
-    bytes, until: Date.now() + admissionMs, fail: reject,
+    bytes, until: waitMs === 0 ? Infinity : Date.now() + waitMs, fail: reject,
     grant(release) {
-      // Keep the charge revocable until the admitted request is about to allocate.
-      signal.addEventListener('abort', release, { once: true });
+      // Grants may come from another request; only the owner touches its signal.
+      granted = release;
       resolve(() => {
-        signal.removeEventListener('abort', release);
-        if (signal.aborted) { release(); throw signal.reason; }
+        signal.removeEventListener('abort', cancel);
+        signal.throwIfAborted();
+        granted = undefined;
         return release;
       });
     },
@@ -62,8 +66,13 @@ export async function reserveMime(bytes: number, signal: AbortSignal): Promise<C
     waiter.fail(reason);
     drain();
   }
-  function cancel() { withdraw(signal.reason); }
-  const timer = setTimeout(() => withdraw(new MimeBusy()), admissionMs);
+  function cancel() {
+    const release = granted;
+    if (!release) { withdraw(signal.reason); return; }
+    granted = undefined;
+    release();
+  }
+  const timer = setTimeout(() => withdraw(new MimeBusy()), waitMs);
   signal.addEventListener('abort', cancel, { once: true });
   waiting.push(waiter);
   drain();
@@ -71,6 +80,6 @@ export async function reserveMime(bytes: number, signal: AbortSignal): Promise<C
   finally {
     // Clear request-owned resources in the waiting request, not the releaser.
     clearTimeout(timer);
-    signal.removeEventListener('abort', cancel);
+    if (!granted) signal.removeEventListener('abort', cancel);
   }
 }

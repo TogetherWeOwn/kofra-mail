@@ -1,8 +1,9 @@
-import { sanitiseCss } from './css.ts';
-import { cssUrl, decodeAttribute, escapeAttribute, escapeText, getContentId, isAnchorUrl, isDataImage,
-  isRemoteImageUrl, isWebUrl, quoteEncodedAttribute, trimUrl } from './urls.ts';
+import { sanitiseCss, type CssPart } from './css.ts';
+import { cssUrl, decodeAttribute, escapeAttribute, escapeHtml, escapeText, getContentId, isAnchorUrl, isDataImage,
+  isRemoteImageUrl, isWebUrl, measureHtml, trimUrl, type HtmlEscape } from './urls.ts';
 
 export const SANITIZER_VERSION = 2;
+export const maxBodyHtmlBytes = 8 * 1024 * 1024;
 
 export type ContentRef = { kind: 'cid'; contentId: string } | { kind: 'img'; url: string };
 export interface SanitisedBody {
@@ -10,7 +11,7 @@ export interface SanitisedBody {
   refs: ContentRef[];
   version: number;
   /** The caller should fall back to plain text or a notice, not display this body. */
-  unsafe?: 'ambiguous_markup';
+  unsafe?: 'ambiguous_markup' | 'output_too_large';
 }
 export interface SanitiseOptions {
   ri?: boolean;
@@ -35,19 +36,9 @@ export function sanitisePlainText(text: string): SanitisedBody {
   return wrap(`<pre>\n${escapeText(text)}</pre>`);
 }
 
-function utf8Cost(char: string): number {
-  const unit = char.charCodeAt(0);
-  return char.length === 2 ? 4 : unit < 0x80 ? 1 : unit < 0x800 ? 2 : 3;
-}
-
 export function boundedPlainText(text: string, maxBytes: number): string | null {
-  let left = maxBytes - prefix.length - suffix.length - '<pre>\n</pre>'.length;
-  if (text.length > left) return null;
-  for (const char of text) {
-    left -= char === '&' ? 5 : char === '<' || char === '>' ? 4 : char === '\0' ? 3 : utf8Cost(char);
-    if (left < 0) return null;
-  }
-  return sanitisePlainText(text).html;
+  const limit = maxBytes - prefix.length - suffix.length - '<pre>\n</pre>'.length;
+  return measureHtml(text, limit, 'text') === null ? null : sanitisePlainText(text).html;
 }
 
 type RefContext = 'h' | 'a' | 's'; // HTML src attribute, CSS attribute, raw CSS
@@ -64,26 +55,43 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
   const remoteAllowed = ri && verdict !== 'phishing';
   let remoteCount = 0;
   let styleParts: string[] | undefined;
+  let styleBytes = 0;
   const textParts: string[] = [];
+  let textBytes = 0;
   let pendingEntity = false;
+  let left = maxBodyHtmlBytes - prefix.length - suffix.length;
+  let tooLarge = false;
+
+  function measure(value: string, limit: number, mode?: HtmlEscape): number {
+    const size = measureHtml(value, limit, mode);
+    if (size === null) {
+      // Workerd can wrap an HTMLRewriter callback error at the stream boundary.
+      tooLarge = true;
+      throw new Error('HTML output limit exceeded');
+    }
+    return size;
+  }
+
+  function emit(value: string, mode?: HtmlEscape): string {
+    left -= measure(value, left, mode);
+    const escaped = mode ? escapeHtml(value, mode) : value;
+    if (escaped) result.push(escaped);
+    return escaped;
+  }
 
   function emitMarkup(markup: string) {
     pendingEntity = false;
-    result.push(markup);
+    emit(markup);
   }
 
   function emitText(text: string) {
     if (!text) return;
-    // Text tokens already contain HTML references. Escape only literal markup
-    // delimiters and, at adjacent text-node boundaries, prevent a new match
-    // across a discarded node. A new reference starts with '&', which ends any
-    // preceding reference without inserting a DOM node or visible separator.
-    let escaped = text.replaceAll('<', '&lt;').replaceAll('\0', '�');
-    if (pendingEntity && /^[a-z\d#;]/i.test(escaped)) {
-      escaped = `&#${escaped.charCodeAt(0)};${escaped.slice(1)}`;
+    // Keep already-encoded references, but prevent a new entity match across a discarded node.
+    if (pendingEntity && /^[a-z\d#;]/i.test(text)) {
+      emit(`&#${text.charCodeAt(0)};`);
+      text = text.slice(1);
     }
-    pendingEntity = /&(?:[a-z\d]*|#[a-z\d]*)$/i.test(escaped);
-    result.push(escaped);
+    pendingEntity = /&(?:[a-z\d]*|#[a-z\d]*)$/i.test(emit(text, 'rewriterText'));
   }
 
   function ref(context: RefContext, value: ContentRef): string {
@@ -98,39 +106,64 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
     return slot(context, refs.push(value) - 1);
   }
 
-  function css(input: string, inline: boolean): string {
-    return sanitiseCss(input, inline).map(part => {
-      if (typeof part === 'string') return inline ? escapeAttribute(part) : part;
-      return ref(inline ? 'a' : 's', { kind: 'img', url: part.url });
-    }).join('').trimEnd();
+  function css(input: string, inline: boolean): CssPart[] {
+    const parts = sanitiseCss(input, inline);
+    while (parts.length) {
+      const last = parts[parts.length - 1];
+      if (typeof last !== 'string') break;
+      const trimmed = last.trimEnd();
+      if (trimmed) { parts[parts.length - 1] = trimmed; break; }
+      parts.pop();
+    }
+    return parts;
   }
 
-  function attributes(tag: string, attrs: Iterable<string[]>): string {
-    let output = '';
+  function emitCss(parts: CssPart[], inline: boolean) {
+    for (const part of parts) {
+      if (typeof part === 'string') emit(part, inline ? 'attribute' : undefined);
+      else emit(ref(inline ? 'a' : 's', { kind: 'img', url: part.url }));
+    }
+  }
+
+  function boundedDecode(raw: string): string | undefined {
+    measure(raw, maxBodyHtmlBytes);
+    return decodeAttribute(raw);
+  }
+
+  function attribute(name: string, value: string, mode: HtmlEscape) {
+    emit(` ${name}="`);
+    emit(value, mode);
+    emit('"');
+  }
+
+  function attributes(tag: string, attrs: Iterable<string[]>) {
     const seen = new Set<string>();
     for (const [name, raw] of attrs) {
       if (seen.has(name)) continue;
       seen.add(name);
       if (name === 'style') {
-        const decoded = decodeAttribute(raw);
-        const value = decoded === undefined ? '' : css(decoded, true);
-        if (value) output += ` style="${value}"`;
+        const decoded = boundedDecode(raw);
+        const parts = decoded === undefined ? [] : css(decoded, true);
+        if (parts.length) {
+          emit(' style="');
+          emitCss(parts, true);
+          emit('"');
+        }
       } else if (name === 'href' && tag === 'a' && verdict !== 'phishing') {
-        const url = trimUrl(decodeAttribute(raw) ?? '');
-        if (isAnchorUrl(url)) output += ` href="${escapeAttribute(url)}"`;
+        const url = trimUrl(boundedDecode(raw) ?? '');
+        if (isAnchorUrl(url)) attribute(name, url, 'attribute');
       } else if (globalAttrs.has(name) || (tag === 'img' && name === 'alt')) {
-        output += ` ${name}="${quoteEncodedAttribute(raw)}"`;
+        attribute(name, raw, 'encodedAttribute');
       }
     }
-    if (tag === 'a') output += ' target="_blank" rel="noopener noreferrer"';
-    return output;
+    if (tag === 'a') emit(' target="_blank" rel="noopener noreferrer"');
   }
 
   try {
     // HTMLRewriter's remove/replace handles element content including raw-text
     // states and implied boundaries. Its callbacks still see removed children,
     // so collect references and build output in a second pass, never the first.
-    const cleaned = await new HTMLRewriter().on('*', {
+    const cleaned = new HTMLRewriter().on('*', {
       element(element) {
         if (removed.has(element.tagName) || element.namespaceURI !== htmlNamespace) {
           // Keep a lexical boundary for the second pass: text on opposite sides
@@ -138,9 +171,9 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
           element.replace('<!---->', { html: true });
         }
       },
-    }).transform(new Response(html)).text();
+    }).transform(new Response(html));
 
-    await new HTMLRewriter().on('*', {
+    const parsed = new HTMLRewriter().on('*', {
       element(element) {
         const tag = element.tagName;
         if (removed.has(tag) || element.namespaceURI !== htmlNamespace) {
@@ -151,19 +184,25 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
           const attrs = [...element.attributes];
           const parts: string[] = [];
           styleParts = parts;
+          styleBytes = 0;
           element.onEndTag(() => {
-            emitMarkup(`<style${attributes(tag, attrs)}>${css(parts.join(''), false)}</style>`);
+            emitMarkup('<style');
+            attributes(tag, attrs);
+            emit('>');
+            emitCss(css(parts.join(''), false), false);
+            emit('</style>');
             styleParts = undefined;
           });
           // An unclosed style is not emitted; no original raw text is copied.
           return;
         }
         let src = '';
+        let data: string | undefined;
         if (tag === 'img') {
-          const value = trimUrl(decodeAttribute(element.getAttribute('src') ?? '') ?? '');
+          const value = trimUrl(boundedDecode(element.getAttribute('src') ?? '') ?? '');
           const contentId = getContentId(value);
           if (contentId) src = ref('h', { kind: 'cid', contentId });
-          else if (isDataImage(value)) src = ` src="${escapeAttribute(value)}"`;
+          else if (isDataImage(value)) data = value;
           else if (isWebUrl(value)) {
             src = isRemoteImageUrl(value) ? ref('h', { kind: 'img', url: value }) : '';
             if (!src) {
@@ -172,23 +211,33 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
             }
           }
         }
-        emitMarkup(`<${tag}${attributes(tag, element.attributes)}${src}>`);
+        emitMarkup(`<${tag}`);
+        attributes(tag, element.attributes);
+        emit(src);
+        if (data !== undefined) attribute('src', data, 'attribute');
+        emit('>');
         if (!voidKept.has(tag)) element.onEndTag(() => emitMarkup(`</${tag}>`));
       },
     }).onDocument({
       text(chunk) {
         if (styleParts) {
-          styleParts.push(chunk.text);
+          styleBytes += measure(chunk.text, maxBodyHtmlBytes - styleBytes);
+          if (chunk.text) styleParts.push(chunk.text);
         } else {
-          textParts.push(chunk.text);
+          textBytes += measure(chunk.text, left - textBytes, 'rewriterText');
+          if (chunk.text) textParts.push(chunk.text);
           if (chunk.lastInTextNode) {
             emitText(textParts.join(''));
             textParts.length = 0;
+            textBytes = 0;
           }
         }
       },
-    }).transform(new Response(cleaned)).text();
+    }).transform(cleaned);
+    // The parser's copy is not the response. Drain it without materialising it.
+    await parsed.body?.pipeTo(new WritableStream());
   } catch (error) {
+    if (tooLarge) return { ...wrap(''), unsafe: 'output_too_large' };
     // workerd can refuse ambiguous raw-text parsing in malformed markup.
     // Do not serve partial output; report the need for a plain-text fallback.
     if (error instanceof TypeError && (error.message.startsWith('Parser error:') || error.message === 'Uncertain HTML structure')) {
@@ -220,10 +269,9 @@ export async function fillRefs(output: SanitisedBody, mint: MintRef, maxBytes?: 
   const substitutions = new Map<string, { text: string; bytes: number }>();
   function literal(start: number, end: number): boolean {
     if (end - start > left) return false;
-    for (const char of output.html.slice(start, end)) {
-      left -= utf8Cost(char);
-      if (left < 0) return false;
-    }
+    const size = measureHtml(output.html.slice(start, end), left);
+    if (size === null) return false;
+    left -= size;
     return true;
   }
   // First account for each literal and substitution. The expanded string is
@@ -233,8 +281,8 @@ export async function fillRefs(output: SanitisedBody, mint: MintRef, maxBytes?: 
     let value = substitutions.get(marker[0]);
     if (!value) {
       const text = replacement(marker[0], marker[1] as RefContext, marker[2]);
-      let bytes = 0;
-      for (const char of text) bytes += utf8Cost(char);
+      const bytes = measureHtml(text, left);
+      if (bytes === null) return null;
       substitutions.set(marker[0], value = { text, bytes });
     }
     left -= value.bytes;

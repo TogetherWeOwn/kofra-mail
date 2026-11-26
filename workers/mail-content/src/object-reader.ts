@@ -65,12 +65,12 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
     return { stream: response.body, size, signal };
   }
   return {
-    withMime<T>(rawKey: string, sub: string, prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
+    withMime<T>(rawKey: string, sub: string, purpose: 'body' | 'att' | 'cid', prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
       // Equal raw keys in different buckets must not share an object read.
-      return shareMime(`${bucket}/${rawKey}`, sub, requestSignal, async install => {
+      return shareMime(`${bucket}/${rawKey}`, sub, requestSignal, async (install, byteWaitMs) => {
         const { stream, size, signal } = await get(rawKey, 'raw');
         try {
-          install((await reserveMime(size, signal))());
+          install((await reserveMime(size, signal, byteWaitMs))());
           const raw = await readExact(stream, size, MAX_RAW_BYTES);
           if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
           requestSignal.throwIfAborted();
@@ -80,7 +80,7 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
           void stream.cancel().catch(() => {});
           throw error;
         }
-      }, prepare);
+      }, prepare, purpose);
     },
     async attachment(proof: AttachmentProof) {
       const { stream, size } = await get(proof.key, 'att');

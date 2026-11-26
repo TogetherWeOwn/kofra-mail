@@ -34,6 +34,14 @@ test('the checker rejects a serialized frame even if the DOM parser discards it'
   assert.throws(() => checkOutput(withFrame), /unpermitted serialized element frame/);
 });
 
+test('sanitiser stops before constructing oversized kept markup without CID references', async () => {
+  const value = '"'.repeat(8 * 1024);
+  const output = await render(runtime, { html: `<p title='${value}'>fixture</p>`.repeat(175) });
+  assert.equal(output.unsafe, 'output_too_large', `sanitiser returned ${Buffer.byteLength(output.html)} bytes`);
+  assert.ok(Buffer.byteLength(output.html) < 1024);
+  assert.deepEqual(output.refs, []);
+});
+
 test('one CID slot is reused for 1,000 images with the same content ID', async () => {
   const output = await render(runtime, { html: '<img src="cid:logo">'.repeat(1_000) });
   assert.deepEqual(output.refs, [{ kind: 'cid', contentId: 'logo' }]);

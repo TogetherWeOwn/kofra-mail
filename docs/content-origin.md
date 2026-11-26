@@ -112,9 +112,9 @@ An `img` URL skips steps 4 and 5 because it carries no mailbox data: it lets its
 
 ## 3. Responses
 
-The raw MIME is read and parsed under a per-isolate budget that is released before the response starts; a request that cannot reserve within 2 s answers 503 with Retry-After. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
+The raw MIME is read and parsed under a per-isolate budget that is released before the response starts. cid and att requests for the same message share one read and parse; any request that cannot be admitted waits up to 2 s before 503. The 503 includes Retry-After. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
 
-Overlapping reads of the same raw key within a workspace share one admission and parse. A subject can lead one read with at most one additional request joining it, or join another subject's read once. Extra requests from that subject return 503 immediately.
+The sharing key is scoped to the workspace. A loading flight accepts up to 16 members, of which at most two can request rendered bodies. A subject can lead one flight at a time. An abort does not release the raw charge while a load or a response preparation is still active.
 
 ### 3.1 Headers on every response
 

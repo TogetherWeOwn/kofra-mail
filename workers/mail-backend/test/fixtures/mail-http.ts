@@ -52,9 +52,10 @@ interface FixtureOptions {
   draftsUploads?: boolean;
   startedAt?: number;
   realContent?: { appOrigin: string; contentOrigin: string };
+  inlineCids?: boolean;
 }
 
-export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now(), realContent }: FixtureOptions = {}) {
+export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now(), realContent, inlineCids = false }: FixtureOptions = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
@@ -62,6 +63,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
   let watchedBody: PromiseWithResolvers<void> | undefined;
+  let contentRawReads = 0;
   const control = crypto.randomUUID();
   const startTime = Math.floor(startedAt / 1000) * 1000;
   let now = startTime;
@@ -126,10 +128,15 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
         MAIL_LOOKUP: { name: 'mail-backend', entrypoint: 'ContentLookup' },
         ACCOUNT_EPOCH: { name: 'account', entrypoint: 'CredentialEpoch' },
       },
-      outboundService: (req: LocalRequest) => {
+      outboundService: async (req: LocalRequest) => {
         const { host, pathname } = new NodeURL(req.url);
         if (req.method !== 'GET' || host !== 'object-store.example.test' || !req.headers.has('authorization')) {
           return new LocalResponse(null, { status: 404 });
+        }
+        if (pathname.includes('/raw/')) {
+          contentRawReads++;
+          // Give the browser burst overlapping object-load time without retrying any image.
+          if (inlineCids && contentRawReads > 1) await new Promise(resolve => setTimeout(resolve, 500));
         }
         const bytes = objects.get(pathname);
         return bytes ? new LocalResponse(bytes, { headers: { 'content-length': String(bytes.byteLength) } }) : new LocalResponse(null, { status: 404 });
@@ -255,6 +262,14 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       const { threadId } = await deliver(message, 'demo');
       const additional = async (subject: string) => deliver({ ...message, subject, text: subject, html: undefined, attachments: undefined }, 'demo');
       await additional('Project schedule');
+      if (inlineCids) {
+        const png = new Uint8Array(Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgZGL+DwABFAEG1rmmRQAAAABJRU5ErkJggg==', 'base64'));
+        const parts = Array.from({ length: 6 }, (_, i) => i);
+        await deliver({ ...message, subject: 'Six local inline images', text: 'Six local inline images.',
+          html: parts.map(i => `<img src="cid:part-${i}@fixture.test" alt="Inline image ${i + 1}">`).join(''),
+          attachments: parts.map(i => ({ name: `inline-${i + 1}.png`, type: 'image/png', bytes: png, inline: true })),
+        }, 'demo');
+      }
       const long = await deliver({ ...message, subject: 'Long plain message', html: undefined, attachments: undefined,
         text: `Preview of long plain message\n${'Message line.\n'.repeat(5_100)}\nUnique tail after the preview` }, 'demo');
       await mail.updateThreads({ ids: [long.threadId], set: { folder: 'archive' } });
@@ -274,6 +289,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
       exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
       seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
       m3: false, credentialEpoch: async () => 1,
+      contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
       sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {

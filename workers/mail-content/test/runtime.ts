@@ -17,7 +17,7 @@ export interface Rendered {
   filled: string;
   refs: Array<{ kind: 'cid'; contentId: string } | { kind: 'img'; url: string }>;
   version: number;
-  unsafe?: 'ambiguous_markup';
+  unsafe?: 'ambiguous_markup' | 'output_too_large';
 }
 
 export async function render(runtime: Miniflare, vector: { html: string; ri?: boolean; verdict?: string; plain?: boolean }, origin?: string) {

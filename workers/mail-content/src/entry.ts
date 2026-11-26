@@ -9,7 +9,7 @@ import { checkedRecord, decodedBytes, EXTERNAL_PART_BYTES, proveAttachment, read
 import {
   checkRemoteImageUrl, contentSecurityHeaders, isInlineImage, remoteImageConfig, remoteImageMethodAllowed, type ContentOrigins,
 } from './proxy.ts';
-import { boundedPlainText, fillRefs, sanitise, sanitisePlainText } from './sanitise.ts';
+import { boundedPlainText, fillRefs, maxBodyHtmlBytes, sanitise, sanitisePlainText } from './sanitise.ts';
 import { CONTENT_URL_SECONDS, isPurpose, mintForWeb, type ClaimsByPurpose, type Purpose, type WebPurpose } from './tokens.ts';
 import { attachmentFor, createVerifier, EpochCache, mintFromBody, type MessageAttachment, type Verified } from './verify.ts';
 
@@ -35,7 +35,6 @@ export type ContentEnv = ContentStoreConfig & {
 
 const epochs = new EpochCache();
 const encoder = new TextEncoder();
-const maxBodyHtmlBytes = 8 * 1024 * 1024;
 const urlFor = (origin: string, purpose: Purpose, token: string) => `${origin}/v1/${purpose}/${token}`;
 const originsFor = (env: ContentEnv): ContentOrigins => ({
   contentOrigin: env.CONTENT_ORIGIN ?? '', appOrigin: env.MAIL_APP_ORIGIN ?? '', localLoopback: env.CONTENT_LOCAL_LOOPBACK === 'on',
@@ -90,7 +89,7 @@ async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: Co
   const entry = purpose !== 'body' ? attachmentFor(message, verified.claims.part) : undefined;
   if (purpose !== 'body' && !entry) return null;
   const objects = readOnlyObjects(env, claims.ws, signal);
-  const prepared = await objects.withMime(message.rawKey, claims.sub,
+  const prepared = await objects.withMime(message.rawKey, claims.sub, purpose,
     mail => prepareMailbox(verified, entry, mail, env, keys, origins, headers, now));
   if (!prepared) return null;
   if (prepared instanceof Uint8Array) return { response: new Response(prepared, { headers }), bytes: prepared.byteLength };
@@ -107,7 +106,7 @@ async function prepareMailbox(verified: VerifiedMailbox, entry: MessageAttachmen
   if (purpose === 'body') {
     const output = mime.html ? await sanitise(mime.html, { ri: verified.claims.ri, verdict: message.verdict }) : null;
     let body: string | null = null;
-    if (output && output.unsafe !== 'ambiguous_markup') {
+    if (output && !output.unsafe) {
       const cidParts = new Map<string, number | null>();
       for (const { part } of message.attachments) {
         const contentId = mimePart(mime.attachments, part)?.contentId?.trim().replace(/^<(.*)>$/, '$1');
