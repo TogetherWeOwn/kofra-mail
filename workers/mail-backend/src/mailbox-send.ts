@@ -348,13 +348,14 @@ export class SendDriver {
     // Step 2: re-check the sender, the limits and the sources; classify recipients.
     const { record } = row;
     const kinds = await this.classify(start.scope, record);
-    const draft = await this.draftOf(start, record);
     let failure: SendFailure | null = null;
+    let draft: DraftObject | undefined;
     if (!await this.senderValid(start.scope, record)) failure = 'invalid_sender';
-    else if (!this.withinLimits(record, draft)) failure = 'message_too_large';
+    // A lost source is never read: its object may be gone.
     else if (await this.sourceLost(record)) failure = 'delivery_error';
-    if (failure) {
-      const reason = failure;
+    else if (!this.withinLimits(record, draft = await this.draftOf(start, record))) failure = 'message_too_large';
+    if (failure || !draft) {
+      const reason = failure ?? 'delivery_error';
       const failed = await this.commit(start, ['releasing'], (timers, _row, index) => {
         index.commitEvents([{ type: 'send_fail', id: this.ref, reason, kinds }]);
         timers.set(SEND_DRIVE, this.ref, this.timer.now);

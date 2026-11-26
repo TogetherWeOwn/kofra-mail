@@ -467,6 +467,8 @@ test('a source the sweeper confirmed lost fails the send at release with deliver
   assert.ok(confirmation.holder.startsWith('draft:'));
   const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
   assert.ok((await h.confirmations()).length >= 1, 'the send keeps the pending confirmation');
+  // The sweeper retired and deleted the revision's generation: its object is gone and confirm answers lost.
+  h.objects.delete(objectPath(confirmation.object_key));
   await h.sends.forceLost(confirmation.holder);
   await h.confirmFailure(false);
   await h.forceSnapshot();
