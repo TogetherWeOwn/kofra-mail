@@ -4,6 +4,7 @@ import { cssUrl, decodeAttribute, escapeAttribute, escapeHtml, escapeText, getCo
 
 export const SANITIZER_VERSION = 2;
 export const maxBodyHtmlBytes = 8 * 1024 * 1024;
+const maxStyleBytes = 1024 * 1024;
 
 export type ContentRef = { kind: 'cid'; contentId: string } | { kind: 'img'; url: string };
 export interface SanitisedBody {
@@ -54,8 +55,7 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
   const cidSlots = new Map<string, number>();
   const remoteAllowed = ri && verdict !== 'phishing';
   let remoteCount = 0;
-  let styleParts: string[] | undefined;
-  let styleBytes = 0;
+  let style: { parts: string[]; bytes: number; dropped: boolean } | undefined;
   const textParts: string[] = [];
   let textBytes = 0;
   let pendingEntity = false;
@@ -182,16 +182,15 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
         if (!kept.has(tag)) return; // unwrap; descend without copying the tag
         if (tag === 'style') {
           const attrs = [...element.attributes];
-          const parts: string[] = [];
-          styleParts = parts;
-          styleBytes = 0;
+          const block = style = { parts: [], bytes: 0, dropped: false };
           element.onEndTag(() => {
+            style = undefined;
+            if (block.dropped) return;
             emitMarkup('<style');
             attributes(tag, attrs);
             emit('>');
-            emitCss(css(parts.join(''), false), false);
+            emitCss(css(block.parts.join(''), false), false);
             emit('</style>');
-            styleParts = undefined;
           });
           // An unclosed style is not emitted; no original raw text is copied.
           return;
@@ -220,9 +219,16 @@ export async function sanitise(html: string, { ri = false, verdict }: SanitiseOp
       },
     }).onDocument({
       text(chunk) {
-        if (styleParts) {
-          styleBytes += measure(chunk.text, maxBodyHtmlBytes - styleBytes);
-          if (chunk.text) styleParts.push(chunk.text);
+        if (style) {
+          if (style.dropped) return;
+          const size = measureHtml(chunk.text, maxStyleBytes - style.bytes);
+          if (size === null) {
+            style.dropped = true;
+            style.parts.length = 0;
+          } else {
+            style.bytes += size;
+            if (chunk.text) style.parts.push(chunk.text);
+          }
         } else {
           textBytes += measure(chunk.text, left - textBytes, 'rewriterText');
           if (chunk.text) textParts.push(chunk.text);

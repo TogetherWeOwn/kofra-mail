@@ -84,11 +84,12 @@ type VerifiedMailbox = Exclude<Verified, { purpose: 'img' }>;
 type Served = { response: Response; bytes: number };
 
 async function serveMailbox(verified: VerifiedMailbox, env: ContentEnv, keys: ContentUrlKeys,
-    origins: ContentOrigins, headers: Headers, now: number, signal: AbortSignal): Promise<Served | null> {
+    origins: ContentOrigins, headers: Headers, now: number, signal: AbortSignal,
+    ctx?: Pick<ExecutionContext, 'waitUntil'>): Promise<Served | null> {
   const { claims, message, purpose } = verified;
   const entry = purpose !== 'body' ? attachmentFor(message, verified.claims.part) : undefined;
   if (purpose !== 'body' && !entry) return null;
-  const objects = readOnlyObjects(env, claims.ws, signal);
+  const objects = readOnlyObjects(env, claims.ws, signal, ctx && (work => ctx.waitUntil(work)));
   const prepared = await objects.withMime(message.rawKey, claims.sub, purpose,
     mail => prepareMailbox(verified, entry, mail, env, keys, origins, headers, now));
   if (!prepared) return null;
@@ -147,7 +148,8 @@ interface Runtime { now: () => number }
 const runtime: Runtime = { now: Date.now };
 const pathPattern = /^\/v1\/(body|cid|att|img)\/([^/]{1,4173})$/;
 
-async function handleContent(request: Request, env: ContentEnv, io: Runtime): Promise<Response> {
+async function handleContent(request: Request, env: ContentEnv, io: Runtime,
+    ctx?: Pick<ExecutionContext, 'waitUntil'>): Promise<Response> {
   const origins = originsFor(env);
   let headers: Headers;
   try { headers = contentSecurityHeaders(origins); }
@@ -180,7 +182,7 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
       if (verified.ok) {
         result = verified.purpose === 'img'
           ? await serveImage(verified.claims.u, origins, proxyConfig(env, origins), request.signal)
-          : await serveMailbox(verified, env, keys, origins, headers, now, request.signal);
+          : await serveMailbox(verified, env, keys, origins, headers, now, request.signal, ctx);
       }
     } catch (error) {
       if (error instanceof MimeBusy) {
@@ -195,10 +197,13 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime): Pr
   return result?.response ?? new Response(null, { status, headers: contentSecurityHeaders(origins) });
 }
 
-export async function serveContent(request: Request, env: ContentEnv, io: Runtime = runtime): Promise<Response> {
-  const response = await handleContent(request, env, io);
+export async function serveContent(request: Request, env: ContentEnv, io: Runtime = runtime,
+    ctx?: Pick<ExecutionContext, 'waitUntil'>): Promise<Response> {
+  const response = await handleContent(request, env, io, ctx);
   response.headers.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
   return response;
 }
 
-export default { fetch: (request: Request, env: ContentEnv) => serveContent(request, env) };
+export default {
+  fetch: (request: Request, env: ContentEnv, ctx: ExecutionContext) => serveContent(request, env, runtime, ctx),
+};

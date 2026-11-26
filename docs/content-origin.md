@@ -112,9 +112,9 @@ An `img` URL skips steps 4 and 5 because it carries no mailbox data: it lets its
 
 ## 3. Responses
 
-The raw MIME is read and parsed under a per-isolate budget that is released before the response starts. cid and att requests for the same message share one read and parse; any request that cannot be admitted waits up to 2 s before 503. The 503 includes Retry-After. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
+The raw MIME is read and parsed under a per-isolate budget that is released before the response starts. cid and att requests for the same message share one read and parse; any request that cannot be admitted waits up to 2 s before 503. The 503 includes Retry-After. This bounds queue time, not object-store I/O. Any reservation that spans a response transfer is released on close, on cancel or 60 s after the response starts.
 
-The sharing key is scoped to the workspace. A loading flight accepts up to 16 members, of which at most two can request rendered bodies. A subject can lead one flight at a time. An abort does not release the raw charge while a load or a response preparation is still active.
+The sharing key is scoped to the workspace. A loading flight accepts up to 16 members, of which at most two can request rendered bodies. A subject can lead one flight at a time. An abort cancels only that response; the shared read has its own 60 s object deadline and is cancelled early only when its last member leaves. The raw charge is held until loading and active preparations settle. A 75 s watchdog retires a stuck flight and reports a metric without request data.
 
 ### 3.1 Headers on every response
 
@@ -183,6 +183,7 @@ Cache-Control: private, no-store
 - **`img src`:** only `cid:`, `data:image/(png|jpeg|gif|webp)` up to 64 KiB, or remote `http(s)`. Remote URLs are rewritten as in section 3.2.
 
 **CSS** (in `style` attributes and `<style>` elements):
+- A `<style>` element larger than 1 MiB is removed with its content.
 - Removed: `@import`, `@font-face`, `expression(…)`, `behavior`, `-moz-binding`, and `url(…)` other than `data:image/…`.
 - When remote images are in effect (`ri` true and the verdict is not `phishing`), remote `url(…)` in `background`/`background-image` is rewritten to an `img` URL, like an `<img>`.
 - `position: fixed` and `position: sticky` become `position: static`.

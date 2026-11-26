@@ -42,6 +42,17 @@ test('sanitiser stops before constructing oversized kept markup without CID refe
   assert.deepEqual(output.refs, []);
 });
 
+test('oversized raw style is dropped without charging the paragraph output', async () => {
+  const css = '/*drop*/'.repeat((9 * 1024 * 1024) / 8);
+  const html = `<style class="discard-this-style">${css}</style><p>Keep this paragraph.</p>`;
+  assert.ok(Buffer.byteLength(html) < 25 * 1024 * 1024);
+  const output = await render(runtime, { html });
+  assert.equal(output.unsafe, undefined);
+  assert.equal(checkOutput(output.filled).text, 'Keep this paragraph.');
+  assert.ok(!output.html.includes('discard-this-style'));
+  assert.ok(!output.html.includes('/*drop*/'));
+});
+
 test('one CID slot is reused for 1,000 images with the same content ID', async () => {
   const output = await render(runtime, { html: '<img src="cid:logo">'.repeat(1_000) });
   assert.deepEqual(output.refs, [{ kind: 'cid', contentId: 'logo' }]);

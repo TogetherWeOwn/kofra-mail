@@ -64,6 +64,9 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
   let watchedBody: PromiseWithResolvers<void> | undefined;
   let contentRawReads = 0;
+  let cidAdmissions = 0;
+  const cidBurst = Promise.withResolvers<void>();
+  const cidAdmissionMarker = 'fixture:cid-member-admitted';
   const control = crypto.randomUUID();
   const startTime = Math.floor(startedAt / 1000) * 1000;
   let now = startTime;
@@ -109,13 +112,22 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
   const workers = [backend];
   if (realContent) {
     const [content, account] = await Promise.all([contentBundle ??= compiled(contentEntry), accountBundle ??= compiled(accountEntry)]);
+    let contentScript = content.outputFiles[0].text;
+    if (inlineCids) {
+      // Instrument only the browser test bundle. The storage stub waits for
+      // six actual admissions, not a guess at browser or runner timing.
+      const admission = 'const member = (await admit(key, sub, signal, purpose))();';
+      assert.equal(contentScript.split(admission).length, 2, 'expected one MIME admission instrumentation point');
+      contentScript = contentScript.replace(admission,
+        `${admission}\nif (purpose === 'cid') console.log(${JSON.stringify(cidAdmissionMarker)});`);
+    }
     workers.push({
       name: 'account', compatibilityDate: '2026-07-30',
       modules: [{ type: 'ESModule', path: 'account.mjs', contents: account.outputFiles[0].text }],
       bindings: { USERS: [...new Set(Object.values(accounts).map(({ userId }) => userId))] },
     }, {
       name: 'mail-content', compatibilityDate: '2026-07-30', compatibilityFlags: ['enable_request_signal'],
-      modules: [{ type: 'ESModule', path: 'mail-content.mjs', contents: content.outputFiles[0].text }],
+      modules: [{ type: 'ESModule', path: 'mail-content.mjs', contents: contentScript }],
       bindings: {
         MAIL_CONTENT_ENABLED: 'on', CONTENT_LOCAL_LOOPBACK: 'on', CONTENT_ORIGIN: realContent.contentOrigin,
         MAIL_APP_ORIGIN: realContent.appOrigin,
@@ -135,15 +147,25 @@ export async function startMailHttpFixture({ demo = false, draftsUploads = false
         }
         if (pathname.includes('/raw/')) {
           contentRawReads++;
-          // Give the browser burst overlapping object-load time without retrying any image.
-          if (inlineCids && contentRawReads > 1) await new Promise(resolve => setTimeout(resolve, 500));
+          if (inlineCids && contentRawReads > 1) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([cidBurst.promise, new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(new Error(`Only ${cidAdmissions} CID requests reached admission`)), 5_000);
+              })]);
+            } finally { clearTimeout(timer); }
+          }
         }
         const bytes = objects.get(pathname);
         return bytes ? new LocalResponse(bytes, { headers: { 'content-length': String(bytes.byteLength) } }) : new LocalResponse(null, { status: 404 });
       },
     });
   }
-  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers });
+  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...(inlineCids && {
+    handleStructuredLogs: ({ message }: { message: string }) => {
+      if (message === cidAdmissionMarker && ++cidAdmissions === 6) cidBurst.resolve();
+    },
+  }) });
   try {
     const ready = await mf.ready;
     const origin = ready.origin;

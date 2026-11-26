@@ -6,8 +6,9 @@ import { remoteImageInFlight } from '../src/proxy.ts';
 
 let clockOffset = 0;
 let releaseHeldMime: (() => void) | undefined;
+let cancelFlightLeader: (() => Promise<void>) | undefined;
 export default {
-  async fetch(req: Request, env: ContentEnv) {
+  async fetch(req: Request, env: ContentEnv, ctx: ExecutionContext) {
     const path = new URL(req.url).pathname;
     if (path === '/__clock') { clockOffset = Number(await req.text()); return new Response(null); }
     if (path === '/__mime-budget') return Response.json(mimeBudgetUsage());
@@ -21,6 +22,11 @@ export default {
       return new Response(null);
     }
     if (path === '/__image-budget') return Response.json(remoteImageInFlight());
+    if (path === '/__cancel-flight-leader') {
+      if (!cancelFlightLeader) return new Response(null, { status: 404 });
+      await cancelFlightLeader();
+      return new Response(null);
+    }
     if (path === '/__owner') { ownerA = await req.json(); return new Response(null); }
     if (path === '/__record') {
       const [key, value] = await req.json<[string, unknown]>();
@@ -42,7 +48,19 @@ export default {
       void response.body?.cancel().catch(() => {});
       return Response.json({ status: response.status, before, after });
     }
-    return serveContent(req, env, io);
+    if (req.headers.has('x-fixture-cancel-leader')) {
+      const controller = new AbortController();
+      const { promise, resolve } = Promise.withResolvers<void>();
+      // Only resolve a JS promise from the control request. Abort in the
+      // cancelled member's own Workerd invocation, not in the control request.
+      const aborted = promise.then(() => controller.abort());
+      const cancel = () => { resolve(); return aborted; };
+      cancelFlightLeader = cancel;
+      try {
+        return await serveContent(new Request(req, { signal: AbortSignal.any([req.signal, controller.signal]) }), env, io, ctx);
+      } finally { if (cancelFlightLeader === cancel) cancelFlightLeader = undefined; }
+    }
+    return serveContent(req, env, io, ctx);
   },
 };
 export { ContentMint } from '../src/entry.ts';

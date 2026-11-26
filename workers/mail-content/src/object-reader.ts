@@ -33,7 +33,8 @@ export type ContentStoreConfig = Partial<Record<
   'CONTENT_S3_ENDPOINT' | 'CONTENT_S3_ACCESS_KEY_ID' | 'CONTENT_S3_SECRET_ACCESS_KEY', string
 >>;
 
-export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSignal: AbortSignal) {
+export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSignal: AbortSignal,
+    keepAlive?: (work: Promise<void>) => void) {
   const { CONTENT_S3_ENDPOINT: endpoint, CONTENT_S3_ACCESS_KEY_ID: accessKeyId, CONTENT_S3_SECRET_ACCESS_KEY: secretAccessKey } = env;
   const origin = endpoint ? URL.parse(endpoint) : null;
   if (!origin || origin.protocol !== 'https:' || origin.href !== `${origin.origin}/` || !accessKeyId || !secretAccessKey) {
@@ -42,10 +43,10 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
   const endpointOrigin = origin.origin;
   const bucket = workspaceMailBucket(ws);
   const s3 = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 });
-  async function get(key: string, kind: 'raw' | 'att') {
+  async function get(key: string, kind: 'raw' | 'att', ownerSignal: AbortSignal) {
     if (!keyOf(key, kind)) throw new Error('invalid mail object key');
     const headersDeadline = kind === 'att' ? new AbortController() : undefined;
-    const signal = AbortSignal.any([requestSignal, headersDeadline?.signal ?? AbortSignal.timeout(60_000)]);
+    const signal = AbortSignal.any([ownerSignal, headersDeadline?.signal ?? AbortSignal.timeout(60_000)]);
     const timer = headersDeadline && setTimeout(() => headersDeadline.abort(new DOMException('object header timeout', 'TimeoutError')), 60_000);
     let response: Response;
     try {
@@ -67,23 +68,22 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
   return {
     withMime<T>(rawKey: string, sub: string, purpose: 'body' | 'att' | 'cid', prepare: (mail: MailMime) => T | Promise<T>): Promise<T> {
       // Equal raw keys in different buckets must not share an object read.
-      return shareMime(`${bucket}/${rawKey}`, sub, requestSignal, async (install, byteWaitMs) => {
-        const { stream, size, signal } = await get(rawKey, 'raw');
+      return shareMime(`${bucket}/${rawKey}`, sub, requestSignal, async (install, byteWaitMs, flightSignal) => {
+        const { stream, size, signal } = await get(rawKey, 'raw', flightSignal);
         try {
           install((await reserveMime(size, signal, byteWaitMs))());
           const raw = await readExact(stream, size, MAX_RAW_BYTES);
           if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
-          requestSignal.throwIfAborted();
           // Same parser version and options as mail-backend's indexed part numbers.
           return await PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
         } catch (error) {
           void stream.cancel().catch(() => {});
           throw error;
         }
-      }, prepare, purpose);
+      }, prepare, purpose, keepAlive);
     },
     async attachment(proof: AttachmentProof) {
-      const { stream, size } = await get(proof.key, 'att');
+      const { stream, size } = await get(proof.key, 'att', requestSignal);
       if (size !== proof.size) {
         void stream.cancel().catch(() => {});
         throw new Error('attachment length mismatch');

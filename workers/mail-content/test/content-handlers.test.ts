@@ -354,6 +354,41 @@ for (const count of [6, 3]) test(`${count} concurrent CIDs all succeed on one ${
   } finally { objectResponses.delete(objectPath('alpha', rawKey)); store.delete(objectPath('alpha', rawKey)); }
 });
 
+test('workerd still serves a live CID follower after the stalled read leader cancels', { timeout: 10_000 }, async () => {
+  const rawKey = await record(alpha, withParts(html), parts);
+  const rawPath = objectPath('alpha', rawKey);
+  const arrived = Promise.withResolvers<void>();
+  const unblock = Promise.withResolvers<void>();
+  objectResponses.set(rawPath, async () => {
+    arrived.resolve();
+    await unblock.promise;
+    const bytes = store.get(rawPath)!;
+    return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+  });
+  const path = await cidUrl(1);
+  const start = reads.length;
+  const leader = mf.dispatchFetch(new URL(path, origin), { headers: { 'x-fixture-cancel-leader': '1' } });
+  try {
+    assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
+    const follower = get(path);
+    // The origin remains blocked while the second HTTP request joins the flight.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await set('cancel-flight-leader', null);
+    unblock.resolve();
+    const stopped = await leader;
+    assert.equal(stopped.status, 404);
+    void stopped.body?.cancel().catch(() => {});
+    const live = await follower;
+    assert.equal(live.status, 200);
+    assert.deepEqual(new Uint8Array(await live.arrayBuffer()), png);
+    assert.deepEqual(reads.slice(start).filter(read => read === rawPath), [rawPath]);
+    assert.equal((await (await get('/__mime-budget')).json() as { inFlight: number }).inFlight, 0);
+  } finally {
+    unblock.resolve();
+    objectResponses.delete(rawPath);
+  }
+});
+
 test('an unread large CID has no MIME charge and does not delay another mailbox', async () => {
   const large = new Uint8Array(17 * 1024 * 1024);
   large.set(png);
