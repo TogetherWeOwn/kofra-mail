@@ -519,7 +519,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(send({ to: [] }, 'empty'), 'invalid_recipients');
       const invalidDraft = await mail.createDraft({ ...input, to: [{ email: 'invalid' }] }, key('draft-invalid'));
       await rejects(mail.sendDraft(invalidDraft.id, { ...key('send-invalid'), ifMatch: invalidDraft.revision }), 'invalid_recipients');
-      const rawBudget = attachmentBudget(limits, Buffer.byteLength(input.body));
+      const rawBudget = attachmentBudget(limits, input.body);
       const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
       const boundaryDraft = await mail.createDraft({ ...input, attachments: [{ kind: 'upload', uploadId: boundary.id }] }, key('draft-fits'));
       const boundarySend = await mail.sendDraft(boundaryDraft.id, { ...key('send-fits'), ifMatch: boundaryDraft.revision });
@@ -741,6 +741,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       const current = directory.items.find(({ id }) => id === mailbox.id);
       assert.ok(current && current.aliases.length < limits.aliasesPerMailbox);
       const aliasInput = { mailboxId: mailbox.id, sendAs: true };
+      // RFC 2047 encoded words are not allowed in an addr-spec, so such a local part is never a directory address.
+      await rejects(admin.createMailbox({ ...input, primaryAddress: `=?conformance@${primaryDomain}` }, key('encoded-mailbox')), 'invalid_request');
+      await rejects(admin.createAlias({ ...aliasInput, address: `a=?b@${primaryDomain}` }, key('encoded-alias')), 'invalid_request');
       const alias = await admin.createAlias({ ...aliasInput, address: `conformance-alias-0@${primaryDomain}` }, key('alias-0'));
       const identity = (await mail.listIdentities()).items.find(({ email }) => email === alias.address);
       assert.equal(identity?.kind, 'alias');
