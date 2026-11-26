@@ -10,15 +10,17 @@ export const IN_PROGRESS_TTL_MS = 5 * 60_000;
 
 export type UploadRow = {
   id: string; objectKey: string; name: string; mediaType: string; size: number;
-  expiresAt: number;
+  expiresAt: number; holder: string;
 };
 
-export const uploadHolder = (id: string) => `upload:${id}`;
-const columns = 'id, object_key AS objectKey, name, media_type AS mediaType, size, expires_at AS expiresAt';
+const columns = 'id, object_key AS objectKey, name, media_type AS mediaType, size, expires_at AS expiresAt, holder';
 export const uploadRow = (sql: SqlStorage, id: string): UploadRow | undefined =>
   sql.exec<UploadRow>(`SELECT ${columns} FROM mailbox_api_uploads WHERE id = ?`, id).toArray()[0];
 export const uploadReferenced = (sql: SqlStorage, id: string): boolean =>
   sql.exec('SELECT 1 FROM mailbox_api_draft_uploads WHERE upload_id = ? LIMIT 1', id).toArray().length !== 0;
+
+export const unusableSource = (sql: SqlStorage, kind: 'draft' | 'upload', id: string): boolean =>
+  sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ?', kind, id).toArray().length !== 0;
 
 export function wireUpload(row: UploadRow): Upload {
   const key = parseObjectKey(row.objectKey);

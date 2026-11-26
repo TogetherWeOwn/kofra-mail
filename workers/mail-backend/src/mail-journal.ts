@@ -14,8 +14,9 @@ export type JournalEvent =
   | { type: 'draft'; id: string; rawKey: string; holder: string; revision?: string; updatedAt?: number;
       uploadIds?: string[]; attachmentKeys?: string[] }
   | { type: 'draft_delete'; id: string; deferRelease?: true }
-  | { type: 'api_upload'; id: string; objectKey: string; name: string; mediaType: string; size: number; expiresAt: number }
+  | { type: 'api_upload'; id: string; objectKey: string; name: string; mediaType: string; size: number; expiresAt: number; holder?: string }
   | { type: 'api_upload_delete'; id: string; objectKey: string }
+  | { type: 'api_source_lost'; kind: 'draft' | 'upload'; id: string; holder: string }
   | { type: 'api_result'; key: string; fingerprint: string; expiresAt: number; result: string }
   | { type: 'api_result_expire'; key: string; expiresAt: number }
   | { type: 'bayes'; token: string; ham: number; spam: number }

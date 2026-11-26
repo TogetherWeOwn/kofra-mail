@@ -6,7 +6,8 @@ import { attachmentRow, displayOf, messageRow, partNumber } from './mailbox-api-
 import { fail, invalid, isId, iso, need, object, requireId, text, utf8 } from './mailbox-api-input.ts';
 import type { ApiDraftRef, MailboxIndex } from './mailbox-index.ts';
 import { parseMail } from './parse-mail.ts';
-import { uploadReferenced, uploadRow } from './mailbox-upload.ts';
+import { unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
+import { parseObjectKey } from './object-key.ts';
 
 export type DraftObjectRef = Omit<ApiDraftRef, 'holder'>;
 type StoredAttachment =
@@ -38,18 +39,21 @@ export function draftRef(sql: SqlStorage, id: string | undefined): ApiDraftRef |
 }
 export function draftRefs(sql: SqlStorage, limit: number, position?: [number, string]): ApiDraftRef[] {
   const range = (where: string, values: SqlStorageValue[], count: number) => sql.exec<ApiDraftRef>(
-    `${select} ${where} ORDER BY a.updated_at DESC, a.id ASC LIMIT ?`, ...values, count).toArray();
+    `${select} WHERE NOT EXISTS (SELECT 1 FROM mailbox_unusable_sources u WHERE u.kind = 'draft' AND u.id = a.id)
+      ${where} ORDER BY a.updated_at DESC, a.id ASC LIMIT ?`, ...values, count).toArray();
   if (!position) return range('', [], limit);
   // For a mixed sort direction, seek separately within the timestamp tie and
   // then through older timestamps, so neither query starts at the table head.
-  const ties = range('WHERE a.updated_at = ? AND a.id > ?', position, limit);
-  return ties.length === limit ? ties : [...ties, ...range('WHERE a.updated_at < ?', [position[0]], limit - ties.length)];
+  const ties = range('AND a.updated_at = ? AND a.id > ?', position, limit);
+  return ties.length === limit ? ties : [...ties, ...range('AND a.updated_at < ?', [position[0]], limit - ties.length)];
 }
 
 async function loadDraft(index: MailboxIndex, ref: DraftObjectRef): Promise<{ draft: DraftObject; bytes: number }> {
-  if (!/^drafts\/[0-9a-f]{64}$/.test(ref.rawKey)) throw new Error('Invalid API draft reference');
+  const parsed = parseObjectKey(ref.rawKey);
+  const digest = parsed?.kind === 'raw' ? parsed.digest : /^drafts\/([0-9a-f]{64})$/.exec(ref.rawKey)?.[1];
+  if (!digest) throw new Error('Invalid API draft reference');
   const bytes = await index.readObject(ref.rawKey);
-  if (bytes.byteLength > MAX_DRAFT_OBJECT_BYTES || await sha256(bytes) !== ref.rawKey.slice('drafts/'.length)) {
+  if (bytes.byteLength > MAX_DRAFT_OBJECT_BYTES || await sha256(bytes) !== digest) {
     throw new Error('Invalid API draft object');
   }
   const draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject;
@@ -128,7 +132,7 @@ export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: un
         const uploadId = requireId(ref.uploadId, `${path}/uploadId`);
         if (enableAttachments) {
           const upload = need(uploadRow(sql, uploadId));
-          if (upload.expiresAt <= now && !uploadReferenced(sql, uploadId)) return fail('not_found');
+          if (unusableSource(sql, 'upload', uploadId) || (upload.expiresAt <= now && !uploadReferenced(sql, uploadId))) return fail('not_found');
           stored.push({ wire: { kind: 'upload', uploadId, name: upload.name, type: upload.mediaType, size: upload.size }, key: upload.objectKey });
         }
         break;

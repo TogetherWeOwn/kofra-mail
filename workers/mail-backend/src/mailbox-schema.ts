@@ -57,8 +57,10 @@ CREATE TABLE IF NOT EXISTS mailbox_api_in_progress (key TEXT PRIMARY KEY, token 
 CREATE INDEX IF NOT EXISTS mailbox_api_progress_expiry ON mailbox_api_in_progress(expires_at, key);
 CREATE TABLE IF NOT EXISTS mailbox_api_uploads (
   id TEXT PRIMARY KEY, object_key TEXT NOT NULL, name TEXT NOT NULL, media_type TEXT NOT NULL,
-  size INTEGER NOT NULL, expires_at INTEGER NOT NULL
+  size INTEGER NOT NULL, expires_at INTEGER NOT NULL, holder TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS mailbox_api_upload_holder ON mailbox_api_uploads(holder);
+CREATE INDEX IF NOT EXISTS mailbox_draft_holder ON drafts(holder);
 CREATE TABLE IF NOT EXISTS mailbox_api_draft_uploads (
   draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
   upload_id TEXT NOT NULL REFERENCES mailbox_api_uploads(id), PRIMARY KEY (draft_id, upload_id)
@@ -71,6 +73,16 @@ CREATE TABLE IF NOT EXISTS mailbox_api_draft_objects (
 CREATE TABLE IF NOT EXISTS mailbox_pending_releases (
   seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, PRIMARY KEY (seq, object_key, holder)
 );
+CREATE TABLE IF NOT EXISTS mailbox_pending_confirmations (
+  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, published_at INTEGER,
+  PRIMARY KEY (seq, object_key, holder)
+);
+CREATE INDEX IF NOT EXISTS mailbox_confirm_published ON mailbox_pending_confirmations(published_at) WHERE published_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mailbox_confirm_unpublished ON mailbox_pending_confirmations(seq) WHERE published_at IS NULL;
+CREATE TABLE IF NOT EXISTS mailbox_unusable_sources (
+  kind TEXT NOT NULL, id TEXT NOT NULL, holder TEXT NOT NULL, PRIMARY KEY (kind, id)
+);
+CREATE TABLE IF NOT EXISTS mailbox_alerts (code TEXT PRIMARY KEY, since INTEGER NOT NULL, sent_at INTEGER);
 CREATE TABLE IF NOT EXISTS mailbox_api_settings (id INTEGER PRIMARY KEY CHECK(id=1), definition TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS mailbox_api_expiry (id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS mailbox_api_expiry_time ON mailbox_api_expiry(expires_at, id);

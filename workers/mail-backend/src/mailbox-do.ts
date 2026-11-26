@@ -84,7 +84,7 @@ export class Mailbox extends DurableObject<Env> {
       }),
     });
     register(UPLOAD_EXPIRY, uploadExpiry(ports));
-    register(IDEM_EXPIRY, idemExpiry(ports, outbound));
+    this.registerTimerKind(IDEM_EXPIRY, idemExpiry(ports, outbound, HELD_RECHECK_MS));
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
@@ -267,13 +267,13 @@ export class Mailbox extends DurableObject<Env> {
         const live = () => storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' && ownsApiKey(sql, key, reservation.token);
         if (!live()) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
         const id = crypto.randomUUID();
-        const objectKey = await index.prepareUpload(id, digest, size, bytes);
+        const { objectKey, holder } = await index.prepareUpload(id, digest, size, bytes);
         let committed = false;
         try {
           return await this.localStep(timers => {
             if (!live()) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
             const createdAt = this.mailApiNow();
-            const row = { id, objectKey, name, mediaType, size, expiresAt: createdAt + UPLOAD_TTL_MS };
+            const row = { id, objectKey, holder, name, mediaType, size, expiresAt: createdAt + UPLOAD_TTL_MS };
             const upload = wireUpload(row);
             const stored = resultEvent(key, fingerprint, { upload }, createdAt, true);
             index.commitEvents([{ type: 'api_upload', ...row }, stored]);
@@ -286,7 +286,7 @@ export class Mailbox extends DurableObject<Env> {
           });
         } catch (error) {
           if (committed) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
-          await index.releaseUpload(id, objectKey);
+          await index.releaseUpload(holder, objectKey);
           throw error;
         }
       });
@@ -318,6 +318,7 @@ export class Mailbox extends DurableObject<Env> {
     return new MailboxIndex(this.ctx.storage, {
       ...kofra(this.env, workspaceId),
       register: (kind, digest, holder) => refs.register(kind, digest, holder),
+      holdProvisional: (target, holder) => refs.holdProvisional(target, holder),
       hold: (key, holder) => refs.hold(key, holder), release: (key, holder) => refs.release(key, holder),
     }, this.ctx.id.toString(), this.env.MAIL_LOCAL_API === 'on');
   }
@@ -776,9 +777,11 @@ export class Mailbox extends DurableObject<Env> {
       const timers = this.timerTable();
       await this.rearm(() => {
         timers.set(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, Math.min(pending ? Math.min(next, soon) : next, requested));
-        if (this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && current?.state === 'ready' &&
-            this.ctx.storage.sql.exec('SELECT 1 FROM mailbox_pending_releases WHERE seq <= ? LIMIT 1', index.journal.flushed()).toArray().length) {
-          timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, this.timerNow() + 60_000);
+        if (current?.state === 'ready') {
+          const through = index.journal.flushed();
+          if (this.ctx.storage.sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_pending_releases WHERE seq <= ?)
+            OR EXISTS (SELECT 1 FROM mailbox_pending_confirmations WHERE seq <= ?) AS pending`, through, through)
+            .one().pending) timers.lower(JOURNAL_FLUSH, JOURNAL_FLUSH_REF, this.timerNow() + 60_000);
         }
       }, true);
     });
@@ -792,12 +795,17 @@ export class Mailbox extends DurableObject<Env> {
     const blocked = life?.state === 'missing' || (life?.state === 'restoring' &&
       (this.env.MAIL_RECOVERY_ENABLED !== 'on' || life.failures >= 5 || (life.restarts ?? 0) >= RESTORE_RESTART_ALERT));
     const sql = this.ctx.storage.sql;
-    sql.exec('CREATE TABLE IF NOT EXISTS mailbox_alerts (code TEXT PRIMARY KEY, since INTEGER NOT NULL, sent_at INTEGER)');
     const skipped = life?.state === 'ready' && (life.restoreSkipped ?? 0) > 0;
     const conflict = life?.state === 'ready' && !!life.conflict;
+    const oldestConfirmation = index ? sql.exec<{ published_at: number }>(`SELECT published_at FROM mailbox_pending_confirmations
+      WHERE published_at IS NOT NULL ORDER BY published_at LIMIT 1`).toArray()[0]?.published_at : undefined;
+    const confirmStaleAt = oldestConfirmation === undefined ? Infinity : oldestConfirmation + FLAGS_FLUSH_MS;
+    const holderLost = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_unusable_sources)
+      OR EXISTS (SELECT 1 FROM mailbox_alerts WHERE code = 'holder_source_lost' AND sent_at IS NULL) AS active`).one().active !== 0;
     const conditions: Array<[MailboxAlertCode, boolean]> = [
-      ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict]];
-    let next = Infinity;
+      ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
+      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost]];
+    let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {
         sql.exec('DELETE FROM mailbox_alerts WHERE code = ?', code);
@@ -847,6 +855,11 @@ export class Mailbox extends DurableObject<Env> {
         fence: () => outbox.bumpRecoveryEpoch(workspaceId, mailboxId),
         replayPage: after => outbox.replayPage(workspaceId, mailboxId, after),
         release: (key, holder) => refs.release(key, holder),
+        confirm: async entries => {
+          const answers = await this.beforeDeadline(deadline, () => refs.confirm(entries));
+          if (!answers) throw new Error('Holder confirmation exceeded restore slice');
+          return answers;
+        },
         rebuild: now => this.rebuildTimers(now),
       });
       // A restart means the manifest vanished under this restore. Each restart
@@ -860,6 +873,26 @@ export class Mailbox extends DurableObject<Env> {
       await outbox.markBackedUp(workspaceId, mailboxId).catch(() => {});
     }
     return Date.now() + (life.state === 'restoring' ? 0 : 1000);
+  }
+
+  private async beforeDeadline<T>(deadline: number, io: () => Promise<T>): Promise<T | null> {
+    const timeLeft = deadline - Date.now();
+    if (timeLeft <= 0) return null;
+    let handle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([io(), new Promise<null>(resolve => { handle = setTimeout(() => resolve(null), timeLeft); })]);
+    } finally { clearTimeout(handle); }
+  }
+
+  private async confirmPublishedHolders(index: MailboxIndex, workspaceId: string, lastSeq: number, deadline: number): Promise<void> {
+    const rows = index.pendingConfirmations(lastSeq);
+    if (!rows.length) return;
+    const refs = this.env.SWEEPER.getByName(workspaceId);
+    const answers = await this.beforeDeadline(deadline, () => refs.confirm(rows.map(({ key, holder }) => ({ key, holder })))).catch(() => null);
+    if (!answers) return;
+    await this.work.run(async () => {
+      if (this.lifecycleState() === 'ready') index.finishConfirmations(rows, answers, false);
+    });
   }
 
   private async releasePublishedHolders(workspaceId: string, lastSeq: number, journalDeadline: number): Promise<void> {
@@ -975,10 +1008,10 @@ export class Mailbox extends DurableObject<Env> {
     const more = published.more || cleanupPending || prunedPage || (reindexDue && !reindexError && pending.length > 0);
     // Deltas were still published; retry only the snapshot, with backoff.
     const deadline = published.snapshotError ? Math.min(Date.now() + backoff(current.failures), reindexAt) : more ? soon : next;
-    if (this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on') {
-      const armed = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
-      await this.releasePublishedHolders(workspaceId, published.lastSeq, Math.min(deadline, armed ?? Infinity));
-    }
+    const armed = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+    const holderDeadline = Math.min(deadline, armed ?? Infinity, Date.now() + PUBLISH_BUDGET_MS);
+    await this.confirmPublishedHolders(index, workspaceId, published.lastSeq, holderDeadline);
+    await this.releasePublishedHolders(workspaceId, published.lastSeq, holderDeadline);
     return deadline;
   }
 }

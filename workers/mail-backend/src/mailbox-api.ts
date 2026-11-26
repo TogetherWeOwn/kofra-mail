@@ -4,7 +4,7 @@ import type { Label, Settings } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { draftInput, draftObjectKeys, draftRef, draftRefs, draftUploadIds, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft } from './mailbox-api-drafts.ts';
 import { apiKey, clearApiKey, fingerprintOf, replayApiKey, reserveApiKey, resultEvent, scheduleResult, type Committed } from './mailbox-api-idempotency.ts';
-import { uploadReferenced, uploadRow, UPLOAD_EXPIRY } from './mailbox-upload.ts';
+import { unusableSource, uploadReferenced, uploadRow, UPLOAD_EXPIRY } from './mailbox-upload.ts';
 import type { TimerTable } from './mailbox-timers.ts';
 import { attachmentRow, displayOf, getThread, labels, listViews, messageRow, missingThreadDisplay, partNumber, threadChanges, threadPage } from './mailbox-api-messages.ts';
 import { canonical, cursorPosition, fail, invalid, isId, makeCursor, need, object, pageLimit, text, utf8, type MailboxApiError } from './mailbox-api-input.ts';
@@ -177,14 +177,18 @@ export class MailboxApi {
         const { items, last, more } = await readDraftPage(this.index, refs, limit);
         return { body: { items, nextCursor: more && last ? makeCursor(scope, [last.updatedAt, last.id]) : null, state: this.state() } };
       }
-      case 'getDraft': return { body: await readDraft(this.index, need(draftRef(this.sql, params.draftId))) };
+      case 'getDraft': {
+        const ref = need(draftRef(this.sql, params.draftId));
+        if (unusableSource(this.sql, 'draft', ref.id)) return fail('unavailable');
+        return { body: await readDraft(this.index, ref) };
+      }
       case 'createDraft': return this.withKey(operation, params, input, options, async commit => {
         const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, !!this.timers);
         const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
         const ref = await this.index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.now, attachmentKeys);
         const { holder: _holder, ...replay } = ref;
         try {
-          commit({ draft: replay }, { type: 'draft', ...ref, ...(this.timers && { attachmentKeys, uploadIds }) },
+          commit({ draft: replay }, { type: 'draft', ...ref, attachmentKeys, uploadIds },
             () => this.rescheduleUploads(uploadIds));
         } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
         return wireDraft(ref, draft);
@@ -199,10 +203,9 @@ export class MailboxApi {
         const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
         const ref = await this.index.prepareApiDraft(previous.id, encodeDraftObject(draft), this.now, attachmentKeys);
         try {
-          this.index.changeMany([{ type: 'draft', ...ref, ...(this.timers && { attachmentKeys, uploadIds }) }],
+          this.index.changeMany([{ type: 'draft', ...ref, attachmentKeys, uploadIds }],
             () => this.rescheduleUploads([...oldUploads, ...uploadIds]));
         } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
-        if (!this.timers) await this.index.releaseDraft(previous);
         return { body: wireDraft(ref, draft) };
       }
       case 'deleteDraft': {
@@ -212,9 +215,8 @@ export class MailboxApi {
         const uploads = this.draftUploads(previous.id);
         const hasObjects = this.sql.exec('SELECT 1 FROM mailbox_api_draft_objects WHERE draft_id = ? LIMIT 1', previous.id).toArray().length;
         if (!this.timers && hasObjects) return fail('not_implemented');
-        this.index.changeMany([{ type: 'draft_delete', id: previous.id, ...(this.timers && { deferRelease: true as const }) }],
+        this.index.changeMany([{ type: 'draft_delete', id: previous.id, deferRelease: true }],
           () => this.rescheduleUploads(uploads));
-        if (!this.timers) await this.index.releaseDraft(previous);
         return {};
       }
       case 'deleteUpload': {

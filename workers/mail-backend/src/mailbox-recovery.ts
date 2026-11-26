@@ -1,6 +1,7 @@
 import { deltaRange, INCARNATION, journalPrefix, readDelta, writeDelta } from './journal-backup.ts';
 import { sha256 } from './bytes.ts';
-import { MissingMailError, type MailboxIndex, type SnapshotRow } from './mailbox-index.ts';
+import { MissingMailError, type MailboxIndex, type PendingConfirmation, type SnapshotRow } from './mailbox-index.ts';
+import type { ConfirmAnswer, ConfirmEntry } from './sweep-ledger.ts';
 import type { ReplayDelivery } from './outbox.ts';
 
 export const SETTINGS_FLUSH_MS = 60_000;
@@ -101,6 +102,7 @@ export type RestorePorts = {
   fence(): Promise<number | null>;
   replayPage(after: number): Promise<ReplayDelivery[]>;
   release(key: string, holder: string): Promise<void>;
+  confirm?(entries: ConfirmEntry[]): Promise<ConfirmAnswer[]>;
   // Recreates local state derived from the restored rows (timer rows), inside
   // the transaction that finishes the restore.
   rebuild?(now: number): void;
@@ -328,6 +330,7 @@ export class MailboxRecovery {
     if (switched) next = { ...next, upload: null, nextSnapshotAt: now + SNAPSHOT_INTERVAL_MS, lastSnapshotAt: now, failures: 0 };
     this.index.transaction(() => {
       this.index.journal.checkpoint(manifest.last_seq);
+      this.index.coverConfirmations(manifest.last_seq, Date.now());
       if (switched) this.index.clearSnapshot();
       this.index.setLifecycle(next);
     });
@@ -438,6 +441,14 @@ export class MailboxRecovery {
     }
   }
 
+  private async confirmRestored(rows: PendingConfirmation[], ports: RestorePorts): Promise<void> {
+    if (!rows.length || !ports.confirm) return;
+    let answers: ConfirmAnswer[];
+    try { answers = await ports.confirm(rows.map(({ key, holder }) => ({ key, holder }))); }
+    catch { return; } // The published entries stay queued for the journal lane.
+    this.index.finishConfirmations(rows, answers, true);
+  }
+
   private async restoreStepOnce(life: RestoringLife, ports: RestorePorts): Promise<Lifecycle> {
     // Every successful step is progress: consecutive failures restart from zero,
     // so a restore that keeps advancing never raises restore_blocked.
@@ -491,15 +502,23 @@ export class MailboxRecovery {
         const found = await getJson<SnapshotRow[]>(this.bucket, this.pageKey(manifest.snapshot_key, page));
         const rows = found?.value;
         if (!Array.isArray(rows) || !rows.length || rows.length > 64) throw new Error('Invalid mailbox snapshot page');
-        return save({ ...life, page, rowNo: life.rowNo + rows.length }, () => {
+        const pending: PendingConfirmation[] = [];
+        const next = save({ ...life, page, rowNo: life.rowNo + rows.length }, () => {
           let rowNo = life.rowNo;
           for (const row of rows) {
             if (!row || row.row_no !== ++rowNo || typeof row.kind !== 'string' || typeof row.value !== 'string') {
               throw new Error('Invalid mailbox snapshot row');
             }
-            this.index.restoreSnapshotRow(row);
+            const entry = this.index.restoreSnapshotRow(row);
+            if (entry) {
+              if (entry.seq > snapshot.seq) throw new Error('Holder confirmation exceeds snapshot sequence');
+              pending.push(entry);
+            }
           }
+          if (pending.length) this.index.coverConfirmations(snapshot.seq, ports.now());
         });
+        await this.confirmRestored(pending, ports);
+        return next;
       }
       case 'deltas': {
         const manifest = await this.owned(life);
@@ -512,7 +531,12 @@ export class MailboxRecovery {
         const key = manifest.delta_keys[life.delta];
         const rows = await readDelta(this.bucket, key, deltaRange(this.prefix, key)!);
         let releases: Array<{ key: string; holder: string }> = [];
-        const next = save({ ...life, delta: life.delta + 1 }, () => { releases = rows.flatMap(row => this.index.replayRow(row)); });
+        const through = rows[rows.length - 1].seq;
+        const next = save({ ...life, delta: life.delta + 1 }, () => {
+          releases = rows.flatMap(row => this.index.replayRow(row));
+          this.index.coverConfirmations(through, ports.now());
+        });
+        await this.confirmRestored(this.index.pendingConfirmations(through, rows[0].seq - 1), ports);
         // A crash before these releases only retains an object longer.
         for (const release of releases) await ports.release(release.key, release.holder);
         return next;
