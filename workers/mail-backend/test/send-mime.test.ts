@@ -157,6 +157,26 @@ test('builders enforce recipient syntax and count across To, Cc and Bcc', async 
   }
 });
 
+test('builders bound display names by UTF-8 bytes before serialization', async () => {
+  const { buildSentCopy, buildSendRequest } = await builders();
+  const name = 'é'.repeat(LIMITS.displayNameBytes / 2);
+  for (const build of [buildSentCopy, buildSendRequest]) {
+    assert.doesNotThrow(() => build({ ...frozen, from: { ...frozen.from, name } }));
+    assert.throws(() => build({ ...frozen, from: { ...frozen.from, name: `${name}x` } }), {
+      message: 'invalid_request', problem: { code: 'invalid_request', errors: [{ field: '/from/name', code: 'too_long' }] },
+    });
+  }
+});
+
+test('filenames disallow horizontal tab like the upload and index policies', async () => {
+  const { buildSentCopy, buildSendRequest } = await builders();
+  for (const build of [buildSentCopy, buildSendRequest]) {
+    assert.throws(() => build({ ...frozen, attachments: [file('before\tafter.txt')] }), {
+      message: 'invalid_header', problem: { code: 'invalid_header', errors: [{ field: '/attachments/0/name', code: 'invalid' }] },
+    });
+  }
+});
+
 test('builders accept 32 file attachments and refuse one more', async () => {
   const { buildSentCopy, buildSendRequest } = await builders();
   const attachments = Array.from({ length: LIMITS.attachmentsPerMessage }, (_, i) => file(`file${i}.txt`));

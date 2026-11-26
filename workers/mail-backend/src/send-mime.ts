@@ -62,13 +62,20 @@ export type SendRequest = EmailMessageBuilder & { headers: SendRequestHeaders };
 const CRLF = '\r\n';
 const encoder = new TextEncoder();
 
-function checkHeader(value: string, field: string) {
-  if (hasHeaderControl(value)) fail('invalid_header', { errors: [{ field, code: 'invalid' }] });
+function checkHeader(value: string, field: string, allowTab = true) {
+  if (hasHeaderControl(value) || (!allowTab && value.includes('\t'))) fail('invalid_header', { errors: [{ field, code: 'invalid' }] });
+}
+
+function exceedsUtf8(value: string, max: number): boolean {
+  return value.length > max || encoder.encode(value).length > max;
 }
 
 function checkAddress({ name, email }: Readonly<AddressInput>, field: string, code: 'invalid_sender' | 'invalid_recipients' | 'invalid_header') {
   checkHeader(email, `${field}/email`);
-  if (name !== undefined) checkHeader(name, `${field}/name`);
+  if (name !== undefined) {
+    checkHeader(name, `${field}/name`);
+    if (exceedsUtf8(name, LIMITS.displayNameBytes)) invalid(`${field}/name`, 'too_long');
+  }
   // A bare ASCII dot-atom and DNS domain, matching the mail-core send contract.
   const [local, domain, extra] = email.split('@');
   const labels = domain?.split('.');
@@ -227,7 +234,7 @@ function planV1(input: SendMimeInput) {
   const { to, cc, bcc, attachments, subject, from, dateAt, sendId } = input;
   checkAddress(from, '/from', 'invalid_sender');
   checkHeader(subject, '/subject');
-  if (encoder.encode(subject).length > LIMITS.subjectBytes) invalid('/subject', 'too_long');
+  if (exceedsUtf8(subject, LIMITS.subjectBytes)) invalid('/subject', 'too_long');
   if (input.frozenReplyTo) checkAddress(input.frozenReplyTo, '/replyTo', 'invalid_header');
   const recipients = to.length + cc.length + bcc.length;
   if (!recipients) fail('invalid_recipients');
@@ -237,8 +244,8 @@ function planV1(input: SendMimeInput) {
   }
   if (attachments.length > LIMITS.attachmentsPerMessage) fail('too_many_attachments', { limit: LIMITS.attachmentsPerMessage });
   const files: EmailAttachment[] = attachments.map(({ name, type, bytes }, i) => {
-    checkHeader(name, `/attachments/${i}/name`);
-    if (!name || encoder.encode(name).length > 255) invalid(`/attachments/${i}/name`);
+    checkHeader(name, `/attachments/${i}/name`, false);
+    if (!name || exceedsUtf8(name, 255)) invalid(`/attachments/${i}/name`);
     checkHeader(type, `/attachments/${i}/type`);
     return { disposition: 'attachment', filename: name, type: attachmentType(type), content: bytes };
   });
@@ -279,7 +286,7 @@ function planV1(input: SendMimeInput) {
 
 function plan(input: SendMimeInput) {
   switch (input.builderVersion) {
-    case SEND_MIME_VERSION: return planV1(input);
+    case 1: return planV1(input);
     default: throw new RangeError('Unsupported MIME builder version');
   }
 }
