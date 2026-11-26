@@ -567,17 +567,26 @@ test('the send keeps a forwarded part\'s holder through release, builds it throu
     assert.equal(holderOf(failing.id), undefined, 'the finished send released it after its publish');
   }));
 
-test('undo with the limiter on: with the send bucket and other sends\' undo buckets exhausted, an undo in the window cancels and nothing goes out', {
-  skip: 'pending R1 (request rate limits): the gateway limiter and its fake bindings are not on main yet; finish after a rebase onto R1',
-}, () => withSend(async (h, mail, from) => {
-  const { send: pending } = await send(mail, from, 'one');
-  // After R1: exhaust this mailbox's send bucket and the undo buckets of other send ids here.
-  await mail.undoSend(pending.id, key('undo'));
-  await h.advance(UNDO);
-  assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
-  assert.deepEqual(await h.sends.queue(), []);
-  assert.equal(await h.sends.emailCalls(), 0);
-}));
+test('undo with the limiter on: with the send bucket and other sends\' undo buckets exhausted, an undo in the window cancels and nothing goes out',
+  () => withSend(async (h, mail, from) => {
+    await h.sends.rateCap('MAIL_RATE_SENDS', 2);
+    await h.sends.rateCap('MAIL_RATE_UNDO', 1);
+    const { send: pending } = await send(mail, from, 'one');
+    await send(mail, from, 'two');
+    const third = await mail.createDraft(draftInput(from), key('draft-three'));
+    await rejects(mail.sendDraft(third.id, { ...key('send-three'), ifMatch: third.revision }), 'rate_limited');
+    // Exhaust the undo buckets of other send ids.
+    for (const other of ['01JOTHER000000000000000001', '01JOTHER000000000000000002']) {
+      await rejects(mail.undoSend(other, key(`undo-${other}`)), 'not_found');
+      await rejects(mail.undoSend(other, key(`undo-${other}`)), 'rate_limited');
+    }
+    const draft = await mail.undoSend(pending.id, key('undo'));
+    assert.equal(draft.id, pending.draftId);
+    await h.advance(UNDO);
+    assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
+    assert.deepEqual((await h.sends.queue()).filter(({ sendId }) => sendId === pending.id), []);
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
 
 test('after a restore, undo works at once while restored messages still wait for reindexing', () => withSend(async (h, mail, from) => {
   const { send: released } = await send(mail, from, 'released');

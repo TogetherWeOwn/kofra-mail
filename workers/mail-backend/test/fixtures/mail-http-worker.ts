@@ -386,6 +386,17 @@ export class Sweeper extends MailSweeper {
 }
 export { ContentLookup } from '../../src/entry.ts';
 
+// Request rate limits with per-key counters that a test can cap, per binding.
+const rateCaps = new Map<string, number>();
+const rateCounts = new Map<string, number>();
+const limiter = (binding: string) => ({ async limit({ key }: { key: string }) {
+  const cap = rateCaps.get(binding);
+  if (cap === undefined) return { success: true };
+  const counted = (rateCounts.get(`${binding}\n${key}`) ?? 0) + 1;
+  rateCounts.set(`${binding}\n${key}`, counted);
+  return { success: counted <= cap };
+} });
+
 const signedBytes = (purpose: string, payload: string) => encoder.encode(`kofra-mail-content/v1\n${purpose}\n${payload}`);
 function contentOrigin(url: URL, env: FixtureEnv) { return `http://localhost:${env.CONTENT_PORT || url.port}`; }
 async function mint(origin: string, purpose: 'body' | 'att', claims: ContentClaims, env: FixtureEnv) {
@@ -463,6 +474,11 @@ export default {
     if (url.pathname.startsWith('/__fixture/')) {
       if (req.method !== 'POST' || req.headers.get('x-fixture-control') !== env.CONTROL_KEY) return missing();
       if (url.pathname === '/__fixture/deliver') return incoming(req, env, req.headers.get('x-fixture-to')!, req.headers.get('x-fixture-from')!);
+      if (url.pathname === '/__fixture/rate-cap') {
+        const { binding, cap } = await req.json<{ binding: string; cap: number }>();
+        rateCaps.set(binding, cap);
+        return new Response(null, { status: 204 });
+      }
       if (url.pathname === '/__fixture/holders') {
         const { workspace, key } = await req.json<{ workspace: string; key: string }>();
         return Response.json(await env.SWEEPER.getByName(workspace).holders(key));
@@ -576,8 +592,8 @@ export default {
     };
     const allow = { async limit() { return { success: true }; } };
     const port: MailApiEnvironment = {
-      MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow, MAIL_RATE_UPLOADS: allow, MAIL_RATE_SENDS: allow,
-      MAIL_RATE_UNDO: allow, MAIL_RATE_UNDO_FLOOD: allow, MAIL_RATE_ADMIN_WRITES: allow,
+      MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow, MAIL_RATE_UPLOADS: allow, MAIL_RATE_SENDS: limiter('MAIL_RATE_SENDS'),
+      MAIL_RATE_UNDO: limiter('MAIL_RATE_UNDO'), MAIL_RATE_UNDO_FLOOD: limiter('MAIL_RATE_UNDO_FLOOD'), MAIL_RATE_ADMIN_WRITES: allow,
       MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAIL_SEND_ENABLED: env.MAIL_SEND_ENABLED,
       MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]

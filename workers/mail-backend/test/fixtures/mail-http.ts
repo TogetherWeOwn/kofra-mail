@@ -267,6 +267,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       releaseHeld: () => controlAction('release-held'),
       dropBuilder: (dropped: boolean) => controlAction('drop-builder', String(dropped)),
       ids: () => readControl<string[]>('send-ids'),
+      rateCap: (binding: 'MAIL_RATE_SENDS' | 'MAIL_RATE_UNDO' | 'MAIL_RATE_UNDO_FLOOD', cap: number) =>
+        controlAction('rate-cap', JSON.stringify({ binding, cap })),
       releaseFailure: (failing: boolean) => controlAction('send-release-failure', String(failing)),
     };
     if (draftsUploads) inspectPut = async (pathname) => {
