@@ -8,7 +8,9 @@ const principal = { userId: 'session-user', name: 'Member', workspaceId: 'sessio
   authTime: Date.now(), credentialEpoch: 7, csrfToken: 'fixture-csrf' };
 function setup(returnedUrl?: string) {
   const calls: unknown[][] = [];
+  const allow = { async limit() { return { success: true }; } };
   const env: MailApiEnvironment = {
+    MAIL_RATE_READS: allow, MAIL_RATE_WRITES: allow,
     MAIL_LOCAL_API: 'on', MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: content,
     MAIL_DEV_SESSION: { resolve: async () => principal },
     DIRECTORY: { prepare: () => ({ bind() { return this; }, async first<T>() { return { id: 'session-mailbox', primary_address: 'member@mail.example' } as T; }, async all<T>() { return { results: [] as T[] }; } }), async batch() { return []; } },

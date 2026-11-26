@@ -8,5 +8,14 @@
   "preview_urls": false,
   "assets": { "binding": "ASSETS", "directory": ".svelte-kit/cloudflare" },
   "services": [{ "binding": "MAIL_CONTENT", "service": "mail-content-local", "entrypoint": "ContentMint" }],
+  "ratelimits": [
+    { "name": "MAIL_RATE_READS", "namespace_id": "1001", "simple": { "limit": 600, "period": 60 } },
+    { "name": "MAIL_RATE_WRITES", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } },
+    { "name": "MAIL_RATE_UPLOADS", "namespace_id": "1003", "simple": { "limit": 64, "period": 60 } },
+    { "name": "MAIL_RATE_SENDS", "namespace_id": "1004", "simple": { "limit": 20, "period": 60 } },
+    { "name": "MAIL_RATE_UNDO", "namespace_id": "1005", "simple": { "limit": 10, "period": 60 } },
+    { "name": "MAIL_RATE_UNDO_FLOOD", "namespace_id": "1006", "simple": { "limit": 600, "period": 60 } },
+    { "name": "MAIL_RATE_ADMIN_WRITES", "namespace_id": "1007", "simple": { "limit": 60, "period": 60 } }
+  ],
   "vars": { "MAIL_LOCAL_API": "off", "MAIL_CONTENT_ENABLED": "off", "MAIL_CONTENT_ORIGIN": "https://content.example" }
 }
