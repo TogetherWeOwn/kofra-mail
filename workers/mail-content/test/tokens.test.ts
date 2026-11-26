@@ -49,6 +49,7 @@ describe('content tokens in workerd', () => {
 
   test('workerd process output carries no token, MAC or claim value', () => {
     assert.ok(sensitive.length > scenarios.length);
+    assert.ok(sensitive.some((value) => value.startsWith('https://')), 'remote image URLs are among the checked values');
     for (const value of sensitive) assert.ok(!stdio.includes(value), 'a sensitive value reached workerd output');
   });
 });

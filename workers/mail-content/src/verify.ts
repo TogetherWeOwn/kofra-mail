@@ -64,11 +64,19 @@ export class EpochCache {
     return this.refresh(sub, now, load);
   }
 
-  /** Always asks `load`, then caches a valid answer. */
+  /**
+   * Always asks `load`, then caches a valid answer. Epochs only rise, so when loads overlap, a slow
+   * reply never replaces a higher epoch that is still fresh; the caller gets the higher one.
+   */
   async refresh(sub: string, now: number, load: (sub: string) => Promise<number | null>): Promise<number | null> {
-    this.#entries.delete(sub);
     const ep = await load(sub);
-    if (typeof ep !== 'number' || !Number.isSafeInteger(ep)) return ep === null ? null : Number.NaN;
+    if (typeof ep !== 'number' || !Number.isSafeInteger(ep)) {
+      this.#entries.delete(sub);
+      return ep === null ? null : Number.NaN;
+    }
+    const known = this.#entries.get(sub);
+    if (known && known.ep > ep && now - known.at < this.#ttl) return known.ep;
+    this.#entries.delete(sub);
     this.#entries.set(sub, { ep, at: now });
     while (this.#entries.size > this.#max) this.#entries.delete(this.#entries.keys().next().value!);
     return ep;

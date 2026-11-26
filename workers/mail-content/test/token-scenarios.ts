@@ -116,6 +116,7 @@ async function setup(ctx: Context, extra: { ep?: number } = {}) {
   const issue = async (purpose: string, claims: Record<string, unknown>, now = NOW) => {
     const token = await mintAny(k.keys, purpose, { ...ids, ep: extra.ep ?? 1, ...claims }, now);
     ctx.sensitive(token, parts(token).payload, parts(token).mac);
+    if (typeof claims.u === 'string') ctx.sensitive(claims.u);
     return token;
   };
   return { k, ids, world, epochs, verifier, issue };
@@ -252,7 +253,7 @@ s('tokens: a payload over 4 KiB fails', async (ctx) => {
   while (length(n + 1) <= 4096) n++;
   check(length(n) > 4090 && length(n + 1) > 4096 && length(n + 1) < 4110, 'fixture: payloads either side of 4,096');
   const edge = await forge(k, 'k1', 'img', sized(n));
-  ctx.sensitive(edge);
+  ctx.sensitive(edge, url(n), url(n + 1), quoted);
   await accepted(verifier.verify('img', edge, NOW), 'payload at most 4,096 characters');
   await accepted(verifier.verify('img', await mintAny(k.keys, 'img', { ...ids, ep: 1, u: url(n) }, NOW), NOW), 'mint at the limit');
   await refused(verifier.verify('img', await forge(k, 'k1', 'img', sized(n + 1)), NOW), 'payload just over 4,096 characters');
@@ -423,6 +424,14 @@ s('authorisation: the epoch cache is keyed by sub, bounded, and expires', async 
   check(failures() === 2, 'two attempts');
   const nulls = async () => { counter.failures++; return null; };
   check(await cache.epoch('e', NOW, nulls) === null && await cache.epoch('e', NOW, nulls) === null && failures() === 4, 'unknown users are not cached');
+  // Overlapping loads: a slow reply from before the epoch rose must not replace the newer answer.
+  const race = new EpochCache();
+  let answerOld!: (ep: number) => void;
+  const slow = race.epoch('f', NOW, () => new Promise<number>((resolve) => { answerOld = resolve; }));
+  check(await race.refresh('f', NOW + 1, async () => 2) === 2, 'the newer reply');
+  answerOld(1);
+  check(await slow === 2, 'the slow request learns the newer epoch');
+  check(await race.epoch('f', NOW + 2, async () => { throw new Error('not asked'); }) === 2, 'the cache keeps the newer epoch');
 });
 
 s('authorisation: a reassigned mailbox fails at once', async (ctx) => {
@@ -519,7 +528,7 @@ s('rotation: old kid verifies while present, fails after removal and after emerg
   await refused(verifierFor(emergency).verify('body', old, NOW), 'emergency: k1 token');
   await refused(verifierFor(emergency).verify('body', fresh, NOW), 'emergency: k2 token');
   const after = await mintAny(emergency.keys, 'img', { ...ids, ep: 1, u: 'https://sender.example/' }, NOW);
-  ctx.sensitive(after);
+  ctx.sensitive(after, 'https://sender.example/');
   check(parts(after).kid === 'k3', 'new mints use the new key');
   await accepted(verifierFor(emergency).verify('img', after, NOW), 'new token');
 });
@@ -573,7 +582,7 @@ s('derived: cid and img claims copy the verified body token, and expire with it'
   const body = await accepted(verifier.verify('body', await issue('body', { ri: true }, NOW - 100), NOW), 'body') as VerifiedBody;
   const cid = await mintFromBody(k.keys, body, { purpose: 'cid', part: 4 }, NOW);
   const img = await mintFromBody(k.keys, body, { purpose: 'img', u: 'https://sender.example/i.png' }, NOW);
-  ctx.sensitive(cid, img);
+  ctx.sensitive(cid, img, 'https://sender.example/i.png');
   check(canon(decodeClaims(cid)) === canon(full(ids, { part: 4 }, 1, NOW, NOW + 200)), 'cid claims');
   check(canon(decodeClaims(img)) === canon(full(ids, { u: 'https://sender.example/i.png' }, 1, NOW, NOW + 200)), 'img claims');
   await accepted(verifier.verify('cid', cid, NOW + 1), 'cid verifies');
@@ -599,7 +608,7 @@ s('derived: only a verifier-issued body result is accepted, img needs ri, and sk
   // A body minted on a clock 20 s ahead: the derived iat is never before the body iat, so the span stays <= 300.
   const ahead = await accepted(verifier.verify('body', await issue('body', { ri: true }, NOW + 20), NOW), 'skewed body') as VerifiedBody;
   const derived = await mintFromBody(k.keys, ahead, { purpose: 'img', u: 'https://sender.example/' }, NOW);
-  ctx.sensitive(derived);
+  ctx.sensitive(derived, 'https://sender.example/');
   const claims = decodeClaims(derived);
   check(claims.iat === NOW + 20 && claims.exp === NOW + 320, 'derived span within 300 s');
   await accepted(verifier.verify('img', derived, NOW), 'derived token verifies');
@@ -612,7 +621,9 @@ s('logs: no path writes to the console', async (ctx) => {
   const { k, ids, world, verifier, issue } = await setup(ctx);
   const token = await issue('body', { ri: false });
   const { kid, payload, mac } = parts(token);
-  await refused(verifier.verify('body', `${kid}.${payload}.${mac.slice(0, -1)}A`, NOW), 'MAC');
+  const macBytes = unb64url(mac);
+  macBytes[31] ^= 1;
+  await refused(verifier.verify('body', `${kid}.${payload}.${b64url(macBytes)}`, NOW), 'MAC');
   await refused(verifier.verify('cid', token, NOW), 'purpose');
   await refused(verifier.verify('body', token, NOW + 301), 'time');
   await refused(verifier.verify('body', `zz.${payload}.${mac}`, NOW), 'kid');
