@@ -222,9 +222,20 @@ function requestHeaders(input: SendMimeInput): SendRequestHeaders {
   };
 }
 
+const opaqueAttachmentType = 'application/octet-stream';
+
 function attachmentType(type: string): string {
   // Uploads already store a MIME type, but a forwarded part may be legacy mail.
-  return type.length <= 127 && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(type) ? type : 'application/octet-stream';
+  return type.length <= 127 && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(type) ? type : opaqueAttachmentType;
+}
+
+function storedAttachmentType(type: string): string {
+  const lower = type.toLowerCase();
+  // Store composite types as opaque base64 files, not MIME containers. The
+  // sent-copy reader also normalizes calendar text, so make it opaque to
+  // preserve the exact attachment bytes. This doesn't change provider metadata.
+  return lower.startsWith('multipart/') || lower.startsWith('message/') || lower === 'text/calendar' || lower === 'application/ics'
+    ? opaqueAttachmentType : type;
 }
 
 // Versioned serialization: leave v1 unchanged when adding another version.
@@ -275,7 +286,7 @@ function planV1(input: SendMimeInput) {
   const [textHeader, textBody] = textPart(input.text);
   pieces.push(textHeader, CRLF, textBody);
   for (const [i, file] of files.entries()) {
-    pieces.push(`--${boundary}${CRLF}Content-Type: ${file.type}${CRLF}`, base64Header,
+    pieces.push(`--${boundary}${CRLF}Content-Type: ${storedAttachmentType(file.type)}${CRLF}`, base64Header,
       contentDisposition(file.filename), CRLF, attachments[i].bytes);
   }
   if (files.length) pieces.push(`--${boundary}--${CRLF}`);

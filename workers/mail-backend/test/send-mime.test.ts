@@ -46,6 +46,18 @@ test('sent MIME matches the forwarded filename golden file and parses with Posta
     attachments.map(({ name, bytes }) => [name, bytes]));
 });
 
+test('parts PostalMime treats specially still round-trip as opaque file bytes in the sent copy', async () => {
+  const { buildSentCopy, buildSendRequest } = await builders();
+  const bytes = encoder.encode('BEGIN:VCALENDAR\r\nEND:VCALENDAR');
+  const attachments = ['multipart/mixed', 'text/calendar', 'application/ics', 'message/rfc822', 'application/pdf']
+    .map((type, i) => ({ ...file(`forwarded-${i}`, bytes), type }));
+  const input = { ...frozen, attachments };
+  const parsed = await PostalMime.parse(buildSentCopy(input).bytes);
+  assert.deepEqual(parsed.attachments.map(({ filename, mimeType, content }) => [filename, mimeType, new Uint8Array(content as ArrayBuffer)]),
+    attachments.map(({ name, bytes, type }) => [name, type === 'application/pdf' ? type : 'application/octet-stream', bytes]));
+  assert.deepEqual(buildSendRequest(input).attachments?.map(({ type }) => type), attachments.map(({ type }) => type));
+});
+
 test('long Unicode headers and filenames round-trip, with no physical line over 998 bytes', async () => {
   const { buildSentCopy } = await builders();
   const unicode = '界🌍'.repeat(100);
