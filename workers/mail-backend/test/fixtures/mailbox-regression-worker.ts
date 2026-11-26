@@ -59,6 +59,7 @@ export class RegressionMailbox extends Mailbox {
     super(ctx, { ...env, MAIL_STATE: { get, put, list, delete: keys => bucket.delete(keys) } as R2Bucket,
       SWEEPER: { getByName: () => ({
         register: async () => { throw new Error('Unexpected fixture registration'); }, hold: async () => {}, release: async () => {},
+      holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
       }) },
     });
     this.io = io;

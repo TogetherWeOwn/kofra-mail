@@ -19,6 +19,7 @@ export class AlarmMailbox extends Mailbox {
     super(ctx, { ...env, SWEEPER: { getByName: () => ({
       register: async () => { throw new Error('Unexpected alarm fixture registration'); },
       hold: async () => {}, release: async () => {},
+      holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
     }) } });
   }
   async scheduledAt() { return this.ctx.storage.getAlarm(); }
