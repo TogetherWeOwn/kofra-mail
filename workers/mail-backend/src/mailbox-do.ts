@@ -853,16 +853,18 @@ export class Mailbox extends DurableObject<Env> {
     return Date.now() + (life.state === 'restoring' ? 0 : 1000);
   }
 
-  private async releasePublishedHolders(workspaceId: string, lastSeq: number): Promise<void> {
+  private async releasePublishedHolders(workspaceId: string, lastSeq: number, journalDeadline: number): Promise<void> {
     type Pending = { seq: number; key: string; holder: string };
     const sql = this.ctx.storage.sql;
     const rows = sql.exec<Pending>(`SELECT seq, object_key AS key, holder FROM mailbox_pending_releases
       WHERE seq <= ? ORDER BY seq, object_key, holder LIMIT 64`, lastSeq).toArray();
     if (!rows.length) return;
     const sweeper = this.env.SWEEPER.getByName(workspaceId);
-    // This tail must not make an unhealthy sweeper block journal work.
+    // An unhealthy sweeper cannot hold this tail past the next journal deadline.
+    const timeLeft = Math.min(PUBLISH_BUDGET_MS, journalDeadline - Date.now());
+    if (timeLeft <= 0) return;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const budget = new Promise<null>(resolve => { timeout = setTimeout(() => resolve(null), PUBLISH_BUDGET_MS); });
+    const budget = new Promise<null>(resolve => { timeout = setTimeout(() => resolve(null), timeLeft); });
     try {
       for (let offset = 0; offset < rows.length; offset += 6) {
         const batch = rows.slice(offset, offset + 6);
@@ -964,7 +966,10 @@ export class Mailbox extends DurableObject<Env> {
     const more = published.more || cleanupPending || prunedPage || (reindexDue && !reindexError && pending.length > 0);
     // Deltas were still published; retry only the snapshot, with backoff.
     const deadline = published.snapshotError ? Math.min(Date.now() + backoff(current.failures), reindexAt) : more ? soon : next;
-    if (this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on') await this.releasePublishedHolders(workspaceId, published.lastSeq);
+    if (this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on') {
+      const armed = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
+      await this.releasePublishedHolders(workspaceId, published.lastSeq, Math.min(deadline, armed ?? Infinity));
+    }
     return deadline;
   }
 }

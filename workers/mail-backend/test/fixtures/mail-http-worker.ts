@@ -80,8 +80,9 @@ export class HttpMailbox extends Mailbox {
         if (first) { first = false; await resume.promise; }
         return value;
       }) as TimerRun['local'];
-      try { await handler.run({ ...timer, local }); }
-      finally { done.resolve(); }
+      void done.promise.catch(() => {});
+      try { await handler.run({ ...timer, local }); done.resolve(); }
+      catch (error) { done.reject(error); throw error; }
     } });
   }
   eventCount(type: string) {

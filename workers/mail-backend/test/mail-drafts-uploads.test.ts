@@ -221,13 +221,17 @@ test('journal cleanup drains a 200-entry backlog in 64-entry minute batches', ()
     await mail.deleteDraft(draft.id);
   }
   assert.equal((await h.pendingReleases()).length, 200);
+  let now = Date.parse(uploaded.expiresAt) - ttl;
   for (const remaining of [136, 72, 8, 0]) {
+    now += 60_000;
     await h.advance(60_000);
     assert.equal((await h.pendingReleases()).length, remaining);
     assert.equal((await h.acknowledgedReleases()).length, 200 - remaining);
+    const lane = (await h.timers()).find(row => row.kind === 'journal_flush');
+    assert.ok(lane);
+    if (remaining) assert.ok(lane.due_at <= now + 60_000, 'backlog is armed within one minute');
+    else assert.ok(lane.due_at > now + 60_000, 'normal deadline is restored after cleanup');
   }
-  const lane = (await h.timers()).find(row => row.kind === 'journal_flush');
-  assert.ok(lane && lane.due_at > Date.parse(uploaded.expiresAt) - ttl + 5 * 60_000, 'normal deadline is restored after cleanup');
 }));
 
 test('overlapping upload_expiry runs commit only one deletion and holder release', () => withMail(async (h) => {
