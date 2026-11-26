@@ -225,12 +225,51 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 - **At most one extra copy per ambiguous event, and at most 3 ambiguous provider errors per send.** Only provider-reported ambiguous errors count toward that cap; an ambiguous event that comes from our side (a restore, or a crash after an authorization) raises the metric and an operator alert and never fails a send, and the crash-loop hold bounds how many such events one send can have. An ambiguous event is any point where `send()` may have delivered without a recorded result: a consumer crash or a restore between `send()` and its published result, an ambiguous provider error, or a restore or lease expiry after Mark (the claim cannot tell whether an authorized call started). A crash after Mark and before an authorization is not an ambiguous event: the Durable Object records every authorization, so in the same epoch the claim knows `send()` never ran, and the crash counts only toward the crash-loop cap. After a restore that record may be lost, so every restored `attempting` recipient is treated as ambiguous (metric and alert, not the cap). A crash before Mark is not an ambiguous event. Terminal results are published before they are acknowledged, and a terminal recipient is never changed except by a late confirmation (which never sends), so a finished send is never repeated.
 - Each occurrence raises the metric `send_ambiguous_retry`, so we measure how often it happens before considering anything stronger.
 
+### 2.7 Holder registration
+
+M3-2 takes a holder before each PUT (hold before write), then commits the mailbox row that references it: a draft revision, an upload or a forwarded part. Two paths would leave a holder that no mailbox state ever references or releases:
+- **A crash between the hold and the commit.** No row exists, so nothing knows about the holder.
+- **A restore that rewinds an unpublished commit.** The row is gone from the restored state, but the sweeper still has the holder.
+
+The sweeper never selects a generation that has a holder, so such an object would be kept forever: a storage leak, not data loss, but unbounded and invisible. Inbound mail does not have it, because a restore replays every completed delivery and re-holds with the same deterministic holder id, and an index row's holder is released with the row. Sends do not have it, because `registerSend` keeps a registration outside the mailbox that cleanup looks up by `sendId`. M3-2's holders are therefore **provisional until a published state confirms them.**
+
+**Sweeper ledger.** Each holder row has a state and an expiry: `generation_holders(key, holder, state, expires_at)`. One `state` column serves every rule: `held` (every holder before this change), `provisional`, `expired`, and the `tombstone` of sections 2.4 and M3-3. Only `held` and `provisional` count in `holder_count`. `expires_at` is set only for `provisional`, and a partial index on `(expires_at, key, holder) WHERE state = 'provisional'` serves the expiry.
+- **`holdProvisional(kind, digest | key, holder)`** is one sweeper transaction with the same generation choice as `register` and `hold` (a retired generation is never chosen or held). It inserts the holder as `provisional` with `expires_at = now + PROVISIONAL_TTL`. If the holder already exists as `provisional`, it moves `expires_at` to `now + PROVISIONAL_TTL`; as `expired`, it becomes `provisional` again and `holder_count` goes up; as `held`, nothing changes; as `tombstone`, it is refused. Before committing, in the same sweeper work step, it arms the sweeper alarm at `min(existing, now + PROVISIONAL_TTL)`, as `release` already does. A provisional holder counts in `holder_count` exactly like a held one, so the object is protected from the moment the holder exists.
+- **`confirm(entries)`** is one sweeper transaction per call, at most 64 entries. For each (key, holder):
+
+  | Holder state | Result | Answer |
+  |---|---|---|
+  | `provisional` | becomes `held`, expiry cleared | `held` |
+  | `held` | unchanged | `held` |
+  | `expired`, generation live (`retry_at IS NULL`) | becomes `held` again, `holder_count` goes up | `rehold` (a metric) |
+  | `expired`, generation retired | unchanged | `lost`: an invariant breach, an operator alert, and the mailbox marks the referencing draft or upload unusable instead of serving a missing object |
+  | absent | nothing; never re-created | `released` (a metric) |
+  | `tombstone` | unchanged; never revived | `released` |
+
+  An absent holder was released by a path that a published state ordered: a pending release, a finished send's cleanup, or the commit-failure path. Re-creating it would bring the leak back.
+- **Expiry:** the sweeper's alarm turns provisional holders with `expires_at <= now` into `expired`, in bounded batches. They leave `holder_count` and refresh `last_ref_at`, so the retention grace counts from the expiry. The row is kept, so a later `confirm` can still tell an expiry from a release. `nextSweepAt()` includes the earliest provisional `expires_at`, and the off-mode and disabled rechecks use it too.
+- **`release`** deletes the row in any state except `tombstone`, and adjusts `holder_count` only for a counted state.
+- **Retired generations:** the sweep transaction that deletes a retired generation first deletes that generation's `expired` and `tombstone` rows.
+
+**Mailbox.** Every holder that M3-2 creates for a draft revision, an upload or a forwarded part is taken with `holdProvisional` before the PUT. The commit that references it also produces a **pending confirmation** `(seq, key, holder)`. It is derived inside `apply()` from the event's own fields, like M3-2's pending releases, and never inserted separately on the API path. It is captured in `captureSnapshot`, restored in `restoreSnapshotRow` and cleared in `resetForRestore`, so a restore from delta or snapshot coverage brings back exactly the confirmations of published commits. After a successful publish, the `journal_flush` lane first confirms the entries with `seq <=` the published seq (bounded, idempotent batches of 64, each removed only after the sweeper acknowledges it), then drains pending releases. While covered entries remain, the lane lowers its own row to now + 60 s through the lower-only API; its deadline is otherwise unchanged, and so is the M3-1 driver.
+
+**Holder ids** contain the mailbox's holder scope (as `message:<holderScope>:…` does), because the sweeper is per workspace and two mailboxes must never share a holder id. They also contain a value minted before the hold that no restore can rewind: the existing draft and upload UUIDs and revision ids, for example `draft:<holderScope>:<draftId>:<revision>`. A client retry mints a new id; its earlier holder is an orphan, and orphans expire. These ids are up to about 150 characters, so the mailbox's own holder bound (128 in M3-2's event validation and pending-release queue) is raised to 256, the sweeper's existing limit. That stays compatible with replays of older events.
+
+**Why this fixes both paths.** A holder whose referencing commit never existed (a crash) or was rewound (a restore) is never confirmed, because no published state carries its pending confirmation. It expires and is released, and the object follows the normal retention grace. A holder whose commit is published is confirmed, and from then on behaves like any held holder.
+
+**`PROVISIONAL_TTL` is 7 days.** It must be far longer than any normal time from commit to publish: settings and drafts publish within 60 seconds, flags within an hour, and `backup_stale` alerts fire at twice those intervals. A commit that stays unpublished for 7 days means the mailbox's backup has been failing for a week with alerts firing. Even then nothing is lost at once: the expired holder's object is retired only after the 35-day retention grace from the expiry, and a confirmation in that window re-holds it (`rehold`). Losing an object therefore needs 42 days without a successful publish. A confirmation that arrives while the retired generation's row remains answers `lost` (see the open question in P0).
+
+**Restores.** Restored state is published by definition, so `restoreStep` confirms each pending confirmation as it applies it, in bounded idempotent batches, instead of waiting for `ready` and the lane. Anything left over is confirmed by the lane. `restoreStep` removes only entries answered `held`, `rehold` or `released`. A `lost` entry stays pending, because marking a draft unusable is a journalled change and must not be written in the middle of a replay; the lane handles it after `ready`. This closes the window in which a mailbox stuck in `restoring` or `missing` could let a published reference expire. The remaining case is a restore blocked for more than 42 days (see the open question in P0).
+
+**Not changed.** Inbound holders, index-row holders, `register` for inbound deliveries, and M3-3's `registerSend` keep their current rules. The retention grace, the generation choice, retirement (`retry_at` is never cleared) and the 35-day sweep are unchanged.
+
 ## 3. Packages
 
 | # | Package | Builder | Tier | Depends on | Size (est) |
 |---|---|---|---|---|---|
 | M3-0 | Measurements on the approved test route | Sol | T1 | an approved test route | 0.5 to 1 day |
 | M3-1 | Timers table and one multiplexed alarm | **Opus** | T0 | inbound mailbox PRs merged | 0.5 to 1 day |
+| P0 | Provisional holders in the sweeper (section 2.7) | **Opus** | T0 | none | 0.5 to 1 day |
 | M3-2 | Drafts, uploads and idempotency in the mailbox | Sol, Opus review | T0 | M3-1 | 1 to 1.5 days |
 | M3-3 | Send state machine: `pending_send`, undo, release | **Opus** | T0 | M3-1, M3-2 | 1.5 to 2 days |
 | M3-4 | MIME builder and sent copy | Sol, Opus review | T1 | M3-3 | 0.5 to 1 day |
@@ -279,6 +318,29 @@ A crash or failed publish anywhere leaves `finish_pending` and the drive row, an
 - The existing journal-flush tests still pass.
 
 **Stop rule:** if multiplexing would change when the journal flushes (the recovery boundary), stop and write a design note.
+
+### P0 Provisional holders in the sweeper (Opus)
+
+**Change:** the sweeper side of section 2.7, in the sweeper ledger and its Durable Object. M3-2 builds the mailbox side on it.
+- The `state` and `expires_at` columns and the partial expiry index. Existing ledgers gain both columns by `ALTER TABLE`, so new and existing ledgers share one schema, and every existing holder row becomes `held`.
+- `holdProvisional` and `confirm`, each one sweeper transaction, with the answers of section 2.7. `holdProvisional` arms the alarm before it commits; `confirm` only adds protection, so it arms nothing.
+- Expiry runs at the start of the sweep transaction, at most 64 holders per alarm. While deletes are off (`MAIL_SWEEP_ENABLED` is not `on`) or the backend is disabled, the alarm only re-arms from `nextSweepAt()`, so no holder loses protection while the sweeper is paused.
+- `hold` and `register` on an existing `provisional` or `expired` holder make it `held`; on a `tombstone` they add nothing (section 2.4). No API writes tombstones yet; M3-3 adds it.
+- `PROVISIONAL_TTL` is 7 days.
+
+**Open question:** the sweep drops a retired generation's rows, its `expired` holders included, as soon as the DELETE is confirmed, usually seconds after retirement. A `confirm` after that finds no holder and answers `released`, not `lost`, so the `lost` alert covers only that short window. One option is for `confirm` to answer `lost` for an absent holder whose `raw/` or `att/` generation row no longer exists, since that row is dropped only after a confirmed DELETE. It needs a design decision before M3-2 relies on `lost`.
+
+**Acceptance:**
+- A provisional holder protects its generation from the sweep; expiry makes it `expired`, and the grace counts from the expiry.
+- `confirm` before expiry answers `held`, after expiry `rehold`, and after retirement `lost`.
+- Release then confirm is a no-op (`released`). A confirm that fails, a release that succeeds and a retried confirm leave no holder.
+- A tombstone is never revived, and is deleted with its retired generation.
+- Confirm racing expiry, in both orders.
+- An idle ledger plus one `holdProvisional` produces an alarm at its expiry, with deletes on and off.
+- Repeats are idempotent; `confirm` takes at most 64 entries, and expiry runs in bounded batches.
+- A ledger written before this change migrates, and every existing sweeper and reconcile test passes unchanged.
+
+**Stop rule:** if `holdProvisional` or `confirm` cannot each be one sweeper transaction, stop and write a design note.
 
 ### M3-2 Drafts, uploads and idempotency (Sol, Opus review)
 
