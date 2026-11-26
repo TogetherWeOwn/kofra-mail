@@ -241,9 +241,14 @@ test('workerd: separate requests in one isolate share the in-flight budget', { t
     held(`${round}c`);
     const first = serve(`https://held.sender.example/${round}a`, budget);
     const second = serve(`https://held.sender.example/${round}b`, budget);
-    await waitForUpstreams(2);
-    assertEmpty404(await serve(`https://held.sender.example/${round}c`, budget));
-    for (const release of releases.splice(0)) release();
+    try {
+      await waitForUpstreams(2);
+      assertEmpty404(await serve(`https://held.sender.example/${round}c`, budget));
+    } finally {
+      // Close every held stream and settle both dispatches even if setup failed.
+      for (const release of releases.splice(0)) release();
+      await Promise.allSettled([first, second]);
+    }
     assert.equal((await first).status, 200, `round ${round}`);
     assert.equal((await second).status, 200, `round ${round}`);
   }
