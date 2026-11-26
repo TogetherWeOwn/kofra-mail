@@ -71,8 +71,10 @@ CREATE TABLE IF NOT EXISTS mailbox_api_draft_objects (
   PRIMARY KEY (draft_id, object_key)
 );
 CREATE TABLE IF NOT EXISTS mailbox_pending_releases (
-  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, PRIMARY KEY (seq, object_key, holder)
+  seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (seq, object_key, holder)
 );
+CREATE INDEX IF NOT EXISTS mailbox_release_retry ON mailbox_pending_releases(retry_at, seq, object_key, holder);
 CREATE TABLE IF NOT EXISTS mailbox_pending_confirmations (
   seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, published_at INTEGER,
   PRIMARY KEY (seq, object_key, holder)

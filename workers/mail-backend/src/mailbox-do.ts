@@ -4,7 +4,7 @@ import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions
 import { ApiFault, fail, isId } from './mailbox-api-input.ts';
 import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult } from './mailbox-api-idempotency.ts';
 import { idemExpiry, uploadExpiry } from './mailbox-expiry.ts';
-import { IDEM_EXPIRY, UPLOAD_EXPIRY, UPLOAD_TTL_MS, readUpload, uploadMediaType, uploadName, wireUpload, type UploadBody } from './mailbox-upload.ts';
+import { IDEM_EXPIRY, IN_PROGRESS_TTL_MS, UPLOAD_EXPIRY, UPLOAD_TTL_MS, readUpload, uploadMediaType, uploadName, wireUpload, type UploadBody } from './mailbox-upload.ts';
 import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
 import { kofra } from './kofra.ts';
@@ -58,6 +58,7 @@ export class Mailbox extends DurableObject<Env> {
   protected timerHandlerBudgetMs = TIMER_HANDLER_BUDGET_MS;
   protected timerRunBudgetMs = TIMER_RUN_BUDGET_MS;
   protected timerRetryMs = TIMER_RETRY_MS;
+  protected holderIoBudgetMs = PUBLISH_BUDGET_MS;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -255,19 +256,28 @@ export class Mailbox extends DurableObject<Env> {
     const index = this.index(scope.workspaceId);
     const reservation = await this.work.run(async () => {
       if (!await this.ready(index, scope) || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
-      return reserveApiKey(sql, key, now);
+      return reserveApiKey(sql, key, this.mailApiNow());
     });
     try {
+      // Only a replay must read the body before validating its filename.
+      const reserved = 'row' in reservation ? reservation : { ...reservation, name: uploadName(params.name) };
+      const deadline = 'row' in reserved ? now + IN_PROGRESS_TTL_MS : reserved.expiresAt;
       return await this.uploads.run(async () => {
         const mediaType = uploadMediaType(input.mediaType);
-        const { digest, size, bytes } = await readUpload(input, 'row' in reservation);
+        const { digest, size, bytes } = await readUpload(input, 'row' in reserved, deadline - this.mailApiNow());
         const fingerprint = await fingerprintOf('createUpload', params, { digest, mediaType });
-        if ('row' in reservation) return replayApiKey(index, reservation.row, fingerprint);
-        const name = uploadName(params.name);
-        const live = () => storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' && ownsApiKey(sql, key, reservation.token);
-        if (!live()) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+        if ('row' in reserved) return replayApiKey(index, reserved.row, fingerprint);
+        const { name } = reserved;
+        const live = () => storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' &&
+          ownsApiKey(sql, key, reserved.token, this.mailApiNow());
+        const remaining = () => live() ? deadline - this.mailApiNow() : 0;
         const id = crypto.randomUUID();
-        const { objectKey, holder } = await index.prepareUpload(id, digest, size, bytes);
+        const prepared = await this.beforeDeadline(Date.now() + remaining(), () => index.prepareUpload(id, digest, size, bytes, remaining));
+        if (!prepared) {
+          if (!bytes.locked) void bytes.cancel().catch(() => {});
+          return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+        }
+        const { objectKey, holder } = prepared;
         let committed = false;
         try {
           return await this.localStep(timers => {
@@ -280,16 +290,19 @@ export class Mailbox extends DurableObject<Env> {
             timers.set(UPLOAD_EXPIRY, id, row.expiresAt);
             scheduleResult(timers, stored);
             if (this.lowerJournal(timers, this.timerNow() + SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS)) this.laneMoved?.resolve();
-            clearApiKey(sql, key, reservation.token);
+            clearApiKey(sql, key, reserved.token);
             committed = true;
             return { body: upload };
           });
         } catch (error) {
           if (committed) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
-          await index.releaseUpload(holder, objectKey);
+          this.ctx.waitUntil(index.releaseUpload(holder, objectKey));
           throw error;
         }
       });
+    } catch (error) {
+      if (!input.stream?.locked) void input.stream?.cancel().catch(() => {});
+      throw error;
     } finally {
       if ('token' in reservation) await this.work.run(async () => clearApiKey(sql, key, reservation.token));
     }
@@ -896,10 +909,10 @@ export class Mailbox extends DurableObject<Env> {
   }
 
   private async releasePublishedHolders(workspaceId: string, lastSeq: number, journalDeadline: number): Promise<void> {
-    type Pending = { seq: number; key: string; holder: string };
+    type Pending = { seq: number; key: string; holder: string; retry_at: number };
     const sql = this.ctx.storage.sql;
-    const rows = sql.exec<Pending>(`SELECT seq, object_key AS key, holder FROM mailbox_pending_releases
-      WHERE seq <= ? ORDER BY seq, object_key, holder LIMIT 64`, lastSeq).toArray();
+    const rows = sql.exec<Pending>(`SELECT seq, object_key AS key, holder, retry_at FROM mailbox_pending_releases
+      WHERE retry_at <= ? AND seq <= ? ORDER BY retry_at, seq, object_key, holder LIMIT 64`, Date.now(), lastSeq).toArray();
     if (!rows.length) return;
     const sweeper = this.env.SWEEPER.getByName(workspaceId);
     // An unhealthy sweeper cannot hold this tail past the next journal deadline.
@@ -908,18 +921,24 @@ export class Mailbox extends DurableObject<Env> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const budget = new Promise<null>(resolve => { timeout = setTimeout(() => resolve(null), timeLeft); });
     try {
-      for (let offset = 0; offset < rows.length; offset += 6) {
-        const batch = rows.slice(offset, offset + 6);
-        const acks = await Promise.race([budget, Promise.allSettled(batch.map(row => sweeper.release(row.key, row.holder)))]);
-        if (!acks) break;
-        await this.work.run(async () => this.ctx.storage.transactionSync(() => {
-          for (const [i, ack] of acks.entries()) {
-            if (ack.status !== 'fulfilled') continue;
-            const { seq, key, holder } = batch[i];
-            // Release is idempotent; acknowledge only the exact published intent.
-            sql.exec('DELETE FROM mailbox_pending_releases WHERE seq = ? AND object_key = ? AND holder = ?', seq, key, holder);
-          }
+      for (let offset = 0; offset < rows.length && Date.now() < journalDeadline; offset += 6) {
+        const batch = await this.work.run(async () => this.ctx.storage.transactionSync(() => {
+          const retryAt = Date.now() + TIMER_RETRY_MS;
+          // Attempted rows sort behind older attempts and rows that have not
+          // yet run, even if a suspended or failed release never acknowledges.
+          return rows.slice(offset, offset + 6).filter(row => sql.exec(`UPDATE mailbox_pending_releases SET retry_at = ?
+            WHERE seq = ? AND object_key = ? AND holder = ? AND retry_at = ?`, retryAt, row.seq, row.key, row.holder, row.retry_at).rowsWritten);
         }));
+        if (Date.now() >= journalDeadline) break;
+        const acks = Promise.allSettled(batch.map(async ({ seq, key, holder }) => {
+          await sweeper.release(key, holder);
+          // Preserve each independent acknowledgement even if its sibling is
+          // still running when the tail runs out of time.
+          await this.work.run(async () => {
+            sql.exec('DELETE FROM mailbox_pending_releases WHERE seq = ? AND object_key = ? AND holder = ?', seq, key, holder);
+          });
+        }));
+        if (!await Promise.race([budget, acks])) break;
       }
     } finally { clearTimeout(timeout); }
   }
@@ -1009,8 +1028,13 @@ export class Mailbox extends DurableObject<Env> {
     // Deltas were still published; retry only the snapshot, with backoff.
     const deadline = published.snapshotError ? Math.min(Date.now() + backoff(current.failures), reindexAt) : more ? soon : next;
     const armed = this.timerTable().due(JOURNAL_FLUSH, JOURNAL_FLUSH_REF);
-    const holderDeadline = Math.min(deadline, armed ?? Infinity, Date.now() + PUBLISH_BUDGET_MS);
-    await this.confirmPublishedHolders(index, workspaceId, published.lastSeq, holderDeadline);
+    const holderNow = Date.now();
+    const holderDeadline = Math.min(deadline, armed ?? Infinity, holderNow + this.holderIoBudgetMs);
+    const releasable = this.ctx.storage.sql.exec(`SELECT 1 FROM mailbox_pending_releases
+      WHERE retry_at <= ? AND seq <= ? LIMIT 1`, holderNow, published.lastSeq).toArray().length !== 0;
+    // Confirm first, but a stuck confirmation must leave time for releases.
+    const confirmDeadline = releasable ? holderNow + Math.floor((holderDeadline - holderNow) / 2) : holderDeadline;
+    await this.confirmPublishedHolders(index, workspaceId, published.lastSeq, confirmDeadline);
     await this.releasePublishedHolders(workspaceId, published.lastSeq, holderDeadline);
     return deadline;
   }

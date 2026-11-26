@@ -51,10 +51,14 @@ export function uploadMediaType(value: string): string {
 // be registered. Read a bounded, rewindable body, hashing each chunk as it
 // arrives; then stream those same chunks into the signed PUT. Never write an
 // untracked staging object or tee a body into an unbounded queue.
-export async function readUpload({ stream, contentLength }: UploadBody, compareCommitted = false): Promise<{
+export async function readUpload({ stream, contentLength }: UploadBody, compareCommitted: boolean, remainingMs: number): Promise<{
   digest: string; size: number; bytes: ReadableStream<Uint8Array>;
 }> {
   const max = LIMITS.uploadBytes;
+  if (remainingMs <= 0) {
+    void stream?.cancel().catch(() => {});
+    return fail('unavailable', { retryAfterSeconds: 1 });
+  }
   // No committed upload exceeded the cap, so an oversized retry is already
   // known to differ without buffering or hashing the rest of its body.
   const tooLarge = () => compareCommitted ? fail('idempotency_key_reused') : fail('payload_too_large', { limit: max });
@@ -75,7 +79,7 @@ export async function readUpload({ stream, contentLength }: UploadBody, compareC
   const timeout = reader && setTimeout(() => {
     timedOut = true;
     void reader.cancel().catch(() => {});
-  }, IN_PROGRESS_TTL_MS);
+  }, remainingMs);
   try {
     while (reader) {
       const { done, value } = await reader.read();
@@ -103,12 +107,15 @@ export async function readUpload({ stream, contentLength }: UploadBody, compareC
     const digest = Array.from(new Uint8Array(await hash.digest), byte => byte.toString(16).padStart(2, '0')).join('');
     if (chunks.length) chunks[chunks.length - 1] = chunks.at(-1)!.subarray(0, offset);
     let cursor = 0;
-    const bytes = new ReadableStream<Uint8Array>({ pull(controller) {
-      const chunk = chunks[cursor];
-      if (!chunk) { controller.close(); return; }
-      chunks[cursor++] = new Uint8Array(0);
-      controller.enqueue(chunk);
-    } });
+    const bytes = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[cursor];
+        if (!chunk) { controller.close(); return; }
+        chunks[cursor++] = new Uint8Array(0);
+        controller.enqueue(chunk);
+      },
+      cancel() { chunks.length = 0; },
+    });
     return { digest, size, bytes };
   } catch (error) {
     void writer.abort().catch(() => {});

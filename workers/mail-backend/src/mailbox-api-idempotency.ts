@@ -25,19 +25,20 @@ export function committedKey(sql: SqlStorage, key: string): IdempotentRow | unde
   return sql.exec<IdempotentRow>('SELECT fingerprint, result, expires_at AS expiresAt FROM mailbox_api_idempotency WHERE key = ?', key).toArray()[0];
 }
 
-export function reserveApiKey(sql: SqlStorage, key: string, now: number): { row: IdempotentRow } | { token: string } {
+export function reserveApiKey(sql: SqlStorage, key: string, now: number): { row: IdempotentRow } | { token: string; expiresAt: number } {
   const row = committedKey(sql, key);
   if (row && row.expiresAt > now) return { row };
   const token = crypto.randomUUID();
+  const expiresAt = now + IN_PROGRESS_TTL_MS;
   const marker = sql.exec(`INSERT INTO mailbox_api_in_progress VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at
-    WHERE mailbox_api_in_progress.expires_at <= ?`, key, token, now + IN_PROGRESS_TTL_MS, now);
+    WHERE mailbox_api_in_progress.expires_at <= ?`, key, token, expiresAt, now);
   if (!marker.rowsWritten) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
-  return { token };
+  return { token, expiresAt };
 }
 
-export function ownsApiKey(sql: SqlStorage, key: string, token: string): boolean {
-  return sql.exec('SELECT 1 FROM mailbox_api_in_progress WHERE key = ? AND token = ?', key, token).toArray().length === 1;
+export function ownsApiKey(sql: SqlStorage, key: string, token: string, now: number): boolean {
+  return sql.exec('SELECT 1 FROM mailbox_api_in_progress WHERE key = ? AND token = ? AND expires_at > ?', key, token, now).toArray().length === 1;
 }
 
 export function clearApiKey(sql: SqlStorage, key: string, token: string): void {

@@ -15,7 +15,7 @@ import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
 export type MailboxObjects = {
   get(key: string): Promise<Uint8Array<ArrayBuffer>>;
   put(key: string, content: Uint8Array<ArrayBuffer>): Promise<void>;
-  putUpload?(key: string, content: ReadableStream<Uint8Array>, size: number, digest: string): Promise<void>;
+  putUpload?(key: string, content: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void>;
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
   holdProvisional?(target: HoldTarget, holder: string): Promise<string>;
   hold(key: string, holder: string): Promise<void>;
@@ -373,12 +373,16 @@ export class MailboxIndex {
     for (const key of new Set([ref.rawKey, ...attachments])) await this.objects.release(key, ref.holder).catch(() => {});
   }
 
-  async prepareUpload(id: string, digest: string, size: number, bytes: ReadableStream<Uint8Array>): Promise<{ objectKey: string; holder: string }> {
+  async prepareUpload(id: string, digest: string, size: number, bytes: ReadableStream<Uint8Array>, remaining: () => number):
+    Promise<{ objectKey: string; holder: string }> {
     if (!this.objects.putUpload || !this.objects.holdProvisional) throw new Error('Upload storage unavailable');
     const holder = `upload:${this.holderScope}:${id}`;
     const objectKey = await this.objects.holdProvisional({ kind: 'att', digest }, holder);
-    try { await this.objects.putUpload(objectKey, bytes, size, digest); }
-    catch (error) { await this.releaseUpload(holder, objectKey); throw error; }
+    try {
+      const timeoutMs = remaining();
+      if (timeoutMs <= 0) throw new Error('Upload lease expired before PUT');
+      await this.objects.putUpload(objectKey, bytes, size, digest, timeoutMs);
+    } catch (error) { await this.releaseUpload(holder, objectKey); throw error; }
     return { objectKey, holder };
   }
 
@@ -398,7 +402,7 @@ export class MailboxIndex {
 
   enqueueRelease(seq: number, key: string, holder: string): void {
     if (!count(seq) || seq === 0 || !isObjectKey(key) || !bounded(holder, 256)) throw new Error('Invalid pending holder release');
-    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_releases VALUES (?, ?, ?)', seq, key, holder);
+    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_releases(seq, object_key, holder) VALUES (?, ?, ?)', seq, key, holder);
   }
 
   private enqueueConfirmation(seq: number, key: string, holder: string, publishedAt: number | null = null): PendingConfirmation {
