@@ -311,11 +311,17 @@ test('local workerd enforces each configured threshold through the gateway', { t
   try {
     for (const [binding, op, admitted] of bucketCases) {
       const { method, path } = ROUTES[op];
-      const reply = await worker.fetch('http://127.0.0.1/', { method: 'POST', body: JSON.stringify({ method,
-        path: path.replace(/\{\w+\}/g, '{id}'), limit: limits[binding], admitted, distinct: binding === 'MAIL_RATE_UNDO_FLOOD', actor: binding,
-      }) });
-      assert.equal(reply.status, 200, binding);
-      const result = await reply.json() as { index: number; status: number; retryAfter: string; body: { code: string; retryAfterSeconds: number } };
+      const probe = async (actor: string) => {
+        const reply = await worker.fetch('http://127.0.0.1/', { method: 'POST', body: JSON.stringify({ method,
+          path: path.replace(/\{\w+\}/g, '{id}'), limit: limits[binding], period, admitted, distinct: binding === 'MAIL_RATE_UNDO_FLOOD', actor,
+        }) });
+        assert.equal(reply.status, 200, binding);
+        return await reply.json() as { index: number; status: number; crossedWindow: boolean; retryAfter: string;
+          body: { code: string; retryAfterSeconds: number } };
+      };
+      let result = await probe(binding);
+      // Miniflare resets counters at wall-clock boundaries. Rerun only a full batch that straddled one.
+      if (result.crossedWindow && result.index === limits[binding] && result.status === admitted) result = await probe(`${binding}-next-window`);
       assert.deepEqual([result.index, result.status, result.retryAfter, result.body.code, result.body.retryAfterSeconds],
         [limits[binding], 429, String(period), 'rate_limited', period], binding);
     }
