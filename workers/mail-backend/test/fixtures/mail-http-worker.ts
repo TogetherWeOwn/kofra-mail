@@ -436,8 +436,8 @@ export default {
       MAIL_LOCAL_API: 'on', MAIL_DRAFT_UPLOADS_ENABLED: env.MAIL_DRAFT_UPLOADS_ENABLED, MAILBOX: env.MAILBOX, DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
-      MAIL_CONTENT_ORIGIN: contentOrigin(url, env),
-      MAIL_CONTENT: { mint: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
+      MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: contentOrigin(url, env),
+      MAIL_CONTENT: { mintForWeb: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
     };
     if (req.headers.get('x-fixture-watch-body') === 'true' && req.body) {
       const reader = req.body.getReader();
