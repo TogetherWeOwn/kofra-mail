@@ -1,0 +1,119 @@
+// The MIME-builder port of the send path (docs/m3-outbound-plan.md, section 3,
+// M3-3). Release builds the sent copy only through this port, from inputs the
+// send froze at sendDraft, so a rerun builds identical bytes. The builder
+// version is frozen too: a deploy that adds a version keeps the old one for
+// sends that recorded it.
+//
+// The default builder here is a deterministic stand-in until the MIME builder
+// package (M3-4) replaces it. It writes plain RFC 5322 with base64 parts and
+// never a Bcc header; it does not trim threading headers or fold long lines,
+// which are the real builder's job.
+
+export type SendMimeAddress = { email: string; name?: string };
+export type SendMimeAttachment = { name: string; type: string; size: number };
+export type SendMimeMessage = {
+  // `<…>`, derived from the send id.
+  messageId: string;
+  // Derived from the send id.
+  boundary: string;
+  // The message's Date: the send's first undoUntil, never moved.
+  date: number;
+  from: SendMimeAddress;
+  replyTo: SendMimeAddress[];
+  to: SendMimeAddress[];
+  cc: SendMimeAddress[];
+  subject: string;
+  text: string;
+  attachments: SendMimeAttachment[];
+  inReplyTo?: string;
+  references?: string;
+};
+// Reads one attachment's bytes, in the order of `attachments`.
+export type SendMimeParts = (index: number) => Promise<Uint8Array<ArrayBuffer>>;
+
+export interface SendMimeBuilder {
+  readonly version: number;
+  // The exact encoded size of `build` for this message, without reading any attachment.
+  encodedSize(message: SendMimeMessage): number;
+  build(message: SendMimeMessage, parts: SendMimeParts): Promise<Uint8Array<ArrayBuffer>>;
+}
+
+export type SendMimeBuilders = { readonly current: number; get(version: number): SendMimeBuilder | undefined };
+
+export function mimeBuilders(...builders: SendMimeBuilder[]): SendMimeBuilders {
+  const byVersion = new Map(builders.map(builder => [builder.version, builder]));
+  if (!builders.length || byVersion.size !== builders.length) throw new Error('Invalid MIME builder set');
+  return { current: Math.max(...byVersion.keys()), get: version => byVersion.get(version) };
+}
+
+const encoder = new TextEncoder();
+const bytes = (text: string) => encoder.encode(text).byteLength;
+const CRLF = '\r\n';
+// Base64 in lines of 76 characters, each followed by CRLF.
+export function base64MimeBytes(size: number): number {
+  const chars = 4 * Math.ceil(size / 3);
+  return chars + 2 * Math.ceil(chars / 76);
+}
+function base64Lines(data: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < data.byteLength; i += 0x8000) binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
+  const encoded = btoa(binary);
+  let out = '';
+  for (let i = 0; i < encoded.length; i += 76) out += `${encoded.slice(i, i + 76)}${CRLF}`;
+  return out;
+}
+const ascii = (text: string) => /^[\x20-\x7e]*$/.test(text);
+const word = (text: string) => ascii(text) ? text : `=?UTF-8?B?${base64Lines(encoder.encode(text)).replaceAll(CRLF, '')}?=`;
+const quoted = (name: string) => ascii(name) ? `"${name.replace(/["\\]/g, '\\$&')}"` : word(name);
+const mailbox = ({ email, name }: SendMimeAddress) => name ? `${quoted(name)} <${email}>` : email;
+const list = (addresses: SendMimeAddress[]) => addresses.map(mailbox).join(', ');
+const filename = (name: string) => `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
+
+type Segment = string | { part: number; size: number };
+
+function layout(message: SendMimeMessage): Segment[] {
+  const headers = [
+    `From: ${mailbox(message.from)}`,
+    ...(message.replyTo.length ? [`Reply-To: ${list(message.replyTo)}`] : []),
+    ...(message.to.length ? [`To: ${list(message.to)}`] : []),
+    ...(message.cc.length ? [`Cc: ${list(message.cc)}`] : []),
+    `Subject: ${word(message.subject)}`,
+    `Date: ${new Date(message.date).toUTCString().replace('GMT', '+0000')}`,
+    `Message-ID: ${message.messageId}`,
+    ...(message.inReplyTo ? [`In-Reply-To: ${message.inReplyTo}`] : []),
+    ...(message.references ? [`References: ${message.references}`] : []),
+    'MIME-Version: 1.0',
+  ];
+  const text = base64Lines(encoder.encode(message.text));
+  const body = `Content-Type: text/plain; charset=UTF-8${CRLF}Content-Transfer-Encoding: base64${CRLF}${CRLF}${text}`;
+  if (!message.attachments.length) return [`${headers.join(CRLF)}${CRLF}${body}`];
+  const delimiter = `--${message.boundary}${CRLF}`;
+  const segments: Segment[] = [
+    `${headers.join(CRLF)}${CRLF}Content-Type: multipart/mixed; boundary="${message.boundary}"${CRLF}${CRLF}${delimiter}${body}`,
+  ];
+  message.attachments.forEach((attachment, part) => {
+    segments.push(`${delimiter}Content-Type: ${attachment.type}${CRLF}Content-Disposition: attachment; ${filename(attachment.name)}${CRLF}`
+      + `Content-Transfer-Encoding: base64${CRLF}${CRLF}`, { part, size: attachment.size });
+  });
+  segments.push(`--${message.boundary}--${CRLF}`);
+  return segments;
+}
+
+export const stubMimeBuilder: SendMimeBuilder = {
+  version: 1,
+  encodedSize(message) {
+    return layout(message).reduce((total, segment) => total + (typeof segment === 'string' ? bytes(segment) : base64MimeBytes(segment.size)), 0);
+  },
+  async build(message, parts) {
+    let out = '';
+    for (const segment of layout(message)) {
+      if (typeof segment === 'string') { out += segment; continue; }
+      const data = await parts(segment.part);
+      if (data.byteLength !== segment.size) throw new Error('Send attachment size changed');
+      out += base64Lines(data);
+    }
+    return new Uint8Array(encoder.encode(out));
+  },
+};
+
+export const defaultMimeBuilders = () => mimeBuilders(stubMimeBuilder);

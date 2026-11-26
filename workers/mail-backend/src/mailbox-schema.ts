@@ -12,6 +12,35 @@ CREATE TABLE IF NOT EXISTS timers (due_at INTEGER NOT NULL, kind TEXT NOT NULL, 
 CREATE INDEX IF NOT EXISTS timers_due ON timers(due_at, kind, ref);
 `;
 
+// The send state machine (docs/m3-outbound-plan.md, section 2; M3-3).
+// mailbox_sends, its recipients (the ledger) and its upload references are
+// non-derived state: every change is a journal event and they are in
+// snapshots. `record` is the send's frozen input (section 2.3). The *_seq
+// columns hold the journal seq of the event that set them, so whether a step
+// is published is a comparison with the journal's flushed position.
+// mailbox_send_drivers and mailbox_send_breaches are local scheduling state,
+// cleared by a restore like the timer rows.
+export const SEND_SCHEMA = `
+CREATE TABLE IF NOT EXISTS mailbox_sends (
+  id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, undo_until INTEGER NOT NULL,
+  holder TEXT NOT NULL, record TEXT NOT NULL, created_seq INTEGER NOT NULL, release_seq INTEGER, queued_seq INTEGER,
+  terminal_seq INTEGER, message_id TEXT, reason TEXT, finish_pending INTEGER NOT NULL DEFAULT 0 CHECK (finish_pending IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS mailbox_send_page ON mailbox_sends(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS mailbox_send_message ON mailbox_sends(message_id) WHERE message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS mailbox_send_holder ON mailbox_sends(holder);
+CREATE TABLE IF NOT EXISTS mailbox_send_recipients (
+  send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, idx INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('external', 'internal')), state TEXT NOT NULL, reason TEXT, PRIMARY KEY (send_id, idx)
+);
+CREATE TABLE IF NOT EXISTS mailbox_send_uploads (
+  send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, upload_id TEXT NOT NULL, PRIMARY KEY (send_id, upload_id)
+);
+CREATE INDEX IF NOT EXISTS mailbox_send_upload_refs ON mailbox_send_uploads(upload_id, send_id);
+CREATE TABLE IF NOT EXISTS mailbox_send_drivers (send_id TEXT PRIMARY KEY, token TEXT NOT NULL, backoff INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
+`;
+
 export const MAILBOX_SCHEMA = `
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY, raw_key TEXT NOT NULL, size INTEGER NOT NULL,
@@ -102,4 +131,5 @@ CREATE TABLE IF NOT EXISTS journal (seq INTEGER PRIMARY KEY, event TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id = 1), modseq INTEGER NOT NULL, flushed INTEGER NOT NULL);
 INSERT OR IGNORE INTO state VALUES (1, 0, 0);
 CREATE TABLE IF NOT EXISTS lifecycle (id INTEGER PRIMARY KEY CHECK(id = 1), value TEXT NOT NULL);
-${TIMERS_SCHEMA}`;
+${TIMERS_SCHEMA}
+${SEND_SCHEMA}`;

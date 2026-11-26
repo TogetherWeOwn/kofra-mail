@@ -14,7 +14,9 @@ import type { JournalEvent } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { decodedAttachment, normalizeSearch, readMailMime } from './parse-mail.ts';
 
-export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; httpWrite?: HttpMailboxWrite };
+// userId is the verified account user making the request; a send records it as its submitter.
+export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; userId?: string;
+  httpWrite?: HttpMailboxWrite };
 export type PreparedApiKey = { token: string; fingerprint: string };
 export type MailboxApiResult = { body?: unknown; status?: number; replayed?: boolean; error?: MailboxApiError };
 export type MailContentBody = { html?: string; text?: string; auth: string };

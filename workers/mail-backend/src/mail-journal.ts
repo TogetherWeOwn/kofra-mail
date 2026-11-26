@@ -1,5 +1,24 @@
 export const JOURNAL_PAGE_SIZE = 64;
 
+// The stored idempotency result committed in the same event as a send's effect.
+export type JournalResult = { key: string; fingerprint: string; expiresAt: number; result: string };
+export type SendAddress = { email: string; name?: string };
+export type SendRecipient = SendAddress & { field: 'to' | 'cc' | 'bcc' };
+export type SendRecipientKind = 'external' | 'internal';
+export type SendFailure = 'invalid_sender' | 'message_too_large' | 'delivery_error';
+// Everything the sent copy's bytes depend on, frozen at sendDraft
+// (docs/m3-outbound-plan.md, section 2.3, step 2). The draft revision is
+// immutable; the boundary and Message-ID derive from the send id.
+export type SendRecord = {
+  id: string; draftId: string; createdAt: number; undoUntil: number; dateAt: number; undoSeconds: number;
+  ownerUserId: string; from: { email: string; name: string }; replyTo: SendAddress[]; builderVersion: number;
+  draft: { rawKey: string; holder: string; revision: string; updatedAt: number };
+  attachmentKeys: string[]; uploadIds: string[]; recipients: SendRecipient[];
+};
+// The sent copy's non-derived index state, as a message event carries it.
+export type SentCopy = { id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
+  subjectKey: string; auth: string; attKeys: string[]; flags: number };
+
 export type JournalEvent =
   // Non-derived message state only: parsed text never enters the journal.
   // subjectKey is a SHA-256 of the normalized subject, so threading survives a restore.
@@ -16,11 +35,26 @@ export type JournalEvent =
   | { type: 'draft_delete'; id: string; deferRelease?: true }
   | { type: 'api_upload'; id: string; objectKey: string; name: string; mediaType: string; size: number; expiresAt: number; holder?: string }
   | { type: 'api_upload_delete'; id: string; objectKey: string }
-  | { type: 'api_source_lost'; kind: 'draft' | 'upload'; id: string; holder: string }
+  | { type: 'api_source_lost'; kind: 'draft' | 'upload' | 'send'; id: string; holder: string }
   | { type: 'api_result'; key: string; fingerprint: string; expiresAt: number; result: string }
   | { type: 'api_result_expire'; key: string; expiresAt: number }
   | { type: 'bayes'; token: string; ham: number; spam: number }
-  | { type: 'purge'; id: string };
+  | { type: 'purge'; id: string }
+  // The send state machine (M3-3). sendDraft: the pending send replaces the
+  // draft, with the idempotency result, in one event.
+  | { type: 'send_create'; send: SendRecord; result: JournalResult }
+  // undoSend: cancelled, and the draft restored under its id with a new revision.
+  | { type: 'send_undo'; id: string; revision: string; updatedAt: number; result: JournalResult }
+  // Release step 1: pending to releasing.
+  | { type: 'send_release'; id: string }
+  // Release step 4: the sent copy's index row and one pending ledger row per recipient.
+  | { type: 'send_queued'; id: string; message: SentCopy; kinds: SendRecipientKind[] }
+  // A release-time failure (step 2): terminal, with one failed ledger row per recipient.
+  | { type: 'send_fail'; id: string; reason: SendFailure; kinds: SendRecipientKind[] }
+  // Finish rule step 4: cleanup is done.
+  | { type: 'send_finish'; id: string }
+  // The restore epilogue's fresh undo window for a restored pending send.
+  | { type: 'send_window'; id: string; undoUntil: number };
 
 export type JournalRow = { seq: number; event: string };
 

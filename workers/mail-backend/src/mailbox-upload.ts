@@ -16,10 +16,12 @@ export type UploadRow = {
 const columns = 'id, object_key AS objectKey, name, media_type AS mediaType, size, expires_at AS expiresAt, holder';
 export const uploadRow = (sql: SqlStorage, id: string): UploadRow | undefined =>
   sql.exec<UploadRow>(`SELECT ${columns} FROM mailbox_api_uploads WHERE id = ?`, id).toArray()[0];
+// A draft or an unfinished send refers to it (a send keeps its draft's uploads until it finishes).
 export const uploadReferenced = (sql: SqlStorage, id: string): boolean =>
-  sql.exec('SELECT 1 FROM mailbox_api_draft_uploads WHERE upload_id = ? LIMIT 1', id).toArray().length !== 0;
+  sql.exec(`SELECT 1 FROM mailbox_api_draft_uploads WHERE upload_id = ?1
+    UNION ALL SELECT 1 FROM mailbox_send_uploads WHERE upload_id = ?1 LIMIT 1`, id).toArray().length !== 0;
 
-export const unusableSource = (sql: SqlStorage, kind: 'draft' | 'upload', id: string): boolean =>
+export const unusableSource = (sql: SqlStorage, kind: 'draft' | 'upload' | 'send', id: string): boolean =>
   sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ?', kind, id).toArray().length !== 0;
 
 export function wireUpload(row: UploadRow): Upload {

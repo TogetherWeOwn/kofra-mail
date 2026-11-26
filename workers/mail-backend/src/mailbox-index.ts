@@ -2,7 +2,8 @@ import { authVerdict, AUTH_VERDICT } from './auth-verdict.ts';
 import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
-import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
+import { MailJournal, type JournalEvent, type JournalRow, type SendRecipientKind, type SentCopy } from './mail-journal.ts';
+import { checkKinds, checkSendRecord, SEND_FAILURES, sendRow, sentCopyId, TERMINAL, validSendId } from './mailbox-send-store.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { JOURNAL_FLUSH } from './mailbox-timers.ts';
 import { IDEM_EXPIRY } from './mailbox-upload.ts';
@@ -450,9 +451,14 @@ export class MailboxIndex {
     const upload = this.sql.exec<{ id: string }>('SELECT id FROM mailbox_api_uploads WHERE holder = ? AND object_key = ?', holder, key).toArray().at(0);
     const draft = !upload && this.sql.exec<{ id: string }>(`SELECT d.id FROM drafts d WHERE d.holder = ? AND
       (d.raw_key = ? OR EXISTS (SELECT 1 FROM mailbox_api_draft_objects a WHERE a.draft_id = d.id AND a.object_key = ?))`, holder, key, key).toArray()[0];
-    const id = upload?.id ?? (draft ? draft.id : undefined);
+    // A pending send keeps referencing its draft revision and its objects (section 2.7).
+    const send = !upload && !draft && this.sql.exec<{ id: string }>(`SELECT s.id FROM mailbox_sends s WHERE s.holder = ?
+      AND (s.finish_pending = 1 OR s.state NOT IN ('sent', 'partial', 'failed', 'cancelled'))
+      AND (json_extract(s.record, '$.draft.rawKey') = ? OR EXISTS (SELECT 1 FROM json_each(s.record, '$.attachmentKeys') k WHERE k.value = ?))`,
+    holder, key, key).toArray()[0];
+    const id = upload?.id ?? (draft ? draft.id : send ? send.id : undefined);
     if (!id) return false;
-    const kind = upload ? 'upload' : 'draft';
+    const kind = upload ? 'upload' : draft ? 'draft' : 'send';
     if (!this.sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ? AND holder = ?', kind, id, holder).toArray().length) {
       this.commitEvents([{ type: 'api_source_lost', kind, id, holder }]);
     }
@@ -536,10 +542,10 @@ export class MailboxIndex {
         break;
       }
       case 'api_source_lost': {
-        if ((event.kind !== 'draft' && event.kind !== 'upload') || !bounded(event.id, 256) || !bounded(event.holder, 256)) {
+        if ((event.kind !== 'draft' && event.kind !== 'upload' && event.kind !== 'send') || !bounded(event.id, 256) || !bounded(event.holder, 256)) {
           throw new Error('Invalid unusable source');
         }
-        const table = event.kind === 'draft' ? 'drafts' : 'mailbox_api_uploads';
+        const table = event.kind === 'draft' ? 'drafts' : event.kind === 'send' ? 'mailbox_sends' : 'mailbox_api_uploads';
         const marked = this.sql.exec(`INSERT OR REPLACE INTO mailbox_unusable_sources(kind, id, holder)
           SELECT ?, id, holder FROM ${table} WHERE id = ? AND holder = ?`, event.kind, event.id, event.holder);
         // A concurrent delete must not cancel an alert that has yet to be accepted.
@@ -621,8 +627,116 @@ export class MailboxIndex {
         // Receipts and fingerprints survive deletion: stale queue retries cannot resurrect it.
         break;
       }
+      case 'send_create': {
+        const { send, result } = event;
+        checkSendRecord(send);
+        this.sql.exec(`INSERT INTO mailbox_sends (id, draft_id, state, created_at, undo_until, holder, record, created_seq, finish_pending)
+          VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 0)`, send.id, send.draftId, send.createdAt, send.undoUntil, send.draft.holder,
+        JSON.stringify(send), this.journal.revision() + 1);
+        for (const id of new Set(send.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);
+        // The send keeps the revision, its objects and their pending
+        // confirmations: deleting the draft row releases nothing (section 2.7).
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'draft' AND id = ?", send.draftId);
+        this.sql.exec('DELETE FROM drafts WHERE id = ?', send.draftId);
+        this.apply({ type: 'api_result', ...result });
+        break;
+      }
+      case 'send_undo': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        if (!row || row.state !== 'pending' || !bounded(event.revision, 64) || !count(event.updatedAt)) throw new Error('Invalid send undo');
+        const seq = this.journal.revision() + 1;
+        this.sql.exec(`UPDATE mailbox_sends SET state = 'cancelled', finish_pending = 1, terminal_seq = ? WHERE id = ?`, seq, row.id);
+        const { draft, attachmentKeys, uploadIds } = row.record;
+        this.sql.exec('INSERT INTO drafts VALUES (?, ?, ?)', row.draftId, draft.rawKey, draft.holder);
+        this.sql.exec('INSERT INTO mailbox_api_drafts VALUES (?, ?, ?)', row.draftId, event.revision, event.updatedAt);
+        for (const key of new Set(attachmentKeys)) this.sql.exec('INSERT INTO mailbox_api_draft_objects VALUES (?, ?)', row.draftId, key);
+        for (const id of new Set(uploadIds)) this.sql.exec('INSERT INTO mailbox_api_draft_uploads VALUES (?, ?)', row.draftId, id);
+        // The restored draft takes over the send's references.
+        this.sql.exec('DELETE FROM mailbox_send_uploads WHERE send_id = ?', row.id);
+        this.sql.exec(`INSERT OR REPLACE INTO mailbox_unusable_sources(kind, id, holder)
+          SELECT 'draft', ?, holder FROM mailbox_unusable_sources WHERE kind = 'send' AND id = ?`, row.draftId, row.id);
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'send' AND id = ?", row.id);
+        this.apply({ type: 'api_result', ...event.result });
+        break;
+      }
+      case 'send_release': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        if (!row || row.state !== 'pending') throw new Error('Invalid send release');
+        this.sql.exec(`UPDATE mailbox_sends SET state = 'releasing', release_seq = ? WHERE id = ?`, this.journal.revision() + 1, row.id);
+        break;
+      }
+      case 'send_queued': {
+        // Replay: the sent copy's non-derived row; reindex rebuilds the rest.
+        const message = { ...event.message, type: 'message' as const };
+        const { flags } = event.message;
+        delete (message as Partial<SentCopy>).flags;
+        validMessage(message);
+        if (!count(flags)) throw new Error('Invalid sent copy');
+        this.queuedState(event.id, message.id, event.kinds);
+        this.upsertThread(message.threadId, '', message.subjectKey, message.createdAt);
+        this.insertRestoredMessage(message, flags);
+        break;
+      }
+      case 'send_fail': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        if (!row || (row.state !== 'releasing' && row.state !== 'pending') || !SEND_FAILURES.includes(event.reason)) throw new Error('Invalid send failure');
+        checkKinds(event.kinds, row.record);
+        this.sql.exec(`UPDATE mailbox_sends SET state = 'failed', reason = ?, finish_pending = 1, terminal_seq = ? WHERE id = ?`,
+          event.reason, this.journal.revision() + 1, row.id);
+        this.sql.exec('DELETE FROM mailbox_send_recipients WHERE send_id = ?', row.id);
+        for (const [idx, kind] of event.kinds.entries()) {
+          this.sql.exec(`INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, 'failed', ?)`, row.id, idx, kind, event.reason);
+        }
+        break;
+      }
+      case 'send_finish': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        if (!row || !row.finishPending || !TERMINAL.includes(row.state)) throw new Error('Invalid send finish');
+        this.sql.exec('UPDATE mailbox_sends SET finish_pending = 0 WHERE id = ?', row.id);
+        // A cancelled send's restored draft keeps these holders; otherwise they
+        // go after this event is published, like any draft revision's.
+        if (row.state !== 'cancelled') {
+          const seq = this.journal.revision() + 1;
+          for (const key of new Set([row.record.draft.rawKey, ...row.record.attachmentKeys])) this.enqueueRelease(seq, key, row.holder);
+        }
+        this.sql.exec('DELETE FROM mailbox_send_uploads WHERE send_id = ?', row.id);
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'send' AND id = ?", row.id);
+        break;
+      }
+      case 'send_window': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        if (!row || row.state !== 'pending' || !count(event.undoUntil) || event.undoUntil < row.undoUntil) throw new Error('Invalid send window');
+        this.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', event.undoUntil, row.id);
+        break;
+      }
       default: throw new Error('Unexpected journal event');
     }
+  }
+
+  // Release step 4's state change, shared by the live commit and replay.
+  private queuedState(id: string, messageId: string, kinds: SendRecipientKind[]): void {
+    const row = validSendId(id) ? sendRow(this.sql, id) : undefined;
+    if (!row || row.state !== 'releasing' || messageId !== sentCopyId(row.id)) throw new Error('Invalid queued send');
+    checkKinds(kinds, row.record);
+    this.sql.exec(`UPDATE mailbox_sends SET state = 'queued', message_id = ?, queued_seq = ? WHERE id = ?`,
+      messageId, this.journal.revision() + 1, row.id);
+    this.sql.exec('DELETE FROM mailbox_send_recipients WHERE send_id = ?', row.id);
+    for (const [idx, kind] of kinds.entries()) this.sql.exec(`INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, 'pending', NULL)`, row.id, idx, kind);
+  }
+
+  // Release step 4 (section 2.4), inside the caller's transaction: the sent
+  // copy's index row, fully derived from its verified bytes, the ledger and
+  // `queued`, journalled as one event. Every attachment stays inside the
+  // stored message: the send's registration covers every holder it needs.
+  commitSentCopy(id: string, rawKey: string, createdAt: number, parsed: ParsedMail, flags: number, kinds: SendRecipientKind[]): void {
+    const messageId = sentCopyId(id);
+    if (this.sql.exec('SELECT 1 FROM messages WHERE id = ?', messageId).toArray().length) throw new Error('Sent copy already indexed');
+    const prepared: Prepared = { ...parsed, attachments: parsed.attachments.map(({ external: _external, ...attachment }) => ({ ...attachment, key: null })) };
+    const { type: _type, ...message } = this.insertMessage({ id: messageId, rawKey, createdAt }, prepared, 'none');
+    this.sql.exec('UPDATE messages SET flags = ? WHERE id = ?', flags, messageId);
+    const event: JournalEvent = { type: 'send_queued', id, message: { ...message, flags }, kinds };
+    this.queuedState(id, messageId, kinds);
+    this.journal.append(event);
   }
 
   // Every object a message holds, including attachment generations recorded
@@ -676,6 +790,13 @@ export class MailboxIndex {
           'uploadIds', json((SELECT json_group_array(upload_id) FROM mailbox_api_draft_uploads WHERE draft_id = d.id)))
         FROM drafts d LEFT JOIN mailbox_api_drafts a ON a.id = d.id;
         INSERT INTO backup_capture(kind, value)
+        SELECT 'send', json_object('id', id, 'draftId', draft_id, 'state', state, 'createdAt', created_at, 'undoUntil', undo_until,
+          'holder', holder, 'record', json(record), 'createdSeq', created_seq, 'releaseSeq', release_seq, 'queuedSeq', queued_seq,
+          'terminalSeq', terminal_seq, 'messageId', message_id, 'reason', reason, 'finishPending', finish_pending) FROM mailbox_sends;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'send_recipient', json_object('sendId', send_id, 'idx', idx, 'kind', kind, 'state', state, 'reason', reason)
+        FROM mailbox_send_recipients;
+        INSERT INTO backup_capture(kind, value)
         SELECT 'pending_release', json_object('seq', seq, 'key', object_key, 'holder', holder) FROM mailbox_pending_releases;
         INSERT INTO backup_capture(kind, value)
         SELECT 'pending_confirmation', json_object('seq', seq, 'key', object_key, 'holder', holder, 'publishedAt', published_at)
@@ -714,6 +835,8 @@ export class MailboxIndex {
       DELETE FROM receipts; DELETE FROM fingerprints; DELETE FROM labels; DELETE FROM drafts; DELETE FROM bayes;
       DELETE FROM mailbox_api_uploads; DELETE FROM mailbox_pending_releases; DELETE FROM mailbox_pending_confirmations;
       DELETE FROM mailbox_unusable_sources;
+      DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
+      DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
     this.sql.exec('DELETE FROM timers WHERE kind <> ?', JOURNAL_FLUSH);
@@ -745,6 +868,30 @@ export class MailboxIndex {
     } else if (row.kind === 'receipt' || row.kind === 'fingerprint') {
       if (!bounded(value, 2048)) throw new Error('Invalid snapshot key');
       this.sql.exec(`INSERT OR IGNORE INTO ${row.kind === 'receipt' ? 'receipts' : 'fingerprints'} VALUES (?)`, value);
+    } else if (row.kind === 'send') {
+      const send = value as { id: string; draftId: string; state: string; createdAt: number; undoUntil: number; holder: string;
+        record: Parameters<typeof checkSendRecord>[0]; createdSeq: number; releaseSeq: number | null; queuedSeq: number | null;
+        terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number };
+      checkSendRecord(send.record);
+      const seqs = [send.releaseSeq, send.queuedSeq, send.terminalSeq];
+      if (send.id !== send.record.id || send.draftId !== send.record.draftId || send.holder !== send.record.draft.holder ||
+          !['pending', 'releasing', 'queued', 'sending', 'delayed', ...TERMINAL].includes(send.state) || !count(send.createdSeq) ||
+          !count(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
+          (send.messageId !== null && send.messageId !== sentCopyId(send.id)) ||
+          (send.reason !== null && !SEND_FAILURES.includes(send.reason as never))) throw new Error('Invalid snapshot send');
+      this.sql.exec('INSERT INTO mailbox_sends VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, send.draftId, send.state,
+        send.createdAt, send.undoUntil, send.holder, JSON.stringify(send.record), send.createdSeq, send.releaseSeq, send.queuedSeq,
+        send.terminalSeq, send.messageId, send.reason, send.finishPending);
+      const finished = send.finishPending === 0 && TERMINAL.includes(send.state as never);
+      if (!finished && send.state !== 'cancelled') {
+        for (const id of new Set(send.record.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);
+      }
+    } else if (row.kind === 'send_recipient') {
+      const entry = value as { sendId: string; idx: number; kind: string; state: string; reason: string | null };
+      if (!validSendId(entry.sendId) || !count(entry.idx) || (entry.kind !== 'external' && entry.kind !== 'internal') ||
+          !['pending', 'attempting', 'sent', 'failed', 'suppressed'].includes(entry.state) ||
+          (entry.reason !== null && !bounded(entry.reason, 64))) throw new Error('Invalid snapshot send recipient');
+      this.sql.exec('INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, ?, ?)', entry.sendId, entry.idx, entry.kind, entry.state, entry.reason);
     } else if (row.kind === 'pending_release') {
       const entry = value as { seq: number; key: string; holder: string };
       this.enqueueRelease(entry.seq, entry.key, entry.holder);
