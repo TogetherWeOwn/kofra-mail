@@ -63,7 +63,7 @@ export class Mailbox extends DurableObject<Env> {
   private laneMoved: PromiseWithResolvers<void> | null = null;
   // One publish at a time per mailbox: the backup lane's and every barrier's
   // (docs/m3-outbound-plan.md, section 2.1), so two never race the manifest ETag.
-  private readonly publishes = new MailboxWork();
+  protected readonly publishes = new MailboxWork();
   // The send path's MIME builders (M3-3's port; M3-4 supplies the real one).
   protected sendMime: SendMimeBuilders = defaultMimeBuilders();
   protected timerHandlerBudgetMs = TIMER_HANDLER_BUDGET_MS;

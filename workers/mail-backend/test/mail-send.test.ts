@@ -708,3 +708,17 @@ test('the mailbox state moves when a publish makes a send visible', () => withSe
   assert.notEqual(shown.state, hidden.state);
   assert.equal((await mail.getSession()).state, shown.state);
 }));
+
+test('a barrier that times out after the publish holding the lane already covered its commit answers with the send', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.shortBarrier(2 * second);
+  await h.sends.holdPublishLane();
+  const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+  await until(async () => (await h.sends.ids()).length === 1, 'the send commit');
+  // The publish ahead covers the send, then keeps the lane past the barrier's budget.
+  await h.sends.coverHeld();
+  const response = await answer;
+  assert.equal(response.status, 202);
+  assert.equal((await response.json() as Send).state, 'pending');
+  await h.sends.releaseHeld();
+}));

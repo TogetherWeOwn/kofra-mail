@@ -9,7 +9,7 @@ import { kofra } from '../../src/kofra.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
 import { fingerprintOf, RESULT_TTL_MS } from '../../src/mailbox-api-idempotency.ts';
-import { SETTINGS_FLUSH_MS } from '../../src/mailbox-recovery.ts';
+import { MailboxRecovery, SETTINGS_FLUSH_MS, type ReadyLife } from '../../src/mailbox-recovery.ts';
 import { JOURNAL_FLUSH, JOURNAL_FLUSH_REF, TIMER_HANDLER_BUDGET_MS, TimerTable, type TimerKind, type TimerRun } from '../../src/mailbox-timers.ts';
 import { deltaRange, journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
@@ -113,7 +113,23 @@ export class HttpMailbox extends Mailbox {
   stallPublish() { this.stallPuts = Promise.withResolvers<void>(); this.stalledPut = Promise.withResolvers<void>(); }
   async publishStalled() { await this.stalledPut.promise; }
   resumePublish() { const stall = this.stallPuts; this.stallPuts = undefined; stall?.resolve(); }
-  shortenBarrier() { this.barrierBudgetMs = 200; }
+  shortenBarrier(ms: number) { this.barrierBudgetMs = ms; }
+  // Holds the publish lane as the backup lane does across snapshot work: on
+  // cover-now it publishes every committed delta, then keeps holding.
+  private held?: { cover: PromiseWithResolvers<void>; covered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> };
+  holdPublishLane(ws: string) {
+    const held = this.held = { cover: Promise.withResolvers<void>(), covered: Promise.withResolvers<void>(), release: Promise.withResolvers<void>() };
+    void this.publishes.run(async () => {
+      await held.cover.promise;
+      const index = this.fixtureIndex(ws);
+      await new MailboxRecovery(index, this.env.MAIL_STATE, this.ctx.id.toString())
+        .publish(index.lifecycle<ReadyLife>()!, Date.now(), async () => { throw new Error('Fixture publishes deltas only'); }, undefined, { deltasOnly: true });
+      held.covered.resolve();
+      await held.release.promise;
+    }).catch(error => held.covered.reject(error));
+  }
+  async coverHeld() { this.held!.cover.resolve(); await this.held!.covered.promise; }
+  releaseHeld() { this.held?.release.resolve(); this.held = undefined; }
   dropBuilder(dropped: boolean) { this.sendMime = fixtureBuilders(dropped ? 'dropped' : 'base'); }
   sendIds() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT id FROM mailbox_sends ORDER BY id').toArray().map(row => row.id); }
   publishFailure(failing: boolean) { this.failPublish = failing; }
@@ -508,7 +524,10 @@ export default {
           case '/__fixture/stall-publish': await box.stallPublish(); break;
           case '/__fixture/publish-stalled': await box.publishStalled(); break;
           case '/__fixture/resume-publish': await box.resumePublish(); break;
-          case '/__fixture/short-barrier': await box.shortenBarrier(); break;
+          case '/__fixture/short-barrier': await box.shortenBarrier(Number(await req.text()) || 200); break;
+          case '/__fixture/hold-publish-lane': await box.holdPublishLane(ws); break;
+          case '/__fixture/cover-held': await box.coverHeld(); break;
+          case '/__fixture/release-held': await box.releaseHeld(); break;
           case '/__fixture/drop-builder': await box.dropBuilder(await req.text() === 'true'); break;
           case '/__fixture/send-ids': return Response.json(await box.sendIds());
           case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
