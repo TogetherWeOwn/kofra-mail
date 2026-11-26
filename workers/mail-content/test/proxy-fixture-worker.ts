@@ -3,12 +3,13 @@
 // request deliberately carries cookies and forwarding headers; none may reach
 // the upstream. `/image` answers the way the `img` handler will: the rebuilt
 // headers and bytes, or 404 with an empty body, plus the rule 7 log line.
-import { checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageResponseHeaders } from '../src/proxy.ts';
+import { checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageInFlight, remoteImageResponseHeaders } from '../src/proxy.ts';
 import { config, origins } from './proxy-fixtures.ts';
 
 export default {
   async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (path === '/inflight') return Response.json(remoteImageInFlight());
     if (path === '/guard') {
       const { urls } = await request.json<{ urls: string[] }>();
       return Response.json(urls.map(url => {

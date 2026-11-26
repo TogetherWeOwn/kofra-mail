@@ -226,6 +226,28 @@ function mediaType(header: string | null): string | undefined {
 
 class Deadline extends Error {}
 
+const copyList = (list: unknown) => (Array.isArray(list) ? Object.freeze([...list]) : list) as readonly string[];
+
+/** A frozen copy of every field the proxy reads. Invalid shapes are kept as-is for validation to refuse. */
+function snapshotConfig(config: RemoteImageConfig): RemoteImageConfig {
+  const own = config.ownDomains;
+  return Object.freeze({
+    maxUrlBytes: config.maxUrlBytes,
+    remoteImageRedirects: config.remoteImageRedirects,
+    remoteImageBytes: config.remoteImageBytes,
+    remoteImageTimeoutMs: config.remoteImageTimeoutMs,
+    refusedZones: copyList(config.refusedZones),
+    remoteImageInFlightBytes: config.remoteImageInFlightBytes,
+    ownDomains: (own !== null && typeof own === 'object' ? Object.freeze({
+      suiteDomain: own.suiteDomain,
+      contentDomain: own.contentDomain,
+      storageDomains: copyList(own.storageDomains),
+      accountDomains: copyList(own.accountDomains),
+      workersDevSubdomain: own.workersDevSubdomain,
+    }) : own) as OwnDomains,
+  });
+}
+
 // Rule 4: concurrent body reads in one isolate share an in-flight budget.
 let inFlightBytes = 0;
 
@@ -246,9 +268,16 @@ function discard(response: Response) {
  * failure result, which the handler answers as 404 with an empty body.
  */
 export async function fetchRemoteImage(
-  input: string, config: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now,
+  input: string, given: RemoteImageConfig, fetchImpl: FetchLike = fetch, now: () => number = Date.now,
 ): Promise<RemoteImageResult> {
   const fail = (reason: RemoteImageFailure): RemoteImageResult => ({ ok: false, reason });
+  // Validate and use a request-local copy, so changing a shared config mid-request cannot move its limits.
+  let config: RemoteImageConfig;
+  try {
+    config = snapshotConfig(given);
+  } catch {
+    return fail('url');
+  }
   const first = checkRemoteImageUrl(input, config);
   if (!first.ok) return fail('url');
 
@@ -296,7 +325,8 @@ export async function fetchRemoteImage(
       const location = response.headers.get('location');
       discard(response);
       response = undefined;
-      if (hop >= config.remoteImageRedirects || location === null || rawAuthorityHasUserInfo(location, url)) return fail('redirect');
+      if (hop >= config.remoteImageRedirects || location === null || byteLength(location) > config.maxUrlBytes
+        || rawAuthorityHasUserInfo(location, url)) return fail('redirect');
       let next: URL;
       try {
         next = new URL(location, url);

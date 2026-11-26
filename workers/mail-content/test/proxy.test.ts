@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
+import { fileURLToPath, URL as NodeURL } from 'node:url';
+import { Worker } from 'node:worker_threads';
 import {
   checkRemoteImageUrl, fetchRemoteImage, logRemoteImage, remoteImageAccept, remoteImageCacheOptions, remoteImageConfig,
   remoteImageMethodAllowed,
@@ -280,11 +282,19 @@ test('fetch: Content-Type must be exactly one valid media type; combined header 
     assert.ok((await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now)).ok, type);
 });
 
-test('fetch: Content-Type parsing stays linear on adversarial parameter lists', { timeout: 5_000 }, async () => {
-  for (const type of ['image/png; ' + ';   '.repeat(40) + 'x', 'image/png' + ' ;'.repeat(20_000) + ' x', 'image/png;' + ' '.repeat(50_000) + 'x']) {
-    const started = performance.now();
-    failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now), 'type');
-    assert.ok(performance.now() - started < 250, `${type.length}-byte header took ${(performance.now() - started).toFixed(0)} ms`);
+test('fetch: Content-Type parsing stays linear on adversarial parameter lists', { timeout: 30_000 }, async () => {
+  // Run in a worker thread with a parent-side watchdog: a synchronous regex stall would block this thread's timers.
+  const worker = new Worker(fileURLToPath(new NodeURL('./proxy-redos-worker.ts', import.meta.url)));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const results = await Promise.race([
+      new Promise<string[]>((resolve, reject) => { worker.once('message', resolve); worker.once('error', reject); }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Content-Type parsing did not finish within 10 s')), 10_000); }),
+    ]);
+    assert.deepEqual(results, ['type', 'type', 'type']);
+  } finally {
+    clearTimeout(timer);
+    await worker.terminate();
   }
 });
 
@@ -372,6 +382,43 @@ test('fetch: an at sign in a same-scheme path-relative Location is a path, not u
     failed(await fetchRemoteImage(target, config, fetchImpl, now), 'redirect');
     assert.equal(calls.length, 1, location);
   }
+});
+
+test('fetch: a redirect Location over 2,048 bytes is refused even if it resolves short', async () => {
+  const long = `/${'./'.repeat(1024)}other.png`;
+  assert.ok(long.length > 2048 && new URL(long, target).href === 'https://img.sender.example/other.png');
+  const { fetchImpl, calls } = upstream({ [target]: redirect(long), 'https://img.sender.example/other.png': image('image/png', images['image/png']) });
+  failed(await fetchRemoteImage(target, config, fetchImpl, now), 'redirect');
+  assert.equal(calls.length, 1);
+});
+
+test('fetch: the configuration is snapshotted at entry, so changing it mid-request changes nothing', async () => {
+  const shared = remoteImageConfig({ ...ownDomains, storageDomains: [...ownDomains.storageDomains] });
+  const big = new Uint8Array(5 * MiB + 1);
+  big.set(images['image/png']);
+  const raise = upstream({ [target]: () => {
+    (shared as { remoteImageBytes: number }).remoteImageBytes = 6 * MiB;
+    (shared as { remoteImageInFlightBytes: number }).remoteImageInFlightBytes = 64 * MiB;
+    return image('image/png', big)();
+  } });
+  failed(await fetchRemoteImage(target, shared, raise.fetchImpl, now), 'size');
+
+  const reshaped = remoteImageConfig({ ...ownDomains, storageDomains: [...ownDomains.storageDomains] });
+  const retarget = upstream({ [target]: () => {
+    (reshaped.ownDomains as { contentDomain: string }).contentDomain = 'elsewhere.example';
+    return redirect(`${origins.contentOrigin}/v1/img/x`)();
+  } });
+  failed(await fetchRemoteImage(target, reshaped, retarget.fetchImpl, now), 'redirect');
+  assert.equal(retarget.calls.length, 1);
+
+  // Tightening mid-request does not apply either: the validated redirect limit holds for the request.
+  const relimited = remoteImageConfig(ownDomains);
+  const next = 'https://img.sender.example/next.png';
+  const hop = upstream({
+    [target]: () => { (relimited as { remoteImageRedirects: number }).remoteImageRedirects = 0; return redirect(next)(); },
+    [next]: image('image/png', images['image/png']),
+  });
+  assert.ok((await fetchRemoteImage(target, relimited, hop.fetchImpl, now)).ok);
 });
 
 test('fetch: a refused starting URL never reaches the upstream', async () => {

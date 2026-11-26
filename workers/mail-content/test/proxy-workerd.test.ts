@@ -226,13 +226,17 @@ test('workerd: separate requests in one isolate share the in-flight budget', { t
   });
   // No declared length, so each open read reserves the full 5 MiB; two fill a 10 MiB budget exactly.
   const budget = { inFlightBytes: 10 * 1024 * 1024 };
-  const waitForUpstreams = async (count: number) => {
+  // Wait for the Worker's own reservation count, not just for the upstream handlers to run.
+  const inFlight = async () => await (await mf.dispatchFetch('https://content.content-zone.example/inflight')).json() as number;
+  const waitForReserved = async (bytes: number) => {
     const until = Date.now() + 5_000;
-    while (releases.length < count) {
-      assert.ok(Date.now() < until, `only ${releases.length} of ${count} upstream reads started`);
+    let reserved = await inFlight();
+    while (reserved < bytes) {
+      assert.ok(Date.now() < until, `only ${reserved} of ${bytes} bytes were reserved`);
       await delay(10);
+      reserved = await inFlight();
     }
-    await delay(50);
+    assert.equal(reserved, bytes);
   };
   // Two rounds: if any reservation leaked from round one, round two cannot fit both reads.
   for (const round of [1, 2]) {
@@ -242,7 +246,7 @@ test('workerd: separate requests in one isolate share the in-flight budget', { t
     const first = serve(`https://held.sender.example/${round}a`, budget);
     const second = serve(`https://held.sender.example/${round}b`, budget);
     try {
-      await waitForUpstreams(2);
+      await waitForReserved(budget.inFlightBytes);
       assertEmpty404(await serve(`https://held.sender.example/${round}c`, budget));
     } finally {
       // Close every held stream and settle both dispatches even if setup failed.
@@ -251,5 +255,6 @@ test('workerd: separate requests in one isolate share the in-flight budget', { t
     }
     assert.equal((await first).status, 200, `round ${round}`);
     assert.equal((await second).status, 200, `round ${round}`);
+    assert.equal(await inFlight(), 0, `round ${round} left a reservation`);
   }
 });
