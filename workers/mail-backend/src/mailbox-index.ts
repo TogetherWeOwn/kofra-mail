@@ -452,8 +452,9 @@ export class MailboxIndex {
     const draft = !upload && this.sql.exec<{ id: string }>(`SELECT d.id FROM drafts d WHERE d.holder = ? AND
       (d.raw_key = ? OR EXISTS (SELECT 1 FROM mailbox_api_draft_objects a WHERE a.draft_id = d.id AND a.object_key = ?))`, holder, key, key).toArray()[0];
     // A pending send keeps referencing its draft revision and its objects (section 2.7).
+    // A cancelled send never reads them again; its restored draft, or a later send of it, holds the reference.
     const send = !upload && !draft && this.sql.exec<{ id: string }>(`SELECT s.id FROM mailbox_sends s WHERE s.holder = ?
-      AND (s.finish_pending = 1 OR s.state NOT IN ('sent', 'partial', 'failed', 'cancelled'))
+      AND s.state <> 'cancelled' AND (s.finish_pending = 1 OR s.state NOT IN ('sent', 'partial', 'failed'))
       AND (json_extract(s.record, '$.draft.rawKey') = ? OR EXISTS (SELECT 1 FROM json_each(s.record, '$.attachmentKeys') k WHERE k.value = ?))`,
     holder, key, key).toArray()[0];
     const id = upload?.id ?? (draft ? draft.id : send ? send.id : undefined);

@@ -58,8 +58,10 @@ test('release waits for the send to be published: no registration, PUT or enqueu
   assert.equal(response.status, 409);
   assert.equal(response.headers.get('retry-after'), '1');
   assert.equal(((await response.json()) as { code: string }).code, 'idempotency_in_progress');
-  const [pending] = (await mail.listSends({})).items;
-  assert.equal(pending.state, 'pending');
+  const [id] = await h.sends.ids();
+  assert.deepEqual((await mail.listSends({})).items, [], 'an unpublished send is not listed');
+  await rejects(mail.getSend(id), 'not_found');
+  const pending = { id };
   const puts = h.writes.length;
   await h.advance(UNDO);
   await h.advance(DRIVE_BACKOFF);
@@ -605,4 +607,76 @@ test('same-key replays wait only for their own publish, not for later unrelated 
   assert.equal(replay.id, pending.id);
   assert.deepEqual(await mail.undoSend(other.send.id, key('undo')), undone);
   await h.publishFailure(false);
+}));
+
+test('a barrier behind a stalled publish answers 409 within its budget, and the retry returns the send', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.shortBarrier();
+  await h.sends.stallPublish();
+  const lane = h.advance(minute); // The backup lane starts publishing the draft and stalls in its write.
+  await h.sends.publishStalled();
+  const started = Date.now();
+  const answer = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+  assert.equal(answer.status, 409);
+  assert.ok(Date.now() - started < 10 * second, 'the answer does not wait for the stalled write');
+  await h.sends.resumePublish();
+  await lane;
+  const sent = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+  assert.equal(sent.state, 'pending');
+  assert.equal((await mail.listSends({})).items.length, 1);
+}));
+
+test('an undo followed by a resend of the restored draft attributes a lost source to the resend, which fails with delivery_error', () => withSend(async (h, mail, from) => {
+  await h.confirmFailure(true);
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.advance(minute);
+  const [confirmation] = await h.confirmations();
+  const first = await mail.sendDraft(draft.id, { ...key('send-a'), ifMatch: draft.revision });
+  const restored = await mail.undoSend(first.id, key('undo'));
+  const resend = await mail.sendDraft(restored.id, { ...key('send-b'), ifMatch: restored.revision });
+  h.objects.delete(objectPath(confirmation.object_key));
+  await h.sends.forceLost(confirmation.holder);
+  await h.confirmFailure(false);
+  await h.forceSnapshot();
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(first.id)).state, 'cancelled');
+  const failed = await mail.getSend(resend.id);
+  assert.equal(failed.state, 'failed');
+  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+}));
+
+test('the stand-in builder keeps every stored header line under 998 octets', () => withSend(async (h, mail, from) => {
+  const to = Array.from({ length: 20 }, (_, i) => ({ email: `person${i}@example.net`, name: `${'Långt namn '.repeat(20)}${i}` }));
+  const { send: pending } = await send(mail, from, 'long', { subject: 'S'.repeat(998), to });
+  await h.advance(UNDO);
+  const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+  const lines = text.split('\r\n');
+  assert.ok(lines.every(line => new TextEncoder().encode(line).byteLength <= 998), 'no line over 998 octets');
+  const [copy] = await sentCopies(mail);
+  assert.equal(copy.subject, 'S'.repeat(998));
+  assert.equal(copy.to.length, 20);
+  assert.equal(copy.to[19].name, `${'Långt namn '.repeat(20)}19`);
+}));
+
+test('a send reports pending until its release commit is published', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await h.sends.crashAfter('released');
+  await h.advance(UNDO);
+  assert.equal((await h.sends.row(pending.id))?.state, 'releasing');
+  assert.equal((await mail.getSend(pending.id)).state, 'pending', 'a restore could still rewind the release');
+  await h.advance(minute);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+}));
+
+test('a deploy without the frozen builder version holds the send as an invariant breach instead of failing it', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await h.sends.dropBuilder(true);
+  await h.advance(UNDO);
+  assert.equal((await h.sends.row(pending.id))?.state, 'releasing');
+  assert.equal(await h.sends.registration(pending.id), null, 'nothing is registered or stored');
+  await h.advance(minute);
+  assert.ok((await h.alerts()).includes('mail:send_invariant'));
+  await h.sends.dropBuilder(false);
+  await h.advance(DRIVE_BACKOFF);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
 }));

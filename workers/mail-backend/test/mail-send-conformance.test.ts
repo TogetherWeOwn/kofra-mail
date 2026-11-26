@@ -13,12 +13,19 @@ test('conformance cases 13, 14, 22, 23 and 23a pass against the backend with the
   const file = fileURLToPath(new URL('./fixtures/send-conformance.ts', import.meta.url));
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
+  // The child has its own deadline, inside this test's, and is killed whatever happens.
   const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
-    ...owned.map(id => `--test-name-pattern=^${id.replace('.', '\\.')}\\. `), file], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    ...owned.map(id => `--test-name-pattern=^${id.replace('.', '\\.')}\\. `), file],
+  { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 540_000, killSignal: 'SIGKILL' });
   let output = '';
   child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk; });
   child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk; });
-  const code = await new Promise<number | null>(resolve => child.on('close', resolve));
+  let code: number | null;
+  try {
+    code = await new Promise<number | null>((resolve, reject) => { child.on('error', reject); child.on('close', resolve); });
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  }
   const passed = [...output.matchAll(/^\s+ok \d+ - (\d+a?)\. /gm)].map(match => match[1]).sort();
   const failed = [...output.matchAll(/^\s+not ok \d+ - (.+)$/gm)].map(match => match[1]);
   assert.deepEqual(failed, [], output);

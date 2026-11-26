@@ -166,3 +166,14 @@ test('registerSend and releaseSend refuse malformed input before any write', asy
   assert.match(await ledger.failure('releaseSend' as never, 'mailbox-a', SEND, 'some', 100), /Invalid sweeper reference/);
   assert.equal(await ledger.registration('mailbox-a', SEND), 'null');
 });
+
+test('the second delete is a day after the first DELETE was confirmed, not after the sweep started', async () => {
+  const ledger = fresh();
+  const { old, due } = await unheld(ledger, digest('a'));
+  await ledger.sweepConfirmedLate(due, 5 * 60_000);
+  assert.equal(await ledger.deletedAt(old), due + 5 * 60_000);
+  assert.equal((await generation(ledger, old))?.retry_at, due + 5 * 60_000 + DAY);
+  assert.deepEqual(await ledger.sweep(due + DAY), [], 'not yet a day after the confirmation');
+  assert.deepEqual(await ledger.sweep(due + 5 * 60_000 + DAY), [old]);
+  assert.equal(await generation(ledger, old), null);
+});

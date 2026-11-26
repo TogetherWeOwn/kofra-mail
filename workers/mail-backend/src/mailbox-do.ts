@@ -70,6 +70,7 @@ export class Mailbox extends DurableObject<Env> {
   protected timerRunBudgetMs = TIMER_RUN_BUDGET_MS;
   protected timerRetryMs = TIMER_RETRY_MS;
   protected holderIoBudgetMs = PUBLISH_BUDGET_MS;
+  protected barrierBudgetMs = PUBLISH_BUDGET_MS;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -169,10 +170,14 @@ export class Mailbox extends DurableObject<Env> {
   // journal outside the lane, and deliveries must not wait on R2.
   protected async publishThrough(seq: number): Promise<boolean> {
     const journal = () => this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
+    // An answer never waits past this: a stalled publish ahead of the barrier
+    // ends the wait (409 for the API, a later drive run for the handler), and
+    // the publish it joined finishes on its own.
+    const deadline = Date.now() + this.barrierBudgetMs;
     for (let round = 0; round < 64 && journal() < seq; round++) {
       let progressed = false;
       try {
-        await this.publishes.run(async () => {
+        const done = await this.beforeDeadline(deadline, () => this.publishes.run(async () => {
           if (journal() >= seq) { progressed = true; return; }
           const life = storedLifecycle<Lifecycle>(this.ctx.storage);
           if (life?.state !== 'ready') return;
@@ -181,7 +186,9 @@ export class Mailbox extends DurableObject<Env> {
           await this.recovery(index).publish(life, Date.now(), async () => { throw new Error('Barrier publishes deltas only'); }, undefined,
             { deltasOnly: true });
           progressed = journal() > before;
-        });
+          return true;
+        }));
+        if (!done) return false;
       } catch { return false; }
       if (!progressed) break;
     }

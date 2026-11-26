@@ -60,6 +60,10 @@ export class ProvisionalLedger extends DurableObject {
     await this.ledger().sweep(now, async key => { removed.push(key); this.stored.delete(key); });
     return removed.sort();
   }
+  // A sweep whose DELETE is confirmed `delay` after the sweep started.
+  async sweepConfirmedLate(now: number, delay: number) {
+    await this.ledger().sweep(now, async () => {}, () => now + delay);
+  }
   async deletedAt(key: string) {
     this.ledger();
     return this.ctx.storage.sql.exec<{ deleted_at: number | null }>('SELECT deleted_at FROM generations WHERE key = ?', key).toArray()[0]?.deleted_at ?? null;

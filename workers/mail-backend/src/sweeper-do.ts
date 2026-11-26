@@ -103,7 +103,7 @@ export class Sweeper extends DurableObject<Env> {
     if (!workspace) return;
     const now = Date.now();
     await this.alarms.run(() => this.ctx.storage.setAlarm(now + 60_000));
-    await ledger.sweep(now, kofra(this.env, workspace).deleteGeneration);
+    await ledger.sweep(now, kofra(this.env, workspace).deleteGeneration, Date.now);
     await this.alarms.run(async () => {
       const next = ledger.nextSweepAt();
       if (next === null) await this.ctx.storage.deleteAlarm();

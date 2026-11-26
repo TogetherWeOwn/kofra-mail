@@ -358,7 +358,8 @@ export class SweepLedger {
     }
   }
 
-  async sweep(now: number, remove: (key: string) => Promise<void>): Promise<void> {
+  // `clock` reads the time a DELETE was confirmed; the second delete is a day after that, not after `now`.
+  async sweep(now: number, remove: (key: string) => Promise<void>, clock: () => number = () => now): Promise<void> {
     if (!Number.isSafeInteger(now) || now < 0) throw new Error('Invalid sweeper time');
     const work = this.storage.transactionSync(() => {
       this.expire(now);
@@ -379,6 +380,7 @@ export class SweepLedger {
     await Promise.all(work.map(async ({ key }) => {
       try { await remove(key); }
       catch { return; } // Unknown outcome; keep the retired row for its next attempt.
+      const confirmed = Math.max(now, clock());
       this.storage.transactionSync(() => {
         const row = this.sql.exec<{ deleted_at: number | null }>('SELECT deleted_at FROM generations WHERE key = ? AND retry_at IS NOT NULL', key)
           .toArray()[0];
@@ -386,7 +388,7 @@ export class SweepLedger {
         if (row.deleted_at === null) {
           // The first confirmed delete: delete once more a day later, for an
           // object that a late PUT may recreate meanwhile. The row stays retired.
-          this.sql.exec('UPDATE generations SET deleted_at = ?, retry_at = ?, attempts = 0 WHERE key = ?', now, now + SECOND_DELETE_MS, key);
+          this.sql.exec('UPDATE generations SET deleted_at = ?, retry_at = ?, attempts = 0 WHERE key = ?', confirmed, confirmed + SECOND_DELETE_MS, key);
           return;
         }
         // A retired generation has no counted holders; drop the rows that remain first.

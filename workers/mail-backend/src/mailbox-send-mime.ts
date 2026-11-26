@@ -6,8 +6,8 @@
 //
 // The default builder here is a deterministic stand-in until the MIME builder
 // package (M3-4) replaces it. It writes plain RFC 5322 with base64 parts and
-// never a Bcc header; it does not trim threading headers or fold long lines,
-// which are the real builder's job.
+// never a Bcc header, and folds every header line well under 998 octets; it
+// does not trim threading headers, which is the real builder's job.
 
 export type SendMimeAddress = { email: string; name?: string };
 export type SendMimeAttachment = { name: string; type: string; size: number };
@@ -63,10 +63,24 @@ function base64Lines(data: Uint8Array): string {
   return out;
 }
 const ascii = (text: string) => /^[\x20-\x7e]*$/.test(text);
-const word = (text: string) => ascii(text) ? text : `=?UTF-8?B?${base64Lines(encoder.encode(text)).replaceAll(CRLF, '')}?=`;
-const quoted = (name: string) => ascii(name) ? `"${name.replace(/["\\]/g, '\\$&')}"` : word(name);
+// Folding whitespace: every header line stays far below the 998-octet limit.
+const FOLD = `${CRLF} `;
+// RFC 2047 encoded words of at most 45 UTF-8 bytes each (60 base64
+// characters), split at code points and folded one word per line.
+function encodedWords(text: string): string {
+  const words: string[] = [];
+  let chunk = '';
+  for (const character of text) {
+    if (chunk && bytes(chunk + character) > 45) { words.push(chunk); chunk = ''; }
+    chunk += character;
+  }
+  if (chunk || !words.length) words.push(chunk);
+  return words.map(word => `=?UTF-8?B?${base64Lines(encoder.encode(word)).replaceAll(CRLF, '')}?=`).join(FOLD);
+}
+const word = (text: string) => ascii(text) && text.length <= 900 ? text : encodedWords(text);
+const quoted = (name: string) => ascii(name) ? `"${name.replace(/["\\]/g, '\\$&')}"` : encodedWords(name);
 const mailbox = ({ email, name }: SendMimeAddress) => name ? `${quoted(name)} <${email}>` : email;
-const list = (addresses: SendMimeAddress[]) => addresses.map(mailbox).join(', ');
+const list = (addresses: SendMimeAddress[]) => addresses.map(mailbox).join(`,${FOLD}`);
 const filename = (name: string) => `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
 
 type Segment = string | { part: number; size: number };
@@ -81,7 +95,7 @@ function layout(message: SendMimeMessage): Segment[] {
     `Date: ${new Date(message.date).toUTCString().replace('GMT', '+0000')}`,
     `Message-ID: ${message.messageId}`,
     ...(message.inReplyTo ? [`In-Reply-To: ${message.inReplyTo}`] : []),
-    ...(message.references ? [`References: ${message.references}`] : []),
+    ...(message.references ? [`References: ${message.references.split(' ').join(FOLD)}`] : []),
     'MIME-Version: 1.0',
   ];
   const text = base64Lines(encoder.encode(message.text));

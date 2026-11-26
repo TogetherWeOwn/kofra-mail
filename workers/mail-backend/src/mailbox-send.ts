@@ -142,9 +142,13 @@ export class SendApi {
     return stored.body ?? {};
   }
 
-  private getSendBody(id: string): Send {
+  // `published`: an API read sees a send only once its sendDraft commit is
+  // published; a replay waits for that publish before it answers.
+  private getSendBody(id: string, published = true): Send {
     const row = need(sendRow(this.sql, id));
-    return wireSend(row, ledger(this.sql, id), flushed(this.sql), this.clock());
+    const through = flushed(this.sql);
+    if (published && row.createdSeq > through) return fail('not_found');
+    return wireSend(row, ledger(this.sql, id), through, this.clock());
   }
 
   async sendDraft(params: Record<string, string>, options: SendOptions): Promise<SendCommit> {
@@ -356,6 +360,8 @@ export class SendDriver {
     const kinds = await this.classify(start.scope, record);
     let failure: SendFailure | null = null;
     let draft: DraftObject | undefined;
+    // A deploy that dropped the frozen builder version is our invariant breach, never the sender's failure.
+    if (!ports.mime.get(record.builderVersion)) return this.breach(start);
     if (!await this.senderValid(start.scope, record)) failure = 'invalid_sender';
     // A lost source is never read: its object may be gone.
     else if (await this.sourceLost(record)) failure = 'delivery_error';

@@ -41,11 +41,12 @@ export function sendByMessage(sql: SqlStorage, messageId: string): SendRow | und
 }
 
 // Active means reported as pending, sending or delayed; an unpublished terminal state still reports as active.
+// A send is listed only once its sendDraft commit is published.
 export function sendPage(sql: SqlStorage, active: boolean, flushed: number, limit: number, position?: [number, string]): SendRow[] {
   const filter = active ? `AND (state IN ('pending', 'releasing', 'queued', 'sending', 'delayed') OR terminal_seq > ?)` : '';
   const where = position ? 'AND (created_at < ? OR (created_at = ? AND id < ?))' : '';
-  const values: SqlStorageValue[] = [...(active ? [flushed] : []), ...(position ? [position[0], position[0], position[1]] : [])];
-  return sql.exec<StoredSendRow>(`SELECT ${columns} FROM mailbox_sends WHERE 1 ${filter} ${where}
+  const values: SqlStorageValue[] = [flushed, ...(active ? [flushed] : []), ...(position ? [position[0], position[0], position[1]] : [])];
+  return sql.exec<StoredSendRow>(`SELECT ${columns} FROM mailbox_sends WHERE created_seq <= ? ${filter} ${where}
     ORDER BY created_at DESC, id DESC LIMIT ?`, ...values, limit).toArray().map(decode);
 }
 
@@ -56,6 +57,7 @@ export function ledger(sql: SqlStorage, id: string): LedgerRow[] {
 // What a client may see: a state reaches a report only after the publish that
 // covers it (section 2.1), so a restore can never take back a reported state.
 export function visibleState(row: SendRow, flushed: number): SendRowState {
+  if (row.releaseSeq !== null && row.releaseSeq > flushed) return 'pending';
   if (row.terminalSeq !== null && row.terminalSeq > flushed) return row.state === 'cancelled' ? 'pending' : 'releasing';
   return row.state;
 }

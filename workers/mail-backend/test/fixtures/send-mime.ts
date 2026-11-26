@@ -32,6 +32,8 @@ const second: SendMimeBuilder = {
   },
 };
 
-export function fixtureBuilders(bumped: boolean): SendMimeBuilders {
-  return bumped ? mimeBuilders(recording(stubMimeBuilder), recording(second)) : mimeBuilders(recording(stubMimeBuilder));
+// `dropped` is a deploy that no longer has version 1.
+export function fixtureBuilders(mode: 'base' | 'bumped' | 'dropped'): SendMimeBuilders {
+  if (mode === 'dropped') return mimeBuilders(recording(second));
+  return mode === 'bumped' ? mimeBuilders(recording(stubMimeBuilder), recording(second)) : mimeBuilders(recording(stubMimeBuilder));
 }

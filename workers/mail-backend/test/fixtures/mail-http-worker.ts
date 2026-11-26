@@ -65,6 +65,8 @@ export class HttpMailbox extends Mailbox {
   private failAlert = false;
   private realtimeHolderClock = false;
   private crashStep?: SendStep;
+  private stallPuts?: PromiseWithResolvers<void>;
+  private stalledPut = Promise.withResolvers<void>();
   private failEpilogue = false;
   private manualAlarm = false;
   private readonly emittedAlerts: string[] = [];
@@ -78,8 +80,10 @@ export class HttpMailbox extends Mailbox {
         if (range && range.from > mailbox.blockedDeltaAfter!) throw new Error('Fixture later delta unreadable');
         return target.get(key, options);
       };
-      if (property === 'put') return (...args: Parameters<R2Bucket['put']>) => {
+      if (property === 'put') return async (...args: Parameters<R2Bucket['put']>) => {
         if (mailbox.failPublish) throw new Error('Fixture publish failure');
+        const stall = mailbox.stallPuts;
+        if (stall) { mailbox.stalledPut.resolve(); await stall.promise; }
         return target.put(...args);
       };
       return typeof value === 'function' ? value.bind(target) : value;
@@ -104,8 +108,14 @@ export class HttpMailbox extends Mailbox {
     let bumped = false;
     try { bumped = ctx.storage.sql.exec('SELECT 1 FROM fixture_builder').toArray().length > 0; }
     catch { /* never bumped */ }
-    this.sendMime = fixtureBuilders(bumped);
+    this.sendMime = fixtureBuilders(bumped ? 'bumped' : 'base');
   }
+  stallPublish() { this.stallPuts = Promise.withResolvers<void>(); this.stalledPut = Promise.withResolvers<void>(); }
+  async publishStalled() { await this.stalledPut.promise; }
+  resumePublish() { const stall = this.stallPuts; this.stallPuts = undefined; stall?.resolve(); }
+  shortenBarrier() { this.barrierBudgetMs = 200; }
+  dropBuilder(dropped: boolean) { this.sendMime = fixtureBuilders(dropped ? 'dropped' : 'base'); }
+  sendIds() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT id FROM mailbox_sends ORDER BY id').toArray().map(row => row.id); }
   publishFailure(failing: boolean) { this.failPublish = failing; }
   private recorded(table: string): unknown[] {
     try { return this.ctx.storage.sql.exec<{ body: string }>(`SELECT body FROM ${table} ORDER BY n`).toArray().map(row => JSON.parse(row.body)); }
@@ -118,7 +128,7 @@ export class HttpMailbox extends Mailbox {
   bumpBuilder() {
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_builder (id INTEGER PRIMARY KEY)');
     this.ctx.storage.sql.exec('INSERT OR IGNORE INTO fixture_builder VALUES (1)');
-    this.sendMime = fixtureBuilders(true);
+    this.sendMime = fixtureBuilders('bumped');
   }
   mimeBuilds() { return builds; }
   shortenHandlerBudget() { this.timerHandlerBudgetMs = 25; this.realtimeHolderClock = true; }
@@ -495,6 +505,12 @@ export default {
           case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
           case '/__fixture/bump-builder': await box.bumpBuilder(); break;
           case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/stall-publish': await box.stallPublish(); break;
+          case '/__fixture/publish-stalled': await box.publishStalled(); break;
+          case '/__fixture/resume-publish': await box.resumePublish(); break;
+          case '/__fixture/short-barrier': await box.shortenBarrier(); break;
+          case '/__fixture/drop-builder': await box.dropBuilder(await req.text() === 'true'); break;
+          case '/__fixture/send-ids': return Response.json(await box.sendIds());
           case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
           case '/__fixture/send-row': return Response.json(await box.sendRow(await req.text()));
           case '/__fixture/lifecycle': return Response.json(await box.lifecycle());

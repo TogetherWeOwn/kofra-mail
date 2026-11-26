@@ -258,6 +258,12 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       generation: (key: string) => readControl<{ key: string; holder_count: number; retry_at: number | null; deleted_at: number | null } | null>('generation', key),
       activateAlias: (address: string) => controlAction('activate-alias', address),
       forceLost: (holder: string) => controlAction('force-lost', holder),
+      stallPublish: () => controlAction('stall-publish'),
+      publishStalled: () => controlAction('publish-stalled'),
+      resumePublish: () => controlAction('resume-publish'),
+      shortBarrier: () => controlAction('short-barrier'),
+      dropBuilder: (dropped: boolean) => controlAction('drop-builder', String(dropped)),
+      ids: () => readControl<string[]>('send-ids'),
       releaseFailure: (failing: boolean) => controlAction('send-release-failure', String(failing)),
     };
     if (draftsUploads) inspectPut = async (pathname) => {
