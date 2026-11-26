@@ -215,28 +215,36 @@ test('workerd: a buffered image becomes a response with exactly the rebuilt head
   assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(whole)));
 });
 
-test('workerd: separate requests in one isolate share the in-flight budget', async () => {
+test('workerd: separate requests in one isolate share the in-flight budget', { timeout: 20_000 }, async () => {
   routes.clear();
   const releases: Array<() => void> = [];
-  for (const name of ['a', 'b', 'c'])
-    routes.set(`https://held.sender.example/${name}`, () => {
-      let controller!: ReadableStreamDefaultController<Uint8Array>;
-      const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; c.enqueue(images['image/png'].slice()); } });
-      releases.push(() => controller.close());
-      return new Response(body, { headers: { 'content-type': 'image/png' } });
-    });
-  // No declared length, so each open read holds the full 5 MiB; a 12 MiB budget fits two.
-  const budget = { inFlightBytes: 12 * 1024 * 1024 };
-  const first = serve('https://held.sender.example/a', budget);
-  const second = serve('https://held.sender.example/b', budget);
-  while (releases.length < 2) await delay(10);
-  await delay(50);
-  const third = await serve('https://held.sender.example/c', budget);
-  assertEmpty404(third);
-  for (const release of releases.splice(0)) release();
-  assert.equal((await first).status, 200);
-  assert.equal((await second).status, 200);
-  // Both reservations were released: a new read fits again.
-  routes.set('https://held.sender.example/d', () => new Response(images['image/png'], { headers: { 'content-type': 'image/png' } }));
-  assert.equal((await serve('https://held.sender.example/d', budget)).status, 200);
+  const held = (path: string) => routes.set(`https://held.sender.example/${path}`, () => {
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; c.enqueue(images['image/png'].slice()); } });
+    releases.push(() => controller.close());
+    return new Response(body, { headers: { 'content-type': 'image/png' } });
+  });
+  // No declared length, so each open read reserves the full 5 MiB; two fill a 10 MiB budget exactly.
+  const budget = { inFlightBytes: 10 * 1024 * 1024 };
+  const waitForUpstreams = async (count: number) => {
+    const until = Date.now() + 5_000;
+    while (releases.length < count) {
+      assert.ok(Date.now() < until, `only ${releases.length} of ${count} upstream reads started`);
+      await delay(10);
+    }
+    await delay(50);
+  };
+  // Two rounds: if any reservation leaked from round one, round two cannot fit both reads.
+  for (const round of [1, 2]) {
+    held(`${round}a`);
+    held(`${round}b`);
+    held(`${round}c`);
+    const first = serve(`https://held.sender.example/${round}a`, budget);
+    const second = serve(`https://held.sender.example/${round}b`, budget);
+    await waitForUpstreams(2);
+    assertEmpty404(await serve(`https://held.sender.example/${round}c`, budget));
+    for (const release of releases.splice(0)) release();
+    assert.equal((await first).status, 200, `round ${round}`);
+    assert.equal((await second).status, 200, `round ${round}`);
+  }
 });
