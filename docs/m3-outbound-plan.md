@@ -270,20 +270,22 @@ The sweeper never selects a generation that has a holder, so such an object woul
 
 ### 2.8 Request rate limits
 
-Contract section 5 runs rate limits in the first step of every request, before the idempotency lookup, and answers 429 `rate_limited` with `Retry-After` and `retryAfterSeconds`. Nothing in M1 to M3 enforces them yet, so **package R1 must merge before `MAIL_SEND_ENABLED` or `MAIL_DRAFT_UPLOADS_ENABLED` is turned on anywhere**.
+Contract section 5 runs rate limits in the first step of every request, before the idempotency lookup, and answers 429 `rate_limited` with `Retry-After` and `retryAfterSeconds`. Nothing in M1 to M3 enforces them yet, so **neither `MAIL_SEND_ENABLED` nor `MAIL_DRAFT_UPLOADS_ENABLED` is turned on in any environment until package R1 has merged and that environment's limiter bindings are configured and verified** (a request over each bucket answers 429 there). Merging R1 alone is not enough.
 
-- **Where:** in `mail-web`, after authentication, CSRF, `access`, re-authentication and feature availability, and before the missing-header check (428), the idempotency lookup and any body read. So a rate-limited request, including a same-key retry of a committed request, answers 429 and never replays a stored result or reserves a key.
-- **Mechanism:** the Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration), one namespace per bucket. Its counters are per location and approximate, which is enough for abuse control. It is not a quota: the account quota gate (M3-6) stays the authority for sends. R1 checks the binding's current pricing and records it in its PR before adding it; it expects no new spend.
+- **Where:** in `mail-web`, after authentication, CSRF, `access`, re-authentication and every feature-availability check (501), including the content-URL dependency that the gateway checks today only after mailbox dispatch, which R1 moves ahead of the limiter. The limiter runs before the missing-header check (428), the idempotency lookup and any body read. So a rate-limited request, including a same-key retry of a committed request, answers 429 and never replays a stored result or reserves a key.
+- **Mechanism:** the Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration), one namespace per bucket, with a 60 s period. Bucket keys come only from the verified session (the account user id, the mailbox and workspace ids the gateway resolved), never from request input. A missing binding fails closed: the route answers 503, never runs unlimited. Its counters are per location and approximate, which is enough for abuse control. It is not a quota: the account quota gate (M3-6) stays the authority for sends. R1 checks the binding's current pricing and records it in its PR before adding it; it expects no new spend.
 - **Buckets** (configuration, never code constants; the starting values below are sized from the M2 UI, where autosave writes about once every 5 s per open draft):
 
 | Bucket | Key | Starting limit |
 |---|---|---|
 | Reads (`GET`) | account user | 600 per 60 s |
 | Writes (other methods, except below) | account user | 120 per 60 s |
-| Uploads (`createUpload`) | account user | 30 per 60 s |
-| Sends and undo (`sendDraft`, `undoSend`) | mailbox | 20 per 60 s |
+| Uploads (`createUpload`) | account user | 64 per 60 s (two full 32-attachment drafts) |
+| Sends (`sendDraft`) | mailbox | 20 per 60 s |
+| Undo (`undoSend`) | mailbox | 60 per 60 s, a bucket of its own that sends never consume |
 | Admin writes | workspace | 60 per 60 s |
 
+- **Undo is never starved by sends:** its separate bucket means the last admitted send can always be undone within its window.
 - **Answer:** 429 `rate_limited` with `Retry-After` and `retryAfterSeconds` equal to the bucket's period, the usual problem body, and no state change. A 429 is never stored as an idempotency result.
 - **Logs:** the bucket name and a count only, never the user, mailbox or address.
 
@@ -292,7 +294,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 | # | Package | Builder | Tier | Depends on | Size (est) |
 |---|---|---|---|---|---|
 | M3-0 | Measurements on the approved test route | Sol | T1 | an approved test route | 0.5 to 1 day |
-| R1 | Request rate limits (section 2.8); gates enabling any M3 flag | Sol, Opus review | T1 | M3-2 | 0.5 day |
+| R1 | Request rate limits (section 2.8); gates enabling any M3 flag | Sol, Opus review | T0 | M3-2 | 0.5 to 1 day |
 | M3-1 | Timers table and one multiplexed alarm | **Opus** | T0 | inbound mailbox PRs merged | 0.5 to 1 day |
 | P0 | Provisional holders in the sweeper (section 2.7) | **Opus** | T0 | none | 0.5 to 1 day |
 | M3-2 | Drafts, uploads and idempotency in the mailbox | Sol, Opus review | T0 | M3-1, P0 | 1 to 1.5 days |
@@ -312,10 +314,14 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 ### R1 Request rate limits (Sol, Opus review)
 
-**Change:** section 2.8 in `mail-web`: the buckets as configuration, the limiter call in the first step of the request, and the 429 answer.
+**Change:** section 2.8 in `mail-web`: the buckets as configuration, the content-dependency availability check moved ahead of the limiter, the limiter call in the first step of the request, fail-closed on a missing binding, and the 429 answer.
 
 **Acceptance:**
-- With a fake limiter binding in local workerd, each bucket answers 429 with `Retry-After` and `retryAfterSeconds` once its limit is reached, and other users' and mailboxes' buckets are unaffected.
+- With a fake limiter binding in local workerd, each bucket answers 429 `rate_limited` once its limit is reached, with `Retry-After` and `retryAfterSeconds` both equal to the period, and other users', mailboxes' and workspaces' buckets are unaffected.
+- **Order:** authentication, CSRF, access, re-authentication and availability failures (501, including the content dependency) never call the limiter; a denied request with missing headers answers 429, not 428; denied `createDraft` and raw `createUpload` requests read no body and look up no key.
+- **Undo under saturation:** with the send bucket exhausted, the last admitted send is undone in time and nothing is delivered.
+- A 32-attachment compose with the limiter on uploads every file.
+- A missing binding answers 503 and admits nothing.
 - A same-key retry of a committed `createDraft` that is rate-limited answers 429 and does not replay; after the period it replays the stored result.
 - A rate-limited request reads no body, reserves no key and writes nothing.
 - A 429 is never stored as an idempotency result.
@@ -627,7 +633,7 @@ M3-10 waits for groups.
 
 ## 5. Security review checklist (Opus, high effort)
 
-The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at least:
+The security review of R1, M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at least:
 
 1. **Send-as:**
    - `from` cannot be spoofed through a display name, an encoded word or a header.
@@ -646,8 +652,9 @@ The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at le
    - **Dispatch fencing:** every remote wait after Mark finishes before `authorizeDispatch`; no `send()` starts after its authorization deadline; no deadline is later than the published `lease_until`; a claim never sends to a recipient `attempting` under an unexpired lease of any epoch.
    - **Internal handoffs:** every holder is taken before the row it protects, in the sweeper, and handoff and child-delivery holders are tombstoned on release; child deliveries are single-mailbox rows that replay after a recipient's restore; a send finishes only after its handoff row exists; the send's own holders, its raw holder included, are released only then, and the sent copy's index holder only with its index row. The handoff's owner and send-as check is a condition of its insert, in the same commit. The destination mailbox is resolved at delivery from the current directory, never from a mapping journalled at release.
 5. **Quota and cost:** one mailbox cannot exhaust the account's daily quota beyond the gate, and the monthly ceiling cannot be passed by concurrency. A retry never releases a kept charge (an authorized or older-epoch fence), and every never-authorized charge on a release list is released before the next fence can send, or by the finish rule when the send ends. The newest fence is tracked across quota days.
-6. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
-7. **Secrets and privacy:**
+6. **Request rate limits (R1):** bucket keys come only from verified session identities and isolate users, mailboxes and workspaces; the limiter runs before any key lookup or body read and after every availability check; a missing binding fails closed; undo is never starved by sends.
+7. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
+8. **Secrets and privacy:**
    - No message content, subject, address or token in logs, alerts or errors.
    - `EMAIL` and storage credentials are never echoed.
-8. **Input bounds:** every limit in `LIMITS` is enforced server-side before any storage write.
+9. **Input bounds:** every limit in `LIMITS` is enforced server-side before any storage write.
