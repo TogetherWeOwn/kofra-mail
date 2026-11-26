@@ -268,15 +268,38 @@ The sweeper never selects a generation that has a holder, so such an object woul
 
 **Not changed.** Inbound holders, index-row holders, `register` for inbound deliveries, and M3-3's `registerSend` keep their current rules. The retention grace, the generation choice, retirement (`retry_at` is never cleared) and the 35-day sweep are unchanged.
 
+### 2.8 Request rate limits
+
+Contract section 5 runs rate limits in the first step of every request, before the idempotency lookup, and answers 429 `rate_limited` with `Retry-After` and `retryAfterSeconds`. Nothing in M1 to M3 enforces them yet, so **neither `MAIL_SEND_ENABLED` nor `MAIL_DRAFT_UPLOADS_ENABLED` is turned on in any environment until package R1 has merged and that environment's limiter bindings are configured and verified**. Merging R1 alone is not enough. The gate applies to deployed environments; local workerd tests and CI fixtures may turn the flags on without it. The check has two steps: before enabling, an operator probe calls each binding directly (one test-only key per bucket, which can neither send nor upload) and sees it refuse past its limit; then, once a flag is on and before user traffic is admitted, an HTTP check on each enabled **bucket** shows both sides of its limit without changing data, through any route in that bucket that has a side-effect-free form: a write missing its required header (428 under the limit, then 429), or a read of a not-found id (404, then 429). Routes without such a form, such as `listSends` or `deleteUpload`, share their bucket with a route that has one, and the bucket check covers them. The undo flood guard is checked with distinct not-found send ids, so the per-send buckets never fill first.
+
+- **Where:** in `mail-web`, after authentication, CSRF, `access`, re-authentication and every feature-availability check (501), including the content-URL dependency that the gateway checks today only after mailbox dispatch, which R1 moves ahead of the limiter. The limiter runs before the missing-header check (428), the idempotency lookup and any body read. So a rate-limited request, including a same-key retry of a committed request, answers 429 and never replays a stored result or reserves a key.
+- **Mechanism:** the Workers Rate Limiting binding (`ratelimits` in the Wrangler configuration), one namespace per bucket, with a 60 s period. Bucket keys come only from the verified session (the account user id, the mailbox and workspace ids the gateway resolved), never from request input, with one exception: the undo bucket appends the parsed `sendId` from the path to the verified mailbox id. The mailbox part is never caller-supplied, so a caller can only spread its own undo requests across its own buckets. A missing binding fails closed: the route answers 503, never runs unlimited. Its counters are per location and approximate, which is enough for abuse control. It is not a quota: the account quota gate (M3-6) stays the authority for sends. R1 checks the binding's current pricing and records it in its PR before adding it; it expects no new spend.
+- **Buckets** (configuration, never code constants; the starting values below are sized from the M2 UI, where autosave writes about once every 5 s per open draft):
+
+| Bucket | Key | Starting limit |
+|---|---|---|
+| Reads (`GET`) | account user | 600 per 60 s |
+| Writes (other methods, except below) | account user | 120 per 60 s |
+| Uploads (`createUpload`) | account user | 64 per 60 s (two full 32-attachment drafts) |
+| Sends (`sendDraft`) | mailbox | 20 per 60 s |
+| Undo (`undoSend`) | mailbox and send id | 10 per 60 s per send, a bucket of its own that sends never consume |
+| Undo flood guard | account user | 600 per 60 s across all undo requests |
+| Admin writes | workspace | 60 per 60 s |
+
+- **Undo is never starved by sends or by other sends' undos:** each send has its own undo bucket, so a timely undo of a pending send (one request plus its same-key retries) always fits, whatever happens to other sends. The flood guard only stops one user's clients from sending hundreds of undo requests a minute for random ids; only that mailbox owner's own clients can reach it, so the only way to starve an undo is self-inflicted flooding, which is an accepted limit.
+- **Answer:** 429 `rate_limited` with `Retry-After` and `retryAfterSeconds` equal to the bucket's period, the usual problem body, and no state change. A 429 is never stored as an idempotency result.
+- **Logs:** the bucket name and a count only, never the user, mailbox or address.
+
 ## 3. Packages
 
 | # | Package | Builder | Tier | Depends on | Size (est) |
 |---|---|---|---|---|---|
 | M3-0 | Measurements on the approved test route | Sol | T1 | an approved test route | 0.5 to 1 day |
+| R1 | Request rate limits (section 2.8); gates enabling any M3 flag | Sol, Opus review | T0 | M3-2 | 0.5 to 1 day |
 | M3-1 | Timers table and one multiplexed alarm | **Opus** | T0 | inbound mailbox PRs merged | 0.5 to 1 day |
 | P0 | Provisional holders in the sweeper (section 2.7) | **Opus** | T0 | none | 0.5 to 1 day |
 | M3-2 | Drafts, uploads and idempotency in the mailbox | Sol, Opus review | T0 | M3-1, P0 | 1 to 1.5 days |
-| M3-3 | Send state machine: `pending_send`, undo, release | **Opus** | T0 | M3-1, M3-2 | 1.5 to 2 days |
+| M3-3 | Send state machine: `pending_send`, undo, release | **Opus** | T0 | M3-1, M3-2, R1 | 1.5 to 2 days |
 | M3-4 | MIME builder and sent copy | Sol, Opus review | T1 | M3-3 | 0.5 to 1 day |
 | M3-5 | Send consumer, per-recipient ledger, DLQ | **Opus** | T0 | M3-3, M3-4 | 1.5 to 2 days |
 | M3-6 | Account quota gate | Sol, Opus review | T0 | M3-5 | 0.5 day |
@@ -288,7 +311,24 @@ The sweeper never selects a generation that has a holder, so such an object woul
 | M3-12 | End-to-end send matrix | Sol runs, Opus triages | T1 | all above, test route | 1 day |
 | M3-13 | Revocable file links for outside recipients (`/f/<token>`) | **Opus** (token and authorisation), Sol (UI) | T0 | M3-2, a contract revision | 1 to 1.5 days |
 
-**Critical path:** M3-1 → M3-2 → M3-3 → M3-5 → M3-8 → M3-12, about 6.5 to 9 working days. M3-0 runs in parallel as soon as a test route is approved. M3-4, M3-6, M3-7 and M3-9 overlap the path.
+**Critical path:** M3-1 → M3-2 → R1 → M3-3 → M3-5 → M3-8 → M3-12, about 7 to 10 working days. M3-0 runs in parallel as soon as a test route is approved. M3-4, M3-6, M3-7 and M3-9 overlap the path.
+
+### R1 Request rate limits (Sol, Opus review)
+
+**Change:** section 2.8 in `mail-web`: the buckets as configuration, the content-dependency availability check moved ahead of the limiter, the limiter call in the first step of the request, fail-closed on a missing binding, and the 429 answer.
+
+**Acceptance:**
+- With a fake limiter binding in local workerd, each bucket answers 429 `rate_limited` once its limit is reached, with `Retry-After` and `retryAfterSeconds` both equal to the period, and other users', mailboxes' and workspaces' buckets are unaffected.
+- **Order:** authentication, CSRF, access, re-authentication and availability failures (501, including the content dependency) never call the limiter; a denied request with missing headers answers 429, not 428; denied `createDraft` and raw `createUpload` requests read no body and look up no key.
+- **Undo under saturation** (a gateway fixture standing in for the mailbox): with the send bucket exhausted, and with other sends' undo buckets exhausted, an undo for a different pending send still reaches the handler.
+- A 32-attachment compose with the limiter on uploads every file.
+- A missing binding answers 503 and admits nothing.
+- A same-key retry of a committed `createDraft` that is rate-limited answers 429 and does not replay; after the period it replays the stored result.
+- A rate-limited request reads no body, reserves no key and writes nothing.
+- A 429 is never stored as an idempotency result.
+- The Wrangler configuration stays local-only; the limits are plain configuration values.
+
+**Stop rule:** if the binding's pricing adds recurring spend, stop and report the measured cost before adding it.
 
 ### M3-0 Measurements (Sol)
 
@@ -387,6 +427,7 @@ The sweeper never selects a generation that has a holder, so such an object woul
 - **Second delete:** an object recreated under a retired generation between the sweeper's two deletes is gone after the second, and the ledger row is dropped only then.
 - **Late PUT after release:** an overtaken run's PUT completes after the send was cancelled and `releaseSend` ran: the object is under an unheld ledger generation and is swept after the grace; no object exists without a ledger row.
 - **Overtaken handler:** a release handler stalls 10 minutes in its PUT while the next firing releases and finishes the send; when the stalled PUT returns, that handler commits nothing and the send stays finished with no drive row.
+- **Undo with the limiter on (R1):** with the send bucket and other sends' undo buckets exhausted, the user undoes a pending send within its window: it ends `cancelled`, and no queue message and no `EMAIL` call happen.
 - **Undo racing the alarm:** either `cancelled` with no queue message ever, or released with undo answering `send_not_pending`. Never both.
 
 **Stop rule:** if the Durable Object's single-threaded ordering cannot give the undo-or-release guarantee without a lock, stop and redesign. Do not add a timer guess.
@@ -587,7 +628,7 @@ The sweeper never selects a generation that has a holder, so such an object woul
 ## 4. Done
 
 M3 is done when all of the following hold:
-- M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
+- R1, M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
 - the conformance suite passes against the backend;
 - the end-to-end matrix shows zero lost messages.
 
@@ -595,7 +636,7 @@ M3-10 waits for groups.
 
 ## 5. Security review checklist (Opus, high effort)
 
-The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at least:
+The security review of R1, M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at least:
 
 1. **Send-as:**
    - `from` cannot be spoofed through a display name, an encoded word or a header.
@@ -614,8 +655,9 @@ The security review of M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks at le
    - **Dispatch fencing:** every remote wait after Mark finishes before `authorizeDispatch`; no `send()` starts after its authorization deadline; no deadline is later than the published `lease_until`; a claim never sends to a recipient `attempting` under an unexpired lease of any epoch.
    - **Internal handoffs:** every holder is taken before the row it protects, in the sweeper, and handoff and child-delivery holders are tombstoned on release; child deliveries are single-mailbox rows that replay after a recipient's restore; a send finishes only after its handoff row exists; the send's own holders, its raw holder included, are released only then, and the sent copy's index holder only with its index row. The handoff's owner and send-as check is a condition of its insert, in the same commit. The destination mailbox is resolved at delivery from the current directory, never from a mapping journalled at release.
 5. **Quota and cost:** one mailbox cannot exhaust the account's daily quota beyond the gate, and the monthly ceiling cannot be passed by concurrency. A retry never releases a kept charge (an authorized or older-epoch fence), and every never-authorized charge on a release list is released before the next fence can send, or by the finish rule when the send ends. The newest fence is tracked across quota days.
-6. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
-7. **Secrets and privacy:**
+6. **Request rate limits (R1):** bucket keys come only from verified session identities and the request's own path ids, and isolate users, mailboxes, workspaces and, for undo, sends; the limiter runs before any key lookup or body read and after every availability check; a missing binding fails closed; undo is never starved by sends.
+7. **Trust and privacy of copies:** internal delivery is trusted only from the `deliveries.source` column, never from MIME. No stored or delivered MIME contains Bcc recipients.
+8. **Secrets and privacy:**
    - No message content, subject, address or token in logs, alerts or errors.
    - `EMAIL` and storage credentials are never echoed.
-8. **Input bounds:** every limit in `LIMITS` is enforced server-side before any storage write.
+9. **Input bounds:** every limit in `LIMITS` is enforced server-side before any storage write.
