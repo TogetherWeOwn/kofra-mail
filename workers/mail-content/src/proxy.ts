@@ -124,6 +124,7 @@ function refusedNames(config: RemoteImageConfig): string[] | undefined {
   return all.every((name): name is string => name !== undefined) ? all : undefined;
 }
 
+const specialSchemes = new Set(['http:', 'https:', 'ws:', 'wss:', 'ftp:', 'file:']);
 const within = (host: string, zone: string) => host === zone || host.endsWith(`.${zone}`);
 
 /**
@@ -132,13 +133,17 @@ const within = (host: string, zone: string) => host === zone || host.endsWith(`.
  * parsing. It mirrors the parser's preprocessing (trim C0 controls and spaces,
  * remove tabs and newlines) and treats a backslash like a slash, as special schemes do.
  */
-function rawAuthorityHasUserInfo(raw: string): boolean {
+function rawAuthorityHasUserInfo(raw: string, base?: URL): boolean {
   const input = raw.replace(/^[\u0000-\u0020]+|[\u0000-\u0020]+$/g, '').replace(/[\t\n\r]/g, '');
   const scheme = /^[a-z][a-z\d+.-]*:/i.exec(input);
   let rest = scheme ? input.slice(scheme[0].length) : input;
   const slashes = /^[/\\]*/.exec(rest)![0];
-  // Without a scheme, only a reference starting with two slashes has an authority.
-  if (!scheme && slashes.length < 2) return false;
+  // Without a scheme, or with the base's own special scheme (`https:/a@b` against an https base),
+  // only two leading slash-like characters start an authority; otherwise the reference is a path.
+  // A different scheme, or no base, starts an authority after any number of slashes.
+  const sameSpecialScheme = scheme !== null && base !== undefined && specialSchemes.has(base.protocol)
+    && scheme[0].toLowerCase() === base.protocol;
+  if ((!scheme || sameSpecialScheme) && slashes.length < 2) return false;
   rest = rest.slice(slashes.length);
   const end = rest.search(/[/\\?#]/);
   return (end === -1 ? rest : rest.slice(0, end)).includes('@');
@@ -204,11 +209,13 @@ const imageTypes: ReadonlyMap<string, (bytes: Uint8Array) => boolean> = new Map(
   ['image/x-icon', b => b.length >= 22 && startsWith(b, [0, 0, 1, 0]) && (b[4] | b[5]) !== 0],
 ]);
 
-// RFC 9110 media-type: type "/" subtype *( OWS ";" OWS name=value ), value a token or quoted-string.
+// RFC 9110 media-type: type "/" subtype *( OWS ";" OWS [ name=value ] ), value a token or quoted-string.
 // Exactly one is allowed, so two combined Content-Type fields ("a, b") never parse.
+// Whitespace after a semicolon belongs only to the optional parameter, so no two branches can match the
+// same spaces and matching stays linear (the other placement backtracks exponentially).
 const tchar = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
 const quoted = '"(?:[\\t \\x21\\x23-\\x5b\\x5d-\\x7e\\x80-\\xff]|\\\\[\\t \\x21-\\x7e\\x80-\\xff])*"';
-const mediaTypeSyntax = new RegExp(`^[\\t ]*(${tchar}/${tchar})(?:[\\t ]*;[\\t ]*${tchar}=(?:${tchar}|${quoted}))*[\\t ]*$`);
+const mediaTypeSyntax = new RegExp(`^[\\t ]*(${tchar}/${tchar})(?:[\\t ]*;(?:[\\t ]*${tchar}=(?:${tchar}|${quoted}))?)*[\\t ]*$`);
 
 function mediaType(header: string | null): string | undefined {
   if (header === null) return undefined;
@@ -289,7 +296,7 @@ export async function fetchRemoteImage(
       const location = response.headers.get('location');
       discard(response);
       response = undefined;
-      if (hop >= config.remoteImageRedirects || location === null || rawAuthorityHasUserInfo(location)) return fail('redirect');
+      if (hop >= config.remoteImageRedirects || location === null || rawAuthorityHasUserInfo(location, url)) return fail('redirect');
       let next: URL;
       try {
         next = new URL(location, url);

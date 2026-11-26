@@ -16,8 +16,14 @@ export default {
         return verdict.ok ? verdict.url.href : null;
       }));
     }
-    const { url, timeoutMs, tokenHash } = await request.json<{ url: string; timeoutMs?: number; tokenHash?: string }>();
-    const effective = timeoutMs === undefined ? config : { ...config, remoteImageTimeoutMs: timeoutMs };
+    const { url, timeoutMs, inFlightBytes, tokenHash } = await request.json<{
+      url: string; timeoutMs?: number; inFlightBytes?: number; tokenHash?: string;
+    }>();
+    const effective = {
+      ...config,
+      ...(timeoutMs === undefined ? {} : { remoteImageTimeoutMs: timeoutMs }),
+      ...(inFlightBytes === undefined ? {} : { remoteImageInFlightBytes: inFlightBytes }),
+    };
     const result = await fetchRemoteImage(url, effective, (input, init) => fetch(input, init), Date.now);
     logRemoteImage(tokenHash ?? '', result);
     if (path === '/image') {

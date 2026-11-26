@@ -42,7 +42,7 @@ const tokenHash = 'c0ffee12'.padEnd(64, '3');
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /** Calls the handler-shaped `/image` path; failures must be an empty-body 404. */
-async function serve(url: string, extra: { timeoutMs?: number } = {}) {
+async function serve(url: string, extra: { timeoutMs?: number; inFlightBytes?: number } = {}) {
   const started = Date.now();
   const response = await mf.dispatchFetch('https://content.content-zone.example/image', {
     method: 'POST', headers: incoming, body: JSON.stringify({ url, tokenHash, ...extra }),
@@ -213,4 +213,30 @@ test('workerd: a buffered image becomes a response with exactly the rebuilt head
   assert.equal(response.headers.get('content-length'), String(whole.length));
   assert.equal(response.headers.get('cache-control'), 'private, no-store');
   assert.ok(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(whole)));
+});
+
+test('workerd: separate requests in one isolate share the in-flight budget', async () => {
+  routes.clear();
+  const releases: Array<() => void> = [];
+  for (const name of ['a', 'b', 'c'])
+    routes.set(`https://held.sender.example/${name}`, () => {
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const body = new ReadableStream<Uint8Array>({ start(c) { controller = c; c.enqueue(images['image/png'].slice()); } });
+      releases.push(() => controller.close());
+      return new Response(body, { headers: { 'content-type': 'image/png' } });
+    });
+  // No declared length, so each open read holds the full 5 MiB; a 12 MiB budget fits two.
+  const budget = { inFlightBytes: 12 * 1024 * 1024 };
+  const first = serve('https://held.sender.example/a', budget);
+  const second = serve('https://held.sender.example/b', budget);
+  while (releases.length < 2) await delay(10);
+  await delay(50);
+  const third = await serve('https://held.sender.example/c', budget);
+  assertEmpty404(third);
+  for (const release of releases.splice(0)) release();
+  assert.equal((await first).status, 200);
+  assert.equal((await second).status, 200);
+  // Both reservations were released: a new read fits again.
+  routes.set('https://held.sender.example/d', () => new Response(images['image/png'], { headers: { 'content-type': 'image/png' } }));
+  assert.equal((await serve('https://held.sender.example/d', budget)).status, 200);
 });

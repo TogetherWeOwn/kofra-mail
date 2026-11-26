@@ -271,11 +271,21 @@ test('fetch: Content-Type must be exactly one valid media type; combined header 
   });
   const dup = upstream({ [target]: combined });
   failed(await fetchRemoteImage(target, config, dup.fetchImpl, now), 'type');
-  for (const type of ['image/png; charset=binary, text/html', 'image/png, image/png', 'image/png;', 'image/png; charset',
-    'image/png; =x', 'image /png', 'image/ png', 'image/png; a="unterminated', 'image/png; a=b; c', '"image/png"'])
+  for (const type of ['image/png; charset=binary, text/html', 'image/png, image/png', 'image/png; charset',
+    'image/png; =x', 'image /png', 'image/ png', 'image/png; a="unterminated', 'image/png; a=b; c', '"image/png"', 'image/png;, text/html'])
     failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now), 'type');
-  for (const type of ['image/png', ' IMAGE/PNG ', 'image/png; charset=binary', 'image/png;q=1', 'image/png ; a="x, y; z"', 'image/png;a=b;c=d'])
+  // RFC 9110 section 5.6.6 allows empty parameters: `*( OWS ";" OWS [ parameter ] )`.
+  for (const type of ['image/png', ' IMAGE/PNG ', 'image/png; charset=binary', 'image/png;q=1', 'image/png ; a="x, y; z"', 'image/png;a=b;c=d',
+    'image/png;', 'image/png; ;', 'image/png;;a=b'])
     assert.ok((await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now)).ok, type);
+});
+
+test('fetch: Content-Type parsing stays linear on adversarial parameter lists', { timeout: 5_000 }, async () => {
+  for (const type of ['image/png; ' + ';   '.repeat(40) + 'x', 'image/png' + ' ;'.repeat(20_000) + ' x', 'image/png;' + ' '.repeat(50_000) + 'x']) {
+    const started = performance.now();
+    failed(await fetchRemoteImage(target, config, upstream({ [target]: image(type, images['image/png']) }).fetchImpl, now), 'type');
+    assert.ok(performance.now() - started < 250, `${type.length}-byte header took ${(performance.now() - started).toFixed(0)} ms`);
+  }
 });
 
 test('fetch: any status other than 200 is refused', async () => {
@@ -340,6 +350,28 @@ test('fetch: a redirect to a refused host, an IP or a bad URL is refused and nev
   }
   const missing = upstream({ [target]: redirect(null) });
   failed(await fetchRemoteImage(target, config, missing.fetchImpl, now), 'redirect');
+});
+
+test('fetch: an at sign in a same-scheme path-relative Location is a path, not user information', async () => {
+  // With a same-scheme special base, fewer than two slashes after the colon start a path, so these are followed.
+  for (const [location, resolved] of [
+    ['https:/photo@2x.png', 'https://img.sender.example/photo@2x.png'],
+    ['HTTPS:/photo@2x.png', 'https://img.sender.example/photo@2x.png'],
+    ['https:photo@2x.png', 'https://img.sender.example/photo@2x.png'],
+    ['/photo@2x.png', 'https://img.sender.example/photo@2x.png'],
+  ]) {
+    const { fetchImpl, calls, unexpected } = upstream({ [target]: redirect(location), [resolved]: image('image/png', images['image/png']) });
+    assert.ok((await fetchRemoteImage(target, config, fetchImpl, now)).ok, location);
+    assert.deepEqual(calls.map(c => c.url), [target, resolved], location);
+    assert.deepEqual(unexpected, [], location);
+  }
+  // Two slash-like characters start an authority even with the same scheme; a different scheme always does.
+  for (const location of ['https://:@other.sender.example/', 'https:/\\:@other.sender.example/', 'https:\\\\:@other.sender.example/',
+    'http:/:@other.sender.example/', 'http::@other.sender.example/']) {
+    const { fetchImpl, calls } = upstream({ [target]: redirect(location) });
+    failed(await fetchRemoteImage(target, config, fetchImpl, now), 'redirect');
+    assert.equal(calls.length, 1, location);
+  }
 });
 
 test('fetch: a refused starting URL never reaches the upstream', async () => {
