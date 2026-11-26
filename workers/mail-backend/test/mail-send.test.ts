@@ -1103,3 +1103,21 @@ test('a transient read failure of a large forwarded part still retries instead o
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
   assert.equal((await h.sends.queue()).length, 1);
 }));
+
+test('a small forwarded part whose source raw object is stored as zero bytes fails the send with delivery_error, an alert and no MIME',
+  () => withSend(async (h, mail, from) => {
+    const { pending } = await forwardDraft(h, mail, from);
+    const [sourceKey] = (JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[] }).attachmentKeys;
+    assert.match(sourceKey, /^raw\//, 'the part stays inside its source message');
+    // The object reader refuses a declared empty body as invalid, for good.
+    h.objects.set(objectPath(sourceKey), new ArrayBuffer(0));
+    const builds = (await h.sends.builds()).length;
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+    assert.deepEqual(await h.sends.queue(), []);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+  }));
