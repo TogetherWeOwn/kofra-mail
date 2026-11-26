@@ -1,6 +1,7 @@
 import { Mailbox, Sweeper } from '../../src/entry.ts';
 import { storedLifecycle } from '../../src/mailbox-index.ts';
-import type { Lifecycle } from '../../src/mailbox-recovery.ts';
+import { SETTINGS_FLUSH_MS, type Lifecycle } from '../../src/mailbox-recovery.ts';
+import { legacyFixtureObjects, seedLegacyDraft } from './legacy-draft.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { handleEmail, handleQueue, handleScheduled, type Env } from '../../src/worker.ts';
 
@@ -8,6 +9,9 @@ export { MailAdmin } from '../../src/entry.ts';
 export { Sweeper as RecoverySweeper };
 
 export class RecoveryMailbox extends Mailbox {
+  async saveDraft(ws: string, mb: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => seedLegacyDraft(index, legacyFixtureObjects(this.env, ws), id, bytes));
+  }
   protected override restoreSliceMs = 0;
   private readonly manifestPut: { fail: boolean; refused: number; pause: boolean };
   private readonly snapshotPut: { fail: boolean };

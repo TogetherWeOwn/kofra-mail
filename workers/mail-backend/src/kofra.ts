@@ -74,12 +74,13 @@ export function kofra(config: KofraConfig, workspaceId: string) {
     throw new Error('Invalid Kofra mail object store configuration');
   }
   const s3 = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: 'auto', retries: 0 });
-  async function request(method: 'GET' | 'PUT' | 'DELETE', key: string, body?: Uint8Array<ArrayBuffer>): Promise<Response> {
+  async function request(method: 'GET' | 'PUT' | 'DELETE', key: string,
+    body?: Uint8Array<ArrayBuffer> | ReadableStream, verifiedDigest?: string, timeoutMs = 60_000): Promise<Response> {
     const keyDigest = objectDigest(key);
     if (!keyDigest) throw new Error('Invalid mail object key');
     let headers: Record<string, string> | undefined;
     if (body) {
-      const digest = await sha256(body);
+      const digest = body instanceof Uint8Array ? await sha256(body) : verifiedDigest;
       if (digest !== keyDigest) throw new Error('Mail object digest mismatch');
       headers = { 'content-type': 'application/octet-stream', 'x-amz-content-sha256': digest };
     }
@@ -88,7 +89,7 @@ export function kofra(config: KofraConfig, workspaceId: string) {
     try {
       response = await s3.fetch(`${url.origin}/${bucket}/${key}`, { method, body, headers, redirect: 'manual',
         // A hung request must not hold a mailbox lane; an aborted one is retried.
-        signal: AbortSignal.timeout(method === 'DELETE' ? 20_000 : 60_000) });
+        signal: AbortSignal.timeout(method === 'DELETE' ? 20_000 : timeoutMs) });
     } catch {
       throw new Error(`Kofra object ${method} failed`);
     }
@@ -111,6 +112,20 @@ export function kofra(config: KofraConfig, workspaceId: string) {
     async put(key: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {
       const response = await request('PUT', key, bytes);
       await response.body?.cancel();
+    },
+    async putUpload(key: string, bytes: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void> {
+      if (parseObjectKey(key)?.kind !== 'att' || !Number.isSafeInteger(size) || size < 0 || size > MAX_RAW_BYTES) {
+        throw new Error('Invalid attachment PUT');
+      }
+      const stream = new FixedLengthStream(size);
+      const pipe = new AbortController();
+      const copied = bytes.pipeTo(stream.writable, { signal: pipe.signal });
+      try {
+        const [response] = await Promise.all([request('PUT', key, stream.readable, digest, Math.min(60_000, timeoutMs)), copied]);
+        await response.body?.cancel();
+      } finally {
+        pipe.abort();
+      }
     },
     async get(key: string): Promise<Uint8Array<ArrayBuffer>> {
       let response: Response;

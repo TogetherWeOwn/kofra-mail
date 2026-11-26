@@ -4,7 +4,8 @@ import { journalPrefix, replayJournal, writeDelta } from '../../src/journal-back
 import { sha256 } from '../../src/bytes.ts';
 import { parseObjectKey, type ObjectKind } from '../../src/object-key.ts';
 import { SweepLedger } from '../../src/sweep-ledger.ts';
-import { MailboxRecovery, readyLife, restoringLife, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { MailboxRecovery, readyLife, restoringLife, SETTINGS_FLUSH_MS, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { legacyFixtureObjects, seedLegacyDraft } from './legacy-draft.ts';
 import { MailboxWork } from '../../src/mailbox-work.ts';
 import { Mailbox } from '../../src/mailbox-do.ts';
 import type { Env as MailboxEnv } from '../../src/worker.ts';
@@ -21,6 +22,9 @@ export class AlarmMailbox extends Mailbox {
       hold: async () => {}, release: async () => {},
       holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
     }) } });
+  }
+  async saveDraft(ws: string, mb: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => seedLegacyDraft(index, legacyFixtureObjects(this.env, ws), id, bytes));
   }
   async scheduledAt() { return this.ctx.storage.getAlarm(); }
   // Step the real handler at explicit checkpoints instead of racing wall-clock alarms.
@@ -208,7 +212,13 @@ export class FixtureMailbox extends DurableObject<Env> {
   async labels() { return JSON.stringify(this.ctx.storage.sql.exec('SELECT id, name FROM labels ORDER BY id').toArray()); }
   async label(id: string, name: string) { this.index().setLabel(id, name); }
   async flags(id: string, flags: number, labels: string[]) { this.index().setFlags(id, flags, labels); }
-  async draft(id: string, text: string) { await this.index().saveDraft(id, new Uint8Array(new TextEncoder().encode(text))); }
+  async draft(id: string, text: string) {
+    const refs = this.env.SWEEP.getByName('workspace');
+    await seedLegacyDraft(this.index(), {
+      put: async (key, bytes) => { await this.env.RAW.put(key, bytes); },
+      hold: (key, holder) => refs.hold(key, holder),
+    }, id, new Uint8Array(new TextEncoder().encode(text)));
+  }
   async bayes(token: string, ham: number, spam: number) { this.index().setBayes(token, ham, spam); }
   async seedBayes(count: number, offset = 0) {
     const index = this.index();

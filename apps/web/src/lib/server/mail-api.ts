@@ -17,11 +17,13 @@ export interface ContentClaims {
 }
 export type OperationResult = {
   body?: unknown;
+  status?: number;
   replayed?: boolean;
   error?: { code: MailErrorCode } & Pick<Partial<Problem>, 'errors' | 'limit' | 'retryAfterSeconds'>;
 };
 export interface MailApiEnvironment {
   MAIL_LOCAL_API?: string;
+  MAIL_DRAFT_UPLOADS_ENABLED?: string;
   MAIL_DEV_SESSION?: {
     resolve(request: Request): Promise<LocalPrincipal | null>;
     members?(workspaceId: string): Promise<Omit<Member, 'hasMailbox'>[]>;
@@ -29,14 +31,17 @@ export interface MailApiEnvironment {
   DIRECTORY?: DirectoryDatabase;
   MAILBOX?: { getByName(name: string): {
     mailApi(ws: string, mb: string, operation: Operation, params: Record<string, string>, input: unknown,
-      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string }): Promise<OperationResult>;
+      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string;
+        httpWrite?: { stream: ReadableStream<Uint8Array> | null; mediaType: string; contentLength: string | null;
+          query: [string, string][] } }): Promise<OperationResult>;
   } };
   MAIL_CONTENT_ORIGIN?: string;
   MAIL_CONTENT?: { mint(purpose: 'body' | 'att', claims: ContentClaims): Promise<ContentUrl> };
 }
 
 const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
-const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend', 'createUpload', 'deleteUpload']);
+const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend']);
+const uploads = new Set<Operation>(['createUpload', 'deleteUpload']);
 const drive = new Set<Operation>(['saveAttachmentToDrive', 'importFromDrive']);
 const matchers = (Object.entries(ROUTES) as [Operation, RouteSpec][]).map(([op, route]) => ({
   op, route, pattern: new RegExp(`^${API_PREFIX}${route.path.replace(/\{([A-Za-z]+)\}/g, '(?<$1>[^/]+)')}$`),
@@ -97,6 +102,9 @@ async function readJson(request: Request, op: Operation): Promise<Record<string,
     }
     text += decoder.decode();
     const input: unknown = JSON.parse(text);
+    // Only decode here: the mailbox checks the resource and revision before
+    // inspecting any replacement fields (including the top-level shape).
+    if (op === 'replaceDraft') return input as Record<string, unknown>;
     if (!input || typeof input !== 'object' || Array.isArray(input)) fail('invalid_request');
     const fields = jsonFields[op];
     // A committed key is resolved by the datastore before field validation.
@@ -134,7 +142,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     const directory = new Directory(env.DIRECTORY, principal.workspaceId, env.MAIL_DEV_SESSION.members?.bind(env.MAIL_DEV_SESSION));
     const mailbox = await directory.byUser(principal.userId);
     if (route.access !== 'admin' && op !== 'getSession' && !mailbox) fail('forbidden');
-    if (m3.has(op)) fail('not_implemented');
+    if (m3.has(op) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
     if (drive.has(op)) fail('feature_unavailable');
 
     const idempotencyKey = request.headers.get('idempotency-key') ?? undefined;
@@ -142,13 +150,18 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     if ((route.idempotency === 'required' && !idempotencyKey) || (route.ifMatch === 'required' && !ifMatch)) fail('precondition_required');
     if (idempotencyKey !== undefined && !keyPattern.test(idempotencyKey)) fail('invalid_request', { errors: [{ field: '/Idempotency-Key', code: 'invalid' }] });
     if (ifMatch !== undefined && !keyPattern.test(ifMatch)) fail('invalid_request', { errors: [{ field: '/If-Match', code: 'invalid' }] });
-    const query = parseQuery(url, route);
+    // Mailbox creates reserve their key inside the mailbox before consuming
+    // the HTTP body or validating operation-specific query fields.
+    const keyedMailbox = op === 'createDraft' || op === 'createLabel' || op === 'createUpload';
+    const httpWrite = keyedMailbox ? { stream: request.body, mediaType: request.headers.get('content-type') ?? '',
+      contentLength: request.headers.get('content-length'), query: [...url.searchParams] } : undefined;
+    const query = httpWrite ? {} : parseQuery(url, route);
     const raw = pattern.exec(url.pathname)?.groups ?? {};
     let params: Record<string, string>;
     try { params = Object.fromEntries(Object.entries(raw).map(([name, value]) => [name, decodeURIComponent(value)])); }
     catch { return fail('not_found'); }
-    const input = route.body === 'json' ? await readJson(request, op) : query;
-    if (op === 'getBodyUrl' && typeof input.remoteImages !== 'boolean') fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
+    const input = !httpWrite && route.body === 'json' ? await readJson(request, op) : query;
+    if (op === 'getBodyUrl' && (!('remoteImages' in input) || typeof input.remoteImages !== 'boolean')) fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
 
     let result: OperationResult;
     if (route.access === 'admin') {
@@ -164,7 +177,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
         result = await env.MAILBOX.getByName(JSON.stringify([principal.workspaceId, mailbox.id])).mailApi(
           principal.workspaceId, mailbox.id, op,
           { ...Object.fromEntries(Object.entries(query).map(([key, value]) => [key, String(value)])), ...params }, input,
-          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId },
+          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId, ...(httpWrite && { httpWrite }) },
         );
       } else result = { body: { state: 'unprovisioned' } };
       if (!result.error && op === 'getSession') {
@@ -193,7 +206,8 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
       fail(code, fields);
     }
     if (result.replayed) headers.set('idempotency-replayed', 'true');
-    return respond(result.body, route.success);
+    if (result.status !== undefined && result.status !== route.success) fail('unavailable');
+    return respond(result.body, result.status ?? route.success);
   } catch (error) {
     const value = error instanceof MailApiError ? error.problem : problem('internal');
     if (value.retryAfterSeconds !== undefined || value.status === 429 || value.status === 503) headers.set('retry-after', String(value.retryAfterSeconds ?? 1));

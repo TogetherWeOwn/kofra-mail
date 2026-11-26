@@ -1,6 +1,7 @@
 import { deltaRange, INCARNATION, journalPrefix, readDelta, writeDelta } from './journal-backup.ts';
 import { sha256 } from './bytes.ts';
-import { MissingMailError, type MailboxIndex, type SnapshotRow } from './mailbox-index.ts';
+import { MissingMailError, type HolderConfirmationCursor, type MailboxIndex, type SnapshotRow } from './mailbox-index.ts';
+import type { ConfirmAnswer, ConfirmEntry } from './sweep-ledger.ts';
 import type { ReplayDelivery } from './outbox.ts';
 
 export const SETTINGS_FLUSH_MS = 60_000;
@@ -53,6 +54,7 @@ export type RestoringLife = {
   state: 'restoring'; scope: Scope; incarnation: string; startedAt: number; failures: number; bootstrap: boolean;
   phase: 'reset' | 'fence' | 'takeover' | 'snapshot' | 'deltas' | 'deliveries';
   epoch: number | null; etag: string | null; rev: number; page: number; rowNo: number; delta: number; after: number;
+  confirmationAfter?: HolderConfirmationCursor;
   // Completed deliveries whose raw object was verifiably gone during replay.
   skipped: number;
   baseSeq?: number; baseChain?: string | null;
@@ -101,6 +103,7 @@ export type RestorePorts = {
   fence(): Promise<number | null>;
   replayPage(after: number): Promise<ReplayDelivery[]>;
   release(key: string, holder: string): Promise<void>;
+  confirm?(entries: ConfirmEntry[]): Promise<ConfirmAnswer[]>;
   // Recreates local state derived from the restored rows (timer rows), inside
   // the transaction that finishes the restore.
   rebuild?(now: number): void;
@@ -328,6 +331,7 @@ export class MailboxRecovery {
     if (switched) next = { ...next, upload: null, nextSnapshotAt: now + SNAPSHOT_INTERVAL_MS, lastSnapshotAt: now, failures: 0 };
     this.index.transaction(() => {
       this.index.journal.checkpoint(manifest.last_seq);
+      this.index.coverConfirmations(manifest.last_seq, Date.now());
       if (switched) this.index.clearSnapshot();
       this.index.setLifecycle(next);
     });
@@ -450,6 +454,21 @@ export class MailboxRecovery {
       this.index.setLifecycle(next);
       return next;
     });
+    if (ports.confirm && (life.phase === 'snapshot' || life.phase === 'deltas' || life.phase === 'deliveries')) {
+      // Drain what has already been applied before later backup reads or D1
+      // replay can block. Do one batch per step so the slice can yield. A
+      // failed batch leaves both its rows and its cursor unchanged.
+      let pending = this.index.pendingRestoreConfirmations(life.confirmationAfter);
+      if (!pending.length && life.confirmationAfter) pending = this.index.pendingRestoreConfirmations();
+      if (pending.length) {
+        const answers = await ports.confirm(pending.map(({ key, holder }) => ({ key, holder })));
+        this.index.finishConfirmations(pending, answers, true);
+        // If the object crashes before saving the cursor, the completed rows
+        // are already gone (or marked lost); it resumes at the first pending row.
+        const last = pending[pending.length - 1];
+        return save({ ...life, confirmationAfter: [last.seq, last.key, last.holder] });
+      }
+    }
     switch (life.phase) {
       case 'reset':
         return save({ ...life, phase: 'fence' }, () => this.index.resetForRestore());
@@ -491,14 +510,20 @@ export class MailboxRecovery {
         const found = await getJson<SnapshotRow[]>(this.bucket, this.pageKey(manifest.snapshot_key, page));
         const rows = found?.value;
         if (!Array.isArray(rows) || !rows.length || rows.length > 64) throw new Error('Invalid mailbox snapshot page');
-        return save({ ...life, page, rowNo: life.rowNo + rows.length }, () => {
+        return save({ ...life, page, rowNo: life.rowNo + rows.length, confirmationAfter: undefined }, () => {
+          let coversHolders = false;
           let rowNo = life.rowNo;
           for (const row of rows) {
             if (!row || row.row_no !== ++rowNo || typeof row.kind !== 'string' || typeof row.value !== 'string') {
               throw new Error('Invalid mailbox snapshot row');
             }
-            this.index.restoreSnapshotRow(row);
+            const entry = this.index.restoreSnapshotRow(row);
+            if (entry) {
+              if (entry.seq > snapshot.seq) throw new Error('Holder confirmation exceeds snapshot sequence');
+              coversHolders = true;
+            }
           }
+          if (coversHolders) this.index.coverConfirmations(snapshot.seq, ports.now());
         });
       }
       case 'deltas': {
@@ -512,7 +537,11 @@ export class MailboxRecovery {
         const key = manifest.delta_keys[life.delta];
         const rows = await readDelta(this.bucket, key, deltaRange(this.prefix, key)!);
         let releases: Array<{ key: string; holder: string }> = [];
-        const next = save({ ...life, delta: life.delta + 1 }, () => { releases = rows.flatMap(row => this.index.replayRow(row)); });
+        const through = rows[rows.length - 1].seq;
+        const next = save({ ...life, delta: life.delta + 1, confirmationAfter: undefined }, () => {
+          releases = rows.flatMap(row => this.index.replayRow(row));
+          this.index.coverConfirmations(through, ports.now());
+        });
         // A crash before these releases only retains an object longer.
         for (const release of releases) await ports.release(release.key, release.holder);
         return next;

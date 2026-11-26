@@ -2,7 +2,11 @@ import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Operation } from '../../../contracts/mail-api/src/service.ts';
 import type { Label, Settings } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
-import { draftInput, draftRef, draftRefs, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft, type DraftObjectRef } from './mailbox-api-drafts.ts';
+import { draftInput, draftObjectKeys, draftRef, draftRefs, draftUploadIds, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft } from './mailbox-api-drafts.ts';
+import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult, type Committed } from './mailbox-api-idempotency.ts';
+import type { HttpMailboxWrite } from './mailbox-http-write.ts';
+import { unusableSource, uploadReferenced, uploadRow, UPLOAD_EXPIRY } from './mailbox-upload.ts';
+import type { TimerTable } from './mailbox-timers.ts';
 import { attachmentRow, displayOf, getThread, labels, listViews, messageRow, missingThreadDisplay, partNumber, threadChanges, threadPage } from './mailbox-api-messages.ts';
 import { canonical, cursorPosition, fail, invalid, isId, makeCursor, need, object, pageLimit, text, utf8, type MailboxApiError } from './mailbox-api-input.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
@@ -10,24 +14,26 @@ import type { JournalEvent } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { decodedAttachment, normalizeSearch, readMailMime } from './parse-mail.ts';
 
-export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string };
-export type MailboxApiResult = { body?: unknown; replayed?: boolean; error?: MailboxApiError };
+export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; httpWrite?: HttpMailboxWrite };
+export type PreparedApiKey = { token: string; fingerprint: string };
+export type MailboxApiResult = { body?: unknown; status?: number; replayed?: boolean; error?: MailboxApiError };
 export type MailContentBody = { html?: string; text?: string; auth: string };
 export type MailContentAttachment = { stream: ReadableStream<Uint8Array>, name: string; mediaType: string; sizeBytes: number };
 export type MailContentResult = { body?: MailContentBody | MailContentAttachment; error?: MailboxApiError };
 export type MailSource = { workspaceId: string; mailboxId: string; messageId: string } &
   ({ remoteImages: boolean } | { part: number; name: string; mediaType: string; sizeBytes: number });
 
-type Committed = { label: Label } | { draft: DraftObjectRef };
 type Event = Exclude<JournalEvent, { type: 'message' }>;
-export const isIdempotentCreate = (operation: Operation) => operation === 'createLabel' || operation === 'createDraft';
+export const isIdempotentCreate = (operation: Operation) => operation === 'createLabel' || operation === 'createDraft' || operation === 'createUpload';
 export const mailApiMutation = (operation: Operation) => isIdempotentCreate(operation) ||
   operation === 'replaceDraft' || operation === 'deleteDraft' || operation === 'updateThreads' ||
-  operation === 'deleteLabel' || operation === 'renameLabel' || operation === 'updateSettings';
+  operation === 'deleteLabel' || operation === 'renameLabel' || operation === 'updateSettings' || operation === 'deleteUpload';
 
 export class MailboxApi {
   constructor(private readonly index: MailboxIndex, private readonly sql: SqlStorage, private readonly workspaceId: string,
-    private readonly mailboxId: string, private readonly incarnation: string, private readonly now: number) {}
+    private readonly mailboxId: string, private readonly incarnation: string, private readonly now: number,
+    private readonly timers?: TimerTable, private readonly preparedKey?: PreparedApiKey,
+    private readonly clock: () => number = () => now, private readonly uploadsEnabled = false) {}
 
   private state() { return `${this.incarnation}-${this.index.journal.revision()}`; }
 
@@ -50,32 +56,42 @@ export class MailboxApi {
     return { ...stored, defaultFrom: canSendAs.includes(stored.defaultFrom) ? stored.defaultFrom : defaults.defaultFrom };
   }
 
-  private async withKey(operation: Operation, params: Record<string, string>, input: unknown, options: MailboxApiOptions,
-    change: (commit: (value: Committed, event: Event) => void) => Promise<unknown>): Promise<MailboxApiResult> {
-    const key = options.idempotencyKey;
-    if (key === undefined || key === '') return fail('precondition_required');
-    if (!isId(key)) return invalid('/Idempotency-Key');
-    const row = this.sql.exec<{ result: string; fingerprint: string }>(`SELECT result, fingerprint FROM mailbox_api_idempotency
-      WHERE key = ? AND expires_at > ?`, key, this.now).toArray()[0];
-    if (row) {
-      const fingerprint = await sha256(utf8(canonical([operation, params, input])));
-      if (row.fingerprint !== fingerprint) return fail('idempotency_key_reused');
-      const value = JSON.parse(row.result) as Committed;
-      return { body: 'label' in value ? value.label : await readDraft(this.index, value.draft), replayed: true };
-    }
-    const token = crypto.randomUUID();
-    const marker = this.sql.exec(`INSERT INTO mailbox_api_in_progress VALUES (?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET token = excluded.token, expires_at = excluded.expires_at
-      WHERE mailbox_api_in_progress.expires_at <= ?`, key, token, this.now + 300_000, this.now);
-    if (!marker.rowsWritten) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+  private async withKey(operation: 'createLabel' | 'createDraft', params: Record<string, string>, input: unknown, options: MailboxApiOptions,
+    change: (commit: (value: Committed, event: Event, after?: () => void) => void) => Promise<unknown>): Promise<MailboxApiResult> {
+    const key = apiKey(options.idempotencyKey);
+    const reservation = this.preparedKey ?? reserveApiKey(this.sql, key, this.now);
+    if ('row' in reservation) return replayApiKey(this.index, reservation.row, await fingerprintOf(operation, params, input));
+    const verify = () => {
+      if (!ownsApiKey(this.sql, key, reservation.token, this.clock())) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    };
     try {
-      const fingerprint = await sha256(utf8(canonical([operation, params, input])));
-      return { body: await change((value, event) => {
-        this.index.changeMany([event, { type: 'api_result', key, fingerprint,
-          expiresAt: this.now + LIMITS.idempotencyRetentionSeconds * 1000, result: JSON.stringify(value) }]);
+      const fingerprint = 'fingerprint' in reservation ? reservation.fingerprint : await fingerprintOf(operation, params, input);
+      verify();
+      return { body: await change((value, event, after) => {
+        verify();
+        const stored = resultEvent(operation, key, fingerprint, value, this.clock());
+        this.index.changeMany([event, stored], () => {
+          if (this.timers) scheduleResult(this.timers, stored);
+          after?.();
+          clearApiKey(this.sql, key, reservation.token);
+        });
       }) };
     } finally {
-      this.sql.exec('DELETE FROM mailbox_api_in_progress WHERE key = ? AND token = ?', key, token);
+      clearApiKey(this.sql, key, reservation.token);
+    }
+  }
+
+  private draftUploads(id: string): string[] {
+    return this.sql.exec<{ id: string }>('SELECT upload_id AS id FROM mailbox_api_draft_uploads WHERE draft_id = ?', id)
+      .toArray().map(row => row.id);
+  }
+
+  private rescheduleUploads(ids: Iterable<string>): void {
+    if (!this.timers) return;
+    for (const id of new Set(ids)) {
+      const row = uploadRow(this.sql, id);
+      if (!row || uploadReferenced(this.sql, id)) this.timers.delete(UPLOAD_EXPIRY, id);
+      else this.timers.set(UPLOAD_EXPIRY, id, row.expiresAt);
     }
   }
 
@@ -169,32 +185,55 @@ export class MailboxApi {
         const { items, last, more } = await readDraftPage(this.index, refs, limit);
         return { body: { items, nextCursor: more && last ? makeCursor(scope, [last.updatedAt, last.id]) : null, state: this.state() } };
       }
-      case 'getDraft': return { body: await readDraft(this.index, need(draftRef(this.sql, params.draftId))) };
+      case 'getDraft': {
+        const ref = need(draftRef(this.sql, params.draftId));
+        if (unusableSource(this.sql, 'draft', ref.id)) return fail('unavailable');
+        return { body: await readDraft(this.index, ref) };
+      }
       case 'createDraft': return this.withKey(operation, params, input, options, async commit => {
-        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now);
-        const ref = await this.index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.now);
+        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, this.uploadsEnabled);
+        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
+        const ref = await this.index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.now, attachmentKeys);
         const { holder: _holder, ...replay } = ref;
-        try { commit({ draft: replay }, { type: 'draft', ...ref }); }
-        catch (error) { await this.index.releaseDraft(ref); throw error; }
+        try {
+          commit({ draft: replay }, { type: 'draft', ...ref, attachmentKeys, uploadIds },
+            () => this.rescheduleUploads(uploadIds));
+        } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
         return wireDraft(ref, draft);
       });
       case 'replaceDraft': {
         if (!options.ifMatch) return fail('precondition_required');
         const previous = need(draftRef(this.sql, params.draftId));
         if (previous.revision !== options.ifMatch) return fail('revision_mismatch');
-        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, await readDraftObject(this.index, previous));
-        const ref = await this.index.prepareApiDraft(previous.id, encodeDraftObject(draft), this.now);
-        try { this.index.changeMany([{ type: 'draft', ...ref }]); }
-        catch (error) { await this.index.releaseDraft(ref); throw error; }
-        await this.index.releaseDraft(previous);
+        const oldUploads = this.draftUploads(previous.id);
+        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now,
+          await readDraftObject(this.index, previous), this.uploadsEnabled);
+        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
+        const ref = await this.index.prepareApiDraft(previous.id, encodeDraftObject(draft), this.now, attachmentKeys);
+        try {
+          this.index.changeMany([{ type: 'draft', ...ref, attachmentKeys, uploadIds }],
+            () => this.rescheduleUploads([...oldUploads, ...uploadIds]));
+        } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
         return { body: wireDraft(ref, draft) };
       }
       case 'deleteDraft': {
         const previous = draftRef(this.sql, params.draftId);
         if (!previous) return {};
         if (options.ifMatch !== undefined && previous.revision !== options.ifMatch) return fail('revision_mismatch');
-        this.index.changeMany([{ type: 'draft_delete', id: previous.id }]);
-        await this.index.releaseDraft(previous);
+        const uploads = this.draftUploads(previous.id);
+        const hasObjects = this.sql.exec('SELECT 1 FROM mailbox_api_draft_objects WHERE draft_id = ? LIMIT 1', previous.id).toArray().length;
+        if (!this.uploadsEnabled && hasObjects) return fail('not_implemented');
+        this.index.changeMany([{ type: 'draft_delete', id: previous.id, deferRelease: true }],
+          () => this.rescheduleUploads(uploads));
+        return {};
+      }
+      case 'deleteUpload': {
+        if (!this.timers || !this.uploadsEnabled) return fail('not_implemented');
+        const id = params.uploadId;
+        const upload = isId(id) && uploadRow(this.sql, id);
+        if (upload && !uploadReferenced(this.sql, id)) this.index.changeMany([
+          { type: 'api_upload_delete', id, objectKey: upload.objectKey },
+        ], () => this.timers!.delete(UPLOAD_EXPIRY, id));
         return {};
       }
       default: return fail('not_implemented');

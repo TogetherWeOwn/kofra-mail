@@ -5,6 +5,9 @@ import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow } from './mail-journal.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { JOURNAL_FLUSH } from './mailbox-timers.ts';
+import { IDEM_EXPIRY } from './mailbox-upload.ts';
+import type { ConfirmAnswer, ConfirmEntry, HoldTarget } from './sweep-ledger.ts';
+import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
@@ -12,7 +15,9 @@ import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
 export type MailboxObjects = {
   get(key: string): Promise<Uint8Array<ArrayBuffer>>;
   put(key: string, content: Uint8Array<ArrayBuffer>): Promise<void>;
+  putUpload?(key: string, content: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void>;
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
+  holdProvisional?(target: HoldTarget, holder: string): Promise<string>;
   hold(key: string, holder: string): Promise<void>;
   release(key: string, holder: string): Promise<void>;
 };
@@ -33,6 +38,9 @@ type SnapshotTable = 'messages' | 'labels' | 'drafts' | 'bayes' | 'settings';
 export type SnapshotRow = { row_no: number; kind: string; value: string };
 type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[]; expiresAt?: number | null };
 export type ApiDraftRef = { id: string; rawKey: string; holder: string; revision: string; updatedAt: number };
+export type PendingConfirmation = ConfirmEntry & { seq: number; publishedAt: number | null };
+export type HolderConfirmationCursor = [seq: number, key: string, holder: string];
+export const HOLDER_CONFIRM_BATCH = 64;
 const trashLabel = 'trash';
 
 const SUBJECT_KEY = /^[a-f0-9]{64}$/;
@@ -299,17 +307,6 @@ export class MailboxIndex {
   setBayes(token: string, ham: number, spam: number) { this.change({ type: 'bayes', token, ham, spam }); }
   setSetting(kind: 'filter' | 'send-as', id: string, definition: string) { this.change({ type: 'setting', kind, id, definition }); }
 
-  async saveDraft(id: string, bytes: Uint8Array<ArrayBuffer>): Promise<void> {
-    if (!id || id.length > 256 || !bytes.byteLength || bytes.byteLength > MAX_RAW_BYTES) throw new Error('Invalid draft');
-    const rawKey = `drafts/${await sha256(bytes)}`;
-    const holder = `draft:${crypto.randomUUID()}`;
-    await this.objects.hold(rawKey, holder);
-    await this.objects.put(rawKey, bytes);
-    const previous = this.sql.exec<{ rawKey: string; holder: string }>('SELECT raw_key AS rawKey, holder FROM drafts WHERE id = ?', id).toArray()[0];
-    this.change({ type: 'draft', id, rawKey, holder });
-    if (previous) await this.objects.release(previous.rawKey, previous.holder);
-  }
-
   async emptyTrash(limit = 64): Promise<number> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 64) throw new Error('Invalid purge limit');
     const candidates = this.sql.exec<{ id: string }>(`SELECT m.id FROM message_labels l
@@ -349,33 +346,137 @@ export class MailboxIndex {
     });
   }
 
-  async prepareApiDraft(id: string, bytes: Uint8Array<ArrayBuffer>, updatedAt: number): Promise<ApiDraftRef> {
-    if (!bytes.byteLength || bytes.byteLength > MAX_RAW_BYTES) throw new Error('Invalid draft size');
-    const rawKey = `drafts/${await sha256(bytes)}`;
-    const holder = `draft:${crypto.randomUUID()}`;
-    await this.objects.hold(rawKey, holder);
-    try { await this.objects.put(rawKey, bytes); }
-    catch (error) { await this.releaseDraft({ rawKey, holder }); throw error; }
-    return { id, rawKey, holder, revision: crypto.randomUUID(), updatedAt };
+  async prepareApiDraft(id: string, bytes: Uint8Array<ArrayBuffer>, updatedAt: number, attachmentKeys: string[] = []): Promise<ApiDraftRef> {
+    if (!bytes.byteLength || bytes.byteLength > MAX_RAW_BYTES || !this.objects.holdProvisional) throw new Error('Invalid draft storage');
+    const revision = crypto.randomUUID();
+    const holder = `draft:${this.holderScope}:${id}:${revision}`;
+    const rawKey = await this.objects.holdProvisional({ kind: 'raw', digest: await sha256(bytes) }, holder);
+    try {
+      for (const key of attachmentKeys) await this.objects.holdProvisional({ key }, holder);
+      await this.objects.put(rawKey, bytes);
+    } catch (error) { await this.releaseDraft({ rawKey, holder }, attachmentKeys); throw error; }
+    return { id, rawKey, holder, revision, updatedAt };
   }
 
-  async releaseDraft(ref: Pick<ApiDraftRef, 'rawKey' | 'holder'>): Promise<void> {
-    // These immutable draft objects are not sweep candidates. Release bookkeeping
-    // cannot turn an already committed change into an apparent API failure.
-    await this.objects.release(ref.rawKey, ref.holder).catch(() => {});
+  async releaseDraft(ref: Pick<ApiDraftRef, 'rawKey' | 'holder'>, attachments: string[] = []): Promise<void> {
+    // Only preparations or commits known to have failed release here.
+    for (const key of new Set([ref.rawKey, ...attachments])) await this.objects.release(key, ref.holder).catch(() => {});
+  }
+
+  async prepareUpload(id: string, digest: string, size: number, bytes: ReadableStream<Uint8Array>, remaining: () => number):
+    Promise<{ objectKey: string; holder: string }> {
+    if (!this.objects.putUpload || !this.objects.holdProvisional) throw new Error('Upload storage unavailable');
+    const holder = `upload:${this.holderScope}:${id}`;
+    const objectKey = await this.objects.holdProvisional({ kind: 'att', digest }, holder);
+    try {
+      const timeoutMs = remaining();
+      if (timeoutMs <= 0) throw new Error('Upload lease expired before PUT');
+      await this.objects.putUpload(objectKey, bytes, size, digest, timeoutMs);
+    } catch (error) { await this.releaseUpload(holder, objectKey); throw error; }
+    return { objectKey, holder };
+  }
+
+  async releaseUpload(holder: string, key: string): Promise<void> {
+    await this.objects.release(key, holder).catch(() => {});
   }
 
   // Caller holds the work lane; membership/validation and all events commit together.
-  changeMany(events: Iterable<Exclude<JournalEvent, MessageEvent>>): void {
-    this.storage.transactionSync(() => {
-      for (const event of events) { this.apply(event); this.journal.append(event); }
+  changeMany(events: Iterable<Exclude<JournalEvent, MessageEvent>>, after?: () => void): void {
+    this.storage.transactionSync(() => { this.commitEvents(events); after?.(); });
+  }
+
+  // Also usable in an existing synchronous timer transaction.
+  commitEvents(events: Iterable<Exclude<JournalEvent, MessageEvent>>): void {
+    for (const event of events) { this.apply(event); this.journal.append(event); }
+  }
+
+  enqueueRelease(seq: number, key: string, holder: string): void {
+    if (!count(seq) || seq === 0 || !isObjectKey(key) || !bounded(holder, 256)) throw new Error('Invalid pending holder release');
+    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_releases(seq, object_key, holder) VALUES (?, ?, ?)', seq, key, holder);
+  }
+
+  private enqueueConfirmation(seq: number, key: string, holder: string, publishedAt: number | null = null): PendingConfirmation {
+    if (!count(seq) || seq === 0 || typeof key !== 'string' || !parseObjectKey(key) || !bounded(holder, 256) ||
+        (publishedAt !== null && !count(publishedAt))) throw new Error('Invalid pending holder confirmation');
+    this.sql.exec('INSERT OR IGNORE INTO mailbox_pending_confirmations(seq, object_key, holder, published_at) VALUES (?, ?, ?, ?)',
+      seq, key, holder, publishedAt);
+    return { seq, key, holder, publishedAt };
+  }
+
+  coverConfirmations(through: number, now: number): void {
+    this.sql.exec(`UPDATE mailbox_pending_confirmations SET published_at = ?
+      WHERE seq <= ? AND published_at IS NULL`, now, through);
+  }
+
+  pendingConfirmations(through: number): PendingConfirmation[] {
+    return this.sql.exec<PendingConfirmation>(`SELECT seq, object_key AS key, holder, published_at AS publishedAt
+      FROM mailbox_pending_confirmations WHERE seq <= ? ORDER BY seq, object_key, holder LIMIT ?`,
+    through, HOLDER_CONFIRM_BATCH).toArray();
+  }
+
+  pendingRestoreConfirmations(after: HolderConfirmationCursor = [0, '', '']): PendingConfirmation[] {
+    return this.sql.exec<PendingConfirmation>(`SELECT seq, object_key AS key, holder, published_at AS publishedAt
+      FROM mailbox_pending_confirmations WHERE published_at IS NOT NULL AND lost_at IS NULL
+      AND (seq, object_key, holder) > (?, ?, ?) ORDER BY seq, object_key, holder LIMIT ?`,
+    ...after, HOLDER_CONFIRM_BATCH).toArray();
+  }
+
+  finishConfirmations(rows: PendingConfirmation[], answers: ConfirmAnswer[], restoring: boolean): void {
+    if (answers.length !== rows.length || answers.some(answer =>
+      answer !== 'held' && answer !== 'rehold' && answer !== 'released' && answer !== 'lost')) throw new Error('Invalid holder confirmation response');
+    const metrics = this.storage.transactionSync(() => {
+      const counts = { holder_rehold: 0, holder_released: 0, holder_lost_unreferenced: 0 };
+      for (const [i, { seq, key, holder }] of rows.entries()) {
+        const answer = answers[i];
+        // Recovery must not write an event into the restored journal history.
+        if (answer === 'lost' && restoring) {
+          this.sql.exec(`UPDATE mailbox_pending_confirmations SET lost_at = ?
+            WHERE seq = ? AND object_key = ? AND holder = ? AND lost_at IS NULL`, Date.now(), seq, key, holder);
+          continue;
+        }
+        const removed = this.sql.exec(`DELETE FROM mailbox_pending_confirmations
+          WHERE seq = ? AND object_key = ? AND holder = ?`, seq, key, holder).rowsWritten;
+        if (removed !== 1) continue;
+        if (answer === 'rehold') counts.holder_rehold++;
+        else if (answer === 'released') counts.holder_released++;
+        else if (answer === 'lost' && !this.markLostSource(key, holder)) counts.holder_lost_unreferenced++;
+      }
+      return counts;
     });
+    for (const [code, total] of Object.entries(metrics)) if (total) console.info({ code, count: total });
+  }
+
+  private markLostSource(key: string, holder: string): boolean {
+    const upload = this.sql.exec<{ id: string }>('SELECT id FROM mailbox_api_uploads WHERE holder = ? AND object_key = ?', holder, key).toArray().at(0);
+    const draft = !upload && this.sql.exec<{ id: string }>(`SELECT d.id FROM drafts d WHERE d.holder = ? AND
+      (d.raw_key = ? OR EXISTS (SELECT 1 FROM mailbox_api_draft_objects a WHERE a.draft_id = d.id AND a.object_key = ?))`, holder, key, key).toArray()[0];
+    const id = upload?.id ?? (draft ? draft.id : undefined);
+    if (!id) return false;
+    const kind = upload ? 'upload' : 'draft';
+    if (!this.sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ? AND holder = ?', kind, id, holder).toArray().length) {
+      this.commitEvents([{ type: 'api_source_lost', kind, id, holder }]);
+    }
+    return true;
+  }
+
+  private deferDraftRelease(id: string): void {
+    const previous = this.sql.exec<{ key: string; holder: string }>('SELECT raw_key AS key, holder FROM drafts WHERE id = ?', id).toArray()[0];
+    if (!previous) return;
+    const seq = this.journal.revision() + 1;
+    this.enqueueRelease(seq, previous.key, previous.holder);
+    for (const { key } of this.sql.exec<{ key: string }>('SELECT object_key AS key FROM mailbox_api_draft_objects WHERE draft_id = ?', id)) {
+      this.enqueueRelease(seq, key, previous.holder);
+    }
   }
 
   pruneApiKeys(now: number): void {
     this.storage.transactionSync(() => {
-      this.sql.exec(`DELETE FROM mailbox_api_idempotency WHERE key IN (SELECT key FROM mailbox_api_idempotency
-        WHERE expires_at <= ? ORDER BY expires_at, key LIMIT 64)`, now);
+      // Rows written before M3-2 have no timer unless restored. Preserve the
+      // legacy cleanup for those rows, not for a key owned by idem_expiry.
+      this.sql.exec(`DELETE FROM mailbox_api_idempotency WHERE key IN (SELECT k.key FROM mailbox_api_idempotency k
+        WHERE expires_at <= ? AND NOT EXISTS (SELECT 1 FROM timers WHERE kind = ? AND ref = k.key)
+          AND json_extract(result, '$.status') IS NULL
+        ORDER BY expires_at, k.key LIMIT 64)`, now, IDEM_EXPIRY);
       this.sql.exec(`DELETE FROM mailbox_api_in_progress WHERE key IN (SELECT key FROM mailbox_api_in_progress
         WHERE expires_at <= ? ORDER BY expires_at, key LIMIT 64)`, now);
     });
@@ -383,7 +484,7 @@ export class MailboxIndex {
 
   private change(event: Exclude<JournalEvent, MessageEvent>) { this.changeMany([event]); }
 
-  private apply(event: Exclude<JournalEvent, MessageEvent>) {
+  private apply(event: Exclude<JournalEvent, MessageEvent>, snapshot = false) {
     switch (event.type) {
       case 'receipt':
         if (!isDeliveryId(event.id)) throw new Error('Invalid receipt');
@@ -410,6 +511,41 @@ export class MailboxIndex {
         JSON.parse(event.result);
         this.sql.exec('INSERT OR REPLACE INTO mailbox_api_idempotency VALUES (?, ?, ?, ?)', event.key, event.fingerprint, event.expiresAt, event.result);
         break;
+      case 'api_result_expire':
+        if (!bounded(event.key, 64) || !count(event.expiresAt)) throw new Error('Invalid API result expiry');
+        this.sql.exec('DELETE FROM mailbox_api_idempotency WHERE key = ? AND expires_at = ?', event.key, event.expiresAt);
+        break;
+      case 'api_upload':
+        if (!bounded(event.id, 64) || typeof event.objectKey !== 'string' || parseObjectKey(event.objectKey)?.kind !== 'att' ||
+            !bounded(event.name, 255) || !bounded(event.mediaType, 127) || !count(event.size) || event.size > LIMITS.uploadBytes ||
+            !count(event.expiresAt) || event.expiresAt === 0) throw new Error('Invalid API upload');
+        if (event.holder !== undefined && !bounded(event.holder, 256)) throw new Error('Invalid upload holder');
+        this.sql.exec('INSERT INTO mailbox_api_uploads VALUES (?, ?, ?, ?, ?, ?, ?)', event.id, event.objectKey, event.name,
+          event.mediaType, event.size, event.expiresAt, event.holder ?? `upload:${event.id}`);
+        if (!snapshot && event.holder !== undefined) this.enqueueConfirmation(this.journal.revision() + 1, event.objectKey, event.holder);
+        break;
+      case 'api_upload_delete': {
+        if (!bounded(event.id, 64) || typeof event.objectKey !== 'string' || parseObjectKey(event.objectKey)?.kind !== 'att') {
+          throw new Error('Invalid API upload deletion');
+        }
+        const removed = this.sql.exec<{ holder: string }>('DELETE FROM mailbox_api_uploads WHERE id = ? AND object_key = ? RETURNING holder',
+          event.id, event.objectKey).toArray()[0];
+        if (!removed) throw new Error('Missing API upload for deletion');
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'upload' AND id = ?", event.id);
+        this.enqueueRelease(this.journal.revision() + 1, event.objectKey, removed.holder);
+        break;
+      }
+      case 'api_source_lost': {
+        if ((event.kind !== 'draft' && event.kind !== 'upload') || !bounded(event.id, 256) || !bounded(event.holder, 256)) {
+          throw new Error('Invalid unusable source');
+        }
+        const table = event.kind === 'draft' ? 'drafts' : 'mailbox_api_uploads';
+        const marked = this.sql.exec(`INSERT OR REPLACE INTO mailbox_unusable_sources(kind, id, holder)
+          SELECT ?, id, holder FROM ${table} WHERE id = ? AND holder = ?`, event.kind, event.id, event.holder);
+        // A concurrent delete must not cancel an alert that has yet to be accepted.
+        if (marked.rowsWritten) this.sql.exec("INSERT OR IGNORE INTO mailbox_alerts(code, since) VALUES ('holder_source_lost', ?)", Date.now());
+        break;
+      }
       case 'setting':
         if ((event.kind !== 'filter' && event.kind !== 'send-as') || !bounded(event.id, 256) || !bounded(event.definition, 8192)) {
           throw new Error('Invalid mailbox setting');
@@ -432,20 +568,42 @@ export class MailboxIndex {
         }
         break;
       }
-      case 'draft':
-        if (!bounded(event.id, 256) || !bounded(event.holder, 128) || typeof event.rawKey !== 'string' ||
-            !event.rawKey.startsWith('drafts/') || !isObjectKey(event.rawKey)) {
+      case 'draft': {
+        const generated = typeof event.rawKey === 'string' && parseObjectKey(event.rawKey)?.kind === 'raw';
+        if (!bounded(event.id, 256) || !bounded(event.holder, 256) || typeof event.rawKey !== 'string' ||
+            (!generated && (!event.rawKey.startsWith('drafts/') || !isObjectKey(event.rawKey)))) {
           throw new Error('Invalid draft');
         }
+        if (event.attachmentKeys !== undefined || event.uploadIds !== undefined) {
+          if (!Array.isArray(event.attachmentKeys) || event.attachmentKeys.length > LIMITS.attachmentsPerMessage ||
+              event.attachmentKeys.some(key => typeof key !== 'string' || !parseObjectKey(key)) ||
+              !Array.isArray(event.uploadIds) || event.uploadIds.length > LIMITS.attachmentsPerMessage ||
+              event.uploadIds.some(id => !bounded(id, 64))) throw new Error('Invalid draft attachments');
+          if (!snapshot) this.deferDraftRelease(event.id);
+        }
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'draft' AND id = ?", event.id);
         this.sql.exec('INSERT INTO drafts VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET raw_key=excluded.raw_key, holder=excluded.holder',
           event.id, event.rawKey, event.holder);
+        if (event.attachmentKeys && event.uploadIds) {
+          this.sql.exec('DELETE FROM mailbox_api_draft_objects WHERE draft_id = ?', event.id);
+          this.sql.exec('DELETE FROM mailbox_api_draft_uploads WHERE draft_id = ?', event.id);
+          for (const key of new Set(event.attachmentKeys)) this.sql.exec('INSERT INTO mailbox_api_draft_objects VALUES (?, ?)', event.id, key);
+          for (const id of new Set(event.uploadIds)) this.sql.exec('INSERT INTO mailbox_api_draft_uploads VALUES (?, ?)', event.id, id);
+        }
         if (event.revision != null || event.updatedAt != null) {
           if (!bounded(event.revision, 64) || !count(event.updatedAt)) throw new Error('Invalid API draft metadata');
           this.sql.exec('INSERT OR REPLACE INTO mailbox_api_drafts VALUES (?, ?, ?)', event.id, event.revision, event.updatedAt);
         }
+        if (!snapshot && generated) {
+          const seq = this.journal.revision() + 1;
+          for (const key of new Set([event.rawKey, ...(event.attachmentKeys ?? [])])) this.enqueueConfirmation(seq, key, event.holder);
+        }
         break;
+      }
       case 'draft_delete':
         if (!bounded(event.id, 256)) throw new Error('Invalid draft deletion');
+        if (event.deferRelease) this.deferDraftRelease(event.id);
+        this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'draft' AND id = ?", event.id);
         this.sql.exec('DELETE FROM drafts WHERE id = ?', event.id);
         break;
       case 'bayes':
@@ -510,8 +668,20 @@ export class MailboxIndex {
         SELECT 'thread', json_object('id', id, 'assigned', assigned, 'lastDate', last_date, 'count', count, 'subjectKey', subject_key)
         FROM threads WHERE count > 0;
         INSERT INTO backup_capture(kind, value)
-        SELECT 'draft', json_object('id', d.id, 'rawKey', d.raw_key, 'holder', d.holder, 'revision', a.revision, 'updatedAt', a.updated_at)
+        SELECT 'api_upload', json_object('id', id, 'objectKey', object_key, 'name', name, 'mediaType', media_type,
+          'size', size, 'expiresAt', expires_at, 'holder', holder) FROM mailbox_api_uploads;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'draft', json_object('id', d.id, 'rawKey', d.raw_key, 'holder', d.holder, 'revision', a.revision, 'updatedAt', a.updated_at,
+          'attachmentKeys', json((SELECT json_group_array(object_key) FROM mailbox_api_draft_objects WHERE draft_id = d.id)),
+          'uploadIds', json((SELECT json_group_array(upload_id) FROM mailbox_api_draft_uploads WHERE draft_id = d.id)))
         FROM drafts d LEFT JOIN mailbox_api_drafts a ON a.id = d.id;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'pending_release', json_object('seq', seq, 'key', object_key, 'holder', holder) FROM mailbox_pending_releases;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'pending_confirmation', json_object('seq', seq, 'key', object_key, 'holder', holder, 'publishedAt', published_at)
+        FROM mailbox_pending_confirmations;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'api_source_lost', json_object('kind', kind, 'id', id, 'holder', holder) FROM mailbox_unusable_sources;
         INSERT INTO backup_capture(kind, value)
         SELECT 'api_settings', json_object('definition', definition) FROM mailbox_api_settings;
         INSERT INTO backup_capture(kind, value)
@@ -542,6 +712,8 @@ export class MailboxIndex {
   resetForRestore() {
     this.sql.exec(`DELETE FROM fts; DELETE FROM message_labels; DELETE FROM attachments; DELETE FROM messages; DELETE FROM threads;
       DELETE FROM receipts; DELETE FROM fingerprints; DELETE FROM labels; DELETE FROM drafts; DELETE FROM bayes;
+      DELETE FROM mailbox_api_uploads; DELETE FROM mailbox_pending_releases; DELETE FROM mailbox_pending_confirmations;
+      DELETE FROM mailbox_unusable_sources;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
     this.sql.exec('DELETE FROM timers WHERE kind <> ?', JOURNAL_FLUSH);
@@ -554,7 +726,7 @@ export class MailboxIndex {
 
   // Applies one snapshot row. Call inside the transaction that advances the
   // restore cursor, so a resumed restore never applies a row twice.
-  restoreSnapshotRow(row: SnapshotRow) {
+  restoreSnapshotRow(row: SnapshotRow): PendingConfirmation | undefined {
     const value: unknown = JSON.parse(row.value);
     if (row.kind === 'message') {
       const message = value as SnapshotMessage;
@@ -573,9 +745,15 @@ export class MailboxIndex {
     } else if (row.kind === 'receipt' || row.kind === 'fingerprint') {
       if (!bounded(value, 2048)) throw new Error('Invalid snapshot key');
       this.sql.exec(`INSERT OR IGNORE INTO ${row.kind === 'receipt' ? 'receipts' : 'fingerprints'} VALUES (?)`, value);
+    } else if (row.kind === 'pending_release') {
+      const entry = value as { seq: number; key: string; holder: string };
+      this.enqueueRelease(entry.seq, entry.key, entry.holder);
+    } else if (row.kind === 'pending_confirmation') {
+      const entry = value as PendingConfirmation;
+      return this.enqueueConfirmation(entry.seq, entry.key, entry.holder, entry.publishedAt);
     } else if (row.kind === 'label' || row.kind === 'bayes' || row.kind === 'draft' || row.kind === 'setting' ||
-      row.kind === 'api_result' || row.kind === 'api_settings') {
-      this.apply({ ...(value as object), type: row.kind } as Exclude<JournalEvent, MessageEvent>);
+      row.kind === 'api_result' || row.kind === 'api_settings' || row.kind === 'api_upload' || row.kind === 'api_source_lost') {
+      this.apply({ ...(value as object), type: row.kind } as Exclude<JournalEvent, MessageEvent>, true);
     } else throw new Error('Invalid snapshot state row');
   }
 

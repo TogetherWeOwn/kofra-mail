@@ -1,7 +1,9 @@
 import { Mailbox } from '../../src/mailbox-do.ts';
 import { MailboxIndex, storedLifecycle } from '../../src/mailbox-index.ts';
-import { BackupConflict, MailboxRecovery, readyLife, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { BackupConflict, MailboxRecovery, readyLife, SETTINGS_FLUSH_MS, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
+import { legacyFixtureObjects, seedLegacyDraft } from './legacy-draft.ts';
 import type { Env } from '../../src/worker.ts';
+export { Sweeper } from '../../src/sweeper-do.ts';
 
 const scope = { workspaceId: 'workspace', mailboxId: 'mailbox' };
 type PauseAt = 'first snapshot page PUT' | 'failed manifest GET' | 'manifest GET' | 'restore fence';
@@ -57,10 +59,15 @@ export class RegressionMailbox extends Mailbox {
       return bucket.list(options);
     };
     super(ctx, { ...env, MAIL_STATE: { get, put, list, delete: keys => bucket.delete(keys) } as R2Bucket,
-      SWEEPER: { getByName: () => ({
-        register: async () => { throw new Error('Unexpected fixture registration'); }, hold: async () => {}, release: async () => {},
-      holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
-      }) },
+      SWEEPER: { getByName: workspaceId => {
+        const refs = env.SWEEPER.getByName(workspaceId);
+        return {
+          register: async () => { throw new Error('Unexpected fixture registration'); }, hold: async () => {},
+          release: (key, holder) => refs.release(key, holder),
+          holdProvisional: (target, holder) => refs.holdProvisional(target, holder),
+          confirm: entries => refs.confirm(entries),
+        };
+      } },
     });
     this.io = io;
     // Capture the first deadline before the real callback can replace its alarm.
@@ -70,6 +77,10 @@ export class RegressionMailbox extends Mailbox {
       if (this.useScheduler && this.scheduledDelay === null) this.scheduledDelay = Number(args[0]) - Date.now();
       return setAlarm(...args);
     } });
+  }
+
+  async saveDraft(ws: string, mb: string, id: string, bytes: Uint8Array<ArrayBuffer>) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, index => seedLegacyDraft(index, legacyFixtureObjects(this.env, ws), id, bytes));
   }
 
   private localIndex() {

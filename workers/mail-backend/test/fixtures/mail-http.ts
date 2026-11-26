@@ -4,7 +4,7 @@ import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response as LocalResponse, type Request as LocalRequest } from 'miniflare';
 import { createHttpMailService } from '../../../../contracts/mail-api/src/http-client.ts';
-import type { ConformanceHarness, Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
+import type { Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
 import { migrateDirectory } from './directory-db.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
@@ -43,12 +43,18 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, parent?:
   return [...header, `Content-Type: multipart/mixed; boundary="${boundary}"`, '', ...[html ?? plain, ...parts].flatMap((part) => [`--${boundary}`, part]), `--${boundary}--`, ''].join(CRLF);
 }
 
-export async function startMailHttpFixture({ demo = false, startedAt = Date.now() }: { demo?: boolean; startedAt?: number } = {}) {
+export async function startMailHttpFixture({ demo = false, draftsUploads = false, startedAt = Date.now() }:
+  { demo?: boolean; draftsUploads?: boolean; startedAt?: number } = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
+  const writes: { key: string; holders: string[] }[] = [];
+  let inspectPut: ((pathname: string) => Promise<void>) | undefined;
+  let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
+  let watchedBody: PromiseWithResolvers<void> | undefined;
   const control = crypto.randomUUID();
-  let now = Math.floor(startedAt / 1000) * 1000;
+  const startTime = Math.floor(startedAt / 1000) * 1000;
+  let now = startTime;
   const mf = new Miniflare({
     host: '127.0.0.1', port: 0,
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
@@ -57,13 +63,25 @@ export async function startMailHttpFixture({ demo = false, startedAt = Date.now(
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
+      ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture' },
     outboundService: async (req: LocalRequest) => {
       const { host, pathname } = new NodeURL(req.url);
       assert.equal(host, 'object-store.example.test');
+      if (pathname === '/fixture-body-read' && req.method === 'POST') {
+        watchedBody?.resolve();
+        return new LocalResponse(null, { status: 204 });
+      }
       switch (req.method) {
-        case 'PUT': objects.set(pathname, await req.arrayBuffer()); return new LocalResponse(null, { status: 201 });
+        case 'PUT': {
+          await inspectPut?.(pathname);
+          const held = nextPut;
+          nextPut = undefined;
+          if (held) { held.start.resolve(); await held.resume.promise; }
+          objects.set(pathname, await req.arrayBuffer());
+          return new LocalResponse(null, { status: 201 });
+        }
         case 'GET': {
           const object = objects.get(pathname);
           return object ? new LocalResponse(object, { headers: { 'content-length': String(object.byteLength) } })
@@ -96,6 +114,58 @@ export async function startMailHttpFixture({ demo = false, startedAt = Date.now(
     const call = (name: string, body: string, extra: Record<string, string> = {}) => fetch(`${origin}/__fixture/${name}`, {
       method: 'POST', headers: { 'x-fixture-control': control, ...extra }, body,
     });
+    const holders = async (key: string, workspace = accounts.member.ws): Promise<string[]> => {
+      const res = await call('holders', JSON.stringify({ workspace, key }));
+      assert.equal(res.status, 200);
+      return res.json() as Promise<string[]>;
+    };
+    const readControl = async <T>(path: string, body = ''): Promise<T> => {
+      const res = await call(path, body);
+      assert.equal(res.status, 200);
+      return res.json() as Promise<T>;
+    };
+    const timers = () => readControl<{ kind: string; ref: string; due_at: number }[]>('timers');
+    const pendingReleases = () => readControl<{ seq: number; object_key: string; holder: string }[]>('pending-releases');
+    const releaseRetryAt = () => readControl<number | null>('release-retry-at');
+    const controlAction = async (path: string, body = '') => {
+      const res = await call(path, body);
+      assert.equal(res.status, 204, res.status === 204 ? undefined : await res.text());
+    };
+    const hasIdempotency = (key: string) => readControl<boolean>('has-idempotency', key);
+    const confirmations = () => readControl<{ seq: number; object_key: string; holder: string }[]>('confirmations');
+    const holderDetails = (key: string) => readControl<{ holder: string; state: string; expires_at: number | null }[]>('holder-details', key);
+    const confirmFailure = (failing: boolean) => controlAction('confirm-failure', String(failing));
+    const stallConfirmation = () => controlAction('stall-confirmation');
+    const stallRelease = (holder: string) => controlAction('stall-release', holder);
+    const expireUploadLease = (key: string) => controlAction('expire-upload-lease', key);
+    const pauseNextPut = () => {
+      const gate = nextPut = { start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+      return { started: gate.start.promise, release: gate.resume.resolve };
+    };
+    const confirmBatches = () => readControl<number[]>('confirm-batches');
+    const releaseHolder = (key: string, holder: string) => controlAction('release-holder', JSON.stringify({ key, holder }));
+    const sweepAt = (time: number) => controlAction('sweep-at', String(time));
+    const alerts = () => readControl<string[]>('alerts');
+    const alertFailure = (failing: boolean) => controlAction('alert-failure', String(failing));
+    const stageAndCrash = () => readControl<boolean>('stage-crash');
+    const persistMaximumHolder = (key: string) => readControl<string>('maximum-holder', key);
+    const restore = () => controlAction('restore');
+    const forceSnapshot = () => readControl<boolean>('snapshot');
+    const uploadSwitch = (enabled: boolean) => controlAction('upload-switch', String(enabled));
+    const publishFailure = (failing: boolean) => controlAction('publish-failure', String(failing));
+    const releaseFailure = (failing: boolean) => controlAction('release-failure', String(failing));
+    const acknowledgedReleases = () => readControl<{ key: string; holder: string }[]>('acknowledged-releases');
+    const purgeTrash = () => readControl<number>('purge-trash');
+    const pauseExpiry = (kind: string) => controlAction('pause-expiry', kind);
+    const expiryStarts = () => readControl<number>('expiry-starts');
+    const eventCount = (kind: string) => readControl<number>('events', kind);
+    const finishExpiry = () => controlAction('finish-expiry');
+    if (draftsUploads) inspectPut = async (pathname) => {
+      const path = /^\/mail-([^/]+)\/(.+)$/.exec(pathname);
+      assert.ok(path, 'expected a workspace-scoped PUT');
+      const [, workspace, key] = path;
+      writes.push({ key, holders: await holders(key, workspace) });
+    };
     const ids = new Map<string, string>();
     const clients = new Map<string, ReturnType<typeof createHttpMailService>>();
     const as = (principal: keyof typeof accounts) => {
@@ -110,8 +180,8 @@ export async function startMailHttpFixture({ demo = false, startedAt = Date.now(
       clients.set(principal, client);
       return client;
     };
-    const advance = async (ms: number) => {
-      const res = await call('advance', String(ms));
+    const advance = async (ms: number, parallel = false) => {
+      const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel) });
       if (!res.ok) throw new Error(`Fixture advance HTTP ${res.status}: ${await res.text()}`);
       now += ms;
     };
@@ -147,8 +217,17 @@ export async function startMailHttpFixture({ demo = false, startedAt = Date.now(
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, as, deliver, advance, m3: false, credentialEpoch: async () => 1,
-      sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() } satisfies ConformanceHarness & { origin: string };
+    return { origin, contentOrigin, as, deliver, advance, objects, writes, holders, timers, pendingReleases, releaseRetryAt, restore, forceSnapshot, uploadSwitch,
+      publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
+      startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
+      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
+      watchBodyRead: () => (watchedBody = Promise.withResolvers<void>()).promise,
+      failNextConfirmation: () => controlAction('fail-next-confirmation'),
+      blockLaterDelta: (after: number) => controlAction('block-later-delta', String(after)),
+      exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
+      seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
+      m3: false, credentialEpoch: async () => 1,
+      sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
   } catch (error) {
     await mf.dispose();
     throw error;

@@ -1,7 +1,8 @@
 import type { AlertEvent } from './deliver.ts';
 
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
-export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict';
+export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
+  'holder_confirm_stale' | 'holder_source_lost';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
 
 const TITLE: Record<Event['code'], string> = {
@@ -12,6 +13,8 @@ const TITLE: Record<Event['code'], string> = {
   backup_stale: 'Mailbox backup is stale',
   restore_blocked: 'Mailbox restore is blocked',
   backup_conflict: 'Mailbox state diverged from its backup',
+  holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
+  holder_source_lost: 'A mailbox source object is missing',
 };
 
 export function mailAlert(binding?: AlertBinding) {
