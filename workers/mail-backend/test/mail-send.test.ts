@@ -354,6 +354,13 @@ test('undo racing the alarm: either cancelled with no queue message, or released
 }));
 
 const objectPath = (key: string) => `/mail-w1/${key}`;
+// Fails instead of hanging when a bounded wait stops being bounded.
+async function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} took over ${ms} ms`)), ms); })]);
+  } finally { clearTimeout(timer); }
+}
 async function until(check: () => boolean | Promise<boolean>, what: string) {
   for (let i = 0; i < 200; i++) {
     if (await check()) return;
@@ -615,11 +622,10 @@ test('a barrier behind a stalled publish answers 409 within its budget, and the 
   await h.sends.stallPublish();
   const lane = h.advance(minute); // The backup lane starts publishing the draft and stalls in its write.
   await h.sends.publishStalled();
-  const started = Date.now();
-  const answer = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+  let answer: Response;
+  try { answer = await within(post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision), 10 * second, 'the barrier'); }
+  finally { await h.sends.resumePublish(); }
   assert.equal(answer.status, 409);
-  assert.ok(Date.now() - started < 10 * second, 'the answer does not wait for the stalled write');
-  await h.sends.resumePublish();
   await lane;
   const sent = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
   assert.equal(sent.state, 'pending');
@@ -716,9 +722,11 @@ test('a barrier that times out after the publish holding the lane already covere
   const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
   await until(async () => (await h.sends.ids()).length === 1, 'the send commit');
   // The publish ahead covers the send, then keeps the lane past the barrier's budget.
-  await h.sends.coverHeld();
-  const response = await answer;
+  let response: Response;
+  try {
+    await h.sends.coverHeld();
+    response = await within(answer, 10 * second, 'the barrier');
+  } finally { await h.sends.releaseHeld(); }
   assert.equal(response.status, 202);
   assert.equal((await response.json() as Send).state, 'pending');
-  await h.sends.releaseHeld();
 }));
