@@ -25,6 +25,7 @@ import {
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
 import type { JournalEvent, JournalResult, SendAddress, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
 import { parseMail } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
@@ -523,15 +524,30 @@ export class SendDriver {
     }
     const verified = new Map<number, Uint8Array<ArrayBuffer>>();
     let matched = true;
-    await eachForwardedPart(key => {
-      const ready = this.ports.ready();
-      if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
-      return ready.index.readObject(key);
-    }, wanted, async ({ index, frozen }, bytes) => {
-      if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return matched = false;
-      verified.set(index, bytes);
-    });
+    try {
+      await eachForwardedPart(key => {
+        const ready = this.ports.ready();
+        if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
+        return this.readSource(ready.index, key);
+      }, wanted, async ({ index, frozen }, bytes) => {
+        if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return matched = false;
+        verified.set(index, bytes);
+      });
+    } catch (error) {
+      if (error instanceof SourceMismatch) return null;
+      throw error;
+    }
     return matched ? verified : null;
+  }
+
+  // A stored object declared empty or over the cap is invalid for good, like a
+  // digest mismatch; a missing object or a failed read still retries.
+  private async readSource(index: MailboxIndex, key: string): Promise<Uint8Array<ArrayBuffer>> {
+    try { return await index.readObject(key); }
+    catch (error) {
+      if (error instanceof ObjectInvalidError) throw new SourceMismatch();
+      throw error;
+    }
   }
 
   private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
@@ -551,7 +567,7 @@ export class SendDriver {
         if (parsed.digest !== EMPTY_DIGEST) throw new SourceMismatch();
         return new Uint8Array(0);
       }
-      const raw = await ready.index.readObject(key);
+      const raw = await this.readSource(ready.index, key);
       if (await sha256(raw) !== parsed.digest) throw new SourceMismatch();
       return raw;
     };

@@ -1056,7 +1056,8 @@ test('a send already fingerprinted on the synthetic row fails with delivery_erro
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
   }));
 
-test('a large forwarded part whose att/ object no longer matches its digest fails the send with delivery_error, an alert and no MIME',
+for (const corruption of ['changed', 'empty'] as const) {
+  test(`a large forwarded part whose att/ object is ${corruption === 'changed' ? 'changed in place' : 'stored as zero bytes'} fails the send with delivery_error, an alert and no MIME`,
   { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
     const large = new Uint8Array(300 * 1024).fill(65);
     const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Large file',
@@ -1067,8 +1068,8 @@ test('a large forwarded part whose att/ object no longer matches its digest fail
     const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
     const [partKey] = (JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[] }).attachmentKeys;
     assert.match(partKey, /^att\//, 'a large part is its own content-addressed object');
-    // The stored bytes are corrupted in place: same length, different content.
-    h.objects.set(objectPath(partKey), new Uint8Array(large.byteLength).fill(66).buffer);
+    // The stored bytes are corrupted: same length and different content, or a declared empty body.
+    h.objects.set(objectPath(partKey), corruption === 'changed' ? new Uint8Array(large.byteLength).fill(66).buffer : new ArrayBuffer(0));
     const builds = (await h.sends.builds()).length;
     await h.advance(UNDO);
     const failed = await mail.getSend(pending.id);
@@ -1082,6 +1083,7 @@ test('a large forwarded part whose att/ object no longer matches its digest fail
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
     assert.equal(await h.sends.emailCalls(), 0);
   }));
+}
 
 test('a transient read failure of a large forwarded part still retries instead of failing the send', { timeout: 60_000 }, () => withSend(async (h, mail, from) => {
   const large = new Uint8Array(300 * 1024).fill(65);

@@ -56,9 +56,9 @@ test('a runner stopped by SIGTERM or SIGINT kills its child group before it exit
         if (!pid) await new Promise(resolve => setTimeout(resolve, 20));
       }
       assert.ok(pid > 0, 'the grandchild started');
-      const exited = new Promise(resolve => runner.on('exit', resolve));
+      const exited = new Promise<NodeJS.Signals | null>(resolve => runner.on('exit', (_code, stopped) => resolve(stopped)));
       runner.kill(signal);
-      await exited;
+      assert.equal(await exited, signal, 'the runner still stops by the signal it received');
       for (let i = 0; i < 100 && alive(); i++) await new Promise(resolve => setTimeout(resolve, 20));
       assert.equal(alive(), false, `the grandchild outlived a runner stopped by ${signal}`);
     } finally {
