@@ -46,7 +46,9 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
   async function get(key: string, kind: 'raw' | 'att', ownerSignal: AbortSignal) {
     if (!keyOf(key, kind)) throw new Error('invalid mail object key');
     const headersDeadline = kind === 'att' ? new AbortController() : undefined;
-    const signal = AbortSignal.any([ownerSignal, headersDeadline?.signal ?? AbortSignal.timeout(60_000)]);
+    // Raw reads use the flight's total deadline. Part streams still have
+    // their own header timeout and per-chunk idle deadline below.
+    const signal = headersDeadline ? AbortSignal.any([ownerSignal, headersDeadline.signal]) : ownerSignal;
     const timer = headersDeadline && setTimeout(() => headersDeadline.abort(new DOMException('object header timeout', 'TimeoutError')), 60_000);
     let response: Response;
     try {
@@ -73,7 +75,9 @@ export function readOnlyObjects(env: ContentStoreConfig, ws: string, requestSign
         try {
           install((await reserveMime(size, signal, byteWaitMs))());
           const raw = await readExact(stream, size, MAX_RAW_BYTES);
+          signal.throwIfAborted();
           if (await sha256(raw) !== parseObjectKey(rawKey)?.digest) throw new Error('mail object digest mismatch');
+          signal.throwIfAborted();
           // Same parser version and options as mail-backend's indexed part numbers.
           return await PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
         } catch (error) {

@@ -6,7 +6,7 @@ type Purpose = 'body' | 'cid' | 'att';
 type Flight = {
   key: string;
   sub: string;
-  deadline: number;
+  loadStartedAt?: number;
   loading: boolean;
   started: boolean;
   loadActive: boolean;
@@ -23,7 +23,10 @@ type Flight = {
 };
 type Member = { flight: Flight; purpose: Purpose; byteWaitMs: number };
 type KeepAlive = (work: Promise<void>) => void;
-const watchdogMs = 75_000;
+const loadTimeoutMs = 25_000;
+const followerTimeoutMs = 27_000;
+const watchdogMs = 30_000;
+class SharedLoadUnavailable extends Error {}
 type Claim = () => Member;
 type Waiter = {
   key: string; sub: string; purpose: Purpose; until: number;
@@ -32,16 +35,22 @@ type Waiter = {
 };
 
 const flights = new Map<string, Flight>();
+// Includes stale generations that are no longer advertised to new members.
+const activeLoads = new Set<Flight>();
 const leaders = new Map<string, Flight>();
 const waiting: Waiter[] = [];
 
 function take(waiter: Waiter, now: number): Member | undefined {
   const lead = leaders.get(waiter.sub);
   if (lead && lead.key !== waiter.key) return;
-  const existing = flights.get(waiter.key);
+  let existing = flights.get(waiter.key);
+  if (existing?.loadActive && now - existing.loadStartedAt! >= followerTimeoutMs) {
+    closeStale(existing);
+    existing = undefined;
+  }
   if (existing && (!existing.loading || existing.members >= 16 || (waiter.purpose === 'body' && existing.bodies >= 2))) return;
   const flight: Flight = existing ?? {
-    key: waiter.key, sub: waiter.sub, deadline: now + watchdogMs, loading: true, started: false, loadActive: false,
+    key: waiter.key, sub: waiter.sub, loading: true, started: false, loadActive: false,
     preparing: 0, members: 0, bodies: 0, retired: false, notify: new Set(), drained: new Set(),
   };
   if (!existing) {
@@ -56,8 +65,9 @@ function take(waiter: Waiter, now: number): Member | undefined {
 function retire(flight: Flight) {
   if (flight.retired) return;
   flight.retired = true;
-  flights.delete(flight.key);
-  leaders.delete(flight.sub);
+  if (flights.get(flight.key) === flight) flights.delete(flight.key);
+  if (leaders.get(flight.sub) === flight) leaders.delete(flight.sub);
+  activeLoads.delete(flight);
   flight.release?.();
   flight.release = undefined;
   flight.stopLoad = undefined;
@@ -82,34 +92,59 @@ function leave({ flight, purpose }: Member) {
   settle(flight);
 }
 
+function closeStale(flight: Flight) {
+  if (!flight.loadActive || flight.retired) return;
+  // Close admission, not accounting: a successor uses the ordinary byte
+  // gate while this generation retains its charge until settlement/watchdog.
+  flight.loading = false;
+  if (flights.get(flight.key) === flight) flights.delete(flight.key);
+}
+
 function expire(flight: Flight) {
-  if (flight.retired) return;
-  const error = new DOMException('raw MIME flight deadline exceeded', 'TimeoutError');
+  // The watchdog is only for a lost loader. A settled load's prepares keep
+  // the charge, even if they run longer than the load watchdog deadline.
+  if (flight.retired || !flight.loadActive) return;
+  const error = new DOMException('raw MIME load watchdog expired', 'TimeoutError');
   flight.expired = error;
   flight.stopLoad?.(error);
   retire(flight);
   console.warn(JSON.stringify({ metric: 'mail_content_mime_flight_watchdog', count: 1 }));
 }
 
-function watch(flight: Flight): { drained: Promise<void>; detach: () => void; clear: () => void } {
-  if (flight.retired) return { drained: Promise.resolve(), detach() {}, clear() {} };
-  // A live follower has its own timer and settlement notification even if
-  // the load's invocation disappears. Do not await its I/O-scoped promises.
+function watch(flight: Flight, retry?: () => void): { drained: Promise<void>; arm: () => void; detach: () => void; clear: () => void } {
+  if (flight.retired) return { drained: Promise.resolve(), arm() {}, detach() {}, clear() {} };
+  // A live follower owns its timers and settlement notification. They must
+  // still work after the producer's request and I/O context disappear.
   const done = Promise.withResolvers<void>();
   flight.drained.add(done.resolve);
-  const timer = setTimeout(() => { expire(flight); drain(); }, Math.max(0, flight.deadline - Date.now()));
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  let follower: ReturnType<typeof setTimeout> | undefined;
   return {
     drained: done.promise,
-    detach() { flight.drained.delete(done.resolve); done.resolve(); },
-    clear() { clearTimeout(timer); },
+    arm() {
+      const started = flight.loadStartedAt;
+      if (!flight.loadActive || started === undefined) return;
+      const elapsed = Date.now() - started;
+      watchdog = setTimeout(() => { expire(flight); drain(); }, Math.max(0, watchdogMs - elapsed));
+      if (retry) follower = setTimeout(() => {
+        if (!flight.loadActive || flight.retired) return;
+        closeStale(flight);
+        retry();
+      }, Math.max(0, followerTimeoutMs - elapsed));
+    },
+    detach() { clearTimeout(follower); flight.drained.delete(done.resolve); done.resolve(); },
+    clear() { clearTimeout(watchdog); },
   };
 }
 
 function drain() {
-  // If the runtime dropped all request-owned timers, reap expired flights
-  // before the next admission; no new request waits on a stale charge.
+  // Recover even if the runtime dropped the producer's request-owned timers.
   const nowMs = Date.now();
-  for (const flight of flights.values()) if (nowMs >= flight.deadline) expire(flight);
+  for (const flight of activeLoads) {
+    const elapsed = nowMs - flight.loadStartedAt!;
+    if (elapsed >= watchdogMs) expire(flight);
+    else if (elapsed >= followerTimeoutMs) closeStale(flight);
+  }
   // Do not let a blocked key or subject sit in front of an independent mailbox.
   for (let i = 0; i < waiting.length;) {
     const waiter = waiting[i];
@@ -171,11 +206,15 @@ async function admit(key: string, sub: string, signal: AbortSignal, purpose: Pur
 type Load = (install: (release: Release) => void, byteWaitMs: number, signal: AbortSignal) => Promise<MailMime>;
 
 function startLoad(flight: Flight, load: Load, byteWaitMs: number, retain: (work: Promise<void>) => void) {
+  const startedAt = Date.now();
   flight.started = true;
   flight.loadActive = true;
+  flight.loadStartedAt = startedAt;
+  activeLoads.add(flight);
   // The controller is owned by the flight, but only this invocation touches
   // it. Another request may settle stopLoad's plain JS promise.
   const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(new DOMException('raw MIME load timed out', 'TimeoutError')), loadTimeoutMs);
   const stop = Promise.withResolvers<DOMException | undefined>();
   flight.stopLoad = stop.resolve;
   void stop.promise.then(reason => { if (reason) controller.abort(reason); }).catch(() => {});
@@ -188,10 +227,14 @@ function startLoad(flight: Flight, load: Load, byteWaitMs: number, retain: (work
         }
         flight.release = release;
       }, byteWaitMs, controller.signal);
+      controller.signal.throwIfAborted();
+      if (Date.now() - startedAt >= loadTimeoutMs) throw new DOMException('raw MIME load timed out', 'TimeoutError');
       if (!flight.retired) flight.outcome = { mail };
     } catch (error) {
       if (!flight.retired) flight.outcome = { error };
     } finally {
+      clearTimeout(timeout);
+      activeLoads.delete(flight);
       flight.loading = false;
       flight.loadActive = false;
       flight.stopLoad = undefined;
@@ -203,12 +246,32 @@ function startLoad(flight: Flight, load: Load, byteWaitMs: number, retain: (work
   retain(work);
 }
 
-/** Share only the verified parse. Each caller prepares its own scoped response. */
+/** Share only the verified parse. A failed shared load gets at most one independent attempt. */
 export async function shareMime<T>(key: string, sub: string, signal: AbortSignal, load: Load,
     prepare: (mail: MailMime) => T | Promise<T>, purpose: Purpose = 'body', keepAlive?: KeepAlive): Promise<T> {
+  try {
+    return await useFlight(key, sub, signal, load, prepare, purpose, keepAlive);
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!(error instanceof SharedLoadUnavailable)) throw error;
+  }
+  // Use the same admission gate. Multiple recovering followers join the
+  // same successor when it is open, not one replacement per requester.
+  try { return await useFlight(key, sub, signal, load, prepare, purpose, keepAlive); }
+  catch {
+    signal.throwIfAborted();
+    throw new MimeBusy();
+  }
+}
+
+async function useFlight<T>(key: string, sub: string, signal: AbortSignal, load: Load,
+    prepare: (mail: MailMime) => T | Promise<T>, purpose: Purpose, keepAlive?: KeepAlive): Promise<T> {
   const member = (await admit(key, sub, signal, purpose))();
   const { flight, byteWaitMs } = member;
-  const watchdog = watch(flight);
+  const producer = !flight.started && !flight.retired;
+  const parsed = Promise.withResolvers<MailMime>();
+  const interrupted = Promise.withResolvers<never>();
+  const watchdog = watch(flight, producer ? undefined : () => interrupted.reject(new SharedLoadUnavailable()));
   let activeWork = 0;
   let detached = false;
   const retain = (work: Promise<unknown>) => {
@@ -218,16 +281,15 @@ export async function shareMime<T>(key: string, sub: string, signal: AbortSignal
     });
     keepAlive?.(settled);
   };
-  const parsed = Promise.withResolvers<MailMime>();
-  const interrupted = Promise.withResolvers<never>();
   void parsed.promise.catch(() => {});
   void interrupted.promise.catch(() => {});
   const abort = () => interrupted.reject(signal.reason);
+  const loadError = (error: unknown) => producer ? error : new SharedLoadUnavailable();
   const notify = () => {
-    if (flight.expired) interrupted.reject(flight.expired);
+    if (flight.expired) interrupted.reject(loadError(flight.expired));
     else if (flight.outcome) {
       if ('mail' in flight.outcome) parsed.resolve(flight.outcome.mail);
-      else parsed.reject(flight.outcome.error);
+      else parsed.reject(loadError(flight.outcome.error));
     }
   };
   signal.addEventListener('abort', abort, { once: true });
@@ -238,10 +300,11 @@ export async function shareMime<T>(key: string, sub: string, signal: AbortSignal
     try {
       // An unclaimed leader can cancel before any I/O exists. A live member
       // claims the load in its own invocation rather than failing the flight.
-      if (!flight.started && !flight.retired) startLoad(flight, load, byteWaitMs, retain);
+      if (producer) startLoad(flight, load, byteWaitMs, retain);
+      watchdog.arm();
       const mail = await Promise.race([interrupted.promise, parsed.promise]);
       signal.throwIfAborted();
-      if (flight.expired) throw flight.expired;
+      if (flight.expired) throw loadError(flight.expired);
       flight.preparing++;
       const work = (async () => {
         try { return await prepare(mail); }

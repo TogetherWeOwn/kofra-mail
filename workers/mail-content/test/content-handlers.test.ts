@@ -389,6 +389,48 @@ test('workerd still serves a live CID follower after the stalled read leader can
   }
 });
 
+for (const recovered of [true, false]) test(`a CID follower ${recovered ? 'recovers from a failed shared load' : 'gets a secured 503 after its own attempt fails'}`, async () => {
+  const rawKey = await record(alpha, withParts(html), parts);
+  const rawPath = objectPath('alpha', rawKey);
+  const arrived = Promise.withResolvers<void>();
+  const failLeader = Promise.withResolvers<void>();
+  let attempts = 0;
+  objectResponses.set(rawPath, async () => {
+    if (++attempts === 1) {
+      arrived.resolve();
+      await failLeader.promise;
+      return new Response(null, { status: 502 });
+    }
+    if (!recovered) return new Response(null, { status: 502 });
+    const bytes = store.get(rawPath)!;
+    return new Response(bytes, { headers: { 'content-length': String(bytes.length) } });
+  });
+  const path = await cidUrl(1);
+  const leader = get(path);
+  try {
+    assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
+    const follower = get(path);
+    // Keep the source blocked while the real Workerd follower opts into the flight.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    assert.equal(attempts, 1);
+    failLeader.resolve();
+    const [failed, replacement] = await Promise.all([leader, follower]);
+    assert.equal(failed.status, 404);
+    assert.equal((await failed.arrayBuffer()).byteLength, 0);
+    const body = new Uint8Array(await replacement.arrayBuffer());
+    assert.equal(replacement.status, recovered ? 200 : 503);
+    if (recovered) assert.deepEqual(body, png);
+    else {
+      assert.equal(body.byteLength, 0);
+      assert.equal(replacement.headers.get('retry-after'), '1');
+      assert.equal(replacement.headers.get('strict-transport-security'), 'max-age=31536000; includeSubDomains');
+      assert.match(replacement.headers.get('content-security-policy') ?? '', /sandbox/);
+    }
+    assert.equal(attempts, 2);
+    assert.equal((await (await get('/__mime-budget')).json() as { inFlight: number }).inFlight, 0);
+  } finally { failLeader.resolve(); objectResponses.delete(rawPath); }
+});
+
 test('an unread large CID has no MIME charge and does not delay another mailbox', async () => {
   const large = new Uint8Array(17 * 1024 * 1024);
   large.set(png);
