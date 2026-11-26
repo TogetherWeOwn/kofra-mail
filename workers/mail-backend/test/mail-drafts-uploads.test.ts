@@ -701,6 +701,8 @@ test('a lost generation does not block restore and is journalled as unusable onl
   assert.ok(holder.expires_at);
   await h.sweepAt(holder.expires_at);
   await h.sweepAt(holder.expires_at + RETENTION_MS);
+  // The second delete, a day after the first, drops the retired row.
+  await h.sweepAt(holder.expires_at + RETENTION_MS + 24 * 60 * 60_000);
   assert.deepEqual(await h.holderDetails(objectKey), []);
   await h.confirmFailure(false);
   await h.restore();

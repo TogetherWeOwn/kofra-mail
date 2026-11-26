@@ -55,6 +55,13 @@ export class SweepRearm extends Sweeper {
     return this.bringAlarmForward(key);
   }
 
+  // Brings a retired generation's second delete, and the alarm, forward.
+  async bringSecondDeleteForward(key: string) {
+    const due = Date.now() + 50;
+    this.ctx.storage.sql.exec('UPDATE generations SET retry_at = ? WHERE key = ? AND retry_at IS NOT NULL', due, key);
+    await this.ctx.storage.setAlarm(due);
+  }
+
   async bringAlarmForward(key?: string) {
     if (await this.ctx.storage.getAlarm() === null) throw new Error('No sweep alarm to advance');
     const due = Date.now() + 50;

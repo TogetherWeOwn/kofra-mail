@@ -60,6 +60,7 @@ test('a provisional holder protects its generation until it expires, and the gra
 
   assert.deepEqual(await ledger.sweep(expiredAt + RETENTION - 1), [], 'the grace starts at the expiry, not at the hold');
   assert.deepEqual(await ledger.sweep(expiredAt + RETENTION), [key]);
+  assert.deepEqual(await ledger.sweep(expiredAt + RETENTION + DAY), [key], 'the second delete, a day after the first');
   assert.equal(await generation(ledger, key), null, 'the confirmed DELETE removes the retired generation');
   assert.deepEqual(await ledger.holders(key), [], 'and its expired holder row first');
 });
@@ -121,6 +122,7 @@ test('confirm answers lost after the expired generation was deleted, and release
   const deleted = await ledger.holdProvisional({ kind: 'raw', digest: digest('d') }, 'draft:scope:gone', 100);
   await ledger.sweep(100 + TTL);
   assert.deepEqual(await ledger.sweep(100 + TTL + RETENTION), [deleted]);
+  assert.deepEqual(await ledger.sweep(100 + TTL + RETENTION + DAY), [deleted], 'the second delete, a day after the first');
   assert.equal(await generation(ledger, deleted), null, 'the confirmed DELETE dropped the generation and its expired row');
   assert.deepEqual(await ledger.confirm([{ key: deleted, holder: 'draft:scope:gone' }], 200 + TTL + RETENTION), ['lost']);
   assert.deepEqual(await ledger.holders(), [], 'lost re-creates nothing');
@@ -178,6 +180,7 @@ test('a tombstone is never revived and is deleted with its generation', async ()
   assert.deepEqual(await generation(ledger, key), { key, holder_count: 0, last_ref_at: 100, retry_at: null });
 
   assert.deepEqual(await ledger.sweep(100 + RETENTION), [key]);
+  assert.deepEqual(await ledger.sweep(100 + RETENTION + DAY), [key], 'the second delete, a day after the first');
   assert.equal(await generation(ledger, key), null);
   assert.deepEqual(await ledger.holders(key), []);
 });
@@ -402,10 +405,13 @@ for (const mode of ['on', 'off'] as const) {
       // The overdue retention deadline is earlier than the expiry, so the alarm fires at once and sweeps it.
       await untilAlarm(box, hold);
       assert.ok(deletes.some(path => path.endsWith(`/${overdue}`)), 'the overdue generation was swept');
-      assert.equal(await box.generation(overdue), null);
+      // Its row stays retired until the second delete, a day later, which is earlier than the expiry.
+      const retired = await box.generation(overdue);
+      assert.ok(retired?.retry_at);
       const [holder] = await box.holders();
       assert.equal(holder.state, 'provisional');
-      assert.equal(await box.alarmAt(), holder.expires_at, 'then the expiry is the next wake-up');
+      assert.ok(retired.retry_at < holder.expires_at!);
+      assert.equal(await box.alarmAt(), retired.retry_at, 'then the second delete is the next wake-up');
     } else {
       await hold();
       const finished = Date.now();

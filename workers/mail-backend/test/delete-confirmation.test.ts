@@ -4,6 +4,8 @@ import { fileURLToPath, URL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response, type Request } from 'miniflare';
 import { RETENTION_MS } from '../src/reconcile.ts';
+// The sweeper's second delete of a retired generation, a day after the first.
+const SECOND_DELETE_MS = 24 * 60 * 60_000;
 import type { DeleteConfirmation } from './fixtures/delete-confirmation.ts';
 
 const generation = `raw/${'a'.repeat(64)}/01KBN8ZJ7G0000000000000000`;
@@ -106,6 +108,10 @@ for (const [name, body] of [['NoSuchBucket', xml('NoSuchBucket')], ['empty 404',
     response = () => new Response(null, { status: 204 });
     await box.sweepAt(due + 60_000);
     assert.deepEqual(deleted, [path, path]);
+    // The row is dropped only after the second delete, a day after the first confirmed one.
+    assert.equal(await box.next(), due + 60_000 + SECOND_DELETE_MS);
+    await box.sweepAt(due + 60_000 + SECOND_DELETE_MS);
+    assert.deepEqual(deleted, [path, path, path]);
     assert.equal(await box.next(), null);
   });
 }
