@@ -17,11 +17,13 @@ export interface ContentClaims {
 }
 export type OperationResult = {
   body?: unknown;
+  status?: number;
   replayed?: boolean;
   error?: { code: MailErrorCode } & Pick<Partial<Problem>, 'errors' | 'limit' | 'retryAfterSeconds'>;
 };
 export interface MailApiEnvironment {
   MAIL_LOCAL_API?: string;
+  MAIL_DRAFT_UPLOADS_ENABLED?: string;
   MAIL_DEV_SESSION?: {
     resolve(request: Request): Promise<LocalPrincipal | null>;
     members?(workspaceId: string): Promise<Omit<Member, 'hasMailbox'>[]>;
@@ -36,7 +38,8 @@ export interface MailApiEnvironment {
 }
 
 const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
-const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend', 'createUpload', 'deleteUpload']);
+const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend']);
+const uploads = new Set<Operation>(['createUpload', 'deleteUpload']);
 const drive = new Set<Operation>(['saveAttachmentToDrive', 'importFromDrive']);
 const matchers = (Object.entries(ROUTES) as [Operation, RouteSpec][]).map(([op, route]) => ({
   op, route, pattern: new RegExp(`^${API_PREFIX}${route.path.replace(/\{([A-Za-z]+)\}/g, '(?<$1>[^/]+)')}$`),
@@ -134,7 +137,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     const directory = new Directory(env.DIRECTORY, principal.workspaceId, env.MAIL_DEV_SESSION.members?.bind(env.MAIL_DEV_SESSION));
     const mailbox = await directory.byUser(principal.userId);
     if (route.access !== 'admin' && op !== 'getSession' && !mailbox) fail('forbidden');
-    if (m3.has(op)) fail('not_implemented');
+    if (m3.has(op) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
     if (drive.has(op)) fail('feature_unavailable');
 
     const idempotencyKey = request.headers.get('idempotency-key') ?? undefined;
@@ -147,8 +150,11 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     let params: Record<string, string>;
     try { params = Object.fromEntries(Object.entries(raw).map(([name, value]) => [name, decodeURIComponent(value)])); }
     catch { return fail('not_found'); }
-    const input = route.body === 'json' ? await readJson(request, op) : query;
-    if (op === 'getBodyUrl' && typeof input.remoteImages !== 'boolean') fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
+    const input = route.body === 'json' ? await readJson(request, op) : route.body === 'bytes'
+      ? { stream: request.body, mediaType: request.headers.get('content-type') ?? 'application/octet-stream',
+        contentLength: request.headers.get('content-length') }
+      : query;
+    if (op === 'getBodyUrl' && (!('remoteImages' in input) || typeof input.remoteImages !== 'boolean')) fail('invalid_request', { errors: [{ field: '/remoteImages', code: 'invalid' }] });
 
     let result: OperationResult;
     if (route.access === 'admin') {
@@ -193,7 +199,8 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
       fail(code, fields);
     }
     if (result.replayed) headers.set('idempotency-replayed', 'true');
-    return respond(result.body, route.success);
+    if (result.status !== undefined && result.status !== route.success) fail('unavailable');
+    return respond(result.body, result.status ?? route.success);
   } catch (error) {
     const value = error instanceof MailApiError ? error.problem : problem('internal');
     if (value.retryAfterSeconds !== undefined || value.status === 429 || value.status === 503) headers.set('retry-after', String(value.retryAfterSeconds ?? 1));
