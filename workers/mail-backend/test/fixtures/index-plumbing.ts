@@ -24,10 +24,28 @@ export class IndexPlumbing extends FixtureMailbox {
     return 'indexed';
   }
 
+  // How the last indexThroughKofra stored each object: the method, and for a
+  // streamed PUT the number of chunks and the largest one.
+  private calls: Array<{ method: string; key: string; chunks?: number; largest?: number }> = [];
+  async storeCalls() { return JSON.stringify(this.calls); }
+
   // The production object store for attachments: the Kofra S3 adapter.
   async indexThroughKofra(id: string, key: string) {
+    const store = kofra(this.env as unknown as KofraConfig, 'workspace');
+    const calls: typeof this.calls = this.calls = [];
     const index = new MailboxIndex(this.ctx.storage, {
-      ...kofra(this.env as unknown as KofraConfig, 'workspace'),
+      ...store,
+      put: (objectKey, bytes) => { calls.push({ method: 'put', key: objectKey }); return store.put(objectKey, bytes); },
+      putStream: (objectKey, content, size, digest) => {
+        const call = { method: 'putStream', key: objectKey, chunks: 0, largest: 0 };
+        calls.push(call);
+        const counted = content.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) {
+          call.chunks++;
+          call.largest = Math.max(call.largest, chunk.byteLength);
+          controller.enqueue(chunk);
+        } }));
+        return store.putStream(objectKey, counted, size, digest);
+      },
       get: async rawKey => {
         const object = await this.env.RAW.get(rawKey);
         if (!object) throw new Error('Missing fixture raw object');

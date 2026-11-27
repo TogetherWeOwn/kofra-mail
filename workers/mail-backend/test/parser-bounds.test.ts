@@ -10,7 +10,7 @@ import type { IndexPlumbing } from './fixtures/index-plumbing.ts';
 
 const id = '01KBN8ZJ7G0000000000000000';
 let runtime: Miniflare;
-let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'parts'> };
+let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'parts' | 'storeCalls'> };
 let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
 // The object store behind the Kofra adapter; a PUT is kept only if its body matches its signed digest.
 const stored = new Map<string, Uint8Array>();
@@ -142,6 +142,10 @@ async function assertStoredLikeBefore(name: string, wire: Uint8Array<ArrayBuffer
   assert.equal(row.size, expected.byteLength);
   assert.equal(row.object_key, `att/${await sha256(expected)}/${id}`);
   assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), expected);
+  // Streamed in blocks of at most 64 KiB, never handed over whole.
+  const calls = JSON.parse(await box.storeCalls()) as Array<{ method: string; key: string; chunks: number; largest: number }>;
+  assert.deepEqual(calls.map(({ method, key }) => [method, key]), [['putStream', row.object_key]]);
+  assert.ok(calls[0].largest <= 64 * 1024 && calls[0].chunks >= Math.ceil(expected.byteLength / (64 * 1024)), JSON.stringify(calls));
 }
 
 test('mailbox streams an attachment that decodes to 3 bytes per raw byte, past the raw message cap', async () => {
