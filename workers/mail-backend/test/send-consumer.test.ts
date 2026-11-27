@@ -444,7 +444,7 @@ test('a restore starts while the quota confirmation stalls: no EMAIL call under 
   await restore(h);
   await resumeAt(h, 'before:confirm');
   const old = await stalled;
-  assert.equal(step(old), 'stale', 'the old fence gets no request and no authorization');
+  assert.deepEqual(old, { ack: true, step: 'abandoned', fence: fenceOf(old), cause: 'request_stale' }, 'the old fence gets no request and no authorization');
   assert.equal((await calls(h)).length, 0);
   const leaseUntil = await leaseOf(h, id, old);
   await until(h, leaseUntil + SKEW - 1);
@@ -883,4 +883,74 @@ test('a request the frozen inputs can no longer build is abandoned with the long
   assert.deepEqual(ledgerOf(state), ['pending'], 'never failed by our own breach');
   assert.equal(logged(h, 'send_request_invalid').length, 1);
   assert.equal((await calls(h)).length, 0);
+}));
+
+test('slow request builds that outlive the lease never count toward the crash-loop hold, and the next normal attempt sends', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'slow-builds');
+  const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
+  for (let round = 0; round < 6; round++) {
+    const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
+    // The consumer dies right after the stale answer, before its own abandonClaim: only the claim can tidy up.
+    await crashAt(h, 'after:sendRequest');
+    const run = consume(h, id);
+    // A held send never reaches the request: fail at once instead of waiting for its read.
+    await Promise.race([read.started, run.then(outcome => assert.fail(`round ${round}: no request was built, the claim answered ${JSON.stringify(outcome)}`))]);
+    const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
+    await until(h, leaseUntil);
+    read.release();
+    assert.equal(step(await run), 'crashed:abandoned', `round ${round}`);
+    await until(h, leaseUntil + SKEW);
+  }
+  const state = await h.sendState(id);
+  assert.equal(state.dispatch?.held_at, null, 'never held');
+  assert.equal(state.dispatch?.unfinished, 0, 'no never-authorized fence counted as unfinished');
+  assert.equal((await calls(h)).length, 0);
+  assert.equal(step(await consume(h, id)), 'recorded');
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
+}));
+
+test('a stale request answer abandons the claim at once: the recipients go back to pending and the fence\'s charge is released', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'stale-request');
+  const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
+  const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
+  const run = consume(h, id);
+  await read.started;
+  const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
+  await until(h, leaseUntil);
+  read.release();
+  const outcome = await run;
+  assert.deepEqual(outcome, { ack: true, step: 'abandoned', fence: fenceOf(outcome), cause: 'request_stale' });
+  const state = await h.sendState(id);
+  assert.deepEqual(ledgerOf(state), ['pending'], 'pending now, not at the lease expiry');
+  assert.equal(state.fences.at(-1)?.outcome, 'abandoned');
+  assert.equal(state.dispatch?.lease_epoch, null, 'the lease ended');
+  const fence = fenceOf(outcome);
+  assert.equal((await h.quota<{ sendId: string; epoch: number; attempt: number }[]>('balances'))
+    .filter(row => row.sendId === id && row.epoch === fence.epoch && row.attempt === fence.attempt).length, 0, 'the charge is released');
+}));
+
+test('a stored acceptance the mailbox answers stale is kept and flagged on replay; one whose send is gone is deleted as an orphan', () => withConsumer(async (h, mail, from) => {
+  // Stale: an authorization the mailbox never recorded, so the real recordResult refuses the acceptance.
+  const staleId = await queued(h, mail, from, 'stale-acceptance');
+  await h.consumer('forgeNextAuthorization');
+  const stale = await consume(h, staleId);
+  assert.equal(step(stale), 'stored', 'a stale acceptance is stored, never dropped');
+  const staleFence = fenceOf(stale);
+  const replay = await h.sendRpc<{ status: string; recorded: number }>('recordStoredResults', staleId, staleFence);
+  assert.deepEqual({ status: replay.status, recorded: replay.recorded }, { status: 'retry', recorded: 0 }, 'not recorded: the row backs off');
+  assert.deepEqual(await h.directoryRows('SELECT kind, unapplied FROM send_results WHERE send_id = ?', staleId), [{ kind: 'accepted', unapplied: 1 }],
+    'kept and flagged');
+  assert.ok(logged(h, 'send_result_unapplied').length >= 1, 'and alerted');
+
+  // Gone: the stored row names a send the ready mailbox no longer has.
+  const goneId = await queued(h, mail, from, 'gone-acceptance', { to: [{ email: 'second@example.net' }] });
+  await h.consumer('answerNextRecord', 'gone');
+  const gone = await consume(h, goneId);
+  assert.equal(step(gone), 'stored');
+  const goneFence = fenceOf(gone);
+  const missing = '01KBN8ZJ7G0000000000000000';
+  await h.directoryChange('UPDATE send_results SET send_id = ? WHERE send_id = ?', missing, goneId);
+  assert.deepEqual(await h.sendRpc('recordStoredResults', missing, goneFence), { status: 'recorded', recorded: 1 });
+  assert.deepEqual(await h.directoryRows('SELECT 1 FROM send_results WHERE send_id = ?', missing), [], 'deleted');
+  assert.equal(logged(h, 'send_result_orphan').length, 1, 'and counted as an orphan');
 }));

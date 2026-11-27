@@ -83,6 +83,13 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
     // and the call lets the call start at the deadline.
     private yieldTrap = false;
     trapYieldAfterCheck(armed: boolean) { this.yieldTrap = armed; }
+    // Invariant breaches the mailbox itself never produces, injected at the consumer's ports: the
+    // next authorizeDispatch answers ok without asking the mailbox (an authorization the mailbox
+    // never recorded), and the next recordResult answers this status without reaching the mailbox.
+    private forgedAuthorization = false;
+    forgeNextAuthorization() { this.forgedAuthorization = true; }
+    private recordAnswer?: 'stale' | 'gone';
+    answerNextRecord(status: 'stale' | 'gone') { this.recordAnswer = status; }
     // An environment without the send_email binding.
     private bindingMissing = false;
     removeBinding(missing: boolean) { this.bindingMissing = missing; }
@@ -142,11 +149,18 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
         authorizeDispatch: async (...args) => {
           const t0 = this.consumerNow();
           const lead = this.mailboxLead;
-          const answer = await this.step(run, 'authorizeDispatch', () => box.authorizeDispatch(...args));
+          const forged = this.forgedAuthorization;
+          this.forgedAuthorization = false;
+          const answer = await this.step(run, 'authorizeDispatch', () => forged
+            ? Promise.resolve({ status: 'ok' as const, remainingMs: 10_000 }) : box.authorizeDispatch(...args));
           if (answer.status === 'ok') run.auth = { fence: args[3], deadline: t0 + answer.remainingMs, lead };
           return answer;
         },
-        recordResult: (...args) => this.step(run, 'recordResult', () => box.recordResult(...args)),
+        recordResult: (...args) => this.step(run, 'recordResult', () => {
+          const status = this.recordAnswer;
+          this.recordAnswer = undefined;
+          return status ? Promise.resolve({ status }) : box.recordResult(...args);
+        }),
         delaySend: (...args) => this.step(run, 'delaySend', () => box.delaySend(...args)),
         abandonClaim: (...args) => this.step(run, 'abandonClaim', () => box.abandonClaim(...args)),
       };

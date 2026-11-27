@@ -418,9 +418,11 @@ export class SendDispatcher {
         return { status: 'refused' };
       }
       const expired = m.externals().filter(entry => entry.state === 'attempting');
-      // Crash-loop cap: a fence whose lease expired with recipients attempting and no report.
-      const unfinished = new Set(expired.map(entry => m.attemptingFence(entry.idx)).filter(fence => fence && fence.outcome === null)
-        .map(fence => fenceKey(fence!)));
+      // Crash-loop cap: a fence whose lease expired with recipients attempting and no report, and
+      // whose call may have reached the provider (an authorization recorded, or an older epoch).
+      // A never-authorized fence of this epoch cannot have called send(): it never counts.
+      const unfinished = new Set(expired.map(entry => m.attemptingFence(entry.idx))
+        .filter(fence => fence && fence.outcome === null && (fence.authorized || fence.epoch < ctx.epoch)).map(fence => fenceKey(fence!)));
       m.d.unfinished += unfinished.size;
       if (m.d.unfinished >= CRASH_CAP) {
         // Held, not resumed: charges of never-authorized fences of this epoch still go (the drive row releases them).

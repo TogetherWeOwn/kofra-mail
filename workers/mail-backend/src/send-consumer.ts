@@ -206,7 +206,9 @@ export async function dispatchSend(message: unknown, ports: ConsumerPorts): Prom
     log('send_request_failed', error);
     return abandon('request');
   }
-  if (built.status === 'stale') return stale();
+  // A stale answer (for example a lease that ran out during the reads): no send(), and the
+  // recipients go back to pending now rather than at the lease expiry. Stale itself if the fence is.
+  if (built.status === 'stale') return abandon('request_stale');
   // Our own invariant breach (the mailbox logs send_request_invalid): never a failure of the send,
   // retried at the longest backoff so it cannot loop every minute.
   if (built.status !== 'ok') return abandon('request_invalid', ports.now() + INVALID_RETRY_MS);

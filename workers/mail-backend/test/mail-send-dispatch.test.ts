@@ -933,19 +933,22 @@ test('a failed stored-result lookup defers the enqueue and the claim until the s
   assert.equal((await h.sends.queue()).length, queuedBefore);
 }));
 
-test('a held send releases its never-authorized charges without resuming', () => withSend(async (h, mail, from) => {
+test('never-authorized expiries never hold a send: each fence is listed by the next claim and its charge released by that claim\'s reservation', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'held-release');
-  let last: SendFence | undefined;
-  for (let round = 0; round < 5; round++) {
-    last = (await attempt(h, id, { stop: 'mark' })).claim.fence;
+  const fences: SendFence[] = [];
+  for (let round = 0; round < 6; round++) {
+    const { claim } = await attempt(h, id, { stop: 'mark' });
+    if (fences.length) assert.deepEqual(claim.release, [fences.at(-1)], `round ${round}: the previous fence is listed`);
+    fences.push(claim.fence);
     await h.advance(LEASE + SKEW);
   }
-  assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'not_now', reason: 'held' });
-  assert.deepEqual((await h.sendState(id)).release, [last]);
-  assert.equal(await balanceOf(h, last!), 1);
-  await h.advance(24 * hour);
-  assert.equal(await balanceOf(h, last!), 0, 'the drive row released it');
-  assert.deepEqual(ledgerOf(await h.sendState(id)), ['attempting'], 'and did not resume the send');
+  const state = await h.sendState(id);
+  assert.equal(state.dispatch?.held_at, null, 'send() never ran, so nothing counts toward the hold');
+  assert.equal(state.dispatch?.unfinished, 0);
+  for (const fence of fences.slice(0, -1)) assert.equal(await balanceOf(h, fence), 0, `fence ${fence.attempt}'s charge was released`);
+  const next = await attempt(h, id, { stop: 'claim' });
+  assert.deepEqual(next.claim.release, [fences.at(-1)]);
+  assert.equal(await balanceOf(h, fences.at(-1)!), 0, 'and the last one by the next reservation');
 }));
 
 test('a restore that ends after a grace hold began extends the hold from its end', () => withSend(async (h, mail, from) => {
