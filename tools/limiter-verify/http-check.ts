@@ -12,7 +12,12 @@ const operationByBucket = {
   admin_writes: 'addDomain',
 } as const satisfies Record<Bucket, keyof typeof ROUTES>;
 const baseBuckets: Bucket[] = ['reads', 'writes', 'admin_writes'];
-const batchSize = 8;
+// Buckets up to this many requests per attempt go one at a time, so the client
+// sees refusals in the limiter's own order. Larger ones (the 600 buckets) go
+// eight at a time to fit inside one period; reordering inside a batch is at most
+// seven positions, well under their band's 60-request margin below the limit.
+const sequentialUpTo = 200;
+const parallel = 8;
 type Session = { cookie?: string; csrf?: string };
 
 type Outcome = 'pass' | 'early' | 'late' | 'fail';
@@ -40,6 +45,7 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
       }
       const notFoundId = crypto.randomUUID();
       const { min, max } = refusalBand(limit);
+      const batchSize = max + 1 <= sequentialUpTo ? 1 : parallel;
       // One attempt sends at most max + 1 requests, up to eight at a time, so a
       // 600-request bucket finishes well inside one period. The counters are
       // approximate: the first refusal must leave between min and max requests
@@ -81,11 +87,10 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
           sent += batch.length;
           if (batch.some((result) => result.status === 'rejected' || result.value === 'bad')) return 'fail';
           const values = batch.map((result) => (result as PromiseFulfilledResult<'admitted' | 'refused'>).value);
-          // Requests leave in index order. Only admissions before the first refusal
-          // count: one admitted after it (a rollover mid-batch) must not lift an early refusal.
-          const first = values.indexOf('refused');
-          admitted += (first === -1 ? values : values.slice(0, first)).filter((value) => value === 'admitted').length;
-          if (first !== -1) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
+          // Inside a parallel batch the limiter's order is unknown, so every
+          // admission in the refusal's batch counts towards the band.
+          admitted += values.filter((value) => value === 'admitted').length;
+          if (values.includes('refused')) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
         }
         return 'late';
       };

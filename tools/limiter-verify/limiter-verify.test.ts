@@ -297,39 +297,41 @@ test('HTTP check fails at the first failed request and aborts the requests still
 });
 
 test('HTTP check fails a bad answer even in the batch with a valid refusal, or as the last request', async () => {
-  const { limit, period } = EXPECTED_BUCKETS.writes;
-  const { max } = refusalBand(limit);
-  const refusal = () => Response.json({ code: 'rate_limited', retryAfterSeconds: period }, {
-    status: 429, headers: { 'retry-after': String(period) },
-  });
-  for (const badAt of [limit + 1, max]) {
+  // reads is a parallel bucket, so the bad answer and the refusal share a batch.
+  for (const [bucket, badAt, refuseAt] of [['reads', 601, 600], ['writes', refusalBand(EXPECTED_BUCKETS.writes.limit).max, -1]] as const) {
+    const { period } = EXPECTED_BUCKETS[bucket];
     let calls = 0;
     const waits: number[] = [];
-    const result = await checkHttp('https://mail.example.test', ['writes'], session, async () => {
+    const result = await checkHttp('https://mail.example.test', [bucket], session, async () => {
       const index = calls++;
       if (index === badAt) return new Response('{}', { status: 500 });
-      // A valid refusal in the same batch as the bad answer (first case), or none at all (second case).
-      if (badAt === limit + 1 && index === limit) return refusal();
-      return new Response(null, { status: 428 });
+      if (index === refuseAt) {
+        return Response.json({ code: 'rate_limited', retryAfterSeconds: period }, { status: 429, headers: { 'retry-after': String(period) } });
+      }
+      return new Response(null, { status: bucket === 'reads' ? 404 : 428 });
     }, async (ms) => { waits.push(ms); });
-    assert.deepEqual(result, [{ bucket: 'writes', pass: false }], `bad answer at request ${badAt + 1}`);
+    assert.deepEqual(result, [{ bucket, pass: false }], `${bucket}: bad answer at request ${badAt + 1}`);
     assert.deepEqual(waits, []);
   }
 });
 
-test('HTTP check counts only admissions before the first refusal in a batch', async () => {
-  const { limit, period } = EXPECTED_BUCKETS.writes;
-  const { min } = refusalBand(limit);
+test('HTTP check sends a small bucket one request at a time, so it sees refusals in the limiter order', async () => {
+  const { limit, period } = EXPECTED_BUCKETS.undo;
+  let pending = 0;
+  let peak = 0;
   let calls = 0;
-  // Refuse request min (one short of the band), then admit the rest of its batch, as a rollover would.
-  const result = await checkHttp('https://mail.example.test', ['writes'], session, async () => {
-    const index = calls++;
-    if (index === min - 1) {
+  const result = await checkHttp('https://mail.example.test', ['undo'], session, async () => {
+    peak = Math.max(peak, ++pending);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    pending--;
+    if (calls++ === limit) {
       return Response.json({ code: 'rate_limited', retryAfterSeconds: period }, { status: 429, headers: { 'retry-after': String(period) } });
     }
     return new Response(null, { status: 428 });
   }, async () => {});
-  assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
+  assert.deepEqual(result, [{ bucket: 'undo', pass: true }]);
+  assert.equal(peak, 1);
+  assert.equal(calls, limit + 1);
 });
 
 test('HTTP check fails an attempt whose requests hang past its deadline', async () => {
@@ -426,11 +428,10 @@ for (const mode of ['never', 'early', 'late', 'wrong retry-after', 'wrong body p
   test(`HTTP check rejects ${mode} rate limiting`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
-    // Requests go out in batches of eight, and one attempt sends at most max + 1.
-    const sent = (n: number) => Math.min(Math.ceil(n / 8) * 8, max + 1);
+    // A bucket this small goes one request at a time, and an attempt sends at most max + 1.
     const { result, calls, waits } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
-    assert.equal(calls, { never: 2 * (max + 1), early: sent(min), late: max + 1 + 8, 'wrong retry-after': sent(limit + 1), 'wrong body period': sent(limit + 1) }[mode]);
+    assert.equal(calls, { never: 2 * (max + 1), early: min, late: max + 1 + 1, 'wrong retry-after': limit + 1, 'wrong body period': limit + 1 }[mode]);
     // Only a late or missing refusal is retried, after one full period.
     assert.deepEqual(waits, mode === 'never' || mode === 'late' ? [61_000] : []);
   });
@@ -440,10 +441,9 @@ for (const mode of ['band low', 'band high'] as const) {
   test(`HTTP check accepts a first refusal at the ${mode === 'band low' ? 'low' : 'high'} edge of the band`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
-    const sent = (n: number) => Math.min(Math.ceil(n / 8) * 8, max + 1);
     const { result, calls, waits } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: true }]);
-    assert.equal(calls, sent((mode === 'band low' ? min : max) + 1));
+    assert.equal(calls, (mode === 'band low' ? min : max) + 1);
     assert.deepEqual(waits, []);
   });
 }
