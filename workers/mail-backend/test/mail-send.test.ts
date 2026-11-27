@@ -384,7 +384,9 @@ test('late PUT after release: an overtaken PUT lands after the send was cancelle
     // The paused PUT is released before the fixture closes, whatever fails.
     try {
       const running = h.advance(UNDO);
-      await within(Promise.race([put.started, running.then(() => { throw new Error('the release ended without its PUT'); })]), 10 * second, 'the PUT');
+      // The short handler budget can return the alarm before its live handler reaches
+      // the PUT, so only a rejected advance or the deadline ends this wait early.
+      await within(Promise.race([put.started, running.then(() => new Promise<never>(() => {}))]), 30 * second, 'the PUT');
       await running;
       registration = await h.sends.registration(pending.id);
       assert.ok(registration?.key);
@@ -426,7 +428,9 @@ for (const next of ['finishes', 'releases'] as const) {
     // The paused PUT is released before the fixture closes, whatever fails.
     try {
       const running = h.advance(UNDO);
-      await within(Promise.race([put.started, running.then(() => { throw new Error('the release ended without its PUT'); })]), 10 * second, 'the PUT');
+      // The short handler budget can return the alarm before its live handler reaches
+      // the PUT, so only a rejected advance or the deadline ends this wait early.
+      await within(Promise.race([put.started, running.then(() => new Promise<never>(() => {}))]), 30 * second, 'the PUT');
       await running;
       const { mailbox } = await mail.getSession();
       if (next === 'finishes') await h.as('admin').updateMailbox(mailbox!.id, { ownerUserId: (await owner.getSession()).user.id });
