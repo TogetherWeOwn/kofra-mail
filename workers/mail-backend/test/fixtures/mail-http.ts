@@ -60,13 +60,13 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, ancestry
 // Local workerd closes without a half-close after an early answer, unlike the
 // Cloudflare edge (see PR verification). Wait for 100 Continue before streaming
 // so an eager write cannot reset the socket before we see the final response.
-export async function fetchOversizedRequest(req: Request, size: number): Promise<Response> {
+export async function fetchOversizedRequest(req: Request, size: number, signal = AbortSignal.timeout(30_000)): Promise<Response> {
   assert.ok(req.body instanceof NodeReadableStream);
   const body = Readable.fromWeb(req.body);
   const headers = new Headers(req.headers);
   headers.set('content-length', String(size));
   headers.set('expect', '100-continue');
-  const request = httpRequest(req.url, { method: req.method, headers: Object.fromEntries(headers), agent: false });
+  const request = httpRequest(req.url, { method: req.method, headers: Object.fromEntries(headers), agent: false, signal });
   try {
     const response = await new Promise<IncomingMessage>((resolve, reject) => {
       request.once('response', (reply) => {
@@ -74,9 +74,17 @@ export async function fetchOversizedRequest(req: Request, size: number): Promise
         body.destroy();
         resolve(reply);
       });
-      request.once('error', reject);
+      let continued = false;
+      request.once('error', (error) => {
+        reject(!continued && signal.aborted
+          ? new Error('server neither answered nor sent 100 Continue for an oversized request', { cause: error }) : error);
+      });
       body.once('error', reject);
-      request.once('continue', () => body.pipe(request));
+      // Local workerd doesn't send Continue for these oversized requests.
+      request.once('continue', () => {
+        continued = true;
+        body.pipe(request);
+      });
       request.flushHeaders();
     });
     const responseHeaders = new Headers();
