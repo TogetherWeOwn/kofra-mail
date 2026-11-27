@@ -114,14 +114,21 @@ export class HttpMailbox extends Mailbox {
   private failRecordTimes = 0;
   failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
   // Holds the next record of one fence attempt, or the next poll right after its select, until resumed.
-  private gates = new Map<string, { taken: boolean; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> }>();
-  pauseAt(point: string) { this.gates.set(point, { taken: false, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }); }
-  async pausedAt(point: string) { await this.gates.get(point)!.reached.promise; }
-  resumeAt(point: string) { const gate = this.gates.get(point); this.gates.delete(point); gate?.resume.resolve(); }
-  // Only the first pass through an armed seam waits.
+  // Each pauseAt arms one gate for one pass through the seam, in order; resumeAt releases the oldest waiting pass.
+  private gates = new Map<string, { taken: boolean; resumed: boolean; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> }[]>();
+  pauseAt(point: string) {
+    const list = this.gates.get(point) ?? [];
+    list.push({ taken: false, resumed: false, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() });
+    this.gates.set(point, list);
+  }
+  async pausedAt(point: string) { await this.gates.get(point)!.at(-1)!.reached.promise; }
+  resumeAt(point: string) {
+    const gate = this.gates.get(point)?.find(entry => entry.taken && !entry.resumed);
+    if (gate) { gate.resumed = true; gate.resume.resolve(); }
+  }
   private async gate(point: string) {
-    const gate = this.gates.get(point);
-    if (!gate || gate.taken) return;
+    const gate = this.gates.get(point)?.find(entry => !entry.taken);
+    if (!gate) return;
     gate.taken = true;
     gate.reached.resolve();
     await gate.resume.promise;

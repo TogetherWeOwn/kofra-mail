@@ -1442,3 +1442,54 @@ test('a keyed notice records a restored acceptance although the reconciler moved
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
   assert.deepEqual(await storedRows(h, id), []);
 }));
+
+// A finished send whose flagged acceptance for fence A a restore made eligible; every record attempt fails.
+async function finishedWithEligibleFlag(h: Fixture, mail: MailService, from: string, token: string) {
+  const id = await queued(h, mail, from, token);
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.advance(LEASE + SKEW);
+  await attempt(h, id, { result: { kind: 'rejected', reason: 'rejected' } });
+  await h.advance(minute);
+  await finished(h, id);
+  await h.restore();
+  await h.failRecordOnce(a.claim.fence.attempt, 10);
+  return { id, a };
+}
+
+test('an attempt whose lease expired writes no retry state over its successor\'s', () => withSend(async (h, mail, from) => {
+  const { id, a } = await finishedWithEligibleFlag(h, mail, from, 'stale-holder');
+  const point = `record:${a.claim.fence.attempt}`;
+  await h.pauseAt(point);
+  const first = h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence);
+  await h.pausedAt(point);
+  // The first attempt's lease runs out while it waits; a second attempt takes a new lease.
+  await h.advance(LEASE + minute);
+  await h.pauseAt(point);
+  const second = h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence);
+  await h.pausedAt(point);
+  const [taken] = await h.directoryRows('SELECT recheck_lease_until AS lease, notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.equal(taken.lease, await h.sends.now() + LEASE, 'the second attempt holds a fresh lease');
+  // The first attempt now fails transiently: it must not touch the second attempt's lease or retry state.
+  await h.resumeAt(point);
+  assert.equal((await first).recorded, 0);
+  const [after] = await h.directoryRows('SELECT recheck_lease_until AS lease, notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.deepEqual(after, taken, 'the successor\'s lease and retry state stand');
+  await h.resumeAt(point);
+  await second;
+}));
+
+test('the settled lookahead reports the earliest effective time over all flagged rows', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'lookahead-min');
+  await h.restore();
+  const epoch = Number((await h.sends.lifecycle())?.epoch);
+  const now = await h.sends.now();
+  const insert = (attempt: number, notifyAfter: number, lease: number | null) => h.directoryChange(`INSERT INTO send_results (workspace_id,
+    mailbox_id, send_id, fence_epoch, fence_attempt, kind, message_id, created_at, notify_after, notify_failures, unapplied, unapplied_epoch,
+    rechecked_epoch, recheck_lease_until) VALUES (?, ?, ?, 0, ?, 'accepted', 'x', 0, ?, 1, 1, 0, ?, ?)`, WS, MB, id, attempt, notifyAfter, epoch, lease);
+  // Due now but held for five minutes, and due in one minute with no holder.
+  await insert(98, now, now + 5 * minute);
+  await insert(99, now + minute, null);
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id), { status: 'retry', recorded: 0, next: now + minute });
+}));
