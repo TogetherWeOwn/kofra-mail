@@ -1232,3 +1232,19 @@ test('a keyed notice that finds its row gone clears that row\'s alert', () => wi
   await h.advance(minute);
   assert.ok(!(await h.sends.activeAlerts()).includes('send_result_stuck'));
 }));
+
+test('a stored result due before the send\'s next wait brings the drive row back at its own time', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'drive-lower');
+  const claim = await h.sendRpc<ClaimAnswer>('claimSend', id);
+  if (claim.status !== 'claimed') return assert.fail('claim');
+  const now = await h.sends.now();
+  assert.deepEqual(await h.sendRpc<AbandonAnswer>('abandonClaim', id, claim.fence, now + hour), { status: 'ok' });
+  await h.advance(minute);
+  const due = await h.sends.now() + 2 * minute;
+  await h.directoryChange(`INSERT INTO send_results (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt, kind, created_at, notify_after)
+    VALUES (?, ?, ?, 0, 99, 'try_later', 0, ?)`, WS, MB, id, due);
+  // The restore epilogue runs the drive row now; the send itself waits an hour.
+  await h.restore();
+  await h.advance(0);
+  assert.deepEqual((await h.sendState(id)).drive, [due]);
+}));

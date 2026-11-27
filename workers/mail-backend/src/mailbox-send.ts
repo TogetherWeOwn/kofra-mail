@@ -525,19 +525,19 @@ export class SendDriver {
       const ready = this.ports.ready()!;
       return this.ports.dispatcher.drive(index, current, timers, ready, this.timer.now);
     });
-    if (decision === STALE || decision === null) return;
+    if (decision === STALE) return;
+    // Unresolved stored results bring the drive row back when the earliest is due, also
+    // when the decision set a later wait (after a failed lookup it keeps its backoff).
+    const next = stored.settled || decision === 'finish' ? null : stored.next;
+    if (next !== null) await this.ports.local(timers => { if (this.current(start)) timers.lower(SEND_DRIVE, this.ref, Math.max(1, next, this.timer.now)); });
+    if (decision === null) return;
     if (decision === 'release') return this.releaseHeld(start);
     if (decision === 'finish') {
       const finished = await this.ports.local(() => sendRow(this.ports.sql, this.ref));
       return finished ? this.finish({ ...start, row: finished }) : undefined;
     }
-    // Unresolved stored results gate only reclaim and enqueue: the drive row comes
-    // back when the earliest is due (after a failed lookup it keeps its backoff).
-    if (!stored.settled) {
-      const next = stored.next;
-      if (next !== null) await this.ports.local(timers => { if (this.current(start)) timers.lower(SEND_DRIVE, this.ref, Math.max(1, next, this.timer.now)); });
-      return;
-    }
+    // Unresolved stored results gate only reclaim and enqueue.
+    if (!stored.settled) return;
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');
