@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS quota_released (ws TEXT NOT NULL, mb TEXT NOT NULL, s
   attempt INTEGER NOT NULL, PRIMARY KEY (ws, mb, send_id, epoch, attempt));
 CREATE TABLE IF NOT EXISTS quota_days (day TEXT PRIMARY KEY, ends_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS quota_config (id INTEGER PRIMARY KEY CHECK (id = 1), day TEXT NOT NULL, exhausted INTEGER NOT NULL,
-  month_end INTEGER);
+  month_limit INTEGER, month_end INTEGER);
 CREATE TABLE IF NOT EXISTS quota_failures (method TEXT PRIMARY KEY, remaining INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS quota_calls (n INTEGER PRIMARY KEY, method TEXT NOT NULL, body TEXT NOT NULL);
 `;
@@ -29,17 +29,22 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
     super(ctx, env);
     this.sql = ctx.storage.sql;
     this.sql.exec(SCHEMA);
-    this.sql.exec("INSERT OR IGNORE INTO quota_config VALUES (1, 'day-0', 0, NULL)");
+    this.sql.exec("INSERT OR IGNORE INTO quota_config VALUES (1, 'day-0', 0, NULL, NULL)");
     this.sql.exec("INSERT OR IGNORE INTO quota_days VALUES ('day-0', ?)", env.INITIAL_TIME + 24 * 60 * 60_000);
   }
 
-  // `month_end` set: the monthly gate is closed until then (it closes the daily gate too).
+  // `exhausted` closes the daily gate; `month_limit` charges in all are allowed until `month_end`.
   private config() {
-    return this.sql.exec<{ day: string; exhausted: number; month_end: number | null }>('SELECT day, exhausted, month_end FROM quota_config').one();
+    return this.sql.exec<{ day: string; exhausted: number; month_limit: number | null; month_end: number | null }>(
+      'SELECT day, exhausted, month_limit, month_end FROM quota_config').one();
   }
-  private gateEnd(): number | null {
-    const { day, exhausted, month_end: monthEnd } = this.config();
-    return monthEnd ?? (exhausted ? this.endOf(day) : null);
+  // The reset of the gate that refuses `wanted` more charges, or null when both admit them.
+  private refusal(wanted: number): number | null {
+    const { day, exhausted, month_limit: limit, month_end: monthEnd } = this.config();
+    if (exhausted) return this.endOf(day);
+    if (limit === null) return null;
+    const used = this.sql.exec<{ n: number }>('SELECT count(*) AS n FROM quota_reservations').one().n;
+    return used + wanted > limit ? monthEnd : null;
   }
   private log(method: string, scope: QuotaScope, fences: SendFence[]) {
     this.sql.exec('INSERT INTO quota_calls (method, body) VALUES (?, ?)', method, JSON.stringify({ scope, fences }));
@@ -74,7 +79,7 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
       for (const entry of release) this.dropFence(scope, entry);
       if (this.released(scope, fence) || this.superseded(scope, fence, recipients)) return { status: 'stale' };
       const { day } = this.config();
-      const closed = this.gateEnd();
+      const closed = this.refusal(recipients.length);
       if (closed !== null) return { status: 'exhausted', resetAt: closed };
       for (const recipient of recipients) {
         this.sql.exec('INSERT OR REPLACE INTO quota_newest VALUES (?, ?, ?, ?, ?, ?)', scope.workspaceId, scope.mailboxId, scope.sendId, recipient,
@@ -95,7 +100,7 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
       const held = this.sql.exec<{ day: string }>('SELECT day FROM quota_reservations WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ?',
         scope.workspaceId, scope.mailboxId, scope.sendId, fence.epoch, fence.attempt).toArray();
       // A charge that must move to a new day, or be reserved again, needs an open gate.
-      const closed = this.gateEnd();
+      const closed = this.refusal(held.length ? 0 : recipients.length);
       if (closed !== null && (!held.length || held.some(row => row.day !== day))) return { status: 'exhausted', resetAt: closed };
       // A charge from an ended day moves to the current one; an expired one is reserved again.
       this.sql.exec('DELETE FROM quota_reservations WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ?',
@@ -125,18 +130,13 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
     return this.endOf(this.config().day);
   }
 
-  async gateResetAt(): Promise<number> {
-    this.fail('gateResetAt');
-    return this.gateEnd() ?? this.endOf(this.config().day);
-  }
-
   // Test controls.
   setDay(day: string, endsAt: number) {
     this.sql.exec('INSERT OR REPLACE INTO quota_days VALUES (?, ?)', day, endsAt);
     this.sql.exec('UPDATE quota_config SET day = ?', day);
   }
   setExhausted(exhausted: boolean) { this.sql.exec('UPDATE quota_config SET exhausted = ?', exhausted ? 1 : 0); }
-  setMonthlyClosed(until: number | null) { this.sql.exec('UPDATE quota_config SET month_end = ?', until); }
+  setMonthly(limit: number | null, end: number | null) { this.sql.exec('UPDATE quota_config SET month_limit = ?, month_end = ?', limit, end); }
   failNext(method: string, times = 1) { this.sql.exec('INSERT OR REPLACE INTO quota_failures VALUES (?, ?)', method, times); }
   // Charges per fence and quota day.
   balances() {

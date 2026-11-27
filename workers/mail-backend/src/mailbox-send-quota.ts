@@ -14,8 +14,8 @@ export type QuotaScope = { workspaceId: string; mailboxId: string; sendId: strin
 
 // `day` names the quota day the charge sits in and `dayEnd` is when that day
 // ends on the quota object's clock (the consumer passes it to
-// authorizeDispatch). `exhausted`: a gate (daily or monthly) is closed until
-// `resetAt`. `stale`: the fence is older than the newest fence seen for a
+// authorizeDispatch). `exhausted`: the gate that refused this request (daily
+// or monthly) opens again at `resetAt`; the consumer passes it to delaySend. `stale`: the fence is older than the newest fence seen for a
 // recipient, or it was released.
 export type QuotaAnswer =
   | { status: 'ok'; day: string; dayEnd: number }
@@ -36,11 +36,9 @@ export interface QuotaPort {
   // Idempotent.
   release(scope: QuotaScope, fences: SendFence[]): Promise<void>;
   // The end of the current quota day, on the quota object's clock: the
-  // provider's daily limit resets then.
+  // provider's daily limit resets then. (A refused reservation carries the
+  // reset of the gate that refused it in its `exhausted` answer.)
   resetAt(): Promise<number>;
-  // When our own closed gate opens again: the daily reset, or the monthly one
-  // while the monthly gate is closed.
-  gateResetAt(): Promise<number>;
 }
 
 export const fenceKey = ({ epoch, attempt }: SendFence) => `${epoch}:${attempt}`;

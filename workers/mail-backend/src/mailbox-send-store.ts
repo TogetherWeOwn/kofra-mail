@@ -57,6 +57,20 @@ export function ledger(sql: SqlStorage, id: string): LedgerRow[] {
   return sql.exec<LedgerRow>('SELECT idx, kind, state, reason FROM mailbox_send_recipients WHERE send_id = ? ORDER BY idx', id).toArray();
 }
 
+// The newest consumer change (M3-5) of these sends that no publish covers yet, or 0.
+export function unpublishedProgress(sql: SqlStorage, ids: string[]): number {
+  if (!ids.length) return 0;
+  return sql.exec<{ seq: number | null }>(`SELECT max(seq) AS seq FROM journal WHERE seq > (SELECT flushed FROM state WHERE id = 1)
+    AND json_extract(event, '$.type') = 'send_progress' AND json_extract(event, '$.id') IN (SELECT value FROM json_each(?))`,
+  JSON.stringify(ids)).one().seq ?? 0;
+}
+
+// A read that would report a send's unpublished consumer change: the caller
+// publishes through `seq` and reads again (docs/m3-outbound-plan.md, section 2.1).
+export class UnpublishedSend extends Error {
+  constructor(readonly seq: number) { super('Send state not yet published'); }
+}
+
 // A send no claim has reached yet has this dispatch state.
 export const NEW_DISPATCH: SendDispatchRow = {
   attempt: 0, leaseEpoch: null, leaseAttempt: null, leaseUntil: null, nextAttemptAt: 0, delayedUntil: null, ambiguous: 0,

@@ -21,7 +21,7 @@ import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox
 import { senderActive, senderState } from './mailbox-send-sender.ts';
 import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
-  dispatchRow, DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
+  dispatchRow, unpublishedProgress, DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
@@ -289,12 +289,7 @@ export class SendApi {
   }
 
   // The newest consumer change (M3-5) of these sends that no publish covers yet, or 0.
-  unpublishedProgress(ids: string[]): number {
-    if (!ids.length) return 0;
-    return this.sql.exec<{ seq: number | null }>(`SELECT max(seq) AS seq FROM journal WHERE seq > ?
-      AND json_extract(event, '$.type') = 'send_progress' AND json_extract(event, '$.id') IN (SELECT value FROM json_each(?))`,
-    flushed(this.sql), JSON.stringify(ids)).one().seq ?? 0;
-  }
+  unpublishedProgress(ids: string[]): number { return unpublishedProgress(this.sql, ids); }
 
   getSend(params: Record<string, string>): Send {
     if (!validSendId(params.sendId)) return fail('not_found');
@@ -520,7 +515,7 @@ export class SendDriver {
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
     // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
     // Until every stored result is recorded, nothing is enqueued: a retry could resend an accepted call.
-    const settled = await this.ports.dispatcher.storedSettled(start.scope, this.ref);
+    const stored = await this.ports.dispatcher.storedSettled(start.scope, this.ref);
     const decision = await this.commit(start, ['queued', 'sending', 'delayed', ...TERMINAL], (timers, current, index) => {
       if (current.finishPending) return 'finish' as const;
       if (TERMINAL.includes(current.state)) return null;
@@ -533,8 +528,13 @@ export class SendDriver {
       const finished = await this.ports.local(() => sendRow(this.ports.sql, this.ref));
       return finished ? this.finish({ ...start, row: finished }) : undefined;
     }
-    // The drive row stays at its backoff and tries the lookup again.
-    if (!settled) return;
+    // Rows remain: no enqueue, and the drive row comes back when the earliest is due
+    // (after a failed lookup it keeps its backoff).
+    if (!stored.settled) {
+      const next = stored.next;
+      if (next !== null) await this.ports.local(timers => { if (this.current(start)) timers.set(SEND_DRIVE, this.ref, Math.max(1, next, this.timer.now)); });
+      return;
+    }
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');

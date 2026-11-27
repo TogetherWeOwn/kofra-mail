@@ -43,6 +43,8 @@ export const RESTORING_NOTICE_MS = 5 * 60_000;
 export const NOTICE_BACKOFF_MS = 60_000;
 export const NOTICE_BACKOFF_MAX_MS = 60 * 60_000;
 const STORED_PAGE = 16;
+// A gate's reset is at most this far ahead (a monthly gate resets within a month).
+export const GATE_RESET_MAX_MS = 32 * 24 * 60 * 60_000;
 // Release-list fences a claim hands out, a Mark removes and a quota call releases at once.
 export const RELEASE_BATCH = 64;
 
@@ -62,6 +64,10 @@ export type ClaimAnswer =
       from: SendRecord['from']; replyTo: SendRecord['replyTo']; sentCopyKey: string | null }
   // `results`: a stored provider result for this send could not be read or recorded yet.
   | { status: 'not_now'; reason: 'restoring' | 'disabled' | 'unpublished' | 'leased' | 'delayed' | 'backoff' | 'held' | 'grace' | 'results' }
+  // The release list is longer than one page: the consumer releases these
+  // fences in a release-only quota call, acknowledges them with
+  // acknowledgeReleases, and claims again. Nothing is reserved meanwhile.
+  | { status: 'release'; release: SendFence[] }
   // Nothing to send for this send now or ever: the consumer acknowledges.
   | { status: 'refused' }
   // A ready mailbox has no such send.
@@ -72,7 +78,8 @@ export type AuthorizeAnswer = { status: 'ok'; remainingMs: number } | { status: 
 export type ReportAnswer = { status: 'recorded' | 'stale' | 'restoring' | 'unpublished' | 'gone' };
 export type DelayAnswer = { status: 'delayed'; until: number } | { status: 'stale' | 'restoring' | 'gone' };
 export type AbandonAnswer = { status: 'ok' | 'stale' | 'restoring' | 'gone' };
-export type StoredAnswer = { status: 'none' | 'recorded' | 'restoring' | 'retry'; recorded: number };
+// `retry`: rows remain, the earliest due at `next`.
+export type StoredAnswer = { status: 'none' | 'recorded' | 'restoring' | 'retry'; recorded: number; next?: number };
 
 type DirectoryDatabase = { withSession(constraint: 'first-primary'): Pick<D1DatabaseSession, 'prepare'> };
 export type DispatchScope = { workspaceId: string; mailboxId: string };
@@ -88,8 +95,8 @@ export type DispatchPorts = {
   // Holds the work lane across `io` and then runs `step` synchronously in a
   // transaction, so `io` is the last await before the step's commit.
   exclusive<A, T>(io: () => Promise<A>, step: (timers: TimerTable, value: A) => T): Promise<T>;
-  // A test seam inside the lane, just before authorizeDispatch's directory statement.
-  beforeSenderCheck?(): Promise<void>;
+  // A test seam inside the lane, before and after authorizeDispatch's directory statement.
+  senderCheckpoint?(phase: 'before' | 'after'): Promise<void>;
   // A test seam before recordResult acts, for fault injection.
   beforeRecord?(fence: SendFence): Promise<void>;
   publishThrough(seq: number): Promise<boolean>;
@@ -421,6 +428,12 @@ export class SendDispatcher {
         m.setRecipient(entry.idx, 'pending');
       }
       endLease(m, ctx);
+      // No reservation under a new fence while a never-authorized charge remains
+      // (section 2.4, step 2): a list longer than one page is drained first.
+      if (m.releaseList().length > RELEASE_BATCH) {
+        this.commit(m, ready, timers, null);
+        return { status: 'release', release: m.releaseList().slice(0, RELEASE_BATCH) };
+      }
       const fence = { epoch: ctx.epoch, attempt: m.d.attempt + 1 };
       if (m.fence(fence)) throw new Error('Send fence reused');
       const leaseUntil = ctx.now + LEASE_MS;
@@ -431,19 +444,35 @@ export class SendDispatcher {
       const record = m.row.record;
       const sentCopy = ports.sql.exec<{ key: string }>('SELECT raw_key AS key FROM messages WHERE id = ?', sentCopyId(id)).toArray()[0];
       return {
-        status: 'claimed', fence, leaseUntil, release: m.releaseList().slice(0, RELEASE_BATCH),
+        status: 'claimed', fence, leaseUntil, release: m.releaseList(),
         recipients: m.externals().filter(entry => entry.state === 'pending').map(({ idx }) => ({ idx, ...record.recipients[idx] })),
         from: record.from, replyTo: record.replyTo, sentCopyKey: sentCopy?.key ?? null,
       };
     };
     const first = await ports.local(timers => step(timers));
     if (!('check' in first)) return first;
-    if (first.mayHaveRun && !await this.storedSettled(scope, id)) return { status: 'not_now', reason: 'results' };
+    if (first.mayHaveRun && !(await this.storedSettled(scope, id)).settled) return { status: 'not_now', reason: 'results' };
     const { record } = first.check;
     // The one directory statement of section 1, on every claim.
     const sender = await senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
     const answer = await ports.local(timers => step(timers, sender));
     return 'check' in answer ? { status: 'not_now', reason: 'restoring' } : answer;
+  }
+
+  // A release-only quota call released these fences: they leave the release list.
+  async acknowledgeReleases(scope: DispatchScope, id: string, released: SendFence[]): Promise<{ status: 'ok' | 'restoring' | 'gone' }> {
+    const { ports } = this;
+    if (!Array.isArray(released) || !released.length || released.length > RELEASE_BATCH || !released.every(validFence)) throw new Error('Invalid send releases');
+    if (!await this.readyFor(scope)) return { status: 'restoring' };
+    return ports.local(timers => {
+      const ready = ports.current();
+      if (!ready) return { status: 'restoring' as const };
+      const m = this.load(id);
+      if (!m) return { status: 'gone' as const };
+      for (const fence of released) m.removeRelease(fence);
+      this.commit(m, ready, timers, null);
+      return { status: 'ok' as const };
+    });
   }
 
   // Consumer step 3: Mark, then the barrier, then the re-check.
@@ -501,8 +530,10 @@ export class SendDispatcher {
     return ports.exclusive(async () => {
       const record = this.load(id)?.row.record;
       if (!record) return null;
-      await ports.beforeSenderCheck?.();
-      return senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
+      await ports.senderCheckpoint?.('before');
+      const active = await senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
+      await ports.senderCheckpoint?.('after');
+      return active;
     }, (timers, sender): AuthorizeAnswer => {
       const ready = ports.current();
       const m = ready && this.load(id);
@@ -644,16 +675,27 @@ export class SendDispatcher {
     return { seq: this.commit(m, ready, timers, driveAt) || ready.index.journal.revision() };
   }
 
-  // A quota wait: `gate` when our own gate (daily or monthly) is closed,
-  // `provider_daily` for the provider's daily-limit error. The mailbox computes
-  // the wait from the quota object's reset plus clockSkew; the consumer never does.
-  async delay(scope: DispatchScope, id: string, fence: SendFence, cause: 'gate' | 'provider_daily'): Promise<DelayAnswer> {
+  // A quota wait. `gate`: our own gate refused the reservation, and `resetAt`
+  // is the reset of the gate that refused it (daily or monthly), as the quota
+  // port answered. `provider_daily`: the provider's daily-limit error, which
+  // waits for the quota day's end. The mailbox adds clockSkew; the consumer
+  // never computes a reset.
+  async delay(scope: DispatchScope, id: string, fence: SendFence, cause: 'gate' | 'provider_daily', resetAt?: number): Promise<DelayAnswer> {
     const { ports } = this;
-    if (!validFence(fence) || (cause !== 'gate' && cause !== 'provider_daily')) throw new Error('Invalid send delay');
+    if (!validFence(fence) || (cause !== 'gate' && cause !== 'provider_daily') || (cause === 'gate') !== (resetAt !== undefined) ||
+        (resetAt !== undefined && !Number.isSafeInteger(resetAt))) throw new Error('Invalid send delay');
+    if (cause === 'gate') {
+      const now = ports.now();
+      if (resetAt! <= now || resetAt! > now + GATE_RESET_MAX_MS) throw new Error('Invalid quota reset');
+    }
     if (!await this.readyFor(scope)) return { status: 'restoring' };
-    const quota = ports.quota();
-    if (!quota) throw new Error('Send quota binding missing');
-    const until = (cause === 'gate' ? await quota.gateResetAt() : await quota.resetAt()) + ports.clockSkewMs;
+    let reset = resetAt;
+    if (reset === undefined) {
+      const quota = ports.quota();
+      if (!quota) throw new Error('Send quota binding missing');
+      reset = await quota.resetAt();
+    }
+    const until = reset + ports.clockSkewMs;
     const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
       m.state = 'delayed';
       m.d.delayedUntil = Math.max(until, ctx.now);
@@ -722,14 +764,15 @@ export class SendDispatcher {
     });
   }
 
-  // True once no stored result of this send is left unrecorded; a failed lookup is not settled.
-  async storedSettled(scope: DispatchScope, id: string): Promise<boolean> {
+  // Settled once no stored result of this send is left unrecorded; a failed
+  // lookup is not settled. `next`: when the earliest remaining row is due.
+  async storedSettled(scope: DispatchScope, id: string): Promise<{ settled: boolean; next: number | null }> {
     try {
-      const { status } = await this.recordStored(scope, id);
-      return status === 'none' || status === 'recorded';
+      const { status, next } = await this.recordStored(scope, id);
+      return { settled: status === 'none' || status === 'recorded', next: next ?? null };
     } catch (error) {
       console.error({ code: 'send_result_lookup', error: error instanceof Error ? error.message : String(error) });
-      return false;
+      return { settled: false, next: null };
     }
   }
 
@@ -741,11 +784,18 @@ export class SendDispatcher {
     if (!validSendId(id)) throw new Error('Invalid send id');
     const ready = await this.readyFor(scope);
     const db = ports.directory.withSession('first-primary');
+    // Due rows first, so a backed-off prefix never starves later rows.
     const { results } = await db.prepare(`SELECT fence_epoch AS epoch, fence_attempt AS attempt, kind, message_id AS messageId, detail,
-      suppressed, notify_failures AS failures FROM send_results WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ?
-      ORDER BY fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, STORED_PAGE)
+      suppressed, notify_failures AS failures FROM send_results WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ? AND notify_after <= ?
+      ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE)
       .all<StoredRow>();
-    if (!results.length) return { status: 'none', recorded: 0 };
+    // Whether any row is left, and when the earliest is due: one page is never taken for all of them.
+    const remaining = async (): Promise<number | null> => (await db.prepare(`SELECT min(notify_after) AS next FROM send_results
+      WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ?`).bind(scope.workspaceId, scope.mailboxId, id).first<{ next: number | null }>())?.next ?? null;
+    if (!results.length) {
+      const next = await remaining();
+      return next === null ? { status: 'none', recorded: 0 } : { status: 'retry', recorded: 0, next };
+    }
     const where = 'workspace_id = ? AND mailbox_id = ? AND send_id = ? AND fence_epoch = ? AND fence_attempt = ?';
     const keys = (row: StoredRow) => [scope.workspaceId, scope.mailboxId, id, row.epoch, row.attempt];
     // A restoring mailbox defers every selected row past the restore's next slice; nothing is re-enqueued here.
@@ -757,7 +807,7 @@ export class SendDispatcher {
       await defer(results);
       return { status: 'restoring', recorded: 0 };
     }
-    let recorded = 0, failed = 0;
+    let recorded = 0;
     for (const [at, row] of results.entries()) {
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
@@ -765,7 +815,10 @@ export class SendDispatcher {
         console.error({ code: 'send_result_record', error: error instanceof Error ? error.message : String(error) });
         answer = 'error';
       }
-      if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
+      // An accepted fact is deleted only once recorded and published, or when its send is gone.
+      const unapplied = answer === 'stale' && row.kind === 'accepted';
+      if (unapplied) console.error({ code: 'send_result_unapplied' });
+      if (!unapplied && (answer === 'recorded' || answer === 'stale' || answer === 'gone')) {
         if (answer === 'gone') metric('send_result_orphan');
         await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
         recorded++;
@@ -773,14 +826,14 @@ export class SendDispatcher {
         await defer(results.slice(at));
         return { status: 'restoring', recorded };
       } else {
-        // This row backs off, doubling from 1 minute to 1 hour; the rest of the page goes on.
+        // This row backs off (an unapplied acceptance too), doubling from 1 minute to 1 hour; the rest of the page goes on.
         const wait = Math.min(NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS * 2 ** Math.min(row.failures, 16));
         await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
           .bind(ports.now() + wait, ...keys(row)).run();
-        failed++;
       }
     }
-    return { status: failed ? 'retry' : 'recorded', recorded };
+    const next = await remaining();
+    return next === null ? { status: 'recorded', recorded } : { status: 'retry', recorded, next };
   }
 
   // The drive handler's decision for a released send (section 2.2's table,

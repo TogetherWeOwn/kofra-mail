@@ -84,14 +84,14 @@ export class HttpMailbox extends Mailbox {
   private pausedEnqueue?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
   async enqueuePaused() { await this.pausedEnqueue!.reached.promise; }
   resumeEnqueue() { this.pausedEnqueue?.resume.resolve(); this.pausedEnqueue = undefined; }
-  // Holds the next authorizeDispatch inside the lane, before its directory statement.
-  private senderGate?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
-  pauseSenderCheck() { this.senderGate = { reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }; }
+  // Holds the next authorizeDispatch inside the lane, before or after its directory statement.
+  private senderGate?: { phase: string; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pauseSenderCheck(phase: string) { this.senderGate = { phase, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }; }
   async senderCheckPaused() { await this.senderGate!.reached.promise; }
   resumeSenderCheck() { const gate = this.senderGate; this.senderGate = undefined; gate?.resume.resolve(); }
-  protected override async sendSenderCheckpoint() {
+  protected override async sendSenderCheckpoint(phase: 'before' | 'after') {
     const gate = this.senderGate;
-    if (gate) { gate.reached.resolve(); await gate.resume.promise; }
+    if (gate?.phase === phase) { gate.reached.resolve(); await gate.resume.promise; }
   }
   // Fails recordResult once for one fence attempt.
   private failRecordAttempt?: number;
@@ -117,7 +117,7 @@ export class HttpMailbox extends Mailbox {
     };
   }
   async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
-    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
+    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults', 'acknowledgeReleases'];
     if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
     return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
   }
@@ -812,7 +812,7 @@ export default {
             const { method, args, mb } = await req.json<{ method: string; args: unknown[]; mb?: string }>();
             return Response.json(await box.sendRpc(ws, mb ?? mailboxId!, method, args) ?? null);
           }
-          case '/__fixture/pause-sender-check': await box.pauseSenderCheck(); break;
+          case '/__fixture/pause-sender-check': await box.pauseSenderCheck(await req.text() || 'before'); break;
           case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
           case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
           case '/__fixture/fail-record-once': await box.failRecordOnce(Number(await req.text())); break;

@@ -456,7 +456,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       sendRpc: <T>(method: string, ...args: unknown[]) => readControl<T>('send-rpc', JSON.stringify({ method, args })),
       // The same call with another mailbox's scope, on the member mailbox's object.
       sendRpcAs: (mb: string, method: string, ...args: unknown[]) => call('send-rpc', JSON.stringify({ method, args, mb })),
-      pauseSenderCheck: () => controlAction('pause-sender-check'),
+      pauseSenderCheck: (phase: 'before' | 'after' = 'before') => controlAction('pause-sender-check', phase),
       senderCheckPaused: () => controlAction('sender-check-paused'),
       resumeSenderCheck: () => controlAction('resume-sender-check'),
       failRecordOnce: (attempt: number) => controlAction('fail-record-once', String(attempt)),

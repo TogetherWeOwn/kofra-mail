@@ -22,7 +22,7 @@ import {
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
-import { SEND_DRIVE } from './mailbox-send-store.ts';
+import { SEND_DRIVE, UnpublishedSend } from './mailbox-send-store.ts';
 import {
   CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type StoredAnswer,
@@ -194,7 +194,7 @@ export class Mailbox extends DurableObject<Env> {
       },
       local: this.local,
       exclusive: (io, step) => this.exclusiveStep(io, step),
-      beforeSenderCheck: () => this.sendSenderCheckpoint(),
+      senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
       beforeRecord: fence => this.sendRecordCheckpoint(fence),
       publishThrough: seq => this.publishThrough(seq),
       journalDue: timers => this.journalDue(timers),
@@ -206,8 +206,8 @@ export class Mailbox extends DurableObject<Env> {
     });
   }
 
-  // A test seam inside the work lane, just before authorizeDispatch's directory statement.
-  protected async sendSenderCheckpoint(): Promise<void> {}
+  // A test seam inside the work lane, before and after authorizeDispatch's directory statement.
+  protected async sendSenderCheckpoint(_phase: 'before' | 'after'): Promise<void> {}
   // A test seam before recordResult acts.
   protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
 
@@ -247,9 +247,16 @@ export class Mailbox extends DurableObject<Env> {
     return this.sendDispatcher().record({ workspaceId, mailboxId }, sendId, fence, result);
   }
 
-  // `gate`: our own daily or monthly gate is closed; `provider_daily`: the provider's daily-limit error.
-  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, cause: 'gate' | 'provider_daily'): Promise<DelayAnswer> {
-    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence, cause);
+  // `gate`: our own gate refused the reservation, with the refusing gate's `resetAt`;
+  // `provider_daily`: the provider's daily-limit error.
+  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, cause: 'gate' | 'provider_daily',
+    resetAt?: number): Promise<DelayAnswer> {
+    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence, cause, resetAt);
+  }
+
+  // After a release-only quota call for a claim's `release` answer.
+  async acknowledgeReleases(workspaceId: string, mailboxId: string, sendId: string, released: SendFence[]) {
+    return this.sendDispatcher().acknowledgeReleases({ workspaceId, mailboxId }, sendId, released);
   }
 
   async abandonClaim(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, retryAt: number): Promise<AbandonAnswer> {
@@ -493,7 +500,17 @@ export class Mailbox extends DurableObject<Env> {
       if (http && (operation === 'createDraft' || operation === 'createLabel')) {
         return await this.createJsonWrite(scope, operation, http, options, now);
       }
-      return await this.executeMailApi(scope, operation, params, input, options);
+      try { return await this.executeMailApi(scope, operation, params, input, options); }
+      catch (error) {
+        // A thread whose sent copy reports an unpublished send state: publish, then read once more.
+        if (!(error instanceof UnpublishedSend)) throw error;
+        if (!await this.publishThrough(error.seq)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+        try { return await this.executeMailApi(scope, operation, params, input, options); }
+        catch (retry) {
+          if (retry instanceof UnpublishedSend) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+          throw retry;
+        }
+      }
     } catch (error) {
       if (error instanceof ApiFault) return { error: error.problem };
       return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
