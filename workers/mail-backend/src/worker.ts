@@ -111,15 +111,15 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
   }
 }
 
-export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
+export async function handleScheduled(_event: ScheduledController, env: Env, now = Date.now): Promise<void> {
   if (!enabled(env)) return;
   queueNames(env);
+  // Delayed cron invocations reserve work from the time they actually run.
   const outbound = env.MAIL_SEND_ENABLED === 'on' && env.SEND?.sendBatch
-    ? reconcileSendResults(env.DIRECTORY, { sendBatch: env.SEND.sendBatch.bind(env.SEND) }, event.scheduledTime)
+    ? reconcileSendResults(env.DIRECTORY, { sendBatch: env.SEND.sendBatch.bind(env.SEND) }, now())
       .catch(() => console.error({ code: 'send_result_reconcile_failed' }))
     : undefined;
   const alert = mailAlert(env.ALERTS);
-  const now = Number.isFinite(event.scheduledTime) ? () => event.scheduledTime : Date.now;
   const [result] = await Promise.all([reconcile({
     outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now,
     send: async id => { await env.DELIVER.send(id); }, alert, sendAlert: alert,
@@ -127,4 +127,4 @@ export async function handleScheduled(event: ScheduledController, env: Env): Pro
   if (result.enqueueErrors || result.alertErrors) console.error({ code: 'mail_reconcile_partial', ...result });
 }
 
-export default { email: handleEmail, queue: handleQueue, scheduled: handleScheduled };
+export default { email: handleEmail, queue: handleQueue, scheduled: (event: ScheduledController, env: Env) => handleScheduled(event, env) };

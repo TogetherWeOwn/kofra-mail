@@ -171,6 +171,20 @@ test('a cron holding an older re-drive generation cannot stamp a later failure a
   assert.equal((await db.prepare('SELECT alerted_at AS alertedAt FROM deliveries WHERE id = ?').bind(id(9)).first())?.alertedAt, 500);
 });
 
+test('a late cron leases deliveries at run time rather than its stale scheduled time', async () => {
+  await insert(8);
+  const now = Date.now();
+  await db.prepare('UPDATE deliveries SET next_attempt_at = ? WHERE id = ?').bind(now - 60_000, id(8)).run();
+  const queued: string[] = [];
+  const env = {
+    MAIL_BACKEND_ENABLED: 'on', DIRECTORY: db, DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq',
+    DELIVER: { send: async (id: string) => { queued.push(id); } },
+  } as unknown as Env;
+  await handleScheduled({ scheduledTime: now - 3_600_000 } as ScheduledController, env);
+  assert.deepEqual(queued, [id(8)]);
+  assert.ok((await outbox.get(id(8)))!.nextAttemptAt > now);
+});
+
 test('scheduled terminal alerts persist until the bound service accepts the POST', async () => {
   await insert(8);
   await db.prepare("UPDATE deliveries SET state = 'failed' WHERE id = ?").bind(id(8)).run();

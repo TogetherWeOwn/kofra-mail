@@ -826,7 +826,7 @@ export default {
             async sendBatch(batch) {
               await probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify([...batch].map(({ body }) => body)) });
             } },
-        });
+        }, () => now(env));
         return new Response(null, { status: 204 });
       }
       if (url.pathname === '/__fixture/rate-cap') {
