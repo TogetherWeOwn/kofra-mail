@@ -1,6 +1,7 @@
 export const MAX_RAW_BYTES = 25 * 1024 * 1024;
-// The most bytes PostalMime can decode from one part of a message within
-// MAX_RAW_BYTES. A quoted-printable part is decoded through its charset and
+// The most bytes PostalMime can decode from one measured attachment part of a
+// message within MAX_RAW_BYTES (calendar parts are re-encoded from their text,
+// are never measured and do not use this bound). A quoted-printable part is decoded through its charset and
 // re-encoded as UTF-8: every raw byte yields at most one character of at most
 // 3 UTF-8 bytes (an invalid byte becomes U+FFFD). A 7bit, 8bit or binary part
 // keeps its bytes. In both, a line break replaces at least one raw byte, and a

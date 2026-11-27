@@ -257,9 +257,16 @@ function hex(digest: ArrayBuffer): string {
 export async function partDigest(source: PartSource): Promise<string> {
   const stream = new crypto.DigestStream('SHA-256');
   const writer = stream.getWriter();
-  for await (const block of partBlocks(source)) await writer.write(block);
+  const digest = stream.digest;
+  digest.catch(() => {});
+  try {
+    for await (const block of partBlocks(source)) await writer.write(block);
+  } catch (error) {
+    await writer.abort(error).catch(() => {});
+    throw error;
+  }
   await writer.close();
-  return hex(await stream.digest);
+  return hex(await digest);
 }
 
 // The part's bytes for a PUT under `digest`. The last block is released only

@@ -46,8 +46,13 @@ function attachmentsMessage(count: number, width = 76, room = 0): string {
 
 function qpMessage(): string {
   // 1 MiB of decoded UTF-8 text, all non-ASCII, in 76-character soft-broken lines.
-  const text = 'Grüße, café, 日本語のテキスト。'.repeat(Math.ceil(MiB / 60));
-  const utf8 = new TextEncoder().encode(text).subarray(0, MiB - (MiB % 3));
+  const sample = 'Grüße, café, 日本語のテキスト。';
+  const full = new TextEncoder().encode(sample.repeat(Math.ceil(MiB / new TextEncoder().encode(sample).byteLength)));
+  // Cut at a character boundary at or below 1 MiB: a UTF-8 continuation byte is 10xxxxxx.
+  let cut = MiB;
+  while ((full[cut] & 0xc0) === 0x80) cut--;
+  const utf8 = full.subarray(0, cut);
+  assert.ok(utf8.byteLength > MiB - 4 && utf8.byteLength <= MiB, `qp body ${utf8.byteLength}`);
   let encoded = '';
   let line = '';
   for (const byte of utf8) {
@@ -83,6 +88,7 @@ function longLines(cte: string, unit = 'x', width = 1_000_000): string {
 // Only the encoded message stays reachable; its source string is dropped.
 const encode = (source: string) => new Uint8Array(new TextEncoder().encode(source));
 const width = /^base64-width-(\d+)$/.exec(kind ?? '');
+assert.ok(!width || (Number.isSafeInteger(Number(width[1])) && Number(width[1]) > 0), 'base64 width must be a positive integer');
 const CASES: Record<string, () => string> = {
   'one-attachment': () => attachmentsMessage(1),
   'eight-attachments': () => attachmentsMessage(8),
@@ -174,6 +180,8 @@ wrap(crypto.subtle, 'digest', digest => async function (this: SubtleCrypto, algo
 const start = performance.now();
 let indexed = 0;
 let stored = 0;
+// Stored attachments decoded again from the raw message (digest and stream).
+let replayed = 0;
 try {
   // The inbound index path without storage: parse, then hash and stream each
   // stored attachment in turn, as holdAndStore does.
@@ -193,6 +201,7 @@ try {
         if (size % (4 * MiB) < block.value.byteLength) sample();
       }
       assert.equal(size, external.size);
+      replayed++;
     }
     stored++;
   }
@@ -202,7 +211,7 @@ try {
 }
 raw = null;
 const elapsedMs = Math.round(performance.now() - start);
-console.log(JSON.stringify({ case: kind, node: process.version, rawBytes, rawMiB: mib(rawBytes), indexed, stored, samples, elapsedMs,
+console.log(JSON.stringify({ case: kind, node: process.version, rawBytes, rawMiB: mib(rawBytes), indexed, stored, replayed, samples, elapsedMs,
   baselineMiB: mib(used(baseline)), peakMiB: mib(used(peak)), deltaMiB: mib(used(peak) - used(baseline)),
   heapUsedMiB: mib(peak.heapUsed), externalMiB: mib(peak.external), arrayBuffersMiB: mib(peak.arrayBuffers),
   literalSumPeakMiB: mib(sumPeak), maxRssMiB: mib(process.resourceUsage().maxRSS * 1024),

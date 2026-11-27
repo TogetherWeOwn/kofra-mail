@@ -120,7 +120,8 @@ function filename(r: Rng): string | null {
 }
 
 type Built = { headers: string[]; body: Uint8Array };
-type Ctx = { r: Rng; eol: string; depth: number; large: number };
+// `boundaries` numbers the message's multipart boundaries, so a seed builds the same message alone or in a run.
+type Ctx = { r: Rng; eol: string; depth: number; large: number; boundaries: { next: number } };
 
 const CHARSETS = ['utf-8', 'UTF-8', 'iso-8859-1', 'windows-1252', 'utf-16le', 'x-unknown', 'iso-8859-8-i', ''];
 const ENCODINGS = ['base64', 'BASE64', 'quoted-printable', '7bit', '8bit', 'binary', '', 'x-uuencode', 'base64; junk'];
@@ -190,12 +191,11 @@ function leaf(ctx: Ctx): Built {
   }
 }
 
-let boundaryCounter = 0;
 function multipart(ctx: Ctx): Built {
   const { r, eol } = ctx;
   const subtype = pick(r, ['mixed', 'mixed', 'alternative', 'related', 'digest', 'report', 'signed']);
   // Sometimes a boundary that is a prefix of a sibling's or a child's boundary.
-  const boundary = chance(r, 0.2) ? `b${boundaryCounter++ % 3}` : `=_${int(r, 1e9).toString(36)}_${boundaryCounter++}`;
+  const boundary = chance(r, 0.2) ? `b${ctx.boundaries.next++ % 3}` : `=_${int(r, 1e9).toString(36)}_${ctx.boundaries.next++}`;
   const quoted = chance(r, 0.5) ? `"${boundary}"` : boundary;
   const headers = [`Content-Type: multipart/${subtype}; boundary=${quoted}`];
   const children = Array.from({ length: 1 + int(r, 4) }, () => entity({ ...ctx, depth: ctx.depth + 1 }));
@@ -236,7 +236,7 @@ function message(ctx: Ctx): Uint8Array<ArrayBuffer> {
 export function corpusMessage(seed: number): Uint8Array<ArrayBuffer> {
   const r = rng(seed);
   const eol = pick(r, ['\r\n', '\r\n', '\n', '\r\r\n']);
-  const bytes = message({ r, eol, depth: 0, large: chance(r, 0.1) ? 2 : 0 });
+  const bytes = message({ r, eol, depth: 0, large: chance(r, 0.1) ? 2 : 0, boundaries: { next: 0 } });
   // Occasionally a bare CR inside a line.
   if (chance(r, 0.1) && bytes.byteLength > 10) bytes[int(r, bytes.byteLength)] = 0x0d;
   return bytes;

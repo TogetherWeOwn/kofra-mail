@@ -300,3 +300,38 @@ test('a stored part stream that fails or is cancelled leaves no unhandled digest
   }
   assert.deepEqual(unhandled, []);
 });
+
+test('a digest replay that fails midway aborts its digest stream and leaves no unhandled rejection', async () => {
+  const raw = EDGE_CASES['a single-part binary message']();
+  const { contents: [source] } = await boundedMime(raw);
+  assert.ok(source && !(source instanceof Uint8Array));
+  const Original = (crypto as unknown as { DigestStream: new (algorithm: string) => WritableStream<ArrayBufferView> }).DigestStream;
+  const aborted: unknown[] = [];
+  class Recording extends Original {
+    constructor(algorithm: string) {
+      super(algorithm);
+      const getWriter = this.getWriter.bind(this);
+      this.getWriter = () => {
+        const writer = getWriter();
+        const abort = writer.abort.bind(writer);
+        writer.abort = reason => { aborted.push(reason); return abort(reason); };
+        return writer;
+      };
+    }
+  }
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  Object.assign(crypto, { DigestStream: Recording });
+  try {
+    // One byte short of the replay: full blocks are written before it fails.
+    await assert.rejects(partDigest({ ...source, size: source.size - 1 }), /Attachment size changed on decode/);
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    Object.assign(crypto, { DigestStream: Original });
+    process.off('unhandledRejection', onUnhandled);
+  }
+  assert.equal(aborted.length, 1);
+  assert.match(String(aborted[0]), /Attachment size changed on decode/);
+  assert.deepEqual(unhandled, []);
+});
