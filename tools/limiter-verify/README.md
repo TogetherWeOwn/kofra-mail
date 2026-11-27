@@ -4,20 +4,20 @@ Run from the repository root with Node.js 24. The clients print only `bucket PAS
 
 ## Step 1: both outbound flags off
 
-1. Put `CLOUDFLARE_ACCOUNT_ID` and a Workers-settings read token in `CLOUDFLARE_API_TOKEN` in the process environment. Check the deployed mail-web script:
+1. Put `CLOUDFLARE_ACCOUNT_ID` and a Workers-settings read token in `CLOUDFLARE_API_TOKEN` in the process environment. Set `PROBE_CONFIG_PATH` to a new private JSON file path outside the checkout, then run:
 
    ```sh
-   node tools/limiter-verify/check-config.ts MAIL_WEB_SCRIPT_NAME
+   node tools/limiter-verify/check-config.ts MAIL_WEB_SCRIPT_NAME --write-probe-config "$PROBE_CONFIG_PATH"
    ```
 
-   The configuration check verifies the binding names, distinct namespaces, limits and periods. It does not print any IDs.
-2. Manually deploy `probe-worker.ts` as a temporary, separate Worker in the same Cloudflare account. In a private operator config, use `nodejs_compat` and copy **the actual mail-web `ratelimits` bindings**, including the same names, `namespace_id` values, limits and periods. Do not attach mail data bindings. Set the Worker secret `R2_PROBE_SECRET`, and load that same value into the client process environment:
+   The check verifies binding names, distinct namespaces, limits and periods. Only if all buckets pass does it create a private configuration file (mode `0600`), using the namespace IDs from the same settings response. It never prints them or overwrites a file. Omit `--write-probe-config` and its path to run the configuration check alone.
+2. Manually deploy the temporary probe Worker in the same Cloudflare account **only from that generated config**. Do not copy or hand-edit the rate limit bindings, commit the file, or attach mail data bindings. The generated config names the Worker `MAIL_WEB_SCRIPT_NAME-r2-probe`. Set the Worker secret `R2_PROBE_SECRET`, and load that same value into the client process environment:
 
    ```sh
    node tools/limiter-verify/probe-client.ts https://probe.example
    ```
 
-   The client sends the secret in `x-r2-probe-secret`. Each request exercises one binding with a fresh `r2-probe:` key. The direct probe tests the threshold, not the period; the settings check verifies the period. Remove the temporary probe after the check.
+   The client sends the secret in `x-r2-probe-secret`. Each request exercises one binding with a fresh `r2-probe:` key. The settings check verifies the period; the direct and HTTP bursts verify the threshold, not the underlying binding period. Remove the temporary Worker and its private config after the check.
 
 ## Step 2: relevant flag on, before user traffic
 

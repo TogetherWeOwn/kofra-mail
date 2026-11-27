@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
@@ -56,6 +59,43 @@ test('Cloudflare settings rejects missing and shared namespace IDs', async () =>
   delete uploads.namespace_id;
   assert.deepEqual(await checkConfig('mail-web', cfEnv, async () => Response.json(response)),
     verdicts('reads', 'writes', 'uploads'));
+});
+
+test('probe config uses exactly the validated mail-web binding names and namespace IDs', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'r2-probe-config-'));
+  t.after(() => rm(directory, { recursive: true }));
+  const probeConfigPath = join(directory, 'probe.json');
+  let calls = 0;
+  const result = await checkConfig('mail-web', cfEnv, async () => {
+    calls++;
+    return Response.json(settings);
+  }, { probeConfigPath });
+  assert.equal(calls, 1);
+  assert.deepEqual(result, verdicts());
+  const config = JSON.parse(await readFile(probeConfigPath, 'utf8'));
+  assert.equal(config.name, 'mail-web-r2-probe');
+  assert.equal(resolve(directory, config.main), fileURLToPath(new URL('./probe-worker.ts', import.meta.url)));
+  assert.deepEqual(config.ratelimits, settings.result.bindings
+    .filter(({ type }: { type: string }) => type === 'ratelimit')
+    .map(({ name, namespace_id, simple }: { name: string; namespace_id: string; simple: unknown }) => ({ name, namespace_id, simple })));
+  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'preview_urls', 'ratelimits', 'workers_dev']);
+  if (process.platform !== 'win32') assert.equal((await stat(probeConfigPath)).mode & 0o777, 0o600);
+});
+
+test('probe config is not created on failed validation and never overwrites a file', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'r2-probe-config-'));
+  t.after(() => rm(directory, { recursive: true }));
+  const probeConfigPath = join(directory, 'probe.json');
+  const incomplete = structuredClone(settings);
+  incomplete.result.bindings.pop();
+  assert.deepEqual(await checkConfig('mail-web', cfEnv, async () => Response.json(incomplete), { probeConfigPath }),
+    verdicts('admin_writes'));
+  await assert.rejects(stat(probeConfigPath), { code: 'ENOENT' });
+
+  await writeFile(probeConfigPath, 'existing file');
+  assert.deepEqual(await checkConfig('mail-web', cfEnv, async () => Response.json(settings), { probeConfigPath }),
+    verdicts(...bucketNames));
+  assert.equal(await readFile(probeConfigPath, 'utf8'), 'existing file');
 });
 
 test('expected buckets match the local Wrangler configuration and gateway mapping', () => {
