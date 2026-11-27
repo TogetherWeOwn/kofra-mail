@@ -161,6 +161,18 @@ test('probe calls only the requested binding with one fresh test key per request
   assert.deepEqual([...keys.values()], [limit + 1, limit + 1]);
 });
 
+test('probe reports a refusal on the last call it is allowed to make', async () => {
+  const { limit, binding } = EXPECTED_BUCKETS.undo;
+  const { max } = refusalBand(limit);
+  let calls = 0;
+  const env = { R2_PROBE_SECRET: probeSecret, [binding]: {
+    async limit() { calls++; return { success: calls <= max }; },
+  } };
+  const response = await probe.fetch(probeRequest('undo', probeSecret), env);
+  assert.deepEqual(await response.json(), { allowed: max, refused: true });
+  assert.equal(calls, max + 1);
+});
+
 test('probe answers 404 without its configured secret and cannot address other bindings', async () => {
   const env = { R2_PROBE_SECRET: probeSecret, MAIL_RATE_UNDO: { limit() { assert.fail('must not call the binding'); } } };
   assert.equal((await probe.fetch(probeRequest('undo'), env)).status, 404);
@@ -202,10 +214,26 @@ test('probe client accepts the band edges and fails early refusals, late or no r
     if (bucket === 'uploads') return new Response(null, { status: 503 });
     if (bucket === 'sends') return Response.json({ allowed: min, refused: true });
     if (bucket === 'admin_writes') return Response.json({ allowed: max, refused: true });
+    if (bucket === 'undo_flood') return Response.json({ allowed: limit, refused: false });
     return Response.json({ allowed: limit, refused: true });
   });
   assert.deepEqual(seen, bucketNames);
-  assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'uploads'));
+  assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'undo_flood', 'uploads'));
+});
+
+test('probe client rejects a fractional admission count', async () => {
+  const result = await checkProbe('https://probe.example.test', probeSecret, async (url) => {
+    const bucket = new URL(String(url)).searchParams.get('bucket') as Bucket;
+    const { min } = refusalBand(EXPECTED_BUCKETS[bucket].limit);
+    return Response.json({ allowed: min + 0.5, refused: true });
+  });
+  assert.deepEqual(result, verdicts(...bucketNames));
+});
+
+test('the refusal band is 90% rounded up to 150% rounded down', () => {
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.writes.limit), { min: 108, max: 180 });
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.uploads.limit), { min: 58, max: 96 });
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.undo.limit), { min: 9, max: 15 });
 });
 
 const routes: [Bucket, string, RegExp, number][] = [
@@ -217,7 +245,7 @@ const routes: [Bucket, string, RegExp, number][] = [
   ['admin_writes', 'POST', /^\/api\/v1\/admin\/domains$/, 428],
 ];
 
-type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong period';
+type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong retry-after' | 'wrong body period';
 async function fakeServer(mode: Mode, buckets: Bucket[]) {
   const counts = new Map<string, number>();
   const undoPaths = new Set<string>();
@@ -239,7 +267,7 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
     // The number of requests a bucket admits before its first refusal.
     const admits = (limit: number) => {
       const { min, max } = refusalBand(limit);
-      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong period': limit }[mode];
+      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong retry-after': limit, 'wrong body period': limit }[mode];
     };
     let limited = false;
     if (bucket === 'undo') {
@@ -248,9 +276,11 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
     }
     limited ||= hit(bucket === 'undo' ? path : bucket) > admits(EXPECTED_BUCKETS[bucket].limit);
     if (mode === 'never' || !limited) { response.writeHead(baseline).end('{}'); return; }
-    const period = mode === 'wrong period' ? 10 : EXPECTED_BUCKETS[bucket].period;
-    response.writeHead(429, { 'retry-after': String(period), 'content-type': 'application/problem+json' })
-      .end(JSON.stringify({ code: 'rate_limited', retryAfterSeconds: period }));
+    const { period } = EXPECTED_BUCKETS[bucket];
+    const header = mode === 'wrong retry-after' ? 10 : period;
+    const body = mode === 'wrong body period' ? 10 : period;
+    response.writeHead(429, { 'retry-after': String(header), 'content-type': 'application/problem+json' })
+      .end(JSON.stringify({ code: 'rate_limited', retryAfterSeconds: body }));
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   try {
@@ -274,13 +304,13 @@ test('HTTP check passes exact sequences on all enabled buckets and separates the
   assert.equal(flood.undoPaths.size, EXPECTED_BUCKETS.undo_flood.limit + 1);
 });
 
-for (const mode of ['never', 'early', 'late', 'wrong period'] as const) {
+for (const mode of ['never', 'early', 'late', 'wrong retry-after', 'wrong body period'] as const) {
   test(`HTTP check rejects ${mode} rate limiting`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
     const { result, calls } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
-    assert.equal(calls, { never: max + 1, early: min, late: max + 1, 'wrong period': limit + 1 }[mode]);
+    assert.equal(calls, { never: max + 1, early: min, late: max + 1, 'wrong retry-after': limit + 1, 'wrong body period': limit + 1 }[mode]);
   });
 }
 
