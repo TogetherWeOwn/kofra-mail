@@ -10,7 +10,7 @@ import type { IndexPlumbing } from './fixtures/index-plumbing.ts';
 
 const id = '01KBN8ZJ7G0000000000000000';
 let runtime: Miniflare;
-let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'overlongThroughKofra' | 'parts' | 'storeCalls'> };
+let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'overlongThroughKofra' | 'parts' | 'shortDigest' | 'storeCalls'> };
 let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
 // The object store behind the Kofra adapter; a PUT is kept only if its body matches its signed digest.
 const stored = new Map<string, Uint8Array>();
@@ -199,4 +199,14 @@ for (const mode of ['overlong', 'digest'] as const) test(`a ${mode === 'overlong
   // block, which is held back until the digest check.
   if (mode === 'digest') assert.ok(lastPutBytes >= binary.byteLength - 64 * 1024 && lastPutBytes < binary.byteLength, `received ${lastPutBytes}`);
   else assert.equal(lastPutBytes, 0);
+});
+
+test('a digest pass that fails midway rejects with no unhandled rejection in the Workers runtime', async () => {
+  const binary = new Uint8Array(300 * 1024).map((_, i) => (i * 2654435761) >>> 24);
+  const key = await upload(multipart('short-digest', [
+    `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=short.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(binary).toString('base64').match(/.{1,76}/g)!.join('\r\n')}`,
+  ]));
+  const result = JSON.parse(await boxes.getByName('kofra-short-digest').shortDigest(key)) as { error: string; unhandled: string[] };
+  assert.equal(result.error, 'Attachment size changed on decode');
+  assert.deepEqual(result.unhandled, []);
 });
