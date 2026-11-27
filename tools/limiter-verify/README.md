@@ -17,7 +17,7 @@ Run from the repository root with Node.js 24. The clients print only `bucket PAS
    node tools/limiter-verify/probe-client.ts https://probe.example
    ```
 
-   The client sends the secret in `x-r2-probe-secret`. Each request exercises one binding with a fresh `r2-probe:` key. The settings check verifies the period; the direct and HTTP bursts verify the threshold, not the underlying binding period. Remove the temporary Worker and its private config after the check.
+   The client sends the secret in `x-r2-probe-secret`. Each request exercises one binding with a fresh `r2-probe:` key. The settings check verifies the period; the direct and HTTP bursts check only that the first refusal falls within the 90–150% band; the exact limit and the period are proved by the configuration check. Remove the temporary Worker and its private config after the check.
 
 ## Step 2: relevant flag on, before user traffic
 
