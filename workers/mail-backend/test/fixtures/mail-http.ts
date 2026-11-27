@@ -5,6 +5,7 @@ import { build } from 'esbuild';
 import { Miniflare, Response as LocalResponse, type Request as LocalRequest, type WorkerOptions } from 'miniflare';
 import { createHttpMailService } from '../../../../contracts/mail-api/src/http-client.ts';
 import type { Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
+import { isSafeMessageId } from '../../../../contracts/mail-api/src/headers.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
 import { migrateDirectory } from './directory-db.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
@@ -31,14 +32,19 @@ const CRLF = '\r\n';
 const base64 = (bytes: string | Uint8Array) => Buffer.from(bytes).toString('base64').replace(/.{1,76}/g, `$&${CRLF}`).trimEnd();
 const word = (value: string) => `=?UTF-8?B?${Buffer.from(value).toString('base64')}?=`;
 const recipients = (addrs: Address[]) => addrs.map((a) => a.name ? `${word(a.name)} <${a.email}>` : a.email).join(', ');
-function buildMime(message: TestMessage, sentAt: number, msgId: string, parent?: string): string {
+const foldFixtureId = (id: string) => id.replace(/(?:\r\n|[\r\n])[ \t]*/g, `${CRLF} `);
+function buildMime(message: TestMessage, sentAt: number, msgId: string, ancestry: readonly string[]): string {
   const boundary = `mixed-${crypto.randomUUID()}`, alternate = `alternative-${crypto.randomUUID()}`;
   const plain = `Content-Type: text/plain; charset=utf-8${CRLF}Content-Transfer-Encoding: base64${CRLF}${CRLF}${base64(message.text)}`;
   const html = message.html === undefined ? undefined : [`Content-Type: multipart/alternative; boundary="${alternate}"`, '',
     `--${alternate}`, plain, `--${alternate}`, 'Content-Type: text/html; charset=utf-8', 'Content-Transfer-Encoding: base64', '', base64(message.html), `--${alternate}--`].join(CRLF);
+  const parent = ancestry.at(-1);
+  const references = ancestry.filter(isSafeMessageId);
   const header = [`From: ${recipients([message.from])}`, `To: ${recipients(message.to)}`,
-    ...(message.cc?.length ? [`Cc: ${recipients(message.cc)}`] : []), `Subject: ${word(message.subject)}`, `Message-ID: ${msgId}`,
-    ...(parent ? [`In-Reply-To: ${parent}`, `References: ${parent}`] : []), `Date: ${new Date(sentAt).toUTCString()}`, 'MIME-Version: 1.0'];
+    ...(message.cc?.length ? [`Cc: ${recipients(message.cc)}`] : []), `Subject: ${word(message.subject)}`, `Message-ID: ${foldFixtureId(msgId)}`,
+    ...(parent ? [`In-Reply-To: ${foldFixtureId(parent)}`] : []),
+    ...(references.length ? [`References: ${references.join(`${CRLF} `)}`] : []),
+    `Date: ${new Date(sentAt).toUTCString()}`, 'MIME-Version: 1.0'];
   if (!message.attachments?.length) return [...header, html ?? plain, ''].join(CRLF);
   const parts = message.attachments.map((part, index) => [
     `Content-Type: ${part.type}`, `Content-Disposition: ${part.inline ? 'inline' : 'attachment'}; filename="${word(part.name)}"`,
@@ -304,7 +310,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       const [, workspace, key] = path;
       writes.push({ key, holders: await holders(key, workspace) });
     };
-    const ids = new Map<string, string>();
+    const ancestryById = new Map<string, string[]>();
     const clients = new Map<string, ReturnType<typeof createHttpMailService>>();
     const as = (principal: keyof typeof accounts) => {
       const cached = clients.get(principal);
@@ -325,13 +331,13 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     };
     const deliver = async (message: TestMessage, to: keyof typeof accounts = 'member') => {
       const msgId = message.messageId ?? `<${crypto.randomUUID()}@fixture.test>`;
-      const parent = message.inReplyTo ? ids.get(message.inReplyTo) : undefined;
-      const mime = buildMime(message, now, msgId, parent);
+      const ancestry = ancestryById.get(message.inReplyTo ?? '') ?? [];
+      const mime = buildMime(message, now, msgId, ancestry);
       const res = await call('deliver', mime, { 'x-fixture-to': accounts[to].address, 'x-fixture-from': message.from.email });
       if (!res.ok) throw new Error(`Fixture delivery HTTP ${res.status}: ${await res.text()}`);
       const result = await res.json() as { threadId: string; messageId: string };
       assert.ok(result.threadId && result.messageId);
-      ids.set(result.messageId, msgId);
+      ancestryById.set(result.messageId, [...ancestry, msgId]);
       return result;
     };
     if (demo) {
@@ -374,10 +380,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       blockLaterDelta: (after: number) => controlAction('block-later-delta', String(after)),
       exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
       seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
-      m3: false, credentialEpoch: async () => 1,
+      m3: send, credentialEpoch: async () => 1,
       contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
-      sentHeaders: async () => { throw new Error('M3 is not part of this backend'); }, close: () => mf.dispose() };
+      sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId), close: () => mf.dispose() };
   } catch (error) {
     await mf.dispose();
     throw error;

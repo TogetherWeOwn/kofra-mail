@@ -8,10 +8,11 @@ export type SendRecipientKind = 'external' | 'internal';
 export type SendFailure = 'invalid_sender' | 'message_too_large' | 'delivery_error';
 // Everything the sent copy's bytes depend on, frozen at sendDraft
 // (docs/m3-outbound-plan.md, section 2.3, step 2). The draft revision is
-// immutable; the boundary and Message-ID derive from the send id.
+// immutable; boundary and Message-ID are derived once at submission.
 export type SendRecord = {
   id: string; draftId: string; createdAt: number; undoUntil: number; dateAt: number; undoSeconds: number;
-  ownerUserId: string; from: { email: string; name: string }; replyTo: SendAddress[]; builderVersion: number;
+  boundary: string; messageId: string;
+  ownerUserId: string; from: { email: string; name: string }; replyTo: [] | [SendAddress]; builderVersion: number;
   draft: { rawKey: string; holder: string; revision: string; updatedAt: number };
   attachmentKeys: string[]; uploadIds: string[]; recipients: SendRecipient[];
   // Each small forwarded part's decoded digest and size, fixed when it was attached.

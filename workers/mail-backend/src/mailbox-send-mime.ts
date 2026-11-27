@@ -3,11 +3,8 @@
 // send froze at sendDraft, so a rerun builds identical bytes. The builder
 // version is frozen too: a deploy that adds a version keeps the old one for
 // sends that recorded it.
-//
-// The default builder here is a deterministic stand-in until the MIME builder
-// package (M3-4) replaces it. It writes plain RFC 5322 with base64 parts and
-// never a Bcc header, and folds every header line well under 998 octets; it
-// does not trim threading headers, which is the real builder's job.
+
+import { buildSentCopy, encodedSentCopySize, SEND_MIME_VERSION, type SendMimeAttachment as SendMimeBuiltAttachment } from './send-mime.ts';
 
 export type SendMimeAddress = { email: string; name?: string };
 export type SendMimeAttachment = { name: string; type: string; size: number };
@@ -19,9 +16,12 @@ export type SendMimeMessage = {
   // The message's Date: the send's first undoUntil, never moved.
   date: number;
   from: SendMimeAddress;
-  replyTo: SendMimeAddress[];
+  // Email Service accepts one Reply-To address; the send record rejects more.
+  replyTo: [] | [SendMimeAddress];
   to: SendMimeAddress[];
   cc: SendMimeAddress[];
+  // Validated alongside To and Cc, but never serialized in the sent copy.
+  bcc: SendMimeAddress[];
   subject: string;
   text: string;
   attachments: SendMimeAttachment[];
@@ -46,88 +46,38 @@ export function mimeBuilders(...builders: SendMimeBuilder[]): SendMimeBuilders {
   return { current: Math.max(...byVersion.keys()), get: version => byVersion.get(version) };
 }
 
-const encoder = new TextEncoder();
-const bytes = (text: string) => encoder.encode(text).byteLength;
-const CRLF = '\r\n';
-// Base64 in lines of 76 characters, each followed by CRLF.
-export function base64MimeBytes(size: number): number {
-  const chars = 4 * Math.ceil(size / 3);
-  return chars + 2 * Math.ceil(chars / 76);
-}
-function base64Lines(data: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < data.byteLength; i += 0x8000) binary += String.fromCharCode(...data.subarray(i, i + 0x8000));
-  const encoded = btoa(binary);
-  let out = '';
-  for (let i = 0; i < encoded.length; i += 76) out += `${encoded.slice(i, i + 76)}${CRLF}`;
-  return out;
-}
-const ascii = (text: string) => /^[\x20-\x7e]*$/.test(text);
-// Folding whitespace: every header line stays far below the 998-octet limit.
-const FOLD = `${CRLF} `;
-// RFC 2047 encoded words of at most 45 UTF-8 bytes each (60 base64
-// characters), split at code points and folded one word per line.
-function encodedWords(text: string): string {
-  const words: string[] = [];
-  let chunk = '';
-  for (const character of text) {
-    if (chunk && bytes(chunk + character) > 45) { words.push(chunk); chunk = ''; }
-    chunk += character;
-  }
-  if (chunk || !words.length) words.push(chunk);
-  return words.map(word => `=?UTF-8?B?${base64Lines(encoder.encode(word)).replaceAll(CRLF, '')}?=`).join(FOLD);
-}
-const word = (text: string) => ascii(text) && text.length <= 900 ? text : encodedWords(text);
-const quoted = (name: string) => ascii(name) ? `"${name.replace(/["\\]/g, '\\$&')}"` : encodedWords(name);
-const mailbox = ({ email, name }: SendMimeAddress) => name ? `${quoted(name)} <${email}>` : email;
-const list = (addresses: SendMimeAddress[]) => addresses.map(mailbox).join(`,${FOLD}`);
-const filename = (name: string) => `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
-
-type Segment = string | { part: number; size: number };
-
-function layout(message: SendMimeMessage): Segment[] {
-  const headers = [
-    `From: ${mailbox(message.from)}`,
-    ...(message.replyTo.length ? [`Reply-To: ${list(message.replyTo)}`] : []),
-    ...(message.to.length ? [`To: ${list(message.to)}`] : []),
-    ...(message.cc.length ? [`Cc: ${list(message.cc)}`] : []),
-    `Subject: ${word(message.subject)}`,
-    `Date: ${new Date(message.date).toUTCString().replace('GMT', '+0000')}`,
-    `Message-ID: ${message.messageId}`,
-    ...(message.inReplyTo ? [`In-Reply-To: ${message.inReplyTo}`] : []),
-    ...(message.references ? [`References: ${message.references.split(' ').join(FOLD)}`] : []),
-    'MIME-Version: 1.0',
-  ];
-  const text = base64Lines(encoder.encode(message.text));
-  const body = `Content-Type: text/plain; charset=UTF-8${CRLF}Content-Transfer-Encoding: base64${CRLF}${CRLF}${text}`;
-  if (!message.attachments.length) return [`${headers.join(CRLF)}${CRLF}${body}`];
-  const delimiter = `--${message.boundary}${CRLF}`;
-  const segments: Segment[] = [
-    `${headers.join(CRLF)}${CRLF}Content-Type: multipart/mixed; boundary="${message.boundary}"${CRLF}${CRLF}${delimiter}${body}`,
-  ];
-  message.attachments.forEach((attachment, part) => {
-    segments.push(`${delimiter}Content-Type: ${attachment.type}${CRLF}Content-Disposition: attachment; ${filename(attachment.name)}${CRLF}`
-      + `Content-Transfer-Encoding: base64${CRLF}${CRLF}`, { part, size: attachment.size });
-  });
-  segments.push(`--${message.boundary}--${CRLF}`);
-  return segments;
+function inputFor(message: SendMimeMessage) {
+  if (message.replyTo.length > 1) throw new Error('More than one frozen Reply-To address');
+  return {
+    from: message.from,
+    to: message.to,
+    cc: message.cc,
+    bcc: message.bcc,
+    subject: message.subject,
+    text: message.text,
+    ...(message.replyTo[0] && { frozenReplyTo: message.replyTo[0] }),
+    ...(message.inReplyTo || message.references ? { threading: { inReplyTo: message.inReplyTo, references: message.references } } : {}),
+    dateAt: message.date,
+    messageId: message.messageId,
+    boundary: message.boundary,
+    builderVersion: SEND_MIME_VERSION,
+  };
 }
 
-export const stubMimeBuilder: SendMimeBuilder = {
-  version: 1,
+const sentCopyMimeBuilder: SendMimeBuilder = {
+  version: SEND_MIME_VERSION,
   encodedSize(message) {
-    return layout(message).reduce((total, segment) => total + (typeof segment === 'string' ? bytes(segment) : base64MimeBytes(segment.size)), 0);
+    return encodedSentCopySize({ ...inputFor(message), attachments: message.attachments });
   },
   async build(message, parts) {
-    let out = '';
-    for (const segment of layout(message)) {
-      if (typeof segment === 'string') { out += segment; continue; }
-      const data = await parts(segment.part);
-      if (data.byteLength !== segment.size) throw new Error('Send attachment size changed');
-      out += base64Lines(data);
+    const attachments: SendMimeBuiltAttachment[] = [];
+    for (const [index, attachment] of message.attachments.entries()) {
+      const data = await parts(index);
+      if (data.byteLength !== attachment.size) throw new Error('Send attachment size changed');
+      attachments.push({ ...attachment, bytes: data });
     }
-    return new Uint8Array(encoder.encode(out));
+    return buildSentCopy({ ...inputFor(message), attachments }).bytes;
   },
 };
 
-export const defaultMimeBuilders = () => mimeBuilders(stubMimeBuilder);
+export const defaultMimeBuilders = () => mimeBuilders(sentCopyMimeBuilder);

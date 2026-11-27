@@ -155,6 +155,24 @@ export class HttpMailbox extends Mailbox {
     this.sendMime = fixtureBuilders('bumped');
   }
   mimeBuilds() { return builds; }
+  async sentHeaders(workspaceId: string, messageId: string): Promise<Record<string, string>> {
+    const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', messageId).toArray()[0];
+    if (!row) throw new Error('Stored sent copy is missing');
+    const raw = new TextDecoder().decode(await this.fixtureIndex(workspaceId).readObject(row.raw_key));
+    const headers: Record<string, string> = {};
+    let current: string | undefined;
+    for (const line of raw.slice(0, raw.indexOf('\r\n\r\n')).split('\r\n')) {
+      if (/^[ \t]/.test(line)) {
+        if (current) headers[current] += ` ${line.trim()}`;
+        continue;
+      }
+      const separator = line.indexOf(':');
+      if (separator < 1) continue;
+      current = line.slice(0, separator).toLowerCase();
+      headers[current] = line.slice(separator + 1).trim();
+    }
+    return headers;
+  }
   shortenHandlerBudget() { this.timerHandlerBudgetMs = 25; this.realtimeHolderClock = true; }
   sendRow(id: string) {
     return this.ctx.storage.sql.exec(`SELECT id, state, undo_until, created_seq, release_seq, queued_seq, terminal_seq, message_id, reason,
@@ -639,6 +657,7 @@ export default {
           case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
           case '/__fixture/bump-builder': await box.bumpBuilder(); break;
           case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/sent-headers': return Response.json(await box.sentHeaders(ws, await req.text()));
           case '/__fixture/stall-publish': await box.stallPublish(); break;
           case '/__fixture/publish-stalled': await box.publishStalled(); break;
           case '/__fixture/resume-publish': await box.resumePublish(); break;

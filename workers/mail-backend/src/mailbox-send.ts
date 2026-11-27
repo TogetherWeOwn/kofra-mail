@@ -18,13 +18,14 @@ import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
 import { mailboxState } from './mailbox-api.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
+import { SendMimeError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
-  DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentBoundary, sentCopyId,
-  sentMessageIdHeader, TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
+  DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
+  TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
-import type { JournalEvent, JournalResult, SendAddress, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import type { JournalEvent, JournalResult, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
 import { parseMail, RawDigestMismatch } from './parse-mail.ts';
@@ -82,9 +83,9 @@ export function mimeMessage(record: SendRecord, draft: DraftObject): SendMimeMes
   const links = (draft.attachments ?? []).flatMap(({ wire }) => wire.kind === 'link' ? [`${wire.name}: ${wire.url}`] : []);
   const { inReplyTo, references } = sendThreading(draft.replyHeaders);
   return {
-    messageId: sentMessageIdHeader(record), boundary: sentBoundary(record), date: record.dateAt,
+    messageId: record.messageId, boundary: record.boundary, date: record.dateAt,
     from: { email: record.from.email, ...(record.from.name ? { name: record.from.name } : {}) }, replyTo: record.replyTo,
-    to: field('to'), cc: field('cc'), subject: draft.fields.subject.toWellFormed(), text: [draft.fields.body, ...links].join('\r\n'),
+    to: field('to'), cc: field('cc'), bcc: field('bcc'), subject: draft.fields.subject.toWellFormed(), text: [draft.fields.body, ...links].join('\r\n'),
     attachments: files(draft).map(({ wire }) => ({ name: sendFileName(wire.name), type: sendFileType(wire.type), size: wire.size })),
     ...(inReplyTo ? { inReplyTo } : {}),
     ...(references ? { references } : {}),
@@ -110,22 +111,20 @@ function checkSendable(draft: DraftObject): SendRecipient[] {
   return all.map(({ email, name, field }) => ({ field, email, ...(name ? { name } : {}) }));
 }
 
-// A settings Reply-To that the MIME builder would refuse answers invalid_header
-// for /replyTo, as the builder does; it is never dropped. Only the first four are used.
-function replyToFromSettings(sql: SqlStorage): SendAddress[] {
+// Email Service accepts one Reply-To address, so settings freeze only the first.
+function replyToFromSettings(sql: SqlStorage): SendRecord['replyTo'] {
   const row = sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
   const value = row ? (JSON.parse(row.definition) as { replyTo?: unknown }).replyTo : undefined;
-  // Absent means no Reply-To; any other value that is not a list is invalid.
+  const invalidReplyTo = () => fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
   if (value === undefined) return [];
-  if (!Array.isArray(value)) return fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
-  return value.slice(0, 4).map(entry => {
-    const { email, name } = (entry ?? {}) as { email?: unknown; name?: unknown };
-    if (typeof email !== 'string' || hasHeaderControl(email) || !validEmail(email) || (name !== undefined &&
-        (typeof name !== 'string' || hasHeaderControl(name) || byteLength(name) > LIMITS.displayNameBytes))) {
-      return fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
-    }
-    return { email, ...(typeof name === 'string' && name ? { name } : {}) };
-  });
+  if (!Array.isArray(value)) return invalidReplyTo();
+  if (!value.length) return [];
+  const { email, name } = (value[0] ?? {}) as { email?: unknown; name?: unknown };
+  if (typeof email !== 'string' || hasHeaderControl(email) || !validEmail(email) || (name !== undefined &&
+      (typeof name !== 'string' || hasHeaderControl(name) || byteLength(name) > LIMITS.displayNameBytes))) {
+    return invalidReplyTo();
+  }
+  return [{ email, ...(name && { name }) }];
 }
 
 function settingsUndoSeconds(sql: SqlStorage): number {
@@ -199,13 +198,25 @@ export class SendApi {
         ? [{ messageId: attachment.wire.messageId, part: attachment.wire.part, ...attachment.part }] : []);
     const undoSeconds = settingsUndoSeconds(this.sql), replyTo = replyToFromSettings(this.sql), attachmentKeys = draftObjectKeys(draft);
     const builder = this.mime.get(this.mime.current)!;
-    const frozen = (at: number, source: Pick<DraftObjectRef, 'rawKey' | 'revision' | 'updatedAt'> & { holder: string }): SendRecord => ({
-      id: ulid(at), draftId: ref.id, createdAt: at, undoUntil: at + undoSeconds * 1000, dateAt: at + undoSeconds * 1000, undoSeconds,
-      ownerUserId: options.userId!, from: { email: from, name }, replyTo, builderVersion: this.mime.current,
-      draft: { rawKey: source.rawKey, holder: source.holder, revision: source.revision, updatedAt: source.updatedAt },
-      attachmentKeys, uploadIds, recipients, parts,
-    });
-    const tooLarge = (record: SendRecord) => builder.encodedSize(mimeMessage(record, draft)) > LIMITS.outboundMessageBytes;
+    const frozen = (at: number, source: Pick<DraftObjectRef, 'rawKey' | 'revision' | 'updatedAt'> & { holder: string }): SendRecord => {
+      const id = ulid(at);
+      const mimeId = id.toLowerCase();
+      return {
+        id, draftId: ref.id, createdAt: at, undoUntil: at + undoSeconds * 1000, dateAt: at + undoSeconds * 1000, undoSeconds,
+        messageId: sendMimeMessageId(mimeId, { email: from }), boundary: sendMimeBoundary(mimeId),
+        ownerUserId: options.userId!, from: { email: from, name }, replyTo, builderVersion: builder.version,
+        draft: { rawKey: source.rawKey, holder: source.holder, revision: source.revision, updatedAt: source.updatedAt },
+        attachmentKeys, uploadIds, recipients, parts,
+      };
+    };
+    const tooLarge = (record: SendRecord) => {
+      try { return builder.encodedSize(mimeMessage(record, draft)) > LIMITS.outboundMessageBytes; }
+      catch (error) {
+        if (!(error instanceof SendMimeError)) throw error;
+        const { code, ...extra } = error.problem;
+        return fail(code, extra);
+      }
+    };
     if (tooLarge(frozen(this.clock(), ref))) return fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
     // A legacy prefix-less `drafts/` revision is first stored as a raw/ generation,
     // as replaceDraft writes one (section 2.7), and committed with the send.
