@@ -27,7 +27,7 @@ import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './ma
 import type { JournalEvent, JournalResult, SendAddress, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
-import { parseMail } from './parse-mail.ts';
+import { parseMail, RawDigestMismatch } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
 import { ulid } from 'ulid';
 
@@ -545,25 +545,21 @@ export class SendDriver {
         verified.set(index, bytes);
       });
     } catch (error) {
-      if (error instanceof SourceMismatch) return null;
+      // The parser checks each source against its raw/ key's digest before parsing.
+      if (error instanceof SourceMismatch || error instanceof RawDigestMismatch) return null;
       throw error;
     }
     return matched ? verified : null;
   }
 
   // A stored object declared empty or over the cap is invalid for good, like a
-  // digest mismatch; a missing object or a failed read still retries. The read
-  // enforces the declared length, so a raw/ source with wrong bytes is corrupt.
+  // digest mismatch; a missing object or a failed read still retries.
   private async readSource(index: MailboxIndex, key: string): Promise<Uint8Array<ArrayBuffer>> {
-    let bytes: Uint8Array<ArrayBuffer>;
-    try { bytes = await index.readObject(key); }
+    try { return await index.readObject(key); }
     catch (error) {
       if (error instanceof ObjectInvalidError) throw new SourceMismatch();
       throw error;
     }
-    const parsed = parseObjectKey(key);
-    if (parsed?.kind === 'raw' && await sha256(bytes) !== parsed.digest) throw new SourceMismatch();
-    return bytes;
   }
 
   private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
