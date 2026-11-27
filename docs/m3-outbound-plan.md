@@ -697,6 +697,7 @@ Before `MAIL_SEND_ENABLED` turns on in any deployed environment:
 4. M3-5, M3-6 and M3-8 merged; internal-only sends stay `queued` until M3-8.
 5. M3-7b's first run in that environment, so the senders are listed and `active`.
 6. The owner's approval for the first production deploy.
+7. No open durability flake: every intermittent CI failure in a send-path or holder-release test (currently "a stalled release does not lose sibling acknowledgements or starve later rows") is root-caused and resolved, with a test that fails first if it was a product race.
 
 ### Follow-ups
 
