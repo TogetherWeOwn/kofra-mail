@@ -1383,6 +1383,11 @@ test('a flagged acceptance a restore made eligible raises send_result_stuck when
   for (let n = 0; n < 12; n++) {
     const [row] = await h.directoryRows('SELECT notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
     if (Number(row.notify_failures) >= 8) break;
+    if (Number(row.notify_failures) === 7) {
+      // One short of the threshold: the row is backed off for an hour, and no alert yet.
+      await h.advance(minute);
+      assert.ok(!(await h.sends.activeAlerts()).includes('send_result_stuck'), 'not before eight failures');
+    }
     await h.advance(Math.max(0, Number(row.notify_after) - await h.sends.now()));
     await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence);
   }
