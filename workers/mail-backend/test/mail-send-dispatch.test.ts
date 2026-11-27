@@ -1331,10 +1331,10 @@ test('a keyed notice that loses a flagged row\'s recheck answers retry at the ho
   await h.pauseAt(`record:${a.claim.fence.attempt}`);
   const first = h.sendRpc<StoredAnswer>('recordStoredResults', id);
   await h.pausedAt(`record:${a.claim.fence.attempt}`);
-  const [held] = await h.directoryRows('SELECT notify_after FROM send_results WHERE send_id = ?', id);
-  assert.equal(held.notify_after, await h.sends.now() + 5 * minute, 'the first poll holds a five-minute lease');
+  const [held] = await h.directoryRows('SELECT recheck_lease_until AS lease FROM send_results WHERE send_id = ?', id);
+  assert.equal(held.lease, await h.sends.now() + 5 * minute, 'the first poll holds a five-minute lease');
   assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence),
-    { status: 'retry', recorded: 0, next: Number(held.notify_after) });
+    { status: 'retry', recorded: 0, next: Number(held.lease) });
   await h.resumeAt(`record:${a.claim.fence.attempt}`);
   await first;
 }));
@@ -1348,9 +1348,10 @@ test('a poll that stops after taking a recheck leaves the row to the next poll o
   const crashed = await h.sendRpcAs(MB, 'recordStoredResults', id, a.claim.fence);
   assert.equal(crashed.status, 500);
   await crashed.body?.cancel();
-  const [leased] = await h.directoryRows('SELECT notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
-  assert.equal(leased.notify_after, await h.sends.now() + 5 * minute, 'no backoff was written, only the lease');
-  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id), { status: 'retry', recorded: 0, next: Number(leased.notify_after) },
+  const [leased] = await h.directoryRows('SELECT notify_after, recheck_lease_until AS lease, notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.equal(leased.lease, await h.sends.now() + 5 * minute, 'the attempt holds its lease');
+  assert.equal(leased.notify_after, 0, 'no backoff was written');
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id), { status: 'retry', recorded: 0, next: Number(leased.lease) },
     'another poll waits for the lease');
   await h.advance(5 * minute);
   await h.sendRpc<StoredAnswer>('recordStoredResults', id);
@@ -1417,4 +1418,27 @@ test('a refused reservation still releases the listed fences it carries; they st
   const delayed = await h.sendRpc<DelayAnswer>('delaySend', id, b.fence, 'gate', refused.status === 'exhausted' ? refused.resetAt : 0);
   assert.equal(delayed.status, 'delayed');
   assert.ok((await h.sendState(id)).release.some(({ attempt: n }) => n === a.fence.attempt), 'still listed until a Mark acknowledges it');
+}));
+
+test('a keyed notice records a restored acceptance although the reconciler moved its notify_after ahead', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'reconciler-ahead');
+  // Fence A marks the recipient and its acceptance is stored and flagged; fence B is rejected and the send finishes.
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.advance(LEASE + SKEW);
+  await attempt(h, id, { result: { kind: 'rejected', reason: 'rejected' } });
+  await h.advance(minute);
+  assert.deepEqual(ledgerOf(await finished(h, id)), ['failed:rejected']);
+  // A restore makes A's fence older-epoch, so its acceptance can apply.
+  await h.restore();
+  // The first keyed notice applies it locally, but its publish fails.
+  await h.publishFailure(true);
+  assert.equal((await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence)).recorded, 0);
+  await h.publishFailure(false);
+  // The reconciler moves notify_after ahead before it sends the retry notice.
+  await h.directoryChange('UPDATE send_results SET notify_after = ? WHERE send_id = ?', await h.sends.now() + hour, id);
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'recorded', recorded: 1 });
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
+  assert.deepEqual(await storedRows(h, id), []);
 }));

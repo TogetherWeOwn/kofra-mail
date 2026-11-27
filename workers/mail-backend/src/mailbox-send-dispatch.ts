@@ -828,8 +828,11 @@ export class SendDispatcher {
       const unchecked = (await db.prepare(`SELECT EXISTS (SELECT 1 FROM send_results WHERE ${sendKey} AND unapplied = 1 AND unapplied_epoch < ?
         AND (rechecked_epoch IS NULL OR rechecked_epoch < ?)) AS found`).bind(scope.workspaceId, scope.mailboxId, id, epoch, epoch)
         .first<{ found: number }>())?.found;
-      const flagged = unchecked ? ports.now() : (await db.prepare(`SELECT notify_after AS at FROM send_results WHERE ${sendKey} AND unapplied = 1
-        AND unapplied_epoch < ? ORDER BY notify_after LIMIT 1`).bind(scope.workspaceId, scope.mailboxId, id, epoch).first<{ at: number }>())?.at;
+      // The earliest flagged row by notify_after; while an attempt holds it, not before its lease ends.
+      const first = unchecked ? null : await db.prepare(`SELECT notify_after AS at, recheck_lease_until AS lease FROM send_results WHERE ${sendKey}
+        AND unapplied = 1 AND unapplied_epoch < ? ORDER BY notify_after LIMIT 1`).bind(scope.workspaceId, scope.mailboxId, id, epoch)
+        .first<{ at: number; lease: number | null }>();
+      const flagged = unchecked ? ports.now() : first ? Math.max(first.at, first.lease ?? 0) : null;
       const times = [next, flagged].filter((at): at is number => typeof at === 'number');
       return times.length ? Math.min(...times) : null;
     };
@@ -855,18 +858,22 @@ export class SendDispatcher {
     let recorded = 0;
     let backoff: number | null = null;
     for (const [at, row] of results.entries()) {
-      // A flagged row's recheck is taken by one poll: the same conditional update marks this epoch's
-      // immediate recheck as used and moves notify_after one lease ahead, so a concurrent or repeated
-      // poll skips the row, and a crash leaves it retryable once the lease runs out.
+      // A flagged row's recheck is taken by one attempt at a time: the conditional update marks this
+      // epoch's immediate recheck as used and holds an in-flight lease (recheck_lease_until), so a
+      // concurrent attempt skips the row, and a crash leaves it retryable once the lease runs out.
+      // The lease is separate from notify_after, which stays the reconciler's schedule: a keyed
+      // notice is refused only while another attempt holds a live lease. A poll also needs the row
+      // still due, so a poll whose read went stale (another attempt ended and backed it off) skips it.
       if (row.unapplied && epoch !== null) {
         const now = ports.now();
-        const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ?, notify_after = ? WHERE ${where} AND unapplied = 1
-          AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR notify_after <= ?) RETURNING 1`)
-          .bind(epoch, now + RECHECK_LEASE_MS, ...keys(row), epoch, now).first();
+        const due = fence ? '' : 'AND notify_after <= ?';
+        const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ?, recheck_lease_until = ? WHERE ${where} AND unapplied = 1
+          AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR ((recheck_lease_until IS NULL OR recheck_lease_until <= ?) ${due})) RETURNING 1`)
+          .bind(epoch, now + RECHECK_LEASE_MS, ...keys(row), epoch, now, ...(fence ? [] : [now])).first();
         if (!taken) {
-          // Another poll holds this row's recheck and may still fail: retry once its lease or backoff ends.
-          const held = await db.prepare(`SELECT notify_after AS at FROM send_results WHERE ${where}`).bind(...keys(row)).first<{ at: number }>();
-          if (held) backoff = backoff === null ? held.at : Math.min(backoff, held.at);
+          // Another attempt holds this row's recheck and may still fail: retry once its lease ends.
+          const held = await db.prepare(`SELECT recheck_lease_until AS at FROM send_results WHERE ${where}`).bind(...keys(row)).first<{ at: number | null }>();
+          if (held?.at != null) backoff = backoff === null ? held.at : Math.min(backoff, held.at);
           continue;
         }
         await ports.afterRecheckTake?.();
@@ -886,7 +893,8 @@ export class SendDispatcher {
         // Definitive: an acceptance that cannot be recorded in this epoch. It is kept, flagged with the
         // epoch, and alerted; it no longer holds up dispatch until the epoch advances.
         console.error({ code: 'send_result_unapplied' });
-        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, unapplied = 1, unapplied_epoch = ?
+        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, unapplied = 1, unapplied_epoch = ?,
+          recheck_lease_until = NULL
           WHERE ${where}`).bind(ports.now() + wait, epoch, ...keys(row)).run();
         backoff = ports.now() + wait;
         await this.resultAlerts(id, row, ['unapplied'], ['stuck']);
@@ -903,7 +911,7 @@ export class SendDispatcher {
         // to 1 hour, and keeps its flag; the rest of the page goes on. A row that keeps failing
         // raises an alert: an applicable one, or a flagged one a restore made eligible (a row
         // flagged in this epoch answers stale, never a transient failure).
-        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
+        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, recheck_lease_until = NULL WHERE ${where}`)
           .bind(ports.now() + wait, ...keys(row)).run();
         backoff = ports.now() + wait;
         if (row.failures + 1 >= STUCK_FAILURES) await this.resultAlerts(id, row, ['stuck'], []);
