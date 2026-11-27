@@ -153,7 +153,10 @@ function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject:
   // malformed fields as the dedupe and inbound thread index still do.
   const messageIdFields = parsed.headers.filter(header => header.key === 'message-id');
   const parent = messageIdFields.length === 1 ? messageIdFields[0].value.trim() : '';
-  const references = parsed.references?.slice(0, 8192).split(/[ \t]+/).filter(isSafeMessageId) ?? [];
+  // References can have adjacent IDs or separators between them. Start at
+  // bracket boundaries without extracting an ID from a malformed nested token.
+  const references = parsed.references?.slice(0, 8192)
+    .match(/(?<![^\s,)>])<[^<>\s]+>(?![^\s,<(])/g)?.filter(isSafeMessageId) ?? [];
   const encoder = new TextEncoder();
   return {
     from, to, cc, replyTo: wireAddresses(parsed.replyTo), hasHtml: !!parsed.html,

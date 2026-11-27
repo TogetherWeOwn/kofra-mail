@@ -1220,6 +1220,16 @@ test('a malformed Message-ID still deduplicates and threads inbound by its first
   assert.equal((await mail.getThread(reply.threadId)).messages.length, 2);
 }));
 
+for (const [label, separator] of [['adjacent', ''], ['comma-separated', ',']] as const) {
+  test(`reply threading preserves ${label} bracketed References IDs`, async () => {
+    const parent = '<parent@example.net>';
+    const chain = ['<root@example.net>', '<earlier@example.net>'];
+    const raw = Uint8Array.from(new TextEncoder().encode(`Message-ID: ${parent}\r\nReferences: ${chain.join(separator)}\r\n\r\nBody`));
+    const parsed = await parseMail(raw, `raw/${sha256(raw.buffer)}/01KBN8ZJ7G0000000000000000`, true);
+    assert.deepEqual(parsed.display?.replyHeaders, { inReplyTo: parent, references: [...chain, parent].join(' ') });
+  });
+}
+
 test('a small forwarded part whose source raw object is changed in place fails the send with delivery_error, an alert and no MIME',
   () => withSend(async (h, mail, from) => {
     const { pending } = await forwardDraft(h, mail, from);
