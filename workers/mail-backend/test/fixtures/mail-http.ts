@@ -289,6 +289,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       changeAttachmentSize: (messageId: string, part: number, delta: number) =>
         controlAction('change-attachment-size', JSON.stringify({ messageId, part, delta })),
       dropSyntheticMark: (messageId: string) => controlAction('drop-synthetic-mark', messageId),
+      changeAttachmentMeta: (messageId: string, part: number, name: string, type: string) =>
+        controlAction('change-attachment-meta', JSON.stringify({ messageId, part, name, type })),
       // The fixture's clock as API calls read it; an advance moves it before its alarms run.
       now: () => readControl<number>('now'),
       seedForwardDraft: (input: { from: string; messageId: string; part: number; delta: number; to?: string[] }) =>

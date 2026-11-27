@@ -1344,3 +1344,23 @@ for (const [label, name, type, sentName, sentType] of [
     assert.deepEqual(copy.attachments.map(({ name: sent }) => sent), [sentName]);
   }));
 }
+
+test('a forwarded part indexed with an uncleaned name and a control character in its type is attached, sized and sent with cleaned values',
+  () => withSend(async (h, mail, from) => {
+    const bytes = new TextEncoder().encode('forwarded file contents');
+    const source = await h.deliver({ from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }], subject: 'Forward this',
+      text: 'See attached', attachments: [{ name: 'notes.txt', type: 'text/plain', bytes }] });
+    const { messages: [delivered] } = await mail.getThread(source.threadId);
+    const { part } = delivered.attachments[0];
+    const legacyName = `old/\tname${'x'.repeat(300)}`;
+    await h.sends.changeAttachmentMeta(source.messageId, part, legacyName, 'text/plain\u0001');
+    const draft = await mail.createDraft(draftInput(from, { forwardOf: source.messageId, attachments: [{ kind: 'message', messageId: source.messageId, part }] }),
+      key('draft'));
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    await h.advance(UNDO);
+    assert.equal((await mail.getSend(pending.id)).state, 'sending');
+    const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+    assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
+    const [copy] = await sentCopies(mail);
+    assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: indexedAttachmentName(legacyName), size: bytes.byteLength }]);
+  }));

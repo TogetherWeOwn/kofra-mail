@@ -206,6 +206,10 @@ export class HttpMailbox extends Mailbox {
   changePartDigest(sendId: string) {
     this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.parts[0].digest', ?) WHERE id = ?`, '0'.repeat(64), sendId);
   }
+  // Stands in for a part indexed before names were cleaned, or with an odd type.
+  changeAttachmentMeta(messageId: string, part: number, name: string, type: string) {
+    this.ctx.storage.sql.exec('UPDATE attachments SET name = ?, mime_type = ? WHERE message_id = ? AND part = ?', name, type, messageId, part);
+  }
   // Stands in for an index row whose size no longer matches what the parser decodes.
   changeAttachmentSize(messageId: string, part: number, delta: number) {
     this.ctx.storage.sql.exec('UPDATE attachments SET size = size + ? WHERE message_id = ? AND part = ?', delta, messageId, part);
@@ -662,6 +666,11 @@ export default {
           case '/__fixture/change-attachment-size': {
             const { messageId, part, delta } = await req.json<{ messageId: string; part: number; delta: number }>();
             await box.changeAttachmentSize(messageId, part, delta);
+            break;
+          }
+          case '/__fixture/change-attachment-meta': {
+            const { messageId, part, name, type } = await req.json<{ messageId: string; part: number; name: string; type: string }>();
+            await box.changeAttachmentMeta(messageId, part, name, type);
             break;
           }
           case '/__fixture/drop-synthetic-mark': await box.dropSyntheticMark(await req.text()); break;
