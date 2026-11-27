@@ -269,6 +269,9 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
         index_holder: string | null; released: string | null } | null>('send-registration', sendId),
       generation: (key: string) => readControl<{ key: string; holder_count: number; retry_at: number | null; deleted_at: number | null } | null>('generation', key),
       activateAlias: (address: string) => controlAction('activate-alias', address),
+      // Runs one directory statement on the next sendDraft, after the API layer's reads and before the mailbox's.
+      beforeMailboxSend: (statement: string, ...binds: unknown[]) => controlAction('before-mailbox-send', JSON.stringify({ statement, binds })),
+      directoryChange: (statement: string, ...binds: unknown[]) => controlAction('directory-change', JSON.stringify({ statement, binds })),
       forceLost: (holder: string) => controlAction('force-lost', holder),
       stallPublish: () => controlAction('stall-publish'),
       publishStalled: () => controlAction('publish-stalled'),

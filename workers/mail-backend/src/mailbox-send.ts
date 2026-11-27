@@ -18,6 +18,7 @@ import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
 import { mailboxState } from './mailbox-api.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
+import { senderActive, senderState } from './mailbox-send-sender.ts';
 import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
   DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
@@ -182,11 +183,16 @@ export class SendApi {
     if (unusableSource(this.sql, 'draft', ref.id)) return fail('unavailable');
     const draft = await readDraftObject(this.index, ref);
     const recipients = checkSendable(draft);
-    const from = options.canSendAs.find(email => email.toLowerCase() === draft.fields.from.toLowerCase());
-    if (!from) return fail('invalid_sender');
+    if (!options.userId) throw new Error('Send submitter missing');
+    // The mailbox's own check, the one directory statement of section 1: never
+    // the caller's earlier, separate reads of the session's mailbox and identities.
+    // A user who lost the mailbox meanwhile gets the API layer's answer for that.
+    const from = draft.fields.from;
+    const sender = await senderState(this.directory, { ...this.scope, ownerUserId: options.userId, from });
+    if (sender === 'not_owner') return fail('forbidden');
+    if (sender !== 'ok') return fail('invalid_sender');
     const uploadIds = draftUploadIds(draft);
     for (const id of uploadIds) if (!uploadRow(this.sql, id) || unusableSource(this.sql, 'upload', id)) return fail('not_found');
-    if (!options.userId) throw new Error('Send submitter missing');
     const profile = await this.directory.withSession('first-primary').prepare(
       'SELECT display_name FROM mailbox_profiles WHERE workspace_id = ? AND mailbox_id = ?')
       .bind(this.scope.workspaceId, this.scope.mailboxId).first<{ display_name: string }>();
@@ -306,11 +312,6 @@ const EMPTY_DIGEST = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b78
 type Stale = typeof STALE;
 type Start = { token: string; incarnation: string; scope: SendScope; row: SendRow };
 
-// The one-statement sender check of section 1: the workspace, the mailbox,
-// the submitting user as its owner and `from` as its active identity, together.
-const SENDER_CHECK = `SELECT 1 AS ok FROM mailboxes m WHERE m.workspace_id = ?1 AND m.id = ?2 AND m.user_id = ?3
-  AND (m.primary_address = ?4 OR EXISTS (SELECT 1 FROM addresses a WHERE a.address_norm = ?4 AND a.workspace_id = m.workspace_id
-    AND a.target_kind = 'mailbox' AND a.target_id = m.id AND a.kind = 'alias' AND a.send_as_policy = 'active'))`;
 // One directory statement marks each recipient that routes to a mailbox of
 // this workspace as internal, by the inbound routing rules. Only the
 // classification is recorded; the destination is resolved at delivery (M3-8).
@@ -621,10 +622,8 @@ export class SendDriver {
     };
   }
 
-  private async senderValid(scope: SendScope, record: SendRecord): Promise<boolean> {
-    const row = await this.ports.directory.withSession('first-primary').prepare(SENDER_CHECK)
-      .bind(scope.workspaceId, scope.mailboxId, record.ownerUserId, record.from.email).first<{ ok: number }>();
-    return row?.ok === 1;
+  private senderValid(scope: SendScope, record: SendRecord): Promise<boolean> {
+    return senderActive(this.ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
   }
 
   private async classify(scope: SendScope, record: SendRecord): Promise<SendRecipientKind[]> {

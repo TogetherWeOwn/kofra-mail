@@ -238,7 +238,8 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     } else {
       if (mailbox) {
         const draftWrite = op === 'createDraft' || op === 'replaceDraft';
-        const canSendAs = draftWrite || op === 'sendDraft' || op === 'getSettings' || op === 'updateSettings'
+        // sendDraft gets no list: the mailbox checks the sender itself, in one directory statement.
+        const canSendAs = draftWrite || op === 'getSettings' || op === 'updateSettings'
           ? (await directory.identities(mailbox.id)).filter((identity) => draftWrite || identity.sendAs === 'active').map((identity) => identity.email) : [];
         result = await env.MAILBOX.getByName(JSON.stringify([principal.workspaceId, mailbox.id])).mailApi(
           principal.workspaceId, mailbox.id, op,
