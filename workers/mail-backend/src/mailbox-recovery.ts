@@ -49,6 +49,9 @@ export type ReadyLife = {
   baseSeq?: number; baseChain?: string | null;
   // Set when publication found a manifest this state cannot have written.
   conflict?: string;
+  // The recovery epoch the last restore raised (0 before any restore under this
+  // field) and when that restore finished: fences of the send path (section 2.5).
+  epoch?: number; restoredAt?: number;
 };
 export type RestoringLife = {
   state: 'restoring'; scope: Scope; incarnation: string; startedAt: number; failures: number; bootstrap: boolean;
@@ -560,7 +563,7 @@ export class MailboxRecovery {
           const now = ports.now();
           const ready: ReadyLife = { ...readyLife(life.scope, life.incarnation, life.etag!, life.rev, now),
             nextSnapshotAt: now, lastSnapshotAt: life.startedAt, restoreSkipped: life.skipped,
-            baseSeq: life.baseSeq, baseChain: life.baseChain };
+            baseSeq: life.baseSeq, baseChain: life.baseChain, ...(life.epoch !== null && { epoch: life.epoch }), restoredAt: now };
           this.index.transaction(() => {
             this.index.setLifecycle(ready);
             ports.rebuild?.(now);

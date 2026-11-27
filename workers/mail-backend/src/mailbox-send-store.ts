@@ -2,7 +2,8 @@ import { hasHeaderControl, isSafeMessageId } from '../../../contracts/mail-api/s
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { RecipientStatus, Send, SendState, SendSummaryState } from '../../../contracts/mail-api/src/wire.ts';
 import { iso } from './mailbox-api-input.ts';
-import type { SendFailure, SendPart, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import type { SendDispatchRow, SendFailure, SendFenceRow, SendMarkRow, SendPart, SendRecipientKind, SendRecord } from './mail-journal.ts';
+import type { SendFence } from './mailbox-send-quota.ts';
 import { parseObjectKey } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 import { isSendMimeBoundary } from './send-mime.ts';
@@ -56,6 +57,78 @@ export function ledger(sql: SqlStorage, id: string): LedgerRow[] {
   return sql.exec<LedgerRow>('SELECT idx, kind, state, reason FROM mailbox_send_recipients WHERE send_id = ? ORDER BY idx', id).toArray();
 }
 
+// A send no claim has reached yet has this dispatch state.
+export const NEW_DISPATCH: SendDispatchRow = {
+  attempt: 0, leaseEpoch: null, leaseAttempt: null, leaseUntil: null, nextAttemptAt: 0, delayedUntil: null, ambiguous: 0,
+  providerWait: 0, refusals: 0, unfinished: 0, heldAt: null, graceUntil: null, graceReason: null,
+};
+
+export function dispatchRow(sql: SqlStorage, id: string): SendDispatchRow {
+  return sql.exec<SendDispatchRow>(`SELECT attempt, lease_epoch AS leaseEpoch, lease_attempt AS leaseAttempt, lease_until AS leaseUntil,
+    next_attempt_at AS nextAttemptAt, delayed_until AS delayedUntil, ambiguous, provider_wait AS providerWait, refusals, unfinished,
+    held_at AS heldAt, grace_until AS graceUntil, grace_reason AS graceReason FROM mailbox_send_dispatch WHERE send_id = ?`, id)
+    .toArray()[0] ?? { ...NEW_DISPATCH };
+}
+
+export function fenceRows(sql: SqlStorage, id: string): SendFenceRow[] {
+  return sql.exec<Omit<SendFenceRow, 'marked' | 'authorized'> & { marked: number; authorized: number }>(`SELECT epoch, attempt,
+    lease_until AS leaseUntil, marked, authorized, outcome FROM mailbox_send_fences WHERE send_id = ? ORDER BY epoch, attempt`, id)
+    .toArray().map(row => ({ ...row, marked: row.marked === 1, authorized: row.authorized === 1 }));
+}
+
+export function markRows(sql: SqlStorage, id: string): SendMarkRow[] {
+  return sql.exec<SendMarkRow>(`SELECT epoch, attempt, idx, outcome, provider_id AS providerId FROM mailbox_send_marks
+    WHERE send_id = ? ORDER BY epoch, attempt, idx`, id).toArray();
+}
+
+export function releaseList(sql: SqlStorage, id: string): SendFence[] {
+  return sql.exec<SendFence>('SELECT epoch, attempt FROM mailbox_send_release_list WHERE send_id = ? ORDER BY epoch, attempt', id).toArray();
+}
+
+const nullableMs = (value: unknown) => value === null || epochMs(value);
+const nullableCount = (value: unknown) => value === null || count(value);
+const FENCE_OUTCOMES: readonly unknown[] = [null, 'accepted', 'rejected', 'try_later', 'outage', 'ambiguous', 'delayed', 'abandoned'];
+const MARK_OUTCOMES: readonly unknown[] = [null, 'sent', 'suppressed', 'failed'];
+export const LEDGER_STATES: readonly string[] = ['pending', 'attempting', 'sent', 'failed', 'suppressed'];
+// Provider message ids are bounded header values; reasons are short provider-neutral codes.
+export const validProviderId = (value: unknown): value is string | null =>
+  value === null || (bounded(value, LIMITS.headerValueBytes) && !hasHeaderControl(value));
+export const validReason = (value: unknown): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+
+// Refuses malformed consumer state before it can enter the state or a replay.
+export function checkDispatch(value: unknown): asserts value is SendDispatchRow {
+  const d = (value ?? {}) as Partial<SendDispatchRow>;
+  const lease = [d.leaseEpoch, d.leaseAttempt, d.leaseUntil];
+  if (!value || typeof value !== 'object' || !count(d.attempt) || !lease.every(nullableCount) ||
+      !(lease.every(part => part === null) || (lease.every(part => part !== null) && d.leaseAttempt! >= 1 && d.leaseAttempt! <= d.attempt! &&
+        epochMs(d.leaseUntil))) || !epochMs(d.nextAttemptAt) || !nullableMs(d.delayedUntil) || !count(d.ambiguous) ||
+      !count(d.providerWait) || !count(d.refusals) || !count(d.unfinished) || !nullableMs(d.heldAt) || !nullableMs(d.graceUntil) ||
+      (d.graceReason !== null && !SEND_FAILURES.includes(d.graceReason as SendFailure)) || (d.graceUntil === null) !== (d.graceReason === null)) {
+    throw new Error('Invalid send dispatch state');
+  }
+}
+
+export function checkFence(value: unknown): asserts value is SendFenceRow {
+  const f = (value ?? {}) as Partial<SendFenceRow>;
+  if (!value || typeof value !== 'object' || !count(f.epoch) || !count(f.attempt) || f.attempt < 1 || !epochMs(f.leaseUntil) ||
+      typeof f.marked !== 'boolean' || typeof f.authorized !== 'boolean' || (f.authorized && !f.marked) || !FENCE_OUTCOMES.includes(f.outcome)) {
+    throw new Error('Invalid send fence');
+  }
+}
+
+export function checkMark(value: unknown, recipients: number): asserts value is SendMarkRow {
+  const m = (value ?? {}) as Partial<SendMarkRow>;
+  if (!value || typeof value !== 'object' || !count(m.epoch) || !count(m.attempt) || m.attempt < 1 || !count(m.idx) || m.idx >= recipients ||
+      !MARK_OUTCOMES.includes(m.outcome) || !validProviderId(m.providerId ?? null) || (m.providerId != null && m.outcome !== 'sent')) {
+    throw new Error('Invalid send mark');
+  }
+}
+
+export function checkReleaseEntry(value: unknown): asserts value is SendFence {
+  const f = (value ?? {}) as Partial<SendFence>;
+  if (!value || typeof value !== 'object' || !count(f.epoch) || !count(f.attempt) || f.attempt < 1) throw new Error('Invalid send release entry');
+}
+
 // What a client may see: a state reaches a report only after the publish that
 // covers it (section 2.1), so a restore can never take back a reported state.
 export function visibleState(row: SendRow, flushed: number): SendRowState {
@@ -67,7 +140,7 @@ export function visibleState(row: SendRow, flushed: number): SendRowState {
 const wireState = (state: SendRowState): SendState =>
   state === 'releasing' || state === 'queued' ? 'sending' : state;
 
-export function wireSend(row: SendRow, recipients: LedgerRow[], flushed: number, now: number): Send {
+export function wireSend(row: SendRow, recipients: LedgerRow[], flushed: number, now: number, delayedUntil: number | null = null): Send {
   const state = visibleState(row, flushed);
   const terminal = TERMINAL.includes(state);
   const queued = row.queuedSeq !== null && row.queuedSeq <= flushed;
@@ -76,6 +149,7 @@ export function wireSend(row: SendRow, recipients: LedgerRow[], flushed: number,
     id: row.id, draftId: row.draftId, state: wireState(state), createdAt: iso(row.createdAt), undoUntil: iso(row.undoUntil),
     undoRemainingMs: state === 'pending' ? Math.max(0, row.undoUntil - now) : 0,
     ...(queued && row.messageId ? { messageId: row.messageId } : {}),
+    ...(state === 'delayed' && delayedUntil !== null ? { delayedUntil: iso(delayedUntil) } : {}),
     recipients: row.record.recipients.map(({ email }, idx): RecipientStatus => {
       const entry = rows.get(idx);
       // The contract has no `attempting`: a provider call in flight is still pending.

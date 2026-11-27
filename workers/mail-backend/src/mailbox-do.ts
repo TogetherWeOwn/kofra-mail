@@ -23,6 +23,11 @@ import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
 import { SEND_DRIVE } from './mailbox-send-store.ts';
+import {
+  CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
+  type ReportAnswer, type StoredAnswer,
+} from './mailbox-send-dispatch.ts';
+import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -145,7 +150,7 @@ export class Mailbox extends DurableObject<Env> {
         const life = storedLifecycle<Lifecycle>(this.ctx.storage);
         if (life?.state !== 'ready') return;
         return { incarnation: life.incarnation, index: this.index(life.scope.workspaceId),
-          scope: { ...life.scope, holderScope: this.ctx.id.toString() } };
+          scope: { ...life.scope, holderScope: this.ctx.id.toString() }, epoch: life.epoch ?? 0, restoredAt: life.restoredAt ?? 0 };
       },
       local: this.local,
       publishThrough: seq => this.publishThrough(seq),
@@ -155,8 +160,79 @@ export class Mailbox extends DurableObject<Env> {
       get queue() { return self.env.SEND; },
       get mime() { return self.sendMime; },
       put: (workspaceId, key, bytes) => kofra(this.env, workspaceId).put(key, bytes),
+      get dispatcher() { return self.sendDispatcher(); },
+      quota: () => this.sendQuota(),
       checkpoint: step => this.sendCheckpoint(step),
     };
+  }
+
+  // The account quota gate (M3-6 supplies the quota object). Without it, a
+  // step that must release or read the quota fails and is retried.
+  protected sendQuota(): QuotaPort | undefined { return undefined; }
+
+  // clockSkew (section 2.4, step 5) is configuration, used only on the mailbox side.
+  private clockSkewMs(): number {
+    const configured = this.env.MAIL_SEND_CLOCK_SKEW_SECONDS;
+    if (configured === undefined || configured === '') return CLOCK_SKEW_MS;
+    const seconds = Number(configured);
+    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) throw new Error('Invalid send clock skew');
+    return seconds * 1000;
+  }
+
+  private sendDispatcher(): SendDispatcher {
+    return new SendDispatcher({
+      sql: this.ctx.storage.sql,
+      ready: scope => this.work.run(async () => {
+        if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+        this.verifyScope(scope);
+        return this.ready(this.index(scope.workspaceId), scope);
+      }),
+      current: () => {
+        const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+        if (life?.state !== 'ready') return;
+        return { index: this.index(life.scope.workspaceId), epoch: life.epoch ?? 0, restoredAt: life.restoredAt ?? 0 };
+      },
+      local: this.local,
+      publishThrough: seq => this.publishThrough(seq),
+      journalDue: timers => this.journalDue(timers),
+      directory: this.env.DIRECTORY,
+      quota: () => this.sendQuota(),
+      clockSkewMs: this.clockSkewMs(),
+      now: () => this.mailApiNow(),
+      sending: this.env.MAIL_SEND_ENABLED === 'on',
+    });
+  }
+
+  // The send consumer's RPCs (docs/m3-outbound-plan.md, section 2.4; M3-5a).
+  async claimSend(workspaceId: string, mailboxId: string, sendId: string): Promise<ClaimAnswer> {
+    return this.sendDispatcher().claim({ workspaceId, mailboxId }, sendId);
+  }
+
+  async markSend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
+    released: SendFence[]): Promise<MarkAnswer> {
+    return this.sendDispatcher().mark({ workspaceId, mailboxId }, sendId, fence, recipients, released);
+  }
+
+  async authorizeDispatch(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
+    quotaDay: string): Promise<AuthorizeAnswer> {
+    return this.sendDispatcher().authorize({ workspaceId, mailboxId }, sendId, fence, recipients, quotaDay);
+  }
+
+  async recordResult(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, result: ProviderResult): Promise<ReportAnswer> {
+    return this.sendDispatcher().record({ workspaceId, mailboxId }, sendId, fence, result);
+  }
+
+  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence): Promise<DelayAnswer> {
+    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence);
+  }
+
+  async abandonClaim(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, retryAt: number): Promise<AbandonAnswer> {
+    return this.sendDispatcher().abandon({ workspaceId, mailboxId }, sendId, fence, retryAt);
+  }
+
+  // Shared by the drive handler and result notices.
+  async recordStoredResults(workspaceId: string, mailboxId: string, sendId: string): Promise<StoredAnswer> {
+    return this.sendDispatcher().recordStored({ workspaceId, mailboxId }, sendId);
   }
 
   // A test seam after each release step; does nothing here.
@@ -1008,9 +1084,12 @@ export class Mailbox extends DurableObject<Env> {
     const holderLost = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_unusable_sources)
       OR EXISTS (SELECT 1 FROM mailbox_alerts WHERE code = 'holder_source_lost' AND sent_at IS NULL) AS active`).one().active !== 0;
     const breach = life?.state === 'ready' && sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_breaches) AS active').one().active !== 0;
+    // A send held after repeated crashes of our own waits for an operator.
+    const held = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_send_dispatch d JOIN mailbox_sends s ON s.id = d.send_id
+      WHERE d.held_at IS NOT NULL AND s.state NOT IN ('sent', 'partial', 'failed', 'cancelled')) AS active`).one().active !== 0;
     const conditions: Array<[MailboxAlertCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
-      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach]];
+      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held]];
     let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {

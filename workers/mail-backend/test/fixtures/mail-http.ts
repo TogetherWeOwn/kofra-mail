@@ -103,6 +103,17 @@ export async function fetchOversizedRequest(req: Request, size: number): Promise
   }
 }
 
+export type SendStateView = {
+  row: { state: string; terminal_seq: number | null; finish_pending: number } | null;
+  ledger: { idx: number; kind: string; state: string; reason: string | null }[];
+  dispatch: Record<string, number | string | null> | null;
+  fences: { epoch: number; attempt: number; lease_until: number; marked: number; authorized: number; outcome: string | null }[];
+  marks: { epoch: number; attempt: number; idx: number; outcome: string | null; provider_id: string | null }[];
+  release: { epoch: number; attempt: number }[];
+  drive: number[];
+  flushed: { flushed: number; modseq: number };
+};
+
 interface FixtureOptions {
   demo?: boolean;
   draftsUploads?: boolean;
@@ -137,7 +148,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     name: 'mail-backend',
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
     compatibilityDate: '2026-06-25',
-    durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true } },
+    durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true },
+      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true } },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
@@ -440,6 +452,14 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       blockLaterDelta: (after: number) => controlAction('block-later-delta', String(after)),
       exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),
       seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
+      // The mailbox's send consumer RPCs (M3-5a), the fake quota object, and the stored consumer state.
+      sendRpc: <T>(method: string, ...args: unknown[]) => readControl<T>('send-rpc', JSON.stringify({ method, args })),
+      quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
+      sendState: (id: string) => readControl<SendStateView>('send-state', id),
+      pauseNextEnqueue: () => controlAction('pause-enqueue'),
+      enqueuePaused: () => controlAction('enqueue-paused'),
+      resumeEnqueue: () => controlAction('resume-enqueue'),
+      restoreAfter: async (ms: number) => { await controlAction('restore-after', String(ms)); now += ms; },
       m3: send, credentialEpoch: async () => 1,
       contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,

@@ -21,10 +21,12 @@ import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox
 import { senderActive, senderState } from './mailbox-send-sender.ts';
 import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
-  DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
+  dispatchRow, DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
+import { delayedUntil, finishReleases, type SendDispatcher } from './mailbox-send-dispatch.ts';
+import type { QuotaPort } from './mailbox-send-quota.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
 import type { JournalEvent, JournalResult, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { ObjectInvalidError } from './object-errors.ts';
@@ -34,7 +36,8 @@ import type { SendDispatch, SweeperReferences } from './worker.ts';
 import { ulid } from 'ulid';
 
 export type SendScope = { workspaceId: string; mailboxId: string; holderScope: string };
-type Ready = { incarnation: string; index: MailboxIndex; scope: SendScope };
+// `epoch` and `restoredAt`: the recovery fence of the send path (section 2.5).
+type Ready = { incarnation: string; index: MailboxIndex; scope: SendScope; epoch: number; restoredAt: number };
 type DirectoryDatabase = { withSession(constraint: 'first-primary'): Pick<D1DatabaseSession, 'prepare'> };
 
 // What the send path needs from its mailbox object. Every storage step runs
@@ -53,6 +56,9 @@ export type SendPorts = {
   queue?: { send(message: SendDispatch): Promise<unknown> };
   mime: SendMimeBuilders;
   put(workspaceId: string, key: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
+  // The consumer's side after release (M3-5a): stored results and the drive decisions.
+  dispatcher: Pick<SendDispatcher, 'drive' | 'recordStored'>;
+  quota(): QuotaPort | undefined;
   // Called after each completed release step; tests inject crashes here.
   checkpoint?(step: SendStep): Promise<void>;
 };
@@ -161,7 +167,7 @@ export class SendApi {
     const row = need(sendRow(this.sql, id));
     const through = flushed(this.sql);
     if (published && row.createdSeq > through) return fail('not_found');
-    return wireSend(row, ledger(this.sql, id), through, this.clock());
+    return wireSend(row, ledger(this.sql, id), through, this.clock(), dispatchRow(this.sql, id).delayedUntil);
   }
 
   async sendDraft(params: Record<string, string>, options: SendOptions): Promise<SendCommit> {
@@ -298,7 +304,7 @@ export class SendApi {
     if (more) rows.pop();
     const last = rows.at(-1);
     return {
-      items: rows.map(row => wireSend(row, ledger(this.sql, row.id), through, now)),
+      items: rows.map(row => wireSend(row, ledger(this.sql, row.id), through, now, dispatchRow(this.sql, row.id).delayedUntil)),
       nextCursor: more && last ? makeCursor(scope, [last.createdAt, last.id]) : null,
       state: mailboxState(this.incarnation, revision(this.sql), through),
     };
@@ -337,7 +343,8 @@ export class SendDriver {
       case 'pending':
       case 'releasing': return this.release(start);
       case 'queued':
-      case 'sending': return this.dispatch(start);
+      case 'sending':
+      case 'delayed': return this.dispatch(start);
       default: return;
     }
   }
@@ -496,15 +503,27 @@ export class SendDriver {
     return this.finish({ ...start, row: failed });
   }
 
-  // Step 4a and 5: publish the release, then enqueue while an external recipient is not terminal.
+  // Step 4a and 5: publish the release, record stored provider results, then
+  // act on the consumer's state: finish, wait, or enqueue while an external
+  // recipient is open and no live lease or backoff holds the send.
   private async dispatch(start: Start): Promise<void> {
     const { row } = start;
     if (row.queuedSeq === null) return;
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
-    const pending = await this.ports.local(() => this.current(start) &&
-      this.ports.sql.exec(`SELECT 1 FROM mailbox_send_recipients WHERE send_id = ? AND kind = 'external'
-        AND state IN ('pending', 'attempting') LIMIT 1`, this.ref).toArray().length === 1);
-    if (!pending) return;
+    // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
+    try { await this.ports.dispatcher.recordStored(start.scope, this.ref); }
+    catch (error) { console.error({ code: 'send_result_lookup', error: error instanceof Error ? error.message : String(error) }); }
+    const decision = await this.commit(start, ['queued', 'sending', 'delayed', ...TERMINAL], (timers, current, index) => {
+      if (current.finishPending) return 'finish' as const;
+      if (TERMINAL.includes(current.state)) return null;
+      const ready = this.ports.ready()!;
+      return this.ports.dispatcher.drive(index, current, timers, ready, this.timer.now);
+    });
+    if (decision === STALE || decision === null) return;
+    if (decision === 'finish') {
+      const finished = await this.ports.local(() => sendRow(this.ports.sql, this.ref));
+      return finished ? this.finish({ ...start, row: finished }) : undefined;
+    }
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');
@@ -520,6 +539,13 @@ export class SendDriver {
     // A restore can reuse `terminalSeq` for other events, so a run overtaken by
     // a restore or a later run must not release a send it no longer drives.
     if (!await ports.local(() => this.current(start) && ports.ready()?.incarnation === start.incarnation)) return;
+    // The quota part of step 3: every fence on the release list, in one idempotent call; kept charges stay.
+    const fences = await ports.local(() => finishReleases(ports.sql, this.ref));
+    if (fences.length) {
+      const quota = ports.quota();
+      if (!quota) throw new Error('Send quota binding missing');
+      await quota.release({ workspaceId: start.scope.workspaceId, mailboxId: start.scope.mailboxId, sendId: row.id }, fences);
+    }
     await ports.sweeper(start.scope.workspaceId).releaseSend(start.scope.mailboxId, row.id, mode);
     await this.commit(start, TERMINAL, (timers, current, index) => {
       if (!current.finishPending) return;
@@ -682,6 +708,12 @@ export function restoreEpilogue(sql: SqlStorage, index: () => MailboxIndex | und
         target.commitEvents([{ type: 'send_window', id, undoUntil } satisfies JournalEvent]);
       }
       timers.set(SEND_DRIVE, id, undoUntil);
+    } else if (row.state === 'delayed' && !row.finishPending) {
+      // A delayed send waits for its reset, unless an internal handoff is still open.
+      const until = delayedUntil(sql, id);
+      const handoff = sql.exec(`SELECT 1 FROM mailbox_send_recipients WHERE send_id = ? AND kind = 'internal' AND state = 'pending' LIMIT 1`, id)
+        .toArray().length === 1;
+      timers.set(SEND_DRIVE, id, Math.max(1, handoff || until === null ? now : until));
     } else timers.set(SEND_DRIVE, id, Math.max(1, now));
   }
 }
