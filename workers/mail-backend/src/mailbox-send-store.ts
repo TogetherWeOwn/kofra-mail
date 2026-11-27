@@ -24,7 +24,8 @@ export type SendRow = {
   messageId: string | null; reason: SendFailure | null; finishPending: boolean;
 };
 type StoredSendRow = Omit<SendRow, 'record' | 'finishPending'> & { record: string; finishPending: number };
-export type LedgerRow = { idx: number; kind: SendRecipientKind; state: 'pending' | 'sent' | 'failed' | 'suppressed'; reason: string | null };
+// `attempting` is the M3-5 consumer's state while it calls the provider; a restore accepts it.
+export type LedgerRow = { idx: number; kind: SendRecipientKind; state: 'pending' | 'attempting' | 'sent' | 'failed' | 'suppressed'; reason: string | null };
 
 const columns = `id, draft_id AS draftId, state, created_at AS createdAt, undo_until AS undoUntil, holder, record,
   created_seq AS createdSeq, release_seq AS releaseSeq, queued_seq AS queuedSeq, terminal_seq AS terminalSeq,
@@ -77,7 +78,8 @@ export function wireSend(row: SendRow, recipients: LedgerRow[], flushed: number,
     ...(queued && row.messageId ? { messageId: row.messageId } : {}),
     recipients: row.record.recipients.map(({ email }, idx): RecipientStatus => {
       const entry = rows.get(idx);
-      if (!entry) return { email, state: 'pending' };
+      // The contract has no `attempting`: a provider call in flight is still pending.
+      if (!entry || entry.state === 'attempting') return { email, state: 'pending' };
       return { email, state: entry.state, ...(entry.state === 'failed' && entry.reason ? { reason: entry.reason } : {}) };
     }),
   };

@@ -73,7 +73,6 @@ export class HttpMailbox extends Mailbox {
   private stallPuts?: PromiseWithResolvers<void>;
   private stalledPut = Promise.withResolvers<void>();
   private failEpilogue = false;
-  private manualAlarm = false;
   private readonly emittedAlerts: string[] = [];
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
@@ -234,6 +233,28 @@ export class HttpMailbox extends Mailbox {
   activeAlerts() { return this.ctx.storage.sql.exec<{ code: string }>('SELECT code FROM mailbox_alerts ORDER BY code').toArray().map(row => row.code); }
   sendBreaches() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT send_id AS id FROM mailbox_send_breaches').toArray().map(row => row.id); }
   // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
+  // Makes the barrier's work-lane wake-up throw inside the lane, as a failed alarm update would.
+  private wakeupFailure = false;
+  failLaneWakeup(failing: boolean) { this.wakeupFailure = failing; }
+  // Holds the next barrier wake-up inside the work lane, until the test opens it.
+  private wakeupGate?: { entered: PromiseWithResolvers<void>; open: PromiseWithResolvers<void> };
+  gateLaneWakeup() { this.wakeupGate = { entered: Promise.withResolvers<void>(), open: Promise.withResolvers<void>() }; }
+  async laneWakeupEntered() { await this.wakeupGate?.entered.promise; }
+  openLaneWakeup() { const gate = this.wakeupGate; this.wakeupGate = undefined; gate?.open.resolve(); }
+  protected override async wakeCoveredWork() {
+    if (this.wakeupFailure) throw new Error('Fixture lane wake-up failure');
+    const gate = this.wakeupGate;
+    if (gate) { gate.entered.resolve(); await gate.open.promise; }
+    return super.wakeCoveredWork();
+  }
+  // A recipient row in the state the M3-5 consumer writes while it calls the provider.
+  setRecipientState(sendId: string, idx: number, state: string) {
+    this.ctx.storage.sql.exec('UPDATE mailbox_send_recipients SET state = ? WHERE send_id = ? AND idx = ?', state, sendId, idx);
+  }
+  // Moves a send row's undo deadline, as a corrupt snapshot row would carry it.
+  setSendUndoUntil(sendId: string, undoUntil: number) {
+    this.ctx.storage.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', undoUntil, sendId);
+  }
   // Points a send's frozen draft revision at another stored object.
   setSendDraftKey(sendId: string, rawKey: string) {
     this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.draft.rawKey', ?) WHERE id = ?`, rawKey, sendId);
@@ -297,8 +318,10 @@ export class HttpMailbox extends Mailbox {
     this.crashStep = undefined;
     throw new Error(`Fixture crash after ${step}`);
   }
+  // In manual mode every platform alarm is refused, even during an explicit
+  // advance: one admitted then could resume after testAlarm restored Date.now.
   override async alarm() {
-    if ((this.env as FixtureEnv).MANUAL_ALARMS === 'on' && !this.manualAlarm) return;
+    if ((this.env as FixtureEnv).MANUAL_ALARMS === 'on') return;
     return super.alarm();
   }
   pauseExpiry(kind: string) {
@@ -361,9 +384,8 @@ export class HttpMailbox extends Mailbox {
     const actual = Date.now;
     const start = actual(), simulated = this.mailApiNow();
     Date.now = this.pauseKind || this.realtimeHolderClock ? () => simulated + actual() - start : () => simulated;
-    this.manualAlarm = true;
-    try { await Promise.all(Array.from({ length: runs }, () => this.alarm())); }
-    finally { Date.now = actual; this.manualAlarm = false; }
+    try { await Promise.all(Array.from({ length: runs }, () => super.alarm())); }
+    finally { Date.now = actual; }
   }
   timers() {
     return this.ctx.storage.sql.exec('SELECT kind, ref, due_at FROM timers ORDER BY kind, ref').toArray();
@@ -695,6 +717,20 @@ export default {
           case '/__fixture/active-alerts': return Response.json(await box.activeAlerts());
           case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
           case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
+          case '/__fixture/fail-lane-wakeup': await box.failLaneWakeup(await req.text() === 'true'); break;
+          case '/__fixture/gate-lane-wakeup': await box.gateLaneWakeup(); break;
+          case '/__fixture/lane-wakeup-entered': await box.laneWakeupEntered(); break;
+          case '/__fixture/open-lane-wakeup': await box.openLaneWakeup(); break;
+          case '/__fixture/set-recipient-state': {
+            const { sendId, idx, state } = await req.json<{ sendId: string; idx: number; state: string }>();
+            await box.setRecipientState(sendId, idx, state);
+            break;
+          }
+          case '/__fixture/set-send-undo-until': {
+            const { sendId, undoUntil } = await req.json<{ sendId: string; undoUntil: number }>();
+            await box.setSendUndoUntil(sendId, undoUntil);
+            break;
+          }
           case '/__fixture/set-send-draft-key': {
             const { sendId, rawKey } = await req.json<{ sendId: string; rawKey: string }>();
             await box.setSendDraftKey(sendId, rawKey);

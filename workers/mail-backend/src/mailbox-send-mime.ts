@@ -32,6 +32,10 @@ export type SendMimeMessage = {
 // Reads one attachment's bytes, in the order of `attachments`.
 export type SendMimeParts = (index: number) => Promise<Uint8Array<ArrayBuffer>>;
 
+// A builder gets the stored values as the draft holds them: file names, types,
+// the subject and threading ids may still need cleaning. Each version owns that
+// cleaning, the same in `encodedSize` and `build`, so a frozen version always
+// builds the same bytes; changing the cleaning needs a new version.
 export interface SendMimeBuilder {
   readonly version: number;
   // The exact encoded size of `build` for this message, without reading any attachment.

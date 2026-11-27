@@ -385,7 +385,9 @@ test('late PUT after release: an overtaken PUT lands after the send was cancelle
     // The paused PUT is released before the fixture closes, whatever fails.
     try {
       const running = h.advance(UNDO);
-      await put.started;
+      // The short handler budget can return the alarm before its live handler reaches
+      // the PUT, so only a rejected advance or the deadline ends this wait early.
+      await within(Promise.race([put.started, running.then(() => new Promise<never>(() => {}))]), 30 * second, 'the PUT');
       await running;
       registration = await h.sends.registration(pending.id);
       assert.ok(registration?.key);
@@ -400,7 +402,8 @@ test('late PUT after release: an overtaken PUT lands after the send was cancelle
     } finally { put.release(); }
     assert.ok(registration?.key);
     await until(() => h.objects.has(objectPath(registration.key!)), 'the late PUT');
-    await new Promise(resolve => setTimeout(resolve, 200));
+    // The resumed handler settles before anything is checked for a stale write.
+    await within(h.sends.driveIdle(), 10 * second, 'the resumed handler');
     assert.equal((await mail.getSend(pending.id)).state, 'cancelled');
     assert.deepEqual(await sentCopies(mail), [], 'the overtaken run committed nothing');
     assert.deepEqual(await h.sends.queue(), []);
@@ -426,21 +429,28 @@ for (const next of ['finishes', 'releases'] as const) {
     // The paused PUT is released before the fixture closes, whatever fails.
     try {
       const running = h.advance(UNDO);
-      await put.started;
+      // The short handler budget can return the alarm before its live handler reaches
+      // the PUT, so only a rejected advance or the deadline ends this wait early.
+      await within(Promise.race([put.started, running.then(() => new Promise<never>(() => {}))]), 30 * second, 'the PUT');
       await running;
       const { mailbox } = await mail.getSession();
       if (next === 'finishes') await h.as('admin').updateMailbox(mailbox!.id, { ownerUserId: (await owner.getSession()).user.id });
       await h.advance(10 * minute);
       // The short handler budget lets the alarm return while the next firing
       // still runs: wait until it has finished, or published and enqueued.
-      if (next === 'finishes') await until(async () => (await h.sends.row(pending.id))?.finish_pending === 0, 'the finish');
+      if (next === 'finishes') {
+        // finish_pending is also 0 while the send is releasing: wait for the published failure too.
+        await until(async () => (await owner.getSend(pending.id)).state === 'failed' && (await h.sends.row(pending.id))?.finish_pending === 0,
+          'the failure and its finish');
+      }
       else await until(async () => (await h.sends.queue()).length === 1 && !!(await owner.getSend(pending.id)).messageId, 'the publish and enqueue');
       settled = await owner.getSend(pending.id);
       assert.equal(settled.state, next === 'finishes' ? 'failed' : 'sending');
     } finally { put.release(); }
     const registration = await h.sends.registration(pending.id);
     await until(() => h.objects.has(objectPath(registration!.key!)), 'the stalled PUT');
-    await new Promise(resolve => setTimeout(resolve, 200));
+    // The resumed handler settles before anything is checked for a stale write.
+    await within(h.sends.driveIdle(), 10 * second, 'the resumed handler');
     assert.deepEqual(await owner.getSend(pending.id), settled, 'the stalled handler changed nothing');
     assert.equal(await h.eventCount('send_queued'), next === 'finishes' ? 0 : 1);
     if (next === 'finishes') {
@@ -659,10 +669,11 @@ test('a barrier behind a stalled publish answers 409 within its budget, and the 
   await h.sends.shortBarrier();
   await h.sends.stallPublish();
   const lane = h.advance(minute); // The backup lane starts publishing the draft and stalls in its write.
-  await h.sends.publishStalled();
   let answer: Response;
-  try { answer = await within(post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision), 10 * second, 'the barrier'); }
-  finally { await h.sends.resumePublish(); }
+  try {
+    await within(h.sends.publishStalled(), 10 * second, 'the stalled publish');
+    answer = await within(post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision), 10 * second, 'the barrier');
+  } finally { await h.sends.resumePublish(); }
   assert.equal(answer.status, 409);
   await lane;
   const sent = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
@@ -757,12 +768,16 @@ test('a barrier queued behind a publish that covers its commit answers with the 
   const draft = await mail.createDraft(draftInput(from), key('draft'));
   await h.sends.stallPublish();
   const lane = h.advance(minute); // The backup lane holds the publish lane, stalled in its first write.
-  await h.sends.publishStalled();
-  const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
-  await until(async () => (await h.sends.ids()).length === 1, 'the send commit');
-  // The lane's publish continues through the new commit before the queued barrier runs.
-  await h.sends.resumePublish();
-  const response = await answer;
+  let answer: Promise<Response> | undefined;
+  try {
+    await within(h.sends.publishStalled(), 10 * second, 'the stalled publish');
+    answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+    await until(async () => (await h.sends.ids()).length === 1, 'the send commit');
+  } finally {
+    // The lane's publish continues through the new commit before the queued barrier runs.
+    await h.sends.resumePublish();
+  }
+  const response = await within(answer, 10 * second, 'the barrier');
   assert.equal(response.status, 202);
   await lane;
 }));
@@ -811,19 +826,19 @@ test('a finish run overtaken by a restore releases nothing: the restored pending
     await h.sends.pausePublishThrough(terminalSeq);
     try {
       await h.advance(second);
-      await h.sends.publishThroughPaused();
+      await within(h.sends.publishThroughPaused(), 10 * second, 'the paused publish');
       await h.restore();
       const restored = await mail.getSend(pending.id);
       assert.equal(restored.state, 'pending', 'the restore lost the unpublished undo');
       assert.ok(restored.undoRemainingMs > 0, 'with a fresh window');
     } finally { await h.sends.resumePublishThrough(); }
     // The overtaken run now publishes through its old seq, which the restored journal reused.
-    await h.sends.driveIdle();
+    await within(h.sends.driveIdle(), 10 * second, 'the overtaken run');
     assert.equal(await h.sends.registration(pending.id), null, 'the overtaken run released nothing');
     assert.equal((await h.sends.row(pending.id))?.state, 'pending');
     // The short handler budget's real-time clock set the window a few milliseconds later.
     await h.advance(UNDO + second);
-    await h.sends.driveIdle();
+    await within(h.sends.driveIdle(), 10 * second, 'the drive');
     assert.equal((await mail.getSend(pending.id)).state, 'sending');
     assert.ok((await h.sends.registration(pending.id))?.key, 'the restored send registered and stored its copy');
     assert.equal((await h.sends.queue()).length, 1);
@@ -1557,3 +1572,109 @@ test('the frozen builder version owns the cleaning: the MIME port gets the store
   assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
   assert.doesNotMatch(text, /^In-Reply-To:/m);
 }));
+
+test('a lost answer during a restore marks the send\'s source unusable at once: release fails it with delivery_error without reading the object',
+  () => withSend(async (h, mail, from) => {
+    await h.confirmFailure(true);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    await h.advance(minute);
+    const [confirmation] = await h.confirmations();
+    assert.ok(confirmation.holder.startsWith('draft:'));
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    // The sweeper retired the revision's generation: its object is gone and confirm answers lost.
+    h.objects.delete(objectPath(confirmation.object_key));
+    await h.sends.forceLost(confirmation.holder);
+    await h.forceSnapshot();
+    // The restore's confirmation pass gets the lost answer; afterwards no live confirmation can run before release.
+    await h.confirmFailure(false);
+    await h.restore();
+    await h.confirmFailure(true);
+    assert.equal((await mail.getSend(pending.id)).state, 'pending');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.deepEqual(await h.sends.queue(), []);
+    // The live confirmation then journals the loss and raises the alert.
+    await h.confirmFailure(false);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+  }));
+
+test('a restore refuses a send row whose undo deadline is earlier than its frozen one, and accepts an equal or later one', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  const { undoUntil } = JSON.parse((await h.sends.row(pending.id))!.record) as { undoUntil: number };
+  await h.sends.setUndoUntil(pending.id, undoUntil + second);
+  await h.forceSnapshot();
+  await h.restore();
+  assert.equal((await mail.getSend(pending.id)).state, 'pending', 'a later deadline restores');
+  await h.sends.setUndoUntil(pending.id, undoUntil - 1);
+  await h.forceSnapshot();
+  await h.restore();
+  // The restore refuses the row: the mailbox stays restoring and the send is never served.
+  await rejects(mail.getSend(pending.id), 'mailbox_restoring');
+  assert.equal((await h.sends.lifecycle())?.state, 'restoring');
+}));
+
+test('a recipient restored as attempting is accepted and reported as pending', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  await h.sends.setRecipientState(pending.id, 0, 'attempting');
+  await h.forceSnapshot();
+  await h.restore();
+  const restored = await mail.getSend(pending.id);
+  assert.deepEqual(restored.recipients.map(({ state }) => state), ['pending']);
+  assert.deepEqual((await mail.listSends({})).items.map(({ id }) => id), [pending.id]);
+}));
+
+test('a covered send answers 202 while the work-lane wake-up after its publish is still held', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.gateLaneWakeup();
+  let response: Response;
+  try {
+    const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+    await within(h.sends.laneWakeupEntered(), 10 * second, 'the wake-up');
+    // The wake-up holds the work lane: the answer, queued ahead of it, must not wait for it.
+    response = await within(answer, 10 * second, 'the covered send');
+  } finally { await h.sends.openLaneWakeup(); }
+  assert.equal(response.status, 202);
+  assert.equal((await response.json() as Send).state, 'pending');
+}));
+
+test('a covered send answers 202 even when the work-lane wake-up after its publish fails', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.failLaneWakeup(true);
+  let response: Response;
+  try { response = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision); }
+  finally { await h.sends.failLaneWakeup(false); }
+  assert.equal(response.status, 202);
+  assert.equal((await response.json() as Send).state, 'pending');
+  await h.advance(UNDO);
+  assert.equal((await mail.listSends({})).items.length, 1);
+}));
+
+for (const retired of ['deleted', 'still readable'] as const) {
+  test(`a draft marked lost during a restore keeps the mark on a send created in a later delta (object ${retired})`, () => withSend(async (h, mail, from) => {
+    await h.confirmFailure(true);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    await h.advance(minute);
+    const [confirmation] = await h.confirmations();
+    assert.ok(confirmation.holder.startsWith('draft:'));
+    // The snapshot holds the draft; sendDraft is replayed from a later delta.
+    await h.forceSnapshot();
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    if (retired === 'deleted') h.objects.delete(objectPath(confirmation.object_key));
+    await h.sends.forceLost(confirmation.holder);
+    await h.confirmFailure(false);
+    await h.restore();
+    await h.confirmFailure(true);
+    assert.equal((await mail.getSend(pending.id)).state, 'pending');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+}
