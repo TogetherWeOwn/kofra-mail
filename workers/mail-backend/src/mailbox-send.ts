@@ -18,6 +18,7 @@ import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
 import { mailboxState } from './mailbox-api.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
+import type { SendRequest } from './send-mime.ts';
 import { senderActive, senderState } from './mailbox-send-sender.ts';
 import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
@@ -333,6 +334,106 @@ const INTERNAL_LOOKUP = `SELECT CAST(j.key AS INTEGER) AS idx FROM json_each(?1)
     AND a.workspace_id = destination.workspace_id
   WHERE original.workspace_id = ?2 AND json_type(j.value) = 'array'`;
 
+// The ready mailbox's index for a read of a send's frozen sources; it throws
+// once the mailbox is no longer the one the caller started on.
+export type SendSourceIndex = () => MailboxIndex;
+
+// Null when the stored revision is invalid for good: declared empty, over the
+// cap, not matching its digest, or digest-verified bytes that do not decode
+// to a draft object release can build. A missing object or a failed read still retries.
+async function sendDraftObject(sources: SendSourceIndex, record: SendRecord): Promise<DraftObject | null> {
+  let draft: DraftObject;
+  try {
+    draft = await readDraftObject(sources(), { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
+  } catch (error) {
+    if (error instanceof ObjectInvalidError) return null;
+    throw error;
+  }
+  return sendableDraftObject(draft) ? draft : null;
+}
+
+// Reads the small forwarded parts, one source at a time, and checks each against
+// the digest and size frozen in the record and the size the builder lays out;
+// null on a mismatch or a part that no longer exists.
+async function sendForwardedParts(sources: SendSourceIndex, record: SendRecord, draft: DraftObject): Promise<Map<number, Uint8Array<ArrayBuffer>> | null> {
+  const wanted: { index: number; key: string; part: number; frozen: SendPart }[] = [];
+  for (const [index, { wire, key }] of files(draft).entries()) {
+    if (wire.kind !== 'message' || !inlinePart(key)) continue;
+    const frozen = record.parts.find(entry => entry.messageId === wire.messageId && entry.part === wire.part);
+    if (!frozen || frozen.size !== wire.size) return null;
+    wanted.push({ index, key, part: wire.part, frozen });
+  }
+  const verified = new Map<number, Uint8Array<ArrayBuffer>>();
+  let matched = true;
+  try {
+    await eachForwardedPart(key => readSource(sources(), key), wanted, async ({ index, frozen }, bytes) => {
+      if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return matched = false;
+      verified.set(index, bytes);
+    });
+  } catch (error) {
+    // The parser checks each source against its raw/ key's digest before parsing.
+    if (error instanceof SourceMismatch || error instanceof RawDigestMismatch) return null;
+    throw error;
+  }
+  return matched ? verified : null;
+}
+
+// A stored object declared empty or over the cap is invalid for good, like a
+// digest mismatch; a missing object or a failed read still retries.
+async function readSource(index: MailboxIndex, key: string): Promise<Uint8Array<ArrayBuffer>> {
+  try { return await index.readObject(key); }
+  catch (error) {
+    if (error instanceof ObjectInvalidError) throw new SourceMismatch();
+    throw error;
+  }
+}
+
+function sendParts(sources: SendSourceIndex, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
+  const list = files(draft);
+  return async index => {
+    // A small forwarded part was read and verified before the build.
+    const verified = forwarded.get(index);
+    if (verified) return verified;
+    const ready = sources();
+    const { wire, key } = list[index];
+    const parsed = parseObjectKey(key);
+    // Uploads and large forwarded parts are att/ objects, verified against their content-addressed key.
+    if (parsed?.kind !== 'att') throw new Error('Invalid send attachment reference');
+    // Object reads refuse a declared empty body, but an empty upload is a valid file.
+    if (wire.size === 0) {
+      if (parsed.digest !== EMPTY_DIGEST) throw new SourceMismatch();
+      return new Uint8Array(0);
+    }
+    const raw = await readSource(ready, key);
+    if (raw.byteLength !== wire.size || await sha256(raw) !== parsed.digest) throw new SourceMismatch();
+    return raw;
+  };
+}
+
+// The structured send() request for the recipients `recipients` (ledger
+// indexes) of a released send, built from the same frozen inputs and with the
+// same builder version as its sent copy (section 2.3, step 2; M3-4), never by
+// parsing the sent copy. Each recipient keeps its field (To, Cc or Bcc); the
+// structured call has no separate envelope, so a retried copy shows only the
+// retried recipients (a recorded limitation). Null when the frozen inputs can
+// no longer build it (an invariant breach after release built the sent copy);
+// a failed read throws and may be retried.
+export async function sendRequestFor(sources: SendSourceIndex, mime: SendMimeBuilders, record: SendRecord,
+  recipients: number[]): Promise<SendRequest | null> {
+  const builder = mime.get(record.builderVersion);
+  const wanted = new Set(recipients);
+  if (!builder || !recipients.length || recipients.some(idx => !record.recipients[idx])) return null;
+  const draft = await sendDraftObject(sources, record);
+  const forwarded = draft && await sendForwardedParts(sources, record, draft);
+  if (!draft || !forwarded) return null;
+  const message = mimeMessage({ ...record, recipients: record.recipients.filter((_, idx) => wanted.has(idx)) }, draft);
+  try { return await builder.request(message, sendParts(sources, draft, forwarded)); }
+  catch (error) {
+    if (error instanceof SourceMismatch || error instanceof SendMimeError || error instanceof SendMimeInvariantError) return null;
+    throw error;
+  }
+}
+
 export class SendDriver {
   constructor(private readonly ports: SendPorts, private readonly timer: TimerRun) {}
 
@@ -596,83 +697,25 @@ export class SendDriver {
     console.error({ code: 'send_invariant' });
   }
 
-  // Null when the stored revision is invalid for good: declared empty, over the
-  // cap, not matching its digest, or digest-verified bytes that do not decode
-  // to a draft object release can build. A missing object or a failed read still retries.
-  private async draftOf(start: Start, record: SendRecord): Promise<DraftObject | null> {
-    const ready = this.ports.ready();
-    if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
-    let draft: DraftObject;
-    try {
-      draft = await readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
-    } catch (error) {
-      if (error instanceof ObjectInvalidError) return null;
-      throw error;
-    }
-    return sendableDraftObject(draft) ? draft : null;
+  // The index of the ready mailbox this run started on; any other answer throws.
+  private sources(start: Start): SendSourceIndex {
+    return () => {
+      const ready = this.ports.ready();
+      if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
+      return ready.index;
+    };
   }
 
-  // Reads the small forwarded parts, one source at a time, and checks each against
-  // the digest and size frozen in the record and the size the builder lays out;
-  // null on a mismatch or a part that no longer exists.
-  private async forwardedParts(start: Start, record: SendRecord, draft: DraftObject): Promise<Map<number, Uint8Array<ArrayBuffer>> | null> {
-    const wanted: { index: number; key: string; part: number; frozen: SendPart }[] = [];
-    for (const [index, { wire, key }] of files(draft).entries()) {
-      if (wire.kind !== 'message' || !inlinePart(key)) continue;
-      const frozen = record.parts.find(entry => entry.messageId === wire.messageId && entry.part === wire.part);
-      if (!frozen || frozen.size !== wire.size) return null;
-      wanted.push({ index, key, part: wire.part, frozen });
-    }
-    const verified = new Map<number, Uint8Array<ArrayBuffer>>();
-    let matched = true;
-    try {
-      await eachForwardedPart(key => {
-        const ready = this.ports.ready();
-        if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
-        return this.readSource(ready.index, key);
-      }, wanted, async ({ index, frozen }, bytes) => {
-        if (!bytes || bytes.byteLength !== frozen.size || await sha256(bytes) !== frozen.digest) return matched = false;
-        verified.set(index, bytes);
-      });
-    } catch (error) {
-      // The parser checks each source against its raw/ key's digest before parsing.
-      if (error instanceof SourceMismatch || error instanceof RawDigestMismatch) return null;
-      throw error;
-    }
-    return matched ? verified : null;
+  private draftOf(start: Start, record: SendRecord): Promise<DraftObject | null> {
+    return sendDraftObject(this.sources(start), record);
   }
 
-  // A stored object declared empty or over the cap is invalid for good, like a
-  // digest mismatch; a missing object or a failed read still retries.
-  private async readSource(index: MailboxIndex, key: string): Promise<Uint8Array<ArrayBuffer>> {
-    try { return await index.readObject(key); }
-    catch (error) {
-      if (error instanceof ObjectInvalidError) throw new SourceMismatch();
-      throw error;
-    }
+  private forwardedParts(start: Start, record: SendRecord, draft: DraftObject): Promise<Map<number, Uint8Array<ArrayBuffer>> | null> {
+    return sendForwardedParts(this.sources(start), record, draft);
   }
 
   private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
-    const list = files(draft);
-    return async index => {
-      // A small forwarded part was read and verified before the build.
-      const verified = forwarded.get(index);
-      if (verified) return verified;
-      const ready = this.ports.ready();
-      if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
-      const { wire, key } = list[index];
-      const parsed = parseObjectKey(key);
-      // Uploads and large forwarded parts are att/ objects, verified against their content-addressed key.
-      if (parsed?.kind !== 'att') throw new Error('Invalid send attachment reference');
-      // Object reads refuse a declared empty body, but an empty upload is a valid file.
-      if (wire.size === 0) {
-        if (parsed.digest !== EMPTY_DIGEST) throw new SourceMismatch();
-        return new Uint8Array(0);
-      }
-      const raw = await this.readSource(ready.index, key);
-      if (raw.byteLength !== wire.size || await sha256(raw) !== parsed.digest) throw new SourceMismatch();
-      return raw;
-    };
+    return sendParts(this.sources(start), draft, forwarded);
   }
 
   private senderValid(scope: SendScope, record: SendRecord): Promise<boolean> {

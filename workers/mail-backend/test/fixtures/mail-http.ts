@@ -136,6 +136,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
+  // Holds the next object GET whose path matches, until released.
+  let nextGet: { match: RegExp; start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
   let watchedBody: PromiseWithResolvers<void> | undefined;
   let contentRawReads = 0;
   let cidAdmissions = 0;
@@ -149,7 +151,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
     compatibilityDate: '2026-06-25',
     durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true },
-      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true } },
+      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true }, SEND_CONSUMER: { className: 'SendConsumer', useSQLite: true } },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
@@ -176,6 +178,12 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
           return new LocalResponse(null, { status: 201 });
         }
         case 'GET': {
+          const held = nextGet && nextGet.match.test(pathname) ? nextGet : undefined;
+          if (held) {
+            nextGet = undefined;
+            held.start.resolve();
+            await held.resume.promise;
+          }
           const reads = watchedReads.get(pathname);
           if (reads !== undefined) watchedReads.set(pathname, reads + 1);
           if (failingReads.has(pathname)) return new LocalResponse('<Error><Code>ServiceUnavailable</Code></Error>', { status: 503 });
@@ -240,8 +248,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       },
     });
   }
-  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...(inlineCids && {
+  // The send path's structured log events (alert codes and metrics), recorded for assertions.
+  const logs: string[] = [];
+  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send) && {
     handleStructuredLogs: ({ message }: { message: string }) => {
+      if (send) logs.push(message);
       if (message === cidAdmissionMarker && ++cidAdmissions === 6) cidBurst.resolve();
     },
   }) });
@@ -282,6 +293,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     const stallConfirmation = () => controlAction('stall-confirmation');
     const stallRelease = (holder: string) => controlAction('stall-release', holder);
     const expireUploadLease = (key: string) => controlAction('expire-upload-lease', key);
+    const pauseNextGet = (match: RegExp) => {
+      const gate = nextGet = { match, start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+      return { started: gate.start.promise, release: gate.resume.resolve };
+    };
     const pauseNextPut = () => {
       const gate = nextPut = { start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
       return { started: gate.start.promise, release: gate.resume.resolve };
@@ -311,6 +326,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       failNextEpilogue: () => controlAction('fail-next-epilogue'),
       bumpBuilder: () => controlAction('bump-builder'),
       builds: () => readControl<{ version: number; parts: number[]; types: string[]; inReplyTo?: string }[]>('mime-builds'),
+      // The builder version of each send() request built through the MIME builder port.
+      requests: () => readControl<number[]>('mime-requests'),
       shortHandlerBudget: () => controlAction('short-handler-budget'),
       row: (id: string) => readControl<{ id: string; state: string; undo_until: number; created_seq: number; release_seq: number | null;
         queued_seq: number | null; terminal_seq: number | null; message_id: string | null; reason: string | null; finish_pending: number;
@@ -443,7 +460,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
-      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
+      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut, pauseNextGet,
       watchBodyRead: () => (watchedBody = Promise.withResolvers<void>()).promise,
       watchObjectReads(path: string) {
         watchedReads.set(path, 0);
@@ -471,6 +488,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       pausedAt: (point: string) => controlAction('paused-at', point),
       resumeAt: (point: string) => controlAction('resume-at', point),
       quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
+      // The send consumer's dispatch core (M3-5b) in the fixture worker, and its fakes.
+      consumer: <T>(method: string, ...args: unknown[]) => readControl<T>('consumer', JSON.stringify({ method, args })),
+      // Structured log lines of the send fixture, in order.
+      logs: () => [...logs],
       sendState: (id: string) => readControl<SendStateView>('send-state', id),
       pauseNextEnqueue: () => controlAction('pause-enqueue'),
       enqueuePaused: () => controlAction('enqueue-paused'),

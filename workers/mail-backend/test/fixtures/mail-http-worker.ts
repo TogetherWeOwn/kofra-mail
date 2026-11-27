@@ -19,13 +19,14 @@ import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../sr
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
 import { SendMimeError } from '../../src/send-mime.ts';
-import { builds, fixtureBuilders } from './send-mime.ts';
+import { builds, fixtureBuilders, requests as mimeRequests } from './send-mime.ts';
 import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
 import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
 import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
 import type { QuotaPort } from '../../src/mailbox-send-quota.ts';
 import { FakeSendQuota } from './send-quota-fake.ts';
+import { sendConsumerFixture } from './send-consumer.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -51,6 +52,8 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   EMAIL?: { send(message: unknown): Promise<unknown> };
   // The recording stand-in for the account quota object (M3-6).
   SEND_QUOTA: DurableObjectNamespace<FakeSendQuota>;
+  // The send consumer's dispatch core (M3-5b), run against this mailbox and quota fake.
+  SEND_CONSUMER: DurableObjectNamespace;
 }
 
 const encoder = new TextEncoder();
@@ -169,7 +172,7 @@ export class HttpMailbox extends Mailbox {
   async arrived(method: string) { await this.arrivals.get(method)!.promise; }
   async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
     this.arrivals.get(method)?.resolve();
-    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
+    const allowed = ['claimSend', 'markSend', 'sendRequest', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
     if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
     return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
   }
@@ -279,6 +282,7 @@ export class HttpMailbox extends Mailbox {
     this.sendMime = fixtureBuilders('bumped');
   }
   mimeBuilds() { return builds; }
+  mimeRequests() { return mimeRequests; }
   async sentHeaders(workspaceId: string, messageId: string): Promise<Record<string, string>> {
     const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', messageId).toArray()[0];
     if (!row) throw new Error('Stored sent copy is missing');
@@ -654,6 +658,8 @@ export class Sweeper extends MailSweeper {
 }
 export { ContentLookup } from '../../src/entry.ts';
 export { FakeSendQuota };
+// The consumer reads the mailbox's clock through the same fixture time.
+export const SendConsumer = sendConsumerFixture((env: FixtureEnv) => now(env));
 
 // Request rate limits with per-key counters that a test can cap, per binding.
 const rateCaps = new Map<string, number>();
@@ -897,6 +903,11 @@ export default {
             return Response.json(await quota[method](...args) ?? null);
           }
           case '/__fixture/send-state': return Response.json(await box.sendState(await req.text()));
+          case '/__fixture/consumer': {
+            const { method, args } = await req.json<{ method: string; args: unknown[] }>();
+            const consumer = env.SEND_CONSUMER.getByName('consumer') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+            return Response.json(await consumer[method](...args) ?? null);
+          }
           case '/__fixture/pause-enqueue': await box.pauseNextEnqueue(); break;
           case '/__fixture/enqueue-paused': await box.enqueuePaused(); break;
           case '/__fixture/resume-enqueue': await box.resumeEnqueue(); break;
@@ -906,6 +917,7 @@ export default {
           case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
           case '/__fixture/bump-builder': await box.bumpBuilder(); break;
           case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/mime-requests': return Response.json(await box.mimeRequests());
           case '/__fixture/sent-headers': return Response.json(await box.sentHeaders(ws, await req.text()));
           case '/__fixture/stall-publish': await box.stallPublish(); break;
           case '/__fixture/publish-stalled': await box.publishStalled(); break;

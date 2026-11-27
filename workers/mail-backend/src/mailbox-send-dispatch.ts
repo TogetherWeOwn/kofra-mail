@@ -14,6 +14,7 @@ import {
   type LedgerRow, type SendRow,
 } from './mailbox-send-store.ts';
 import type { TimerRun, TimerTable } from './mailbox-timers.ts';
+import type { SendRequest } from './send-mime.ts';
 import type {
   JournalEvent, SendDispatchRow, SendFailure, SendFenceOutcome, SendFenceRow, SendLedgerChange, SendMarkRow, SendRecipient, SendRecord,
 } from './mail-journal.ts';
@@ -74,6 +75,8 @@ export type ClaimAnswer =
   // A ready mailbox has no such send.
   | { status: 'gone' };
 export type MarkAnswer = { status: 'ok' | 'stale' };
+// `invalid`: the frozen inputs can no longer build the request (an invariant breach).
+export type RequestAnswer = { status: 'ok'; request: SendRequest } | { status: 'stale' | 'invalid' };
 export type AuthorizeAnswer = { status: 'ok'; remainingMs: number } | { status: 'stale' } | { status: 'quota_window'; retryAfter: number };
 // `unpublished`: recorded, but no publish covers it yet; the caller keeps the result and retries.
 export type ReportAnswer = { status: 'recorded' | 'stale' | 'restoring' | 'unpublished' | 'gone' };
@@ -113,6 +116,9 @@ export type DispatchPorts = {
   journalDue(timers: TimerTable): void;
   directory: DirectoryDatabase;
   quota(): QuotaPort | undefined;
+  // The structured send() request for these recipients from the send's frozen
+  // inputs; null when they can no longer build it.
+  buildRequest(record: SendRecord, recipients: number[]): Promise<SendRequest | null>;
   clockSkewMs: number;
   now(): number;
   sending: boolean;
@@ -541,6 +547,43 @@ export class SendDispatcher {
     });
   }
 
+  // Consumer step 3a's request: the structured send() request for the fence's
+  // Mark set, built from the send's frozen inputs (never from the sent copy).
+  // The fence rules are Mark's: only the current, live, marked lease of a send
+  // that is not finished gets a request. It records nothing; authorizeDispatch
+  // checks everything again.
+  async request(scope: DispatchScope, id: string, fence: SendFence): Promise<RequestAnswer> {
+    const { ports } = this;
+    if (!validFence(fence)) throw new Error('Invalid send request');
+    if (!ports.sending || !await this.readyFor(scope)) return { status: 'stale' };
+    // The fence's attempting Mark set, or null when the fence is not the current, live, marked lease.
+    const claimed = () => ports.local(() => {
+      const ready = ports.current();
+      const m = ready && this.load(id);
+      if (!ready || !m) return null;
+      const ctx = this.ctx(ready);
+      const row = m.fence(fence);
+      if (m.finished || fence.epoch !== ctx.epoch || !sameFence(m.lease(), fence) || ctx.now >= m.d.leaseUntil! || !row?.marked) return null;
+      const recipients = m.markSet(fence).map(mark => mark.idx)
+        .filter(idx => m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence));
+      return recipients.length ? { record: m.row.record, recipients } : null;
+    });
+    const before = await claimed();
+    if (!before) return { status: 'stale' };
+    const request = await ports.buildRequest(before.record, before.recipients);
+    if (!request) {
+      console.error({ code: 'send_request_invalid' });
+      return { status: 'invalid' };
+    }
+    // The reads took time: the answer holds only if the fence and its Mark set are unchanged now.
+    if (!await this.readyFor(scope)) return { status: 'stale' };
+    const after = await claimed();
+    if (!after || after.recipients.length !== before.recipients.length || !after.recipients.every((idx, i) => idx === before.recipients[i])) {
+      return { status: 'stale' };
+    }
+    return { status: 'ok', request };
+  }
+
   // Consumer step 4: at most one authorization per fence. `quotaDayEnd` is the
   // end of the quota day the consumer's charge is confirmed in, as `confirm` returned it.
   async authorize(scope: DispatchScope, id: string, fence: SendFence, recipients: number[], quotaDayEnd: number): Promise<AuthorizeAnswer> {
@@ -719,7 +762,8 @@ export class SendDispatcher {
       reset = await quota.resetAt();
     }
     const until = reset + ports.clockSkewMs;
-    const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
+    // Only the provider's daily-limit answer to a call is a definitive provider outcome that ends the crash streak.
+    const answer = await ports.local(timers => this.report(id, fence, timers, cause === 'provider_daily', (m, ctx) => {
       m.state = 'delayed';
       m.d.delayedUntil = Math.max(until, ctx.now);
       return { outcome: 'delayed', driveAt: m.d.delayedUntil };
@@ -734,7 +778,8 @@ export class SendDispatcher {
     const { ports } = this;
     if (!validFence(fence) || !Number.isSafeInteger(retryAt)) throw new Error('Invalid send abandon');
     if (!await this.readyFor(scope)) return { status: 'restoring' };
-    const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
+    // An abandon proves only that this attempt did not send: the crash streak stands.
+    const answer = await ports.local(timers => this.report(id, fence, timers, false, (m, ctx) => {
       const next = Math.min(ctx.now + ABANDON_MAX_MS, Math.max(ctx.now + ABANDON_MIN_MS, retryAt));
       m.d.nextAttemptAt = next;
       return { outcome: 'abandoned', driveAt: next };
@@ -746,7 +791,9 @@ export class SendDispatcher {
 
   // delaySend and abandonClaim: only the current fence changes anything. Its
   // recipients return to pending, the lease ends, and its charge is released.
-  private report(id: string, fence: SendFence, timers: TimerTable,
+  // `resetStreak`: a definitive provider outcome for this fence, which ends the
+  // run of unfinished attempts; an abandon or our own gate never does.
+  private report(id: string, fence: SendFence, timers: TimerTable, resetStreak: boolean,
     change: (m: SendModel, ctx: Ctx) => { outcome: SendFenceOutcome; driveAt: number }): { status: 'done'; at: number } | AbandonAnswer {
     const ready = this.ports.current();
     if (!ready) return { status: 'restoring' };
@@ -760,7 +807,7 @@ export class SendDispatcher {
     m.putFence({ ...row, outcome });
     m.addRelease(fence);
     m.endLease();
-    m.d.unfinished = 0;
+    if (resetStreak) m.d.unfinished = 0;
     this.commit(m, ready, timers, driveAt, true);
     return { status: 'done', at: driveAt };
   }
@@ -908,6 +955,17 @@ export class SendDispatcher {
       } else if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
         // Definitive: recorded and published, a result that can never apply, or no such send.
         if (answer === 'gone') metric('send_result_orphan');
+        // A refused call is not charged: a refusal that can never apply releases only its own
+        // fence's reservation (never a newer fence's). A failure keeps the charge.
+        if (answer !== 'recorded' && (row.kind === 'rejected' || row.kind === 'try_later' || row.kind === 'outage')) {
+          try {
+            const quota = ports.quota();
+            if (!quota) throw new Error('Send quota binding missing');
+            await quota.release({ ...scope, sendId: id }, [{ epoch: row.epoch, attempt: row.attempt }]);
+          } catch (error) {
+            console.error({ code: 'send_stale_release_failed', error: error instanceof Error ? error.message : String(error) });
+          }
+        }
         // The alert goes first: a crash after the delete cannot leave it active.
         await this.resultAlerts(id, row, [], ['unapplied', 'stuck']);
         await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();

@@ -5,7 +5,10 @@
 // sends that recorded it.
 
 import { hasHeaderControl, indexedAttachmentName, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
-import { buildSentCopyFromParts, encodedSentCopySize, SEND_MIME_VERSION, SendMimeInvariantError } from './send-mime.ts';
+import {
+  buildSendRequest, buildSentCopyFromParts, encodedSentCopySize, SEND_MIME_VERSION, SendMimeInvariantError,
+  type SendMimeAttachment as SendMimeBuiltAttachment, type SendRequest,
+} from './send-mime.ts';
 
 export type SendMimeAddress = { email: string; name?: string };
 export type SendMimeAttachment = { name: string; type: string; size: number };
@@ -41,6 +44,10 @@ export interface SendMimeBuilder {
   // The exact encoded size of `build` for this message, without reading any attachment.
   encodedSize(message: SendMimeMessage): number;
   build(message: SendMimeMessage, parts: SendMimeParts): Promise<Uint8Array<ArrayBuffer>>;
+  // The structured send() request from the same inputs and the same cleaning
+  // as `build` (M3-4): the consumer's request never comes from re-parsing the
+  // sent copy. `message` lists only the recipients the call goes to.
+  request(message: SendMimeMessage, parts: SendMimeParts): Promise<SendRequest>;
 }
 
 export type SendMimeBuilders = { readonly current: number; get(version: number): SendMimeBuilder | undefined };
@@ -107,6 +114,20 @@ const sentCopyMimeBuilder: SendMimeBuilder = {
     const message = cleanMimeMessageV1(raw);
     return buildSentCopyFromParts({ ...inputFor(message), attachments: message.attachments }, parts);
   },
+  async request(raw, parts) {
+    const message = cleanMimeMessageV1(raw);
+    return buildSendRequest({ ...inputFor(message), attachments: await attachmentsOf(message, parts) });
+  },
 };
+
+async function attachmentsOf(message: SendMimeMessage, parts: SendMimeParts): Promise<SendMimeBuiltAttachment[]> {
+  const attachments: SendMimeBuiltAttachment[] = [];
+  for (const [index, attachment] of message.attachments.entries()) {
+    const data = await parts(index);
+    if (data.byteLength !== attachment.size) throw new SendMimeInvariantError('Send attachment size changed');
+    attachments.push({ ...attachment, bytes: data });
+  }
+  return attachments;
+}
 
 export const defaultMimeBuilders = () => mimeBuilders(sentCopyMimeBuilder);
