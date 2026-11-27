@@ -198,15 +198,22 @@ export class Mailbox extends DurableObject<Env> {
       if (!progressed) break;
     }
     if (journal() < seq) return false;
-    // Confirmations and releases this publish covered are the lane's work; bring it forward.
+    // A covered caller never waits for this wake-up or fails on it: a lost one
+    // leaves the work to the backup lane's own run.
+    this.ctx.waitUntil(this.wakeCoveredWork().catch(error =>
+      console.error({ code: 'barrier_lane_wakeup', error: error instanceof Error ? error.message : String(error) })));
+    return true;
+  }
+
+  // Confirmations and releases a publish covered are the lane's work; bring it forward.
+  protected async wakeCoveredWork(): Promise<void> {
     await this.work.run(async () => {
-      const through = journal();
+      const through = this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
       if (this.ctx.storage.sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_pending_releases WHERE seq <= ?)
         OR EXISTS (SELECT 1 FROM mailbox_pending_confirmations WHERE seq <= ?) AS pending`, through, through).one().pending) {
         await this.lowerLane(this.timerNow() + 60_000);
       }
     });
-    return true;
   }
 
   private async sendApi(scope: Scope, operation: 'sendDraft' | 'undoSend' | 'getSend' | 'listSends', params: Record<string, string>,

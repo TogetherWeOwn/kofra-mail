@@ -1493,3 +1493,15 @@ test('a recipient restored as attempting is accepted and reported as pending', (
   assert.deepEqual(restored.recipients.map(({ state }) => state), ['pending']);
   assert.deepEqual((await mail.listSends({})).items.map(({ id }) => id), [pending.id]);
 }));
+
+test('a covered send answers 202 even when the work-lane wake-up after its publish fails', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.failLaneWakeup(true);
+  let response: Response;
+  try { response = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision); }
+  finally { await h.sends.failLaneWakeup(false); }
+  assert.equal(response.status, 202);
+  assert.equal((await response.json() as Send).state, 'pending');
+  await h.advance(UNDO);
+  assert.equal((await mail.listSends({})).items.length, 1);
+}));
