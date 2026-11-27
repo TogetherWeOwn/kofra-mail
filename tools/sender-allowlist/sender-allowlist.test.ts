@@ -97,7 +97,9 @@ test('lowering comes before deploy; only deployed, still-pending rows can be pro
     assert.equal(fixture.policy(toLower), 'pending');
     assert.deepEqual(list, [disabled, moved, quotedAddress, revoked]);
     fixture.setPolicy(revoked, 'revoked');
-    fixture.db.prepare('UPDATE addresses SET workspace_id = ? WHERE address_norm = ?').run('other', moved);
+    fixture.mailbox('other-mailbox', 'other');
+    fixture.db.prepare('UPDATE addresses SET workspace_id = ?, target_id = ? WHERE address_norm = ?')
+      .run('other', 'other-mailbox', moved);
     fixture.db.prepare('UPDATE domains SET sending_state = ? WHERE name = ?').run('disabled', 'later-disabled.test');
     return version;
   });
@@ -110,6 +112,24 @@ test('lowering comes before deploy; only deployed, still-pending rows can be pro
     assert.ok(fixture.calls.some(({ params }) => params.includes(address)));
     assert.ok(fixture.calls.every(({ sql }) => !sql.includes(address)));
   }
+});
+
+test('a recreated pending row in the same workspace can activate the already-deployed address', async (t) => {
+  const fixture = await directoryFixture(t);
+  fixture.domain();
+  fixture.address(alice, 'pending', 'wk', 'original-mailbox');
+  fixture.address(quotedAddress);
+  const counts = await runSenderAllowlist(new CloudflareMail(credentials, fixture.request), async (list) => {
+    assert.deepEqual(list, [alice, quotedAddress]);
+    fixture.db.prepare('DELETE FROM addresses WHERE address_norm IN (?, ?)').run(alice, quotedAddress);
+    fixture.address(alice, 'pending', 'wk', 'different-mailbox');
+    return version;
+  });
+  assert.equal(counts.promoted, 1);
+  const current = fixture.db.prepare('SELECT target_id, send_as_policy FROM addresses WHERE address_norm = ?').get(alice);
+  assert.equal(current?.target_id, 'different-mailbox');
+  assert.equal(current?.send_as_policy, 'active');
+  assert.equal(fixture.policy(quotedAddress), undefined);
 });
 
 const deploymentCases = [

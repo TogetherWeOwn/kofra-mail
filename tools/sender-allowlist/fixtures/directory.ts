@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import type { TestContext } from 'node:test';
@@ -18,8 +19,11 @@ export const credentials = {
 
 export async function directoryFixture(t: TestContext) {
   const db = new DatabaseSync(':memory:');
-  db.exec(`CREATE TABLE addresses (address_norm TEXT PRIMARY KEY, workspace_id TEXT, send_as_policy TEXT);
-    CREATE TABLE domains (name TEXT PRIMARY KEY, workspace_id TEXT, kind TEXT, sending_state TEXT);`);
+  db.exec(readFileSync(new URL('../../../workers/mail-backend/migrations/0001_directory.sql', import.meta.url), 'utf8'));
+  function mailbox(id: string, workspace: string) {
+    db.prepare('INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING')
+      .run(id, workspace, id, `${id}@mailbox-fixture.test`);
+  }
   const calls: { sql: string; params: string[] }[] = [];
   const events: string[] = [];
   const control = {
@@ -71,11 +75,15 @@ export async function directoryFixture(t: TestContext) {
   return {
     db, calls, events, control, origin,
     request: ((input, options) => fetch(origin + new URL(String(input)).pathname, options)) as typeof fetch,
-    domain(name = exampleDomain, workspace = 'wk', kind = 'primary', state = 'active') {
-      db.prepare('INSERT INTO domains VALUES (?, ?, ?, ?)').run(name, workspace, kind, state);
+    mailbox,
+    domain(name = exampleDomain, sendingState = 'active') {
+      db.prepare(`INSERT INTO domains (id, name, workspace_id, kind, routing_state, sending_state)
+        VALUES (?, ?, 'wk', 'primary', 'active', ?)`).run(name, name, sendingState);
     },
-    address(name: string, policy = 'pending', workspace = 'wk') {
-      db.prepare('INSERT INTO addresses VALUES (?, ?, ?)').run(name, workspace, policy);
+    address(name: string, policy = 'pending', workspace = 'wk', target = `mailbox-${workspace}`) {
+      mailbox(target, workspace);
+      db.prepare(`INSERT INTO addresses (address_norm, workspace_id, send_as_policy, target_id, target_kind, kind)
+        VALUES (?, ?, ?, ?, 'mailbox', 'alias')`).run(name, workspace, policy, target);
     },
     policy(name: string): string | undefined {
       return db.prepare('SELECT send_as_policy FROM addresses WHERE address_norm = ?').get(name)?.send_as_policy as string | undefined;
