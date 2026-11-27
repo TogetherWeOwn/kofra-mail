@@ -527,6 +527,8 @@ export class SendDispatcher {
       if (row.outcome !== null && row.outcome !== 'abandoned' && row.outcome !== 'delayed') return { seq: ready.index.journal.revision() };
       const current = !m.finished && fence.epoch === ctx.epoch && sameFence(m.lease(), fence);
       if (!current) return this.recordStale(m, ready, timers, row, result, ctx);
+      // A provider result needs a call, and a call needs the fence's authorization.
+      if (!row.authorized) return { status: 'stale' };
       const attempting = m.markSet(fence).map(mark => mark.idx)
         .filter(idx => m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence));
       let next: number | null = null;

@@ -113,13 +113,15 @@ test('a stale fence: abandonClaim, delaySend, Mark and failure, retry or ambiguo
   assert.deepEqual(after.marks.filter(mark => mark.attempt === a.claim.fence.attempt).map(mark => mark.provider_id), ['provider-a']);
 }));
 
-test('a stale fence that was never authorized cannot record even a confirmed result', () => withSend(async (h, mail, from) => {
+test('a fence that was never authorized cannot record even a confirmed result, current or stale', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'unauthorized');
   const a = await attempt(h, id, { stop: 'mark' });
   await h.advance(LEASE + SKEW);
-  await attempt(h, id, { stop: 'mark' });
+  const b = await attempt(h, id, { stop: 'mark' });
   const before = core(await h.sendState(id));
   assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, a.claim.fence, { kind: 'accepted', messageId: null }), { status: 'stale' });
+  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, b.claim.fence, { kind: 'accepted', messageId: null }), { status: 'stale' });
+  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, b.claim.fence, { kind: 'rejected', reason: 'rejected' }), { status: 'stale' });
   assert.deepEqual(core(await h.sendState(id)), before);
 }));
 
