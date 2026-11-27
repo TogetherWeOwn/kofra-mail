@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { ImageOff } from '@lucide/svelte';
+  import ImageOff from '@lucide/svelte/icons/image-off';
   import { onDestroy, untrack } from 'svelte';
   import type { MailService, Message } from '@kofra/mail-contract';
   import { contentFrameUrl } from './content-origin';

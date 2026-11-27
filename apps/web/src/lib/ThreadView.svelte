@@ -1,6 +1,16 @@
 <script lang="ts">
   import type { Conversation, Label, MailService, MessageAttachment, ThreadChange, View } from '@kofra/mail-contract';
-  import { Archive, ArrowLeft, Download, Forward, HardDrive, Inbox, OctagonAlert, Paperclip, Reply, Tag, Trash2 } from '@lucide/svelte';
+  import Archive from '@lucide/svelte/icons/archive';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+  import Download from '@lucide/svelte/icons/download';
+  import Forward from '@lucide/svelte/icons/forward';
+  import HardDrive from '@lucide/svelte/icons/hard-drive';
+  import Inbox from '@lucide/svelte/icons/inbox';
+  import OctagonAlert from '@lucide/svelte/icons/octagon-exclamation-point';
+  import Paperclip from '@lucide/svelte/icons/paperclip';
+  import Reply from '@lucide/svelte/icons/reply';
+  import Tag from '@lucide/svelte/icons/tag';
+  import Trash2 from '@lucide/svelte/icons/trash';
 
   import { SvelteMap } from 'svelte/reactivity';
   import MessageContent from './MessageContent.svelte';

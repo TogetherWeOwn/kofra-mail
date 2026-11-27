@@ -8,7 +8,10 @@
 </script>
 
 <script lang="ts">
-  import { HardDrive, Paperclip, Trash2, X } from '@lucide/svelte';
+  import HardDrive from '@lucide/svelte/icons/hard-drive';
+  import Paperclip from '@lucide/svelte/icons/paperclip';
+  import Trash2 from '@lucide/svelte/icons/trash';
+  import X from '@lucide/svelte/icons/x';
   import { onMount } from 'svelte';
   import { isMailApiError, type AddressInput, type Identity, type MailService } from '@kofra/mail-contract';
   import { mailAction } from './mail-action';
