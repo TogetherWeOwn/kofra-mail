@@ -1408,3 +1408,18 @@ test('a stored draft with more attachments than pageSizeMax fails the send with 
   await h.advance(minute);
   assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
 }));
+
+for (const type of ['multipart/mixed', 'message/rfc822']) {
+  test(`an upload stored with the composite type ${type} is sent as an opaque file and kept in the sent copy`, () => withSend(async (h, mail, from) => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const uploaded = await mail.createUpload({ name: 'parts.bin', type, bytes: new Blob([bytes]) }, key('upload'));
+    const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+    await h.advance(UNDO);
+    assert.equal((await mail.getSend(pending.id)).state, 'sending');
+    const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+    assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
+    assert.match(text, /^AQID\r$/m, 'the three bytes, base64');
+    const [copy] = await sentCopies(mail);
+    assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: 'parts.bin', size: 3 }]);
+  }));
+}

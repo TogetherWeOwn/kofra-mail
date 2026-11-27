@@ -90,9 +90,11 @@ export function sendFileName(name: string): string {
   const whole = name.toWellFormed();
   return isFileName(whole) ? whole : indexedAttachmentName(whole);
 }
+// A composite type (multipart/*, message/*) on a leaf part with a base64 body
+// makes parsers drop the file, so it is sent as an opaque file.
 export function sendFileType(type: string): string {
   const whole = type.toWellFormed();
-  return whole.length <= 255 && !hasHeaderControl(whole) ? whole : 'application/octet-stream';
+  return whole.length <= 255 && !hasHeaderControl(whole) && !/^\s*(?:multipart|message)\//i.test(whole) ? whole : 'application/octet-stream';
 }
 // Threading is optional: an unsafe or over-long In-Reply-To is left out, and
 // References keeps its safe ids, in order, while the unfolded value fits
