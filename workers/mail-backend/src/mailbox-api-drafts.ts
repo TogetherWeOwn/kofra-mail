@@ -72,25 +72,36 @@ async function loadDraft(index: MailboxIndex, ref: DraftObjectRef): Promise<{ dr
 
 const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
 const isText = (value: unknown): value is string => typeof value === 'string';
+// A string within `max` UTF-8 bytes, the bound the draft save path applies.
+const isBounded = (value: unknown, max: number, header = false) =>
+  isText(value) && utf8(value).byteLength <= max && !(header && hasHeaderControl(value));
 const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
 const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value);
+const isAddress = (value: unknown) => isRecord(value) && isBounded(value.email, LIMITS.addressBytes, true) &&
+  optional(value.name, name => isBounded(name, LIMITS.displayNameBytes, true));
 function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
-  if (wire.kind === 'link') return isText(wire.url);
+  if (wire.kind === 'link') return isBounded(wire.url, LIMITS.linkUrlBytes) && isBounded(wire.name, LIMITS.linkNameBytes);
   // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
   const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
   return isText(wire.type) && isCount(wire.size) &&
     optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
     (wire.kind === 'upload' ? kind === 'att' && isText(wire.uploadId) : wire.kind === 'message' && !!kind && isText(wire.messageId) && isCount(wire.part));
 }
-// The parts of a decoded draft object that release turns into MIME. The API
-// read paths keep their own answers, so only release applies this check.
+// Everything release reads from a decoded draft object, within the bounds the
+// draft save path applies; anything else is unusable for good. The API read
+// paths keep their own answers, so only release applies this check.
 export function sendableDraftObject(draft: DraftObject): boolean {
   const { fields, attachments, replyHeaders } = draft as unknown as Record<string, unknown> & { fields: Record<string, unknown> };
-  return isText(fields.subject) && isText(fields.body) &&
+  const lists = [fields.to, fields.cc, fields.bcc];
+  return isBounded(fields.from, LIMITS.addressBytes, true) && lists.every(list => Array.isArray(list) && list.every(isAddress)) &&
+    lists.reduce<number>((sum, list) => sum + (list as unknown[]).length, 0) <= LIMITS.recipientsPerMessage &&
+    isBounded(fields.subject, LIMITS.subjectBytes, true) && isBounded(fields.body, LIMITS.bodyBytes) &&
+    optional(fields.inReplyTo, isId) && optional(fields.forwardOf, isId) &&
     optional(attachments, list => Array.isArray(list) && list.every(isStoredAttachment)) &&
-    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
+    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, value => isBounded(value, LIMITS.headerValueBytes, true)) &&
+      optional(headers.references, value => isBounded(value, LIMITS.headerValueBytes, true)));
 }
 export async function readDraftObject(index: MailboxIndex, ref: DraftObjectRef): Promise<DraftObject> {
   return (await loadDraft(index, ref)).draft;
