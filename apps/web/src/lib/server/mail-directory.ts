@@ -100,10 +100,12 @@ export class Directory {
     const name = mailbox.display_name ?? '';
     const primary = await this.prep(`SELECT send_as_policy FROM addresses
       WHERE address_norm = ? AND workspace_id = ? AND target_kind = 'mailbox' AND target_id = ? AND kind = 'primary'`,
-    mailbox.primary_address, this.ws, mailboxId).first<Pick<AliasRow, 'send_as_policy'>>();
+    mailbox.primary_address, this.ws, mailboxId).first<{ send_as_policy: string }>();
     const identities: Identity[] = [];
-    if (primary?.send_as_policy === 'active' || primary?.send_as_policy === 'pending') {
-      identities.push({ email: mailbox.primary_address, name, kind: 'primary', primary: true, sendAs: primary.send_as_policy });
+    // As for aliases, a legacy policy is draftable but does not authorize sending.
+    if (primary && primary.send_as_policy !== 'off') {
+      identities.push({ email: mailbox.primary_address, name, kind: 'primary', primary: true,
+        sendAs: primary.send_as_policy === 'active' ? 'active' : 'pending' });
     }
     const aliases = (await this.aliases(mailboxId)).filter((alias) => alias.sendAs !== 'off');
     return [...identities, ...aliases.map(({ address: email, sendAs }): Identity => ({ email, name, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending' }))];
