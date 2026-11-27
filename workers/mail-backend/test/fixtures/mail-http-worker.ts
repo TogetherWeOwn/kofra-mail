@@ -201,8 +201,15 @@ export class HttpMailbox extends Mailbox {
   // Makes the barrier's work-lane wake-up throw, as a failed alarm update would.
   private wakeupFailure = false;
   failLaneWakeup(failing: boolean) { this.wakeupFailure = failing; }
+  // Holds the next barrier wake-up before it runs, until the test opens it.
+  private wakeupGate?: { entered: PromiseWithResolvers<void>; open: PromiseWithResolvers<void> };
+  gateLaneWakeup() { this.wakeupGate = { entered: Promise.withResolvers<void>(), open: Promise.withResolvers<void>() }; }
+  async laneWakeupEntered() { await this.wakeupGate?.entered.promise; }
+  openLaneWakeup() { const gate = this.wakeupGate; this.wakeupGate = undefined; gate?.open.resolve(); }
   protected override async wakeCoveredWork() {
     if (this.wakeupFailure) throw new Error('Fixture lane wake-up failure');
+    const gate = this.wakeupGate;
+    if (gate) { gate.entered.resolve(); await gate.open.promise; }
     return super.wakeCoveredWork();
   }
   // A recipient row in the state the M3-5 consumer writes while it calls the provider.
@@ -674,6 +681,9 @@ export default {
           case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
           case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
           case '/__fixture/fail-lane-wakeup': await box.failLaneWakeup(await req.text() === 'true'); break;
+          case '/__fixture/gate-lane-wakeup': await box.gateLaneWakeup(); break;
+          case '/__fixture/lane-wakeup-entered': await box.laneWakeupEntered(); break;
+          case '/__fixture/open-lane-wakeup': await box.openLaneWakeup(); break;
           case '/__fixture/set-recipient-state': {
             const { sendId, idx, state } = await req.json<{ sendId: string; idx: number; state: string }>();
             await box.setRecipientState(sendId, idx, state);

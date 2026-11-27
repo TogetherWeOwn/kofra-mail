@@ -1509,6 +1509,20 @@ test('a recipient restored as attempting is accepted and reported as pending', (
   assert.deepEqual((await mail.listSends({})).items.map(({ id }) => id), [pending.id]);
 }));
 
+test('a covered send answers 202 while the work-lane wake-up after its publish is still held', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  await h.sends.gateLaneWakeup();
+  let response: Response;
+  try {
+    const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+    await within(h.sends.laneWakeupEntered(), 10 * second, 'the wake-up');
+    // The wake-up is still held: the answer must not wait for it.
+    response = await within(answer, 10 * second, 'the covered send');
+  } finally { await h.sends.openLaneWakeup(); }
+  assert.equal(response.status, 202);
+  assert.equal((await response.json() as Send).state, 'pending');
+}));
+
 test('a covered send answers 202 even when the work-lane wake-up after its publish fails', () => withSend(async (h, mail, from) => {
   const draft = await mail.createDraft(draftInput(from), key('draft'));
   await h.sends.failLaneWakeup(true);
