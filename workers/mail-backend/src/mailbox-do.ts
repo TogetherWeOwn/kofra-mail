@@ -199,6 +199,7 @@ export class Mailbox extends DurableObject<Env> {
       afterClaimRelease: () => this.sendReleaseCheckpoint(),
       afterResultDelete: () => this.sendResultDeleteCheckpoint(),
       afterStoredSelect: () => this.sendStoredSelectCheckpoint(),
+      afterRecheckTake: () => this.sendRecheckTakeCheckpoint(),
       publishThrough: seq => this.publishThrough(seq),
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
@@ -219,6 +220,8 @@ export class Mailbox extends DurableObject<Env> {
   protected async sendResultDeleteCheckpoint(): Promise<void> {}
   // A test seam right after a poll selected its stored rows.
   protected async sendStoredSelectCheckpoint(): Promise<void> {}
+  // A test seam right after a poll took a flagged row's recheck.
+  protected async sendRecheckTakeCheckpoint(): Promise<void> {}
 
   // Holds the work lane across `io`, then runs `step` in a transaction and
   // re-arms without reading the alarm first, so `io` is the last await before

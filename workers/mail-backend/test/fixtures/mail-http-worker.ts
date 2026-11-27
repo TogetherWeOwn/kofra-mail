@@ -127,6 +127,14 @@ export class HttpMailbox extends Mailbox {
     await gate.resume.promise;
   }
   protected override async sendStoredSelectCheckpoint() { await this.gate('select'); }
+  // Fails the mailbox once right after a poll took a flagged row's recheck, before any backoff is written.
+  private crashTake = false;
+  crashAfterRecheckTake() { this.crashTake = true; }
+  protected override async sendRecheckTakeCheckpoint() {
+    if (!this.crashTake) return;
+    this.crashTake = false;
+    throw new Error('Fixture crash after the recheck take');
+  }
   protected override async sendRecordCheckpoint(fence: { attempt: number }) {
     await this.gate(`record:${fence.attempt}`);
     if (fence.attempt !== this.failRecordAttempt || this.failRecordTimes <= 0) return;
@@ -855,6 +863,7 @@ export default {
           case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
           case '/__fixture/crash-after-result-delete': await box.crashAfterResultDelete(); break;
           case '/__fixture/pause-at': await box.pauseAt(await req.text()); break;
+          case '/__fixture/crash-after-recheck-take': await box.crashAfterRecheckTake(); break;
           case '/__fixture/paused-at': await box.pausedAt(await req.text()); break;
           case '/__fixture/resume-at': await box.resumeAt(await req.text()); break;
           case '/__fixture/quota': {

@@ -1301,3 +1301,36 @@ test('a rechecked older-epoch flagged row still holds a reclaim until its notify
   assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'not_now', reason: 'results' });
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['attempting']);
 }));
+
+test('a keyed notice that loses a flagged row\'s recheck answers retry at the holder\'s lease end', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'notice-loses');
+  const { a } = await flaggedAfterRestore(h, id);
+  await h.pauseAt(`record:${a.claim.fence.attempt}`);
+  const first = h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.pausedAt(`record:${a.claim.fence.attempt}`);
+  const [held] = await h.directoryRows('SELECT notify_after FROM send_results WHERE send_id = ?', id);
+  assert.equal(held.notify_after, await h.sends.now() + 5 * minute, 'the first poll holds a five-minute lease');
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence),
+    { status: 'retry', recorded: 0, next: Number(held.notify_after) });
+  await h.resumeAt(`record:${a.claim.fence.attempt}`);
+  await first;
+}));
+
+test('a poll that stops after taking a recheck leaves the row to the next poll once the lease runs out', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'lease-expiry');
+  const { a } = await flaggedAfterRestore(h, id);
+  // Records succeed from here on (no fence has attempt 0).
+  await h.failRecordOnce(0);
+  await h.crashAfterRecheckTake();
+  const crashed = await h.sendRpcAs(MB, 'recordStoredResults', id, a.claim.fence);
+  assert.equal(crashed.status, 500);
+  await crashed.body?.cancel();
+  const [leased] = await h.directoryRows('SELECT notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.equal(leased.notify_after, await h.sends.now() + 5 * minute, 'no backoff was written, only the lease');
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id), { status: 'retry', recorded: 0, next: Number(leased.notify_after) },
+    'another poll waits for the lease');
+  await h.advance(5 * minute);
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent'], 'the next poll took the row and recorded it');
+  assert.deepEqual(await storedRows(h, id), []);
+}));

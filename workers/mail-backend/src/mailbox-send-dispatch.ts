@@ -106,6 +106,8 @@ export type DispatchPorts = {
   afterResultDelete?(): Promise<void>;
   // A test seam right after a poll selected its stored rows.
   afterStoredSelect?(): Promise<void>;
+  // A test seam right after a poll took a flagged row's recheck.
+  afterRecheckTake?(): Promise<void>;
   publishThrough(seq: number): Promise<boolean>;
   // Moves the journal lane to the settings recovery point, so every commit is published soon.
   journalDue(timers: TimerTable): void;
@@ -861,7 +863,13 @@ export class SendDispatcher {
         const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ?, notify_after = ? WHERE ${where} AND unapplied = 1
           AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR notify_after <= ?) RETURNING 1`)
           .bind(epoch, now + RECHECK_LEASE_MS, ...keys(row), epoch, now).first();
-        if (!taken) continue;
+        if (!taken) {
+          // Another poll holds this row's recheck and may still fail: retry once its lease or backoff ends.
+          const held = await db.prepare(`SELECT notify_after AS at FROM send_results WHERE ${where}`).bind(...keys(row)).first<{ at: number }>();
+          if (held) backoff = backoff === null ? held.at : Math.min(backoff, held.at);
+          continue;
+        }
+        await ports.afterRecheckTake?.();
       }
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
