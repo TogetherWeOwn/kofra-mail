@@ -3,12 +3,17 @@ import { defaultMimeBuilders, mimeBuilders, type SendMimeBuilder, type SendMimeB
 // Record raw port inputs and part reads through the real builder. Version 2
 // adds a header so the restore test can tell it apart from the frozen one.
 export const builds: { version: number; parts: number[]; types: string[]; inReplyTo?: string }[] = [];
+// The builder version of each send() request built through the port.
+export const requests: number[] = [];
 
 function recording(builder: SendMimeBuilder): SendMimeBuilder {
   return {
     version: builder.version,
     encodedSize: message => builder.encodedSize(message),
-    request: (message, parts) => builder.request(message, parts),
+    request: (message, parts) => {
+      requests.push(builder.version);
+      return builder.request(message, parts);
+    },
     async build(message, parts) {
       const read: number[] = [];
       const bytes = await builder.build(message, async index => {

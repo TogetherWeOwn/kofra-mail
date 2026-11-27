@@ -19,7 +19,7 @@ import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../sr
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
 import { SendMimeError } from '../../src/send-mime.ts';
-import { builds, fixtureBuilders } from './send-mime.ts';
+import { builds, fixtureBuilders, requests as mimeRequests } from './send-mime.ts';
 import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
 import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
@@ -282,6 +282,7 @@ export class HttpMailbox extends Mailbox {
     this.sendMime = fixtureBuilders('bumped');
   }
   mimeBuilds() { return builds; }
+  mimeRequests() { return mimeRequests; }
   async sentHeaders(workspaceId: string, messageId: string): Promise<Record<string, string>> {
     const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', messageId).toArray()[0];
     if (!row) throw new Error('Stored sent copy is missing');
@@ -916,6 +917,7 @@ export default {
           case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
           case '/__fixture/bump-builder': await box.bumpBuilder(); break;
           case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/mime-requests': return Response.json(await box.mimeRequests());
           case '/__fixture/sent-headers': return Response.json(await box.sentHeaders(ws, await req.text()));
           case '/__fixture/stall-publish': await box.stallPublish(); break;
           case '/__fixture/publish-stalled': await box.publishStalled(); break;

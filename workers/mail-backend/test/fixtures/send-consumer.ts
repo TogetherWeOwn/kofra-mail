@@ -30,13 +30,15 @@ export type EmailBehaviour =
 // One send() call, on three clocks: the consumer's, the harness's real time,
 // and the authorizing mailbox's clock at that real time.
 export type EmailCall = {
-  n: number; sendId: string; fence: SendFence | null; deadline: number | null; consumerNow: number; real: number; authClock: number;
+  // `granted`: the mailbox itself answered ok; false for a forged grant.
+  n: number; sendId: string; fence: SendFence | null; deadline: number | null; granted: boolean; consumerNow: number; real: number; authClock: number;
   to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; replyTo: string | null; headers: Record<string, string>;
   attachments: { filename: string; type: string; size: number }[];
 };
 
 class FixtureCrash extends Error { constructor() { super('Fixture consumer crashed'); } }
-type Run = { dead: boolean; auth: { fence: SendFence; deadline: number; lead: number } | null; checked?: boolean };
+// `forged`: the grant came from forgeNextAuthorization, not from the mailbox.
+type Run = { dead: boolean; auth: { fence: SendFence; deadline: number; lead: number; forged: boolean } | null; checked?: boolean };
 // `wait`: the run waits there until resumed; `crash`: the run dies there (at once, or when resumed).
 type Gate = { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void>; wait: boolean; crash: boolean; taken?: boolean };
 
@@ -148,12 +150,16 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
         sendRequest: (...args) => this.step(run, 'sendRequest', () => box.sendRequest(...args)),
         authorizeDispatch: async (...args) => {
           const t0 = this.consumerNow();
-          const lead = this.mailboxLead;
           const forged = this.forgedAuthorization;
           this.forgedAuthorization = false;
-          const answer = await this.step(run, 'authorizeDispatch', () => forged
-            ? Promise.resolve({ status: 'ok' as const, remainingMs: 10_000 }) : box.authorizeDispatch(...args));
-          if (answer.status === 'ok') run.auth = { fence: args[3], deadline: t0 + answer.remainingMs, lead };
+          // The mailbox clock's lead as of the grant, read when the answer returns (before the after: seam).
+          let lead = this.mailboxLead;
+          const answer = await this.step(run, 'authorizeDispatch', async () => {
+            const granted = forged ? { status: 'ok' as const, remainingMs: 10_000 } : await box.authorizeDispatch(...args);
+            lead = this.mailboxLead;
+            return granted;
+          });
+          if (answer.status === 'ok') run.auth = { fence: args[3], deadline: t0 + answer.remainingMs, lead, forged };
           return answer;
         },
         recordResult: (...args) => this.step(run, 'recordResult', () => {
@@ -197,7 +203,8 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
       const auth = run.auth;
       const { attachments = [], headers = {}, replyTo, subject, text } = request as SendRequest & { text?: string; subject?: string };
       this.calls.push({
-        n: this.calls.length + 1, sendId: message.sendId, fence: auth?.fence ?? null, deadline: auth?.deadline ?? null, consumerNow: this.consumerNow(),
+        n: this.calls.length + 1, sendId: message.sendId, fence: auth?.fence ?? null, deadline: auth?.deadline ?? null, granted: !!auth && !auth.forged,
+        consumerNow: this.consumerNow(),
         real, authClock: real + (auth?.lead ?? this.mailboxLead), to: addresses(request.to), cc: addresses(request.cc), bcc: addresses(request.bcc),
         subject: subject ?? '', text: text ?? '', replyTo: replyTo === undefined ? null : address(replyTo), headers: { ...headers },
         attachments: attachments.map(({ filename, type, content }) => ({ filename, type: type ?? '',

@@ -326,6 +326,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       failNextEpilogue: () => controlAction('fail-next-epilogue'),
       bumpBuilder: () => controlAction('bump-builder'),
       builds: () => readControl<{ version: number; parts: number[]; types: string[]; inReplyTo?: string }[]>('mime-builds'),
+      // The builder version of each send() request built through the MIME builder port.
+      requests: () => readControl<number[]>('mime-requests'),
       shortHandlerBudget: () => controlAction('short-handler-budget'),
       row: (id: string) => readControl<{ id: string; state: string; undo_until: number; created_seq: number; release_seq: number | null;
         queued_seq: number | null; terminal_seq: number | null; message_id: string | null; reason: string | null; finish_pending: number;

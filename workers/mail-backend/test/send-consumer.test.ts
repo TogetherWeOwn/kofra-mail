@@ -25,9 +25,11 @@ const draftInput = (from: string, patch: Partial<DraftInput> = {}): DraftInput =
 
 // Across all of these (plan, M3-5 "Dispatch fencing"): no EMAIL call starts
 // after its authorization deadline or under a fence whose lease_until has passed.
-async function checkFencing(h: Fixture) {
+// `forged`: how many calls a test deliberately made under a grant the mailbox never gave.
+async function checkFencing(h: Fixture, forged: number) {
   const calls = await h.consumer<EmailCall[]>('emailCalls');
   const states = new Map<string, SendStateView>();
+  assert.equal(calls.filter(call => !call.granted).length, forged, 'every EMAIL call follows a grant from the mailbox, except the deliberate forgeries');
   for (const call of calls) {
     assert.ok(call.fence && call.deadline !== null, `EMAIL call ${call.n} started without an authorization`);
     assert.ok(call.consumerNow < call.deadline, `EMAIL call ${call.n} started at ${call.consumerNow}, not before its deadline ${call.deadline}`);
@@ -39,14 +41,14 @@ async function checkFencing(h: Fixture) {
   }
 }
 
-async function withConsumer(run: (h: Fixture, mail: MailService, from: string) => Promise<void>) {
+async function withConsumer(run: (h: Fixture, mail: MailService, from: string) => Promise<void>, { forged = 0 } = {}) {
   const fixture = await startMailHttpFixture({ send: true });
   try {
     const mail = fixture.as('member');
     const { mailbox } = await mail.getSession();
     assert.ok(mailbox);
     await run(fixture, mail, mailbox.primaryAddress);
-    await checkFencing(fixture);
+    await checkFencing(fixture, forged);
   } finally { await fixture.close(); }
 }
 
@@ -853,9 +855,10 @@ test('the sendRequest answer is checked again after its reads: a fence that expi
   const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
   const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
   const pending = h.sendRpc<{ status: string }>('sendRequest', id, claim.fence);
-  await read.started;
-  await until(h, leaseUntil);
-  read.release();
+  // A request that returns before reading the draft fails at once instead of waiting for the read.
+  await Promise.race([read.started, pending.then(answer => assert.fail(`answered before its read: ${JSON.stringify(answer)}`))]);
+  try { await until(h, leaseUntil); }
+  finally { read.release(); }
   assert.deepEqual(await pending, { status: 'stale' }, 'the in-flight request answers stale once its lease ran out');
   assert.deepEqual(await h.sendRpc('sendRequest', id, claim.fence), { status: 'stale' }, 'as a fresh one does');
 }));
@@ -885,28 +888,90 @@ test('a request the frozen inputs can no longer build is abandoned with the long
   assert.equal((await calls(h)).length, 0);
 }));
 
-test('slow request builds that outlive the lease never count toward the crash-loop hold, and the next normal attempt sends', () => withConsumer(async (h, mail, from) => {
-  const id = await queued(h, mail, from, 'slow-builds');
+// One request build that outlives its lease (the draft read is held until the lease ends).
+// `dies`: the consumer dies right after the stale answer, so the attempt has no report.
+async function slowBuild(h: Fixture, id: string, dies: boolean, label: string) {
   const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
+  const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
+  if (dies) await crashAt(h, 'after:sendRequest');
+  const run = consume(h, id);
+  // A held send never reaches the request: fail at once instead of waiting for its read.
+  await Promise.race([read.started, run.then(outcome => assert.fail(`${label}: no request was built, the claim answered ${JSON.stringify(outcome)}`))]);
+  const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
+  try { await until(h, leaseUntil); }
+  finally { read.release(); }
+  assert.equal(step(await run), dies ? 'crashed:abandoned' : 'abandoned', label);
+  return leaseUntil;
+}
+
+test('slow request builds with a live consumer are reported by abandonClaim: never counted, never held, and the next normal attempt sends', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'slow-alive');
   for (let round = 0; round < 6; round++) {
-    const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
-    // The consumer dies right after the stale answer, before its own abandonClaim: only the claim can tidy up.
-    await crashAt(h, 'after:sendRequest');
-    const run = consume(h, id);
-    // A held send never reaches the request: fail at once instead of waiting for its read.
-    await Promise.race([read.started, run.then(outcome => assert.fail(`round ${round}: no request was built, the claim answered ${JSON.stringify(outcome)}`))]);
-    const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
-    await until(h, leaseUntil);
-    read.release();
-    assert.equal(step(await run), 'crashed:abandoned', `round ${round}`);
-    await until(h, leaseUntil + SKEW);
+    await slowBuild(h, id, false, `round ${round}`);
+    await until(h, Number((await h.sendState(id)).dispatch?.next_attempt_at));
   }
   const state = await h.sendState(id);
   assert.equal(state.dispatch?.held_at, null, 'never held');
-  assert.equal(state.dispatch?.unfinished, 0, 'no never-authorized fence counted as unfinished');
-  assert.equal((await calls(h)).length, 0);
+  assert.equal(state.dispatch?.unfinished, 0, 'a reported attempt is never unfinished');
   assert.equal(step(await consume(h, id)), 'recorded');
-  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
+}));
+
+test('slow request builds whose consumer dies before reporting count as unfinished: the send is held after five', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'slow-dies');
+  for (let round = 0; round < 5; round++) {
+    const leaseUntil = await slowBuild(h, id, true, `round ${round}`);
+    await until(h, leaseUntil + SKEW);
+  }
+  assert.deepEqual(await consume(h, id), { ack: true, step: 'not_now' });
+  const state = await h.sendState(id);
+  assert.ok(state.dispatch?.held_at, 'held after five unreported expiries (plan section 2.4, crash-loop cap)');
+  assert.equal((await calls(h)).length, 0);
+}));
+
+test('an abandon never resets the crash streak: authorized expiries alternating with stale-request abandons hold the send after five', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'mixed-streak');
+  for (let round = 0; round < 5; round++) {
+    // An accepted call whose consumer dies before recordResult: an unfinished authorized attempt.
+    await crashAt(h, 'before:recordResult');
+    const lost = await consume(h, id);
+    assert.equal(step(lost), 'crashed:store_failed', `round ${round}`);
+    await until(h, await leaseOf(h, id, lost) + SKEW);
+    if (round === 4) break;
+    // A live consumer whose request build outlives the lease reports with abandonClaim.
+    await slowBuild(h, id, false, `abandon ${round}`);
+    await until(h, Number((await h.sendState(id)).dispatch?.next_attempt_at));
+  }
+  assert.deepEqual(await consume(h, id), { ack: true, step: 'not_now' }, 'held: no sixth call');
+  const state = await h.sendState(id);
+  assert.ok(state.dispatch?.held_at, 'held after five unfinished authorized attempts, whatever abandons sat between them');
+  assert.equal((await calls(h)).length, 5);
+}));
+
+test('a gate delay never resets the crash streak either: authorized expiries alternating with quota waits hold the send after five', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'gate-streak');
+  for (let round = 0; round < 5; round++) {
+    await crashAt(h, 'before:recordResult');
+    const lost = await consume(h, id);
+    assert.equal(step(lost), 'crashed:store_failed', `round ${round}`);
+    await until(h, await leaseOf(h, id, lost) + SKEW);
+    if (round === 4) break;
+    // Our own gate is closed: delaySend('gate') before any send() under the new fence.
+    await h.quota('setExhausted', true);
+    assert.equal(step(await consume(h, id)), 'delayed', `gate ${round}`);
+    await h.quota('setExhausted', false);
+    await nextDay(h);
+    await until(h, Number((await h.sendState(id)).dispatch?.delayed_until));
+  }
+  assert.deepEqual(await consume(h, id), { ack: true, step: 'not_now' }, 'held: no sixth call');
+  assert.ok((await h.sendState(id)).dispatch?.held_at, 'held after five unfinished authorized attempts, whatever gate waits sat between them');
+  assert.equal((await calls(h)).length, 5);
+}));
+
+test('the send() request is built with the send\'s frozen builder version, not the current one', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'frozen-builder');
+  await h.sends.bumpBuilder();
+  assert.equal(step(await consume(h, id)), 'recorded');
+  assert.deepEqual(await h.sends.requests(), [1], 'the request used version 1, as the sent copy did');
 }));
 
 test('a stale request answer abandons the claim at once: the recipients go back to pending and the fence\'s charge is released', () => withConsumer(async (h, mail, from) => {
@@ -914,10 +979,9 @@ test('a stale request answer abandons the claim at once: the recipients go back 
   const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
   const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
   const run = consume(h, id);
-  await read.started;
-  const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
-  await until(h, leaseUntil);
-  read.release();
+  await Promise.race([read.started, run.then(outcome => assert.fail(`no request was built: ${JSON.stringify(outcome)}`))]);
+  try { await until(h, (await h.sendState(id)).fences.at(-1)!.lease_until); }
+  finally { read.release(); }
   const outcome = await run;
   assert.deepEqual(outcome, { ack: true, step: 'abandoned', fence: fenceOf(outcome), cause: 'request_stale' });
   const state = await h.sendState(id);
@@ -935,6 +999,7 @@ test('a stored acceptance the mailbox answers stale is kept and flagged on repla
   await h.consumer('forgeNextAuthorization');
   const stale = await consume(h, staleId);
   assert.equal(step(stale), 'stored', 'a stale acceptance is stored, never dropped');
+  assert.deepEqual((await calls(h)).map(call => call.granted), [false], 'the one forged grant, which the harness check expects');
   const staleFence = fenceOf(stale);
   const replay = await h.sendRpc<{ status: string; recorded: number }>('recordStoredResults', staleId, staleFence);
   assert.deepEqual({ status: replay.status, recorded: replay.recorded }, { status: 'retry', recorded: 0 }, 'not recorded: the row backs off');
@@ -953,4 +1018,4 @@ test('a stored acceptance the mailbox answers stale is kept and flagged on repla
   assert.deepEqual(await h.sendRpc('recordStoredResults', missing, goneFence), { status: 'recorded', recorded: 1 });
   assert.deepEqual(await h.directoryRows('SELECT 1 FROM send_results WHERE send_id = ?', missing), [], 'deleted');
   assert.equal(logged(h, 'send_result_orphan').length, 1, 'and counted as an orphan');
-}));
+}, { forged: 1 }));

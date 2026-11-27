@@ -418,11 +418,9 @@ export class SendDispatcher {
         return { status: 'refused' };
       }
       const expired = m.externals().filter(entry => entry.state === 'attempting');
-      // Crash-loop cap: a fence whose lease expired with recipients attempting and no report, and
-      // whose call may have reached the provider (an authorization recorded, or an older epoch).
-      // A never-authorized fence of this epoch cannot have called send(): it never counts.
-      const unfinished = new Set(expired.map(entry => m.attemptingFence(entry.idx))
-        .filter(fence => fence && fence.outcome === null && (fence.authorized || fence.epoch < ctx.epoch)).map(fence => fenceKey(fence!)));
+      // Crash-loop cap: a fence whose lease expired with recipients attempting and no report.
+      const unfinished = new Set(expired.map(entry => m.attemptingFence(entry.idx)).filter(fence => fence && fence.outcome === null)
+        .map(fence => fenceKey(fence!)));
       m.d.unfinished += unfinished.size;
       if (m.d.unfinished >= CRASH_CAP) {
         // Held, not resumed: charges of never-authorized fences of this epoch still go (the drive row releases them).
@@ -764,7 +762,8 @@ export class SendDispatcher {
       reset = await quota.resetAt();
     }
     const until = reset + ports.clockSkewMs;
-    const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
+    // Only the provider's daily-limit answer to a call is a definitive provider outcome that ends the crash streak.
+    const answer = await ports.local(timers => this.report(id, fence, timers, cause === 'provider_daily', (m, ctx) => {
       m.state = 'delayed';
       m.d.delayedUntil = Math.max(until, ctx.now);
       return { outcome: 'delayed', driveAt: m.d.delayedUntil };
@@ -779,7 +778,8 @@ export class SendDispatcher {
     const { ports } = this;
     if (!validFence(fence) || !Number.isSafeInteger(retryAt)) throw new Error('Invalid send abandon');
     if (!await this.readyFor(scope)) return { status: 'restoring' };
-    const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
+    // An abandon proves only that this attempt did not send: the crash streak stands.
+    const answer = await ports.local(timers => this.report(id, fence, timers, false, (m, ctx) => {
       const next = Math.min(ctx.now + ABANDON_MAX_MS, Math.max(ctx.now + ABANDON_MIN_MS, retryAt));
       m.d.nextAttemptAt = next;
       return { outcome: 'abandoned', driveAt: next };
@@ -791,7 +791,9 @@ export class SendDispatcher {
 
   // delaySend and abandonClaim: only the current fence changes anything. Its
   // recipients return to pending, the lease ends, and its charge is released.
-  private report(id: string, fence: SendFence, timers: TimerTable,
+  // `resetStreak`: a definitive provider outcome for this fence, which ends the
+  // run of unfinished attempts; an abandon or our own gate never does.
+  private report(id: string, fence: SendFence, timers: TimerTable, resetStreak: boolean,
     change: (m: SendModel, ctx: Ctx) => { outcome: SendFenceOutcome; driveAt: number }): { status: 'done'; at: number } | AbandonAnswer {
     const ready = this.ports.current();
     if (!ready) return { status: 'restoring' };
@@ -805,7 +807,7 @@ export class SendDispatcher {
     m.putFence({ ...row, outcome });
     m.addRelease(fence);
     m.endLease();
-    m.d.unfinished = 0;
+    if (resetStreak) m.d.unfinished = 0;
     this.commit(m, ready, timers, driveAt, true);
     return { status: 'done', at: driveAt };
   }
