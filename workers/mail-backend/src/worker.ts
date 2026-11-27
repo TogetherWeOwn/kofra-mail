@@ -9,6 +9,7 @@ import { kofra, type KofraConfig } from './kofra.ts';
 import { MailAlerts } from './mail-alerts.ts';
 import { Outbox } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
+import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
 
 export type ObjectReferences = {
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
@@ -40,7 +41,8 @@ export type Env = KofraConfig & {
   MAIL_SEND_ENABLED?: string;
   // The bound on clock differences of the send path, in seconds (default 30).
   MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
-  SEND?: { send(message: SendDispatch): Promise<unknown> };
+  MAIL_ENVIRONMENT?: string;
+  SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;
@@ -109,13 +111,19 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
   }
 }
 
-export async function handleScheduled(_event: ScheduledController, env: Env): Promise<void> {
+export async function handleScheduled(event: ScheduledController, env: Env): Promise<void> {
   if (!enabled(env)) return;
   queueNames(env);
-  const result = await reconcile({
-    outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now: Date.now,
-    send: async id => { await env.DELIVER.send(id); }, alert: mailAlert(env.ALERTS),
-  });
+  const outbound = env.MAIL_SEND_ENABLED === 'on' && env.SEND?.sendBatch
+    ? reconcileSendResults(env.DIRECTORY, { sendBatch: env.SEND.sendBatch.bind(env.SEND) }, event.scheduledTime)
+      .catch(() => console.error({ code: 'send_result_reconcile_failed' }))
+    : undefined;
+  const alert = mailAlert(env.ALERTS);
+  const now = Number.isFinite(event.scheduledTime) ? () => event.scheduledTime : Date.now;
+  const [result] = await Promise.all([reconcile({
+    outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now,
+    send: async id => { await env.DELIVER.send(id); }, alert, sendAlert: alert,
+  }), outbound]);
   if (result.enqueueErrors || result.alertErrors) console.error({ code: 'mail_reconcile_partial', ...result });
 }
 

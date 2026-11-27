@@ -122,10 +122,11 @@ interface FixtureOptions {
   inlineCids?: boolean;
   // The send path (M3-3) with fake SEND and EMAIL bindings and manual alarms.
   send?: boolean;
+  configureWorkers?: (backend: WorkerOptions, workers: WorkerOptions[]) => void;
 }
 
 export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
-  send = false }: FixtureOptions = {}) {
+  send = false, configureWorkers }: FixtureOptions = {}) {
   const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
@@ -248,6 +249,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       },
     });
   }
+  configureWorkers?.(backend, workers);
   // The send path's structured log events (alert codes and metrics), recorded for assertions.
   const logs: string[] = [];
   const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send) && {
@@ -498,6 +500,13 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       resumeEnqueue: () => controlAction('resume-enqueue'),
       restoreAfter: async (ms: number) => { await controlAction('restore-after', String(ms)); now += ms; },
       m3: send, credentialEpoch: async () => 1,
+      worker: (name: string) => mf.getWorker(name),
+      queue: (binding: string, name: string) => mf.getQueueProducer(binding, name),
+      beginRestore: (principal: 'member' | 'other' = 'member') => controlAction('begin-restore', principal),
+      failClaims: (count: number) => controlAction('fail-claims', String(count)),
+      failedClaims: () => readControl<number>('failed-claims'),
+      backendCron: () => controlAction('backend-cron'),
+      sendEvent: (code: string, principal: 'member' | 'other' = 'member') => controlAction('send-event', JSON.stringify({ code, principal })),
       contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
       sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId), close: () => mf.dispose() };

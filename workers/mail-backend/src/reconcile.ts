@@ -1,15 +1,17 @@
 import type { Alert } from './deliver.ts';
 import type { MailAlerts } from './mail-alerts.ts';
 import { STUCK_RETRIES, type Outbox } from './outbox.ts';
+import type { DailySendAlert } from './send-alert-events.ts';
 
 export const RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
 type ReconcilePorts = {
   outbox: Pick<Outbox, 'due' | 'reserve' | 'alertDue' | 'alerted'>;
-  mailAlerts?: Pick<MailAlerts, 'pending' | 'sent' | 'deferred' | 'prune' | 'recordFailed' | 'recordStuck'>;
+  mailAlerts?: Pick<MailAlerts, 'pending' | 'reserveSend' | 'sent' | 'deferred' | 'prune' | 'recordFailed' | 'recordStuck'>;
   now(): number;
   send(id: string): Promise<void>;
   alert: Alert;
+  sendAlert?(event: DailySendAlert): Promise<void>;
 };
 
 export async function reconcile(ports: ReconcilePorts): Promise<{ enqueueErrors: number; alertErrors: number }> {
@@ -37,9 +39,15 @@ export async function reconcile(ports: ReconcilePorts): Promise<{ enqueueErrors:
     await outbox.alerted(id, redrives, now);
   }
   if (mailAlerts) {
-    for (const { key, event } of await mailAlerts.pending()) {
-      try { await ports.alert(event); }
-      catch { alertErrors++; await mailAlerts.deferred(key, ports.now()); continue; }
+    for (const { key, event } of await mailAlerts.pending(now)) {
+      if ('environment' in event) {
+        if (!ports.sendAlert || !await mailAlerts.reserveSend(key, now)) continue;
+        try { await ports.sendAlert(event); }
+        catch { alertErrors++; continue; } // The reservation rotates the failed attempt.
+      } else {
+        try { await ports.alert(event); }
+        catch { alertErrors++; await mailAlerts.deferred(key, ports.now()); continue; }
+      }
       await mailAlerts.sent(key, ports.now());
     }
     await mailAlerts.prune(now - RETENTION_MS);

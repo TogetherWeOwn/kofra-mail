@@ -1,5 +1,6 @@
 import type { AlertEvent } from './deliver.ts';
 import { isDeliveryId } from './outbox.ts';
+import { dailySendAlert, dailySendAlertKey, type DailySendAlert, type SendEventCode } from './send-alert-events.ts';
 
 const DLQ_PREFIX = 'delivery_dlq:';
 const FAILED_PREFIX = 'delivery_failed:';
@@ -36,17 +37,33 @@ export class MailAlerts {
       .bind(key, 'mail:delivery_dlq', now).run();
   }
 
-  async pending(): Promise<Array<{ key: string; event: AlertEvent }>> {
-    // The timestamp range gives SQLite an indexed seek even on an empty table.
+  async recordSend(environment: string, code: SendEventCode, now: number): Promise<void> {
+    await this.db.prepare('INSERT OR IGNORE INTO mail_alerts (key, source, created_at) VALUES (?, ?, ?)')
+      .bind(dailySendAlertKey(environment, code, now), `mail:${code}`, now).run();
+  }
+
+  async pending(now: number): Promise<Array<{ key: string; event: AlertEvent | DailySendAlert }>> {
+    // One indexed range scan of the unsent outbox, also when the range is empty.
     const { results } = await this.db.withSession('first-primary').prepare(`SELECT key FROM mail_alerts
-      WHERE sent_at IS NULL AND created_at >= 0 ORDER BY created_at, key LIMIT ?`).bind(ALERT_PAGE).all<{ key: string }>();
-    return results.map(({ key }) => {
+      WHERE sent_at IS NULL AND created_at BETWEEN 0 AND ? ORDER BY created_at, key LIMIT ?`).bind(now, ALERT_PAGE).all<{ key: string }>();
+    return results.flatMap<{ key: string; event: AlertEvent | DailySendAlert }>(({ key }) => {
+      const send = dailySendAlert(key);
+      if (send) return [{ key, event: send }];
+      if (key.startsWith('send-event:')) return [];
       const prefix = [FAILED_PREFIX, STUCK_PREFIX, DLQ_PREFIX].find(p => key.startsWith(p)) ?? DLQ_PREFIX;
       const code = prefix === FAILED_PREFIX ? 'delivery_failed' : prefix === STUCK_PREFIX ? 'delivery_stuck' : 'delivery_dlq';
       const [id, generation] = key.slice(prefix.length).split(':');
       const occurrence = generation && /^[1-9][0-9]{0,8}$/.test(generation) ? Number(generation) : undefined;
-      return { key, event: { code, deliveryId: isDeliveryId(id) ? id : undefined, ...(occurrence ? { occurrence } : {}) } };
+      return [{ key, event: { code, deliveryId: isDeliveryId(id) ? id : undefined, ...(occurrence ? { occurrence } : {}) } }];
     });
+  }
+
+  // Concurrent cron ticks must not both take the same send alert. A lost
+  // acknowledgement can still redeliver it with the same endpoint key.
+  async reserveSend(key: string, now: number): Promise<boolean> {
+    const row = await this.db.prepare(`UPDATE mail_alerts SET created_at = ?
+      WHERE key = ? AND sent_at IS NULL AND created_at <= ? RETURNING key`).bind(now + 60_000, key, now).first();
+    return row !== null;
   }
 
   // A rejected alert moves behind the others, so one the receiver keeps refusing

@@ -1,9 +1,12 @@
+import { sha256 } from './bytes.ts';
 import type { AlertEvent } from './deliver.ts';
+import { sendEventTitle, type DailySendAlert } from './send-alert-events.ts';
 
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
-  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant' | 'send_held' | 'send_result_unapplied' | 'send_result_stuck';
+  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
+type SendAlert = DailySendAlert | { code: 'send_dlq'; environment: string; time: number; occurrence: string };
 
 const TITLE: Record<Event['code'], string> = {
   delivery_dlq: 'Mail delivery dead-lettered',
@@ -16,19 +19,26 @@ const TITLE: Record<Event['code'], string> = {
   holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
   holder_source_lost: 'A mailbox source object is missing',
   send_invariant: 'A send is held after a release invariant failed',
-  send_held: 'A send is held after repeated unfinished attempts',
-  send_result_unapplied: 'A stored provider acceptance cannot be recorded',
-  send_result_stuck: 'A stored provider result keeps failing to record',
 };
 
 export function mailAlert(binding?: AlertBinding) {
-  return async (event: Event): Promise<void> => {
+  return async (event: Event | SendAlert): Promise<void> => {
     if (!binding) throw new Error('Mail alert binding missing');
-    const key = 'key' in event ? event.key
-      : event.deliveryId ? (event.occurrence ? `${event.deliveryId}:${event.occurrence}` : event.deliveryId) : 'invalid-delivery';
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const source = `mail:${event.code}`;
+    let body: Record<string, string | number>;
+    if ('environment' in event) {
+      const key = await sha256(new Uint8Array(new TextEncoder().encode(event.occurrence)));
+      headers['idempotency-key'] = key;
+      body = { source, key, title: event.code === 'send_dlq' ? 'Outbound mail queue message dead-lettered' : sendEventTitle(event.code),
+        environment: event.environment, count: 1, time: event.time };
+    } else {
+      const key = 'key' in event ? event.key
+        : event.deliveryId ? (event.occurrence ? `${event.deliveryId}:${event.occurrence}` : event.deliveryId) : 'invalid-delivery';
+      body = { source, key, title: TITLE[event.code] };
+    }
     const response = await binding.fetch('https://alerts.internal/v1/alert', {
-      method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ source: `mail:${event.code}`, key, title: TITLE[event.code] }),
+      method: 'POST', redirect: 'manual', headers, body: JSON.stringify(body),
     });
     // Do not read or log a response from the alert service.
     void response.body?.cancel().catch(() => {});

@@ -8,6 +8,10 @@
 import type { MailboxIndex } from './mailbox-index.ts';
 import { fenceBefore, fenceKey, sameFence, validFence, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
 import { senderActive } from './mailbox-send-sender.ts';
+import { SendStalls } from './mailbox-send-stalls.ts';
+import type { SendEventCode } from './send-alert-events.ts';
+import { NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS, RESTORING_NOTICE_MS } from './send-result-backoff.ts';
+export { NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS, RESTORING_NOTICE_MS } from './send-result-backoff.ts';
 import {
   dispatchRow, fenceRows, ledger, markRows, releaseList, SEND_DRIVE, sendRow, sentCopyId, TERMINAL, validErrorCode, validProviderId, validReason,
   validSendId,
@@ -39,10 +43,6 @@ export const ABANDON_MAX_MS = 60 * 60_000;
 // Unfinished attempts in a row that hold a send, and how often a held send's drive row fires.
 export const CRASH_CAP = 5;
 export const HOLD_RECHECK_MS = 24 * 60 * 60_000;
-// A stored result found while the mailbox restores waits at least this long.
-export const RESTORING_NOTICE_MS = 5 * 60_000;
-export const NOTICE_BACKOFF_MS = 60_000;
-export const NOTICE_BACKOFF_MAX_MS = 60 * 60_000;
 const STORED_PAGE = 16;
 // Failed attempts (about 4 hours of backoff) after which an applicable stored row raises an alert.
 export const STUCK_FAILURES = 8;
@@ -116,6 +116,7 @@ export type DispatchPorts = {
   journalDue(timers: TimerTable): void;
   directory: DirectoryDatabase;
   quota(): QuotaPort | undefined;
+  alert?(code: SendEventCode): Promise<void>;
   // The structured send() request for these recipients from the send's frozen
   // inputs; null when they can no longer build it.
   buildRequest(record: SendRecord, recipients: number[]): Promise<SendRequest | null>;
@@ -332,7 +333,17 @@ function checkRecipients(value: unknown): asserts value is number[] {
 }
 
 export class SendDispatcher {
-  constructor(private readonly ports: DispatchPorts) {}
+  private readonly stalls: SendStalls;
+  constructor(private readonly ports: DispatchPorts) { this.stalls = new SendStalls(ports.sql); }
+
+  private async alert(code: SendEventCode): Promise<void> {
+    console.error({ code });
+    await this.ports.alert?.(code);
+  }
+
+  private expirePreMark(id: string, now: number, timers: TimerTable): void {
+    if (this.ports.sending && this.stalls.expire(id, now)) this.ports.journalDue(timers);
+  }
 
   private ctx(ready: Ready): Ctx {
     return { now: this.ports.now(), epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
@@ -349,6 +360,7 @@ export class SendDispatcher {
     const event = m.event();
     if (event) {
       ready.index.commitEvents([event]);
+      if (m.terminal) this.stalls.clear(m.row.id);
       this.ports.journalDue(timers);
     }
     if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, Math.max(1, driveAt));
@@ -417,6 +429,7 @@ export class SendDispatcher {
         this.commit(m, ready, timers, grace(m, 'invalid_sender', ctx), true);
         return { status: 'refused' };
       }
+      this.expirePreMark(id, ctx.now, timers);
       const expired = m.externals().filter(entry => entry.state === 'attempting');
       // Crash-loop cap: a fence whose lease expired with recipients attempting and no report.
       const unfinished = new Set(expired.map(entry => m.attemptingFence(entry.idx)).filter(fence => fence && fence.outcome === null)
@@ -452,6 +465,7 @@ export class SendDispatcher {
       const fence = { epoch: ctx.epoch, attempt: m.d.attempt + 1 };
       if (m.fence(fence)) throw new Error('Send fence reused');
       const leaseUntil = ctx.now + LEASE_MS;
+      this.stalls.claim(id, ctx.now, leaseUntil + ctx.skew);
       m.putFence({ ...fence, leaseUntil, marked: false, authorized: false, outcome: null });
       Object.assign(m.d, { attempt: fence.attempt, leaseEpoch: fence.epoch, leaseAttempt: fence.attempt, leaseUntil, delayedUntil: null });
       m.state = 'sending';
@@ -488,8 +502,8 @@ export class SendDispatcher {
       const quota = this.ports.quota();
       if (!quota) throw new Error('Send quota binding missing');
       await quota.release({ ...scope, sendId: id }, fences);
-    } catch (error) {
-      console.error({ code: 'send_quota_release', error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      await this.alert('send_quota_release');
       return false;
     }
     await this.ports.afterClaimRelease?.();
@@ -523,6 +537,7 @@ export class SendDispatcher {
         m.setRecipient(idx, 'attempting');
         m.putMark({ ...fence, idx, outcome: null, providerId: null });
       }
+      this.stalls.mark(id, ctx.now);
       m.putFence({ ...current, marked: true, leaseUntil });
       m.d.leaseUntil = leaseUntil;
       // Only the fences the consumer's quota call released leave the list.
@@ -572,7 +587,7 @@ export class SendDispatcher {
     if (!before) return { status: 'stale' };
     const request = await ports.buildRequest(before.record, before.recipients);
     if (!request) {
-      console.error({ code: 'send_request_invalid' });
+      await this.alert('send_request_invalid');
       return { status: 'invalid' };
     }
     // The reads took time: the answer holds only if the fence and its Mark set are unchanged now.
@@ -639,6 +654,7 @@ export class SendDispatcher {
     checkResult(result);
     if (!await this.readyFor(scope)) return { status: 'restoring' };
     await ports.beforeRecord?.(fence);
+    const alerts: SendEventCode[] = [];
     const outcome = await ports.local((timers): ReportAnswer | { seq: number; refused?: true } => {
       const ready = ports.current();
       if (!ready) return { status: 'restoring' };
@@ -688,7 +704,7 @@ export class SendDispatcher {
           next = m.d.nextAttemptAt = ctx.now + wait;
           // Only time the provider caused counts toward the deadline; our outages never do.
           if (result.kind === 'try_later') m.d.providerWait += wait;
-          else console.error({ code: 'send_outage', provider: result.code });
+          else alerts.push('send_outage');
           // Refused by the provider, in the same commit: the release survives a failed quota call.
           m.addRelease(fence);
           refused = true;
@@ -701,7 +717,7 @@ export class SendDispatcher {
           m.d.providerWait += AMBIGUOUS_BACKOFF_MS;
           m.d.refusals = m.d.outages = 0;
           metric('send_ambiguous_retry');
-          if (result.code !== undefined && result.code !== 'timeout') console.error({ code: 'send_unknown_error', provider: result.code });
+          if (result.code !== undefined && result.code !== 'timeout') alerts.push('send_unknown_error');
           break;
       }
       m.putFence({ ...row, outcome: result.kind });
@@ -709,12 +725,13 @@ export class SendDispatcher {
       m.d.unfinished = 0;
       let driveAt = next ?? ctx.now;
       if (m.d.ambiguous >= AMBIGUOUS_CAP || m.d.providerWait >= DEADLINE_MS) {
-        console.error({ code: m.d.ambiguous >= AMBIGUOUS_CAP ? 'send_ambiguous_cap' : 'send_deadline' });
+        alerts.push(m.d.ambiguous >= AMBIGUOUS_CAP ? 'send_ambiguous_cap' : 'send_deadline');
         driveAt = grace(m, 'delivery_error', ctx) ?? ctx.now;
       } else if (m.allTerminal()) driveAt = finish(m, ctx);
       return { seq: this.commit(m, ready, timers, driveAt, true) || ready.index.journal.revision(), ...(refused && { refused: true as const }) };
     });
     if ('status' in outcome) return outcome;
+    for (const code of alerts) await this.alert(code);
     if (outcome.refused) await this.releaseNow(scope, id, fence);
     return await ports.publishThrough(outcome.seq) ? { status: 'recorded' } : { status: 'unpublished' };
   }
@@ -757,9 +774,14 @@ export class SendDispatcher {
     if (!await this.readyFor(scope)) return { status: 'restoring' };
     let reset = resetAt;
     if (reset === undefined) {
-      const quota = ports.quota();
-      if (!quota) throw new Error('Send quota binding missing');
-      reset = await quota.resetAt();
+      try {
+        const quota = ports.quota();
+        if (!quota) throw new Error('Send quota binding missing');
+        reset = await quota.resetAt();
+      } catch (error) {
+        await this.alert('send_quota_failed');
+        throw error;
+      }
     }
     const until = reset + ports.clockSkewMs;
     // Only the provider's daily-limit answer to a call is a definitive provider outcome that ends the crash streak.
@@ -804,6 +826,8 @@ export class SendDispatcher {
     if (m.finished || fence.epoch !== ctx.epoch || !sameFence(m.lease(), fence) || !row || row.outcome !== null) return { status: 'stale' };
     for (const { idx } of m.markSet(fence)) if (m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence)) m.setRecipient(idx, 'pending');
     const { outcome, driveAt } = change(m, ctx);
+    this.expirePreMark(id, ctx.now, timers);
+    this.stalls.release(id, ctx.now, outcome === 'delayed' ? driveAt : undefined);
     m.putFence({ ...row, outcome });
     m.addRelease(fence);
     m.endLease();
@@ -825,8 +849,8 @@ export class SendDispatcher {
     try {
       const { status, next } = await this.recordStored(scope, id);
       return { settled: status === 'none' || status === 'recorded', next: next ?? null };
-    } catch (error) {
-      console.error({ code: 'send_result_lookup', error: error instanceof Error ? error.message : String(error) });
+    } catch {
+      console.error({ code: 'send_result_lookup' });
       return { settled: false, next: null };
     }
   }
@@ -933,8 +957,8 @@ export class SendDispatcher {
       }
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
-      catch (error) {
-        console.error({ code: 'send_result_record', error: error instanceof Error ? error.message : String(error) });
+      catch {
+        console.error({ code: 'send_result_record' });
         answer = 'error';
       }
       if (answer === 'restoring') {
@@ -962,8 +986,8 @@ export class SendDispatcher {
             const quota = ports.quota();
             if (!quota) throw new Error('Send quota binding missing');
             await quota.release({ ...scope, sendId: id }, [{ epoch: row.epoch, attempt: row.attempt }]);
-          } catch (error) {
-            console.error({ code: 'send_stale_release_failed', error: error instanceof Error ? error.message : String(error) });
+          } catch {
+            await this.alert('send_stale_release_failed');
           }
         }
         // The alert goes first: a crash after the delete cannot leave it active.
@@ -1023,6 +1047,8 @@ export class SendDispatcher {
     const m = new SendModel(this.ports.sql, row);
     const r: Ready = { ...ready, index };
     const ctx: Ctx = { now, epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
+    if (this.ports.sending && m.state === 'queued' && m.openExternals().length && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
+    this.expirePreMark(row.id, now, timers);
     if (m.d.heldAt !== null) {
       // Held after repeated crashes of our own: never failed, never claimed; an operator resumes it.
       timers.set(SEND_DRIVE, row.id, now + HOLD_RECHECK_MS);

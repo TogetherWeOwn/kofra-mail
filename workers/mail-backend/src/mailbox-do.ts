@@ -9,6 +9,8 @@ import { IDEM_EXPIRY, IN_PROGRESS_TTL_MS, UPLOAD_EXPIRY, UPLOAD_TTL_MS, readUplo
 import { contentRecord, type MailboxContentRecord } from './mailbox-api-messages.ts';
 import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
+import { MailAlerts } from './mail-alerts.ts';
+import { isSendEventCode, type SendEventCode } from './send-alert-events.ts';
 import { kofra } from './kofra.ts';
 import { MailboxIndex, PermanentMailError, storedLifecycle } from './mailbox-index.ts';
 import {
@@ -22,12 +24,13 @@ import {
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, sendRequestFor, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
-import { SEND_DRIVE, UnpublishedSend, unpublishedProgress } from './mailbox-send-store.ts';
+import { SEND_DRIVE, UnpublishedSend, unpublishedProgress, validSendId } from './mailbox-send-store.ts';
+import { SendStalls } from './mailbox-send-stalls.ts';
 import {
   CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
-import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
+import { validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -162,6 +165,7 @@ export class Mailbox extends DurableObject<Env> {
       put: (workspaceId, key, bytes) => kofra(this.env, workspaceId).put(key, bytes),
       get dispatcher() { return self.sendDispatcher(); },
       quota: () => this.sendQuota(),
+      alert: code => this.sendOperatorEvent(code),
       checkpoint: step => this.sendCheckpoint(step),
     };
   }
@@ -204,6 +208,7 @@ export class Mailbox extends DurableObject<Env> {
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
       quota: () => this.sendQuota(),
+      alert: code => this.sendOperatorEvent(code),
       buildRequest: (record, recipients) => {
         const life = storedLifecycle<Lifecycle>(this.ctx.storage);
         // Reads stop once the mailbox is no longer the ready incarnation the request started on.
@@ -286,9 +291,39 @@ export class Mailbox extends DurableObject<Env> {
     return this.sendDispatcher().abandon({ workspaceId, mailboxId }, sendId, fence, retryAt);
   }
 
+  private async enqueueSendEvent(code: SendEventCode, now: number): Promise<void> {
+    if (!this.env.MAIL_ENVIRONMENT) return;
+    await new MailAlerts(this.env.DIRECTORY).recordSend(this.env.MAIL_ENVIRONMENT, code, now);
+  }
+
+  private async sendOperatorEvent(code: SendEventCode): Promise<void> {
+    try { await this.enqueueSendEvent(code, this.mailApiNow()); }
+    catch { console.error({ code: 'send_alert_store_failed' }); }
+  }
+
+  // Service-only RPC for errors in the dispatch Worker (quota is called there).
+  async recordSendEvent(workspaceId: string, mailboxId: string, code: unknown): Promise<void> {
+    this.verifyScope({ workspaceId, mailboxId });
+    if (!isSendEventCode(code)) throw new Error('Invalid send alert code');
+    if (enabled(this.env) && this.env.MAIL_SEND_ENABLED === 'on') await this.enqueueSendEvent(code, this.mailApiNow());
+  }
+
   // Shared by the drive handler and result notices; a notice passes its fence,
   // and that row is recorded whatever its notify_after.
   async recordStoredResults(workspaceId: string, mailboxId: string, sendId: string, fence?: SendFence): Promise<StoredAnswer> {
+    this.verifyScope({ workspaceId, mailboxId });
+    if (enabled(this.env) && fence && validFence(fence) && validSendId(sendId)) {
+      // Recheck directory absence in the same statement as the keyed delete.
+      // A non-ready mailbox still in the directory may recover the send.
+      const orphan = await this.env.DIRECTORY.prepare(`DELETE FROM send_results
+        WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ? AND fence_epoch = ? AND fence_attempt = ?
+        AND NOT EXISTS (SELECT 1 FROM mailboxes WHERE workspace_id = ? AND id = ?) RETURNING 1`)
+        .bind(workspaceId, mailboxId, sendId, fence.epoch, fence.attempt, workspaceId, mailboxId).first();
+      if (orphan) {
+        console.log({ metric: 'send_result_orphan' });
+        return { status: 'none', recorded: 0 };
+      }
+    }
     return this.sendDispatcher().recordStored({ workspaceId, mailboxId }, sendId, fence);
   }
 
@@ -1181,11 +1216,12 @@ export class Mailbox extends DurableObject<Env> {
     const unapplied = resultAlert('unapplied');
     // A stored result that can apply but keeps failing to record.
     const stuck = resultAlert('stuck');
-    const conditions: Array<[MailboxAlertCode, boolean]> = [
+    const stallAt = life?.state === 'ready' && this.env.MAIL_SEND_ENABLED === 'on' ? new SendStalls(sql).next() : Infinity;
+    const conditions: Array<[MailboxAlertCode | SendEventCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
       ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held],
-      ['send_result_unapplied', unapplied], ['send_result_stuck', stuck]];
-    let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
+      ['send_result_unapplied', unapplied], ['send_result_stuck', stuck], ['send_stalled', stallAt <= now]];
+    let next = Math.min(confirmStaleAt > now ? confirmStaleAt : Infinity, stallAt > now ? stallAt : Infinity);
     for (const [code, active] of conditions) {
       if (!active) {
         sql.exec('DELETE FROM mailbox_alerts WHERE code = ?', code);
@@ -1197,8 +1233,10 @@ export class Mailbox extends DurableObject<Env> {
         next = Math.min(next, sent_at + ALERT_COOLDOWN_MS);
         continue;
       }
-      try { await mailAlert(this.env.ALERTS)({ code, key: this.ctx.id.toString() }); }
-      catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); continue; }
+      try {
+        if (isSendEventCode(code)) await this.enqueueSendEvent(code, now);
+        else await mailAlert(this.env.ALERTS)({ code, key: this.ctx.id.toString() });
+      } catch { next = Math.min(next, Date.now() + HELD_RECHECK_MS); continue; }
       const sentAt = Date.now();
       sql.exec('UPDATE mailbox_alerts SET sent_at = ? WHERE code = ?', sentAt, code);
       // A skipped-delivery report is sent once per restore.
