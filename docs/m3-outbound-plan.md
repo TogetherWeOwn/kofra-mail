@@ -336,7 +336,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 ### M3-0 Measurements (Sol)
 
 **Acceptance:** a receipt with the raw results for:
-- **Size:** the real outbound limit, from sends of 4.9, 5.1, 6, 18, 24 and 25 MiB encoded (just under and over each documented value). It sets `LIMITS.outboundMessageBytes`.
+- **Size:** the provider-safe outbound ceiling, from sends of 4.9, 5.1, 6, 18, 24 and 25 MiB encoded (just under and over each documented value). Raising `LIMITS.outboundMessageBytes` also requires the serializer and parser to meet the memory budget.
 - **Envelope:** whether `send()` accepts envelope recipients separately from the visible To and Cc lists (for partial retries).
 - **Suppression:** how a dropped (suppressed) recipient is reported in the `send()` result.
 - **Errors:** the error codes for quota, header-size and invalid-recipient failures.
@@ -347,6 +347,16 @@ Contract section 5 runs rate limits in the first step of every request, before t
 - **Clock skew:** the difference between a Durable Object's clock and the consumer Worker's clock, over at least 100 paired samples in different locations. It checks the `clockSkew` assumption of section 2.4.
 
 **Stop rule:** at most 20 sends, only to the approved test addresses. If a result contradicts the contract (for example the limit is under 5 MiB), stop and report it.
+
+#### Results (2026-11-27)
+
+- **Size:** Cloudflare applies a 25 MiB (26,214,400-byte) cap to its assembled message. A 24 MiB serialized message was accepted. A 25 MiB serialized message assembled to 26,564,023 bytes (about 1.3% larger) and was refused with `E_CONTENT_TOO_LARGE`. The measured provider-safe ceiling is 24 MiB; the contract cap stays 5 MiB until bounded sent-copy parsing lands.
+- **Remaining size check (M3-12):** the 1.3% expansion was measured on an attachment-heavy message. A large non-ASCII body may expand more if the provider uses quoted-printable. Measure that shape before raising the cap.
+- **Envelope:** the structured call has no separate envelope-recipient list. The recorded limitation applies: selecting a subset for a retry also changes the visible recipient lists in the provider copy.
+- **Errors and headers:** an invalid recipient returned `E_VALIDATION_ERROR`; a sender on a domain not onboarded returned `E_SENDER_DOMAIN_NOT_AVAILABLE`. A 2,048-byte `References` was accepted. The provider accepted 2,049 bytes in the header-size probe; the contract keeps the documented 2,048-byte bound.
+- **Sender allow-list:** lists of 500 and 2,000 addresses were accepted, including sends from the last listed address. An explicit empty `allowed_sender_addresses` list does **not** restrict senders, so the deployment job omits the binding for an empty list. In the non-empty control, an unlisted sender was refused with `E_SENDER_NOT_VERIFIED`.
+- **Clock skew:** p99 was 4.5 ms, with a 116 ms endpoint bound and no backward step. `clockSkew` stays 30 s.
+- **Provisional until M3-12:** daily quota reset time, equality of the returned `messageId` and delivered `Message-ID`, and suppression reporting were not measured.
 
 ### M3-1 Timers (Opus)
 

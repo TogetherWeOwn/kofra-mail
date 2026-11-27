@@ -319,7 +319,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 | Limit | Value | Source |
 |---|---|---|
 | Inbound message | 25 MiB | Cloudflare Email Service |
-| Outbound message (encoded) | 5 MiB until measured; the documented values are 5 and 25 MiB | Email Service docs disagree; the outbound size test sets it |
+| Outbound message (encoded) | 5 MiB | 24 MiB was accepted for an attachment-heavy message; the cap rises only after the sent-copy serializer and the mail parser fit the memory budget and a large non-ASCII body has been measured at the provider |
 | Recipients / file attachments per message | 50 / 32 | Email Service |
 | Custom header value | 2,048 bytes, unfolded; References is trimmed to fit | Email Service |
 | Upload | 25 MiB per file | matches inbound |

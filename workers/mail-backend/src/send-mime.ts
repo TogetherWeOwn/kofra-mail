@@ -111,7 +111,7 @@ function checkAddress({ name, email }: Readonly<AddressInput>, field: string, co
 }
 
 function simpleBase64(bytes: Uint8Array): string {
-  // This only receives one line's worth of bytes (at most 57).
+  // Only for bounded RFC 2047 header words (at most 42 bytes).
   return btoa(String.fromCharCode(...bytes));
 }
 
@@ -198,10 +198,36 @@ function base64Size(length: number): number {
   return Math.ceil(length / 3) * 4 + Math.max(1, Math.ceil(length / 57)) * CRLF.length;
 }
 
-function wrappedBase64(bytes: Uint8Array): string {
-  const lines: string[] = [];
-  for (let offset = 0; offset < bytes.length; offset += 57) lines.push(simpleBase64(bytes.subarray(offset, offset + 57)));
-  return lines.join(CRLF) + CRLF;
+const base64Alphabet = encoder.encode('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/');
+const base64Pad = 0x3d; // '='
+
+/** Write frozen v1's 76-column base64 without any per-line allocation. */
+function writeBase64(source: Uint8Array, output: Uint8Array, offset: number): number {
+  let i = 0;
+  // The empty part still owns one CRLF. Full lines are 57 bytes, so only
+  // the final line can need padding.
+  do {
+    const end = Math.min(i + 57, source.length);
+    while (i + 2 < end) {
+      const a = source[i++], b = source[i++], c = source[i++];
+      output[offset++] = base64Alphabet[a >>> 2];
+      output[offset++] = base64Alphabet[((a & 3) << 4) | (b >>> 4)];
+      output[offset++] = base64Alphabet[((b & 15) << 2) | (c >>> 6)];
+      output[offset++] = base64Alphabet[c & 63];
+    }
+    if (i < end) {
+      const a = source[i++];
+      const hasSecond = i < end;
+      const b = hasSecond ? source[i++] : 0;
+      output[offset++] = base64Alphabet[a >>> 2];
+      output[offset++] = base64Alphabet[((a & 3) << 4) | (b >>> 4)];
+      output[offset++] = hasSecond ? base64Alphabet[(b & 15) << 2] : base64Pad;
+      output[offset++] = base64Pad;
+    }
+    output[offset++] = 13;
+    output[offset++] = 10;
+  } while (i < source.length);
+  return offset;
 }
 
 function quotedPrintable(bytes: Uint8Array, ceiling: number, framing: string): string | undefined {
@@ -348,29 +374,56 @@ export function encodedSentCopySize(input: SendMimeSizingInput): number {
   return plan(input, attachment => attachment.size).encodedSize;
 }
 
-function checkedPlan(input: SendMimeInput) {
-  const result = plan(input, attachment => attachment.bytes.byteLength);
+function checkedPlan<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>, sizeOf: (attachment: Attachment) => number) {
+  const result = plan(input, sizeOf);
   if (result.encodedSize > LIMITS.outboundMessageBytes) fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
   return result;
 }
 
+function writePiece(piece: string | Uint8Array, bytes: Uint8Array, offset: number): number {
+  if (typeof piece !== 'string') return writeBase64(piece, bytes, offset);
+  const { read, written } = encoder.encodeInto(piece, bytes.subarray(offset));
+  // A truncated final string can fill the output without advancing past it.
+  if (read !== piece.length) throw new SendMimeInvariantError('MIME size plan mismatch');
+  return offset + written;
+}
+
 /** Stored copy only. Its bytes never include the Bcc recipients. */
 export function buildSentCopy(input: SendMimeInput): SentCopy {
-  const { pieces, encodedSize } = checkedPlan(input);
+  const { pieces, encodedSize } = checkedPlan(input, attachment => attachment.bytes.byteLength);
   const bytes = new Uint8Array(encodedSize);
   let offset = 0;
   for (const piece of pieces) {
-    const text = typeof piece === 'string' ? piece : wrappedBase64(piece instanceof Uint8Array ? piece : input.attachments[piece.part].bytes);
-    offset += encoder.encodeInto(text, bytes.subarray(offset)).written;
+    offset = writePiece(typeof piece === 'string' || piece instanceof Uint8Array ? piece : input.attachments[piece.part].bytes, bytes, offset);
   }
+  if (offset !== encodedSize) throw new SendMimeInvariantError('MIME size plan mismatch');
   return { bytes, encodedSize };
+}
+
+/** Build from verified part sizes, retaining only the attachment being written. */
+export async function buildSentCopyFromParts(input: SendMimeSizingInput,
+  readPart: (index: number) => Promise<Uint8Array<ArrayBuffer>>): Promise<Uint8Array<ArrayBuffer>> {
+  const { pieces, encodedSize } = checkedPlan(input, attachment => attachment.size);
+  const bytes = new Uint8Array(encodedSize);
+  let offset = 0;
+  for (const piece of pieces) {
+    if (typeof piece === 'string' || piece instanceof Uint8Array) {
+      offset = writePiece(piece, bytes, offset);
+    } else {
+      const data = await readPart(piece.part);
+      if (data.byteLength !== piece.size) throw new SendMimeInvariantError('Send attachment size changed');
+      offset = writeBase64(data, bytes, offset);
+    }
+  }
+  if (offset !== encodedSize) throw new SendMimeInvariantError('MIME size plan mismatch');
+  return bytes;
 }
 
 const destination = ({ name, email }: Readonly<AddressInput>) => name ? { name, email } : email;
 
 /** Structured binding payload only: this function never sends mail. */
 export function buildSendRequest(input: SendMimeInput): SendRequest {
-  const { files, headers } = checkedPlan(input);
+  const { files, headers } = checkedPlan(input, attachment => attachment.bytes.byteLength);
   const to = input.to.map(destination), cc = input.cc.map(destination), bcc = input.bcc.map(destination);
   const attachments: EmailAttachment[] = files.map(({ name, type }, i) => ({
     disposition: 'attachment', filename: name, type, content: input.attachments[i].bytes,
