@@ -3,20 +3,32 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath, URL } from 'node:url';
 import { TextEncoder } from 'node:util';
 import { build } from 'esbuild';
-import { Miniflare } from 'miniflare';
+import { Miniflare, Response, type Request } from 'miniflare';
+import { parseMail as referenceParseMail } from './fixtures/parse-mail-reference.ts';
 import { sha256 } from '../src/bytes.ts';
 import type { IndexPlumbing } from './fixtures/index-plumbing.ts';
 
 const id = '01KBN8ZJ7G0000000000000000';
 let runtime: Miniflare;
-let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'parts'> };
+let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'parts'> };
 let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
+// The object store behind the Kofra adapter; a PUT is kept only if its body matches its signed digest.
+const stored = new Map<string, Uint8Array>();
 before(async () => {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/index-plumbing.ts', import.meta.url))],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
   runtime = new Miniflare({ modules: [{ type: 'ESModule', path: 'worker.mjs', contents: bundle.outputFiles[0].text }],
     compatibilityDate: '2025-06-01', durableObjects: { BOX: { className: 'IndexPlumbing', useSQLite: true } },
-    r2Buckets: ['RAW', 'STATE'] });
+    r2Buckets: ['RAW', 'STATE'],
+    bindings: { KOFRA_S3_ENDPOINT: 'https://storage.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture-access', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture-signing' },
+    outboundService: async (request: Request) => {
+      const url = new URL(request.url);
+      if (request.method !== 'PUT' || url.origin !== 'https://storage.example.test') return new Response(null, { status: 403 });
+      const body = new Uint8Array(await request.arrayBuffer());
+      if (request.headers.get('x-amz-content-sha256') !== await sha256(body)) return new Response('<Error><Code>BadDigest</Code></Error>', { status: 400 });
+      stored.set(url.pathname, body);
+      return new Response(null, { status: 200 });
+    } });
   boxes = await runtime.getDurableObjectNamespace('BOX') as unknown as typeof boxes;
   raw = await runtime.getR2Bucket('RAW');
 });
@@ -64,4 +76,31 @@ test('mailbox keeps the fourth inline message/rfc822 as an attachment', async ()
   assert.equal(await box.indexRaw(id, await upload(mime)), 'indexed');
   const rows = JSON.parse(await box.parts()) as Array<{ name: string; mime_type: string }>;
   assert.deepEqual(rows.map(({ name, mime_type }) => [name, mime_type]), [['level-4.eml', 'message/rfc822']]);
+});
+
+test('mailbox stores large attachments through the streamed Kofra PUT with the keys and bytes of the unbounded parse', async () => {
+  const binary = new Uint8Array(700 * 1024).map((_, i) => (i * 2654435761) >>> 24);
+  const text = 'Grüße aus Köln = 100 % sicher\r\n'.repeat(12_000);
+  const qp = Array.from(new TextEncoder().encode(text), b => b > 126 || b === 61 ? `=${b.toString(16).toUpperCase()}` : String.fromCharCode(b))
+    .join('').replace(/\r\n/g, '=0D=0A=\r\n');
+  const mime = multipart('stored', [
+    'Content-Type: text/plain\r\n\r\nThree files.',
+    `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=one.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(binary).toString('base64').match(/.{1,76}/g)!.join('\r\n')}`,
+    `Content-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename=two.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n${qp}`,
+    `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=small.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAECAw==`,
+  ]);
+  const key = await upload(mime);
+  const reference = await referenceParseMail(new Uint8Array(new TextEncoder().encode(mime)), key);
+  const box = boxes.getByName('kofra-store');
+  await box.indexThroughKofra(id, key);
+  const rows = JSON.parse(await box.parts()) as Array<{ part: number; size: number; object_key: string | null }>;
+  assert.equal(rows.length, 3);
+  assert.equal(stored.size, 2);
+  for (const [i, row] of rows.entries()) {
+    const expected = reference.attachments[i];
+    assert.equal(row.size, expected.size);
+    if (!expected.external) { assert.equal(row.object_key, null); continue; }
+    assert.equal(row.object_key, `att/${await sha256(expected.external)}/${id}`);
+    assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), expected.external);
+  }
 });

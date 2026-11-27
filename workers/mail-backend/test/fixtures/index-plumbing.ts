@@ -1,5 +1,6 @@
+import { kofra, type KofraConfig } from '../../src/kofra.ts';
 import { MailboxIndex, PermanentMailError } from '../../src/mailbox-index.ts';
-import { FixtureMailbox } from './mailbox-worker.ts';
+import { FixtureMailbox, fixturePutUpload } from './mailbox-worker.ts';
 export { FixtureSweeper } from './mailbox-worker.ts';
 
 export class IndexPlumbing extends FixtureMailbox {
@@ -11,6 +12,7 @@ export class IndexPlumbing extends FixtureMailbox {
         return new Uint8Array(await object.arrayBuffer());
       },
       put: async (objectKey, bytes) => { await this.env.RAW.put(objectKey, bytes); },
+      putUpload: fixturePutUpload(this.env.RAW),
       register: async (kind, digest) => `${kind}/${digest}/01KBN8ZJ7G0000000000000000`,
       hold: async () => {}, release: async () => {},
     }, this.ctx.id.toString());
@@ -20,6 +22,21 @@ export class IndexPlumbing extends FixtureMailbox {
       throw error;
     }
     return 'indexed';
+  }
+
+  // The production object store for attachments: the Kofra S3 adapter.
+  async indexThroughKofra(id: string, key: string) {
+    const index = new MailboxIndex(this.ctx.storage, {
+      ...kofra(this.env as unknown as KofraConfig, 'workspace'),
+      get: async rawKey => {
+        const object = await this.env.RAW.get(rawKey);
+        if (!object) throw new Error('Missing fixture raw object');
+        return new Uint8Array(await object.arrayBuffer());
+      },
+      register: async (kind, digest) => `${kind}/${digest}/01KBN8ZJ7G0000000000000000`,
+      hold: async () => {}, release: async () => {},
+    }, this.ctx.id.toString());
+    await index.ingest(id, key, 100);
   }
 
   async journalEvents() {
