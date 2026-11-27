@@ -10,8 +10,8 @@ Run from the repository root with Node.js 24. The clients print only `bucket PAS
    node tools/limiter-verify/check-config.ts MAIL_WEB_SCRIPT_NAME --write-probe-config "$PROBE_CONFIG_PATH"
    ```
 
-   The check verifies binding names, distinct namespaces, limits and periods. Only if all buckets pass does it create a private configuration file (mode `0600`), using the namespace IDs from the same settings response. It never prints them or overwrites a file. Omit `--write-probe-config` and its path to run the configuration check alone.
-2. Manually deploy the temporary probe Worker in the same Cloudflare account **only from that generated config**. Do not copy or hand-edit the rate limit bindings, commit the file, or attach mail data bindings. The generated config names the Worker `MAIL_WEB_SCRIPT_NAME-r2-probe`. Set the Worker secret `R2_PROBE_SECRET`, and load that same value into the client process environment:
+   The check verifies binding names, distinct namespaces, limits and periods. Only if all buckets pass does it create a private configuration file (mode `0600`) with the checked account and the namespace IDs from the same settings response. It never prints those IDs or overwrites a file. Omit `--write-probe-config` and its path to run the configuration check alone.
+2. Manually deploy the temporary probe Worker **only from that generated config**. Do not override the account, copy or hand-edit the rate limit bindings, commit the file, or attach mail data bindings. The generated name normally ends in `-r2-probe`; long or normalized names use a shortened name and hash suffix. Set the Worker secret `R2_PROBE_SECRET`, and load that same value into the client process environment:
 
    ```sh
    node tools/limiter-verify/probe-client.ts https://probe.example

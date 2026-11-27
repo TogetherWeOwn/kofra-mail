@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,10 +9,20 @@ type Environment = { CLOUDFLARE_ACCOUNT_ID?: string; CLOUDFLARE_API_TOKEN?: stri
 type Options = { probeConfigPath?: string };
 type ProbeRateBinding = { name: string; namespace_id: string; simple: { limit: number; period: number } };
 const pathSegment = /^[a-z0-9_-]+$/i;
+const maxWorkerNameLength = 63;
 
-async function writeProbeConfig(path: string, name: string, ratelimits: ProbeRateBinding[]): Promise<void> {
+function probeName(script: string): string {
+  const label = script.toLowerCase().replaceAll('_', '-').replace(/^-+|-+$/g, '') || 'mail';
+  const plain = `${label}-r2-probe`;
+  if (label === script && plain.length <= maxWorkerNameLength) return plain;
+  const suffix = `-r2-probe-${createHash('sha256').update(script).digest('hex').slice(0, 12)}`;
+  return `${label.slice(0, maxWorkerNameLength - suffix.length)}${suffix}`;
+}
+
+async function writeProbeConfig(path: string, script: string, account: string, ratelimits: ProbeRateBinding[]): Promise<void> {
   const config = {
-    name,
+    name: probeName(script),
+    account_id: account,
     main: relative(dirname(resolve(path)), fileURLToPath(new URL('./probe-worker.ts', import.meta.url))),
     compatibility_date: '2026-11-22',
     compatibility_flags: ['nodejs_compat'],
@@ -26,8 +37,7 @@ export async function checkConfig(script: string | undefined, env: Environment, 
   { probeConfigPath }: Options = {}): Promise<Verdict[]> {
   const { CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_TOKEN: token } = env;
   if (!script || !pathSegment.test(script) || !account || !pathSegment.test(account) || !token) return failures();
-  const probeName = `${script}-r2-probe`;
-  if (probeConfigPath !== undefined && (!probeConfigPath || probeName.length > 63)) return failures();
+  if (probeConfigPath === '') return failures();
 
   try {
     const url = `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${script}/settings`;
@@ -56,7 +66,9 @@ export async function checkConfig(script: string | undefined, env: Environment, 
       verified.push({ name: binding, namespace_id, simple: { limit, period } });
       return { bucket, pass: true };
     });
-    if (probeConfigPath && verified.length === bucketNames.length) await writeProbeConfig(probeConfigPath, probeName, verified);
+    if (probeConfigPath && verified.length === bucketNames.length) {
+      await writeProbeConfig(probeConfigPath, script, account, verified);
+    }
     return verdicts;
   } catch {
     return failures();

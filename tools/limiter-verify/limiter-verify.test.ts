@@ -74,12 +74,28 @@ test('probe config uses exactly the validated mail-web binding names and namespa
   assert.deepEqual(result, verdicts());
   const config = JSON.parse(await readFile(probeConfigPath, 'utf8'));
   assert.equal(config.name, 'mail-web-r2-probe');
+  assert.equal(config.account_id, account);
   assert.equal(resolve(directory, config.main), fileURLToPath(new URL('./probe-worker.ts', import.meta.url)));
   assert.deepEqual(config.ratelimits, settings.result.bindings
     .filter(({ type }: { type: string }) => type === 'ratelimit')
     .map(({ name, namespace_id, simple }: { name: string; namespace_id: string; simple: unknown }) => ({ name, namespace_id, simple })));
-  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'preview_urls', 'ratelimits', 'workers_dev']);
+  assert.deepEqual(Object.keys(config).sort(), ['account_id', 'compatibility_date', 'compatibility_flags', 'main', 'name', 'preview_urls', 'ratelimits', 'workers_dev']);
   if (process.platform !== 'win32') assert.equal((await stat(probeConfigPath)).mode & 0o777, 0o600);
+});
+
+test('long source Worker names generate bounded distinct probe names', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'r2-probe-config-'));
+  t.after(() => rm(directory, { recursive: true }));
+  const names = [];
+  for (const suffix of ['a', 'b']) {
+    const probeConfigPath = join(directory, `${suffix}.json`);
+    assert.deepEqual(await checkConfig(`${'m'.repeat(62)}${suffix}`, cfEnv,
+      async () => Response.json(settings), { probeConfigPath }), verdicts());
+    const { name } = JSON.parse(await readFile(probeConfigPath, 'utf8'));
+    assert.match(name, /^[a-z0-9-]{1,63}$/);
+    names.push(name);
+  }
+  assert.notEqual(names[0], names[1]);
 });
 
 test('probe config is not created on failed validation and never overwrites a file', async (t) => {
