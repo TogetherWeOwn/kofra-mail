@@ -4,8 +4,12 @@ import { attachmentBudget } from '@kofra/mail-contract';
 import { defineConformance } from '@kofra/mail-contract/conformance';
 import { createFakeMailHarness } from './service-fake.ts';
 
-defineConformance('in-memory fake', async () => createFakeMailHarness({ contentOrigin: 'https://content.usercontent.example' }));
-defineConformance('in-memory fake, Drive off', async () => createFakeMailHarness({ contentOrigin: 'https://content.usercontent.example', drive: false }));
+// Exercise the same boundaries without buffering full-size uploads in each
+// fake. The HTTP backend conformance runs against the actual contract limit.
+const outboundMessageBytes = 5 * 1024 ** 2;
+const contentOrigin = 'https://content.usercontent.example';
+defineConformance('in-memory fake', async () => createFakeMailHarness({ contentOrigin, outboundMessageBytes }));
+defineConformance('in-memory fake, Drive off', async () => createFakeMailHarness({ contentOrigin, outboundMessageBytes, drive: false }));
 
 test('a workspace cannot register a domain already used by another workspace', async () => {
   const harness = createFakeMailHarness();
@@ -183,7 +187,7 @@ test('a replacement can keep an expired reply target but cannot name a foreign m
 });
 
 test('encoded address headers can push a budget-sized file over the send limit', async () => {
-  const mail = createFakeMailHarness().as('member');
+  const mail = createFakeMailHarness({ outboundMessageBytes }).as('member');
   const { limits } = await mail.getSession();
   const { defaultFrom } = await mail.getSettings();
   const body = 'Hello';
@@ -222,9 +226,10 @@ test('attachment filename encoding contributes to the sent MIME size', async () 
 });
 
 test('the fake counts base64 line wrapping and expansion for the body as well as the file', async () => {
-  const mail = createFakeMailHarness().as('member');
+  const mail = createFakeMailHarness({ outboundMessageBytes }).as('member');
   const { defaultFrom } = await mail.getSettings();
   const { limits } = await mail.getSession();
+  assert.equal(limits.outboundMessageBytes, outboundMessageBytes);
   // Leave room for headers after base64 expansion, but not for line wrapping.
   const body = 'é'.repeat(limits.bodyBytes / 2);
   const rawFileBytes = (limits.outboundMessageBytes - 64 * 1024) * 3 / 4 - Buffer.byteLength(body);

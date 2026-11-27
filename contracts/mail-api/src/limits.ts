@@ -3,8 +3,7 @@ const MiB = 1024 * KiB;
 
 /**
  * Limits every implementation enforces and reports in `Session.limits`.
- * Clients read the served values; they never hard-code them, because
- * `outboundMessageBytes` changes once the outbound size test has run.
+ * Clients read the served values rather than hard-coding them.
  */
 export interface Limits {
   /** Largest inbound message the platform accepts; larger mail is rejected before our code runs. */
@@ -70,17 +69,19 @@ export interface Limits {
  * Contract values. Sources: Cloudflare Email Service limits (inbound 25 MiB,
  * 50 recipients, 32 attachments, 2,048-byte header values), Durable Object
  * threading rule (100 messages), and this contract's own bounds.
- *
- * `outboundMessageBytes` is 5 MiB, the lower of the two documented values,
- * until the outbound size test measures the real limit. A backend raises it
- * only from that measurement.
  */
 export const LIMITS = {
   inboundMessageBytes: 25 * MiB,
-  outboundMessageBytes: 5 * MiB,
+  // Measured: Cloudflare refuses its own assembled message above 26,214,400 bytes
+  // (E_CONTENT_TOO_LARGE). Its structured send assembled about 1.3% more bytes
+  // than our serialized MIME. It accepted 24 MiB serialized, about 4% below
+  // the provider cap before that expansion. The server checks the real
+  // serialized length (encodedSize); attachmentBudget is only a client hint.
+  outboundMessageBytes: 24 * MiB,
   recipientsPerMessage: 50,
   attachmentsPerMessage: 32,
   uploadBytes: 25 * MiB,
+  // The provider accepted 2,049 bytes; keep the documented 2,048.
   headerValueBytes: 2048,
   subjectBytes: 998,
   bodyBytes: 1 * MiB,

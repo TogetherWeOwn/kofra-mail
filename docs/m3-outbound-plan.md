@@ -348,6 +348,15 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Stop rule:** at most 20 sends, only to the approved test addresses. If a result contradicts the contract (for example the limit is under 5 MiB), stop and report it.
 
+#### Results (2026-11-27)
+
+- **Size:** Cloudflare applies a 25 MiB (26,214,400-byte) cap to its assembled message. A 24 MiB serialized message was accepted. A 25 MiB serialized message assembled to 26,564,023 bytes (about 1.3% larger) and was refused with `E_CONTENT_TOO_LARGE`. The contract limits the actual serialized size to 24 MiB, about 4% below the provider cap before assembly expansion.
+- **Envelope:** the structured call has no separate envelope-recipient list. The recorded limitation applies: selecting a subset for a retry also changes the visible recipient lists in the provider copy.
+- **Errors and headers:** an invalid recipient returned `E_VALIDATION_ERROR`; a sender on a domain not onboarded returned `E_SENDER_DOMAIN_NOT_AVAILABLE`. A 2,048-byte `References` was accepted. The provider accepted 2,049 bytes in the header-size probe; the contract keeps the documented 2,048-byte bound.
+- **Sender allow-list:** lists of 500 and 2,000 addresses were accepted, including sends from the last listed address. An explicit empty `allowed_sender_addresses` list does **not** restrict senders, so the deployment job omits the binding for an empty list. In the non-empty control, an unlisted sender was refused with `E_SENDER_NOT_VERIFIED`.
+- **Clock skew:** p99 was 4.5 ms, with a 116 ms endpoint bound and no backward step. `clockSkew` stays 30 s.
+- **Provisional until M3-12:** daily quota reset time, equality of the returned `messageId` and delivered `Message-ID`, and suppression reporting were not measured.
+
 ### M3-1 Timers (Opus)
 
 **Change:** the `timers(due_at, kind, ref)` table, primary key `(kind, ref)` and indexed on `due_at`. The alarm is always the earliest `due_at`.
@@ -626,7 +635,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 ### M3-13 Revocable file links (Opus, Sol)
 
-**Why:** uploads may be 25 MiB while outbound mail may be capped at 5 MiB, and Drive links reach workspace members only. Until this package lands, the contract refuses an over-budget draft with `message_too_large` (contract section 8.3).
+**Why:** uploads may be 25 MiB while outbound mail is capped at the measured 24 MiB serialized limit, and Drive links reach workspace members only. Until this package lands, the contract refuses an over-budget draft with `message_too_large` (contract section 8.3).
 
 **Change:** first a contract revision: a `file_link` attachment kind, a link expiry chosen by the sender, and routes to list and revoke links. Then the `links` table in the mailbox, a random token per link, and `mail.<suite-domain>/f/<token>` answering with a 5-minute signed download on the content origin.
 - That download URL has its own purpose, `lnk`, with the link id as a claim. On every request the verifier checks that the link is still live (a Durable Object lookup, like step 5 of content-origin section 2.3), so revoking a link kills download URLs already minted from it, not only new ones.
