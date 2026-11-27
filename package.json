@@ -6,8 +6,8 @@
   "engines": { "node": ">=24" },
   "scripts": {
     "dev": "npm run dev -w @kofra/mail-web",
-    "check": "npm run check -w @kofra/mail-contract && npm run check -w @kofra/mail-core && npm run check -w @kofra/mail-web && tsc -p tools/limiter-verify/tsconfig.json",
-    "test": "node --test contracts/mail-api/src/*.test.ts packages/mail-core/src/*.test.ts apps/web/src/lib/*.test.ts tools/limiter-verify/*.test.ts",
+    "check": "npm run check -w @kofra/mail-contract && npm run check -w @kofra/mail-core && npm run check -w @kofra/mail-web && tsc -p tools/limiter-verify/tsconfig.json && tsc -p tools/sender-allowlist/tsconfig.json",
+    "test": "node --test contracts/mail-api/src/*.test.ts packages/mail-core/src/*.test.ts apps/web/src/lib/*.test.ts tools/limiter-verify/*.test.ts tools/sender-allowlist/*.test.ts",
     "build": "npm run build -w @kofra/mail-web",
     "test:e2e": "npm run test:e2e -w @kofra/mail-web"
   },
@@ -17,5 +17,5 @@
       "undici": "7.30.2"
     }
   },
-  "devDependencies": { "@types/node": "24.19.2", "typescript": "5.9.3" }
+  "devDependencies": { "@types/node": "24.19.2", "typescript": "5.9.3", "wrangler": "4.166.0" }
 }

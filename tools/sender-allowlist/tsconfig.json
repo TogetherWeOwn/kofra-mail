@@ -1,0 +1,5 @@
+{
+  "extends": "../limiter-verify/tsconfig.json",
+  "compilerOptions": { "erasableSyntaxOnly": true, "skipLibCheck": true },
+  "include": ["*.ts", "fixtures/*.ts"]
+}
