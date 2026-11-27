@@ -72,7 +72,6 @@ export class HttpMailbox extends Mailbox {
   private stallPuts?: PromiseWithResolvers<void>;
   private stalledPut = Promise.withResolvers<void>();
   private failEpilogue = false;
-  private manualAlarm = false;
   private readonly emittedAlerts: string[] = [];
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
@@ -277,8 +276,10 @@ export class HttpMailbox extends Mailbox {
     this.crashStep = undefined;
     throw new Error(`Fixture crash after ${step}`);
   }
+  // In manual mode every platform alarm is refused, even during an explicit
+  // advance: one admitted then could resume after testAlarm restored Date.now.
   override async alarm() {
-    if ((this.env as FixtureEnv).MANUAL_ALARMS === 'on' && !this.manualAlarm) return;
+    if ((this.env as FixtureEnv).MANUAL_ALARMS === 'on') return;
     return super.alarm();
   }
   pauseExpiry(kind: string) {
@@ -341,9 +342,8 @@ export class HttpMailbox extends Mailbox {
     const actual = Date.now;
     const start = actual(), simulated = this.mailApiNow();
     Date.now = this.pauseKind || this.realtimeHolderClock ? () => simulated + actual() - start : () => simulated;
-    this.manualAlarm = true;
-    try { await Promise.all(Array.from({ length: runs }, () => this.alarm())); }
-    finally { Date.now = actual; this.manualAlarm = false; }
+    try { await Promise.all(Array.from({ length: runs }, () => super.alarm())); }
+    finally { Date.now = actual; }
   }
   timers() {
     return this.ctx.storage.sql.exec('SELECT kind, ref, due_at FROM timers ORDER BY kind, ref').toArray();
