@@ -900,12 +900,13 @@ export class SendDispatcher {
         recorded++;
       } else {
         // Transient (an error, or not yet published): the row backs off, doubling from 1 minute
-        // to 1 hour, and keeps its flag; the rest of the page goes on. An applicable row that
-        // keeps failing raises an alert.
+        // to 1 hour, and keeps its flag; the rest of the page goes on. A row that keeps failing
+        // raises an alert: an applicable one, or a flagged one a restore made eligible (a row
+        // flagged in this epoch answers stale, never a transient failure).
         await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
           .bind(ports.now() + wait, ...keys(row)).run();
         backoff = ports.now() + wait;
-        if (!row.unapplied && row.failures + 1 >= STUCK_FAILURES) await this.resultAlerts(id, row, ['stuck'], []);
+        if (row.failures + 1 >= STUCK_FAILURES) await this.resultAlerts(id, row, ['stuck'], []);
       }
     }
     if (fence) return backoff === null ? { status: 'recorded', recorded } : { status: 'retry', recorded, next: backoff };

@@ -1372,3 +1372,44 @@ test('a sendDraft replay reports the send only once its consumer changes are pub
   assert.equal(replayed.id, sent.id);
   assert.deepEqual(replayed.recipients.map(({ state }) => state), ['sent']);
 }));
+
+test('a flagged acceptance a restore made eligible raises send_result_stuck when it keeps failing', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'stuck-flagged');
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.failRecordOnce(a.claim.fence.attempt, 20);
+  await h.restore();
+  for (let n = 0; n < 12; n++) {
+    const [row] = await h.directoryRows('SELECT notify_after, notify_failures FROM send_results WHERE send_id = ?', id);
+    if (Number(row.notify_failures) >= 8) break;
+    await h.advance(Math.max(0, Number(row.notify_after) - await h.sends.now()));
+    await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence);
+  }
+  const [row] = await h.directoryRows('SELECT notify_failures, unapplied FROM send_results WHERE send_id = ?', id);
+  assert.ok(Number(row.notify_failures) >= 8);
+  assert.equal(row.unapplied, 1, 'still flagged');
+  await h.advance(minute);
+  assert.ok((await h.sends.activeAlerts()).includes('send_result_stuck'));
+}));
+
+test('a refused reservation still releases the listed fences it carries; they stay listed until a Mark (fake quota, early coverage)', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'refused-release');
+  const a = await h.sendRpc<ClaimAnswer>('claimSend', id);
+  if (a.status !== 'claimed') return assert.fail('claim');
+  assert.equal((await h.quota<QuotaAnswer>('reserve', scope(id), a.fence, [0], a.release, 0)).status, 'ok');
+  await h.quota('failNext', 'release');
+  await h.sendRpc<AbandonAnswer>('abandonClaim', id, a.fence, 0);
+  assert.equal(await balanceOf(h, a.fence), 1, 'a live, listed charge');
+  await h.advance(minute);
+  const b = await h.sendRpc<ClaimAnswer>('claimSend', id);
+  if (b.status !== 'claimed') return assert.fail('claim');
+  assert.deepEqual(b.release, [a.fence]);
+  await h.quota('setExhausted', true);
+  const refused = await h.quota<QuotaAnswer>('reserve', scope(id), b.fence, [0], b.release, 0);
+  assert.equal(refused.status, 'exhausted');
+  assert.equal(await balanceOf(h, a.fence), 0, 'released although the reservation was refused');
+  const delayed = await h.sendRpc<DelayAnswer>('delaySend', id, b.fence, 'gate', refused.status === 'exhausted' ? refused.resetAt : 0);
+  assert.equal(delayed.status, 'delayed');
+  assert.ok((await h.sendState(id)).release.some(({ attempt: n }) => n === a.fence.attempt), 'still listed until a Mark acknowledges it');
+}));
