@@ -15,6 +15,9 @@ export class SendMimeError extends Error {
   }
 }
 
+/** A deterministic violation of the builder's frozen input contract. */
+export class SendMimeInvariantError extends Error {}
+
 function fail(code: MailErrorCode, extra?: Omit<SendMimeProblem, 'code'>): never {
   throw new SendMimeError({ code, ...extra });
 }
@@ -162,7 +165,7 @@ function fold(name: string, words: readonly string[]): string {
     }
     line += ` ${word}`;
     encodedLine ||= encodedWord;
-    if (line.length > (encodedLine ? 76 : 998)) throw new Error('MIME header line too long');
+    if (line.length > (encodedLine ? 76 : 998)) throw new SendMimeInvariantError('MIME header line too long');
   }
   lines.push(line);
   return lines.join(CRLF) + CRLF;
@@ -291,19 +294,19 @@ function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachmen
     if (!name || exceedsUtf8(name, 255)) invalid(`/attachments/${i}/name`);
     checkHeader(type, `/attachments/${i}/type`);
     const size = sizeOf(attachment);
-    if (!Number.isSafeInteger(size) || size < 0) throw new RangeError('Invalid MIME attachment size');
+    if (!Number.isSafeInteger(size) || size < 0) throw new SendMimeInvariantError('Invalid MIME attachment size');
     return { name, type: attachmentType(type), size };
   });
 
   const date = new Date(dateAt);
   if (!Number.isSafeInteger(dateAt) || !Number.isFinite(date.getTime()) || date.getUTCFullYear() < 1900 || date.getUTCFullYear() > 9999) {
-    throw new RangeError('Invalid frozen MIME date');
+    throw new SendMimeInvariantError('Invalid frozen MIME date');
   }
-  if (sendId !== undefined && !/^[a-zA-Z0-9_-]{1,64}$/.test(sendId)) throw new TypeError('Invalid frozen send ID');
+  if (sendId !== undefined && !/^[a-zA-Z0-9_-]{1,64}$/.test(sendId)) throw new SendMimeInvariantError('Invalid frozen send ID');
   const boundary = sendId === undefined ? input.boundary : input.boundary ?? sendMimeBoundary(sendId);
   const messageId = sendId === undefined ? input.messageId : input.messageId ?? sendMimeMessageId(sendId, from);
   if (!isSafeMessageId(messageId) || hasHeaderControl(messageId) || !isSendMimeBoundary(boundary)) {
-    throw new TypeError('Invalid frozen MIME wire values');
+    throw new SendMimeInvariantError('Invalid frozen MIME wire values');
   }
   const headers = requestHeaders(input);
   const pieces: Piece[] = [
@@ -336,7 +339,7 @@ function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachmen
 function plan<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>, sizeOf: (attachment: Attachment) => number) {
   switch (input.builderVersion) {
     case 1: return planV1(input, sizeOf);
-    default: throw new RangeError('Unsupported MIME builder version');
+    default: throw new SendMimeInvariantError('Unsupported MIME builder version');
   }
 }
 

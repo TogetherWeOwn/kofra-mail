@@ -18,7 +18,7 @@ import { SENT_COPY_FLAGS } from './mailbox-api-messages.ts';
 import { mailboxState } from './mailbox-api.ts';
 import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
-import { SendMimeError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
+import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
   DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
@@ -425,9 +425,14 @@ export class SendDriver {
     else if (await this.sourceLost(record)) failure = 'delivery_error';
     // A draft revision that no longer matches its digest is unusable, like a lost source.
     else if (!(draft = await this.draftOf(start, record))) failure = 'delivery_error';
-    else if (!this.withinLimits(record, draft)) failure = 'message_too_large';
-    // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
-    else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
+    else {
+      let withinLimits: boolean;
+      try { withinLimits = this.withinLimits(record, draft); }
+      catch (error) { return this.mimeRefusal(start, kinds, error); }
+      if (!withinLimits) failure = 'message_too_large';
+      // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
+      else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
+    }
     if (failure || !draft || !forwarded) return this.fail(start, kinds, failure ?? 'delivery_error', draft === null || !forwarded);
     // Step 3: build, register (holders before PUT), then PUT.
     const builder = ports.mime.get(record.builderVersion);
@@ -438,7 +443,7 @@ export class SendDriver {
       // An att/ object that does not match its content-addressed digest is
       // corrupt for good, like a lost source; a failed read still retries.
       if (error instanceof SourceMismatch) return this.fail(start, kinds, 'delivery_error', true);
-      throw error;
+      return this.mimeRefusal(start, kinds, error);
     }
     const digest = await sha256(bytes);
     const registration = await ports.sweeper(start.scope.workspaceId).registerSend(start.scope.mailboxId, record.id, digest,
@@ -460,6 +465,16 @@ export class SendDriver {
     if (queued === STALE) return;
     await ports.checkpoint?.('queued');
     return this.dispatch({ ...start, row: queued });
+  }
+
+  private mimeRefusal(start: Start, kinds: SendRecipientKind[], error: unknown): Promise<void> {
+    if (error instanceof SendMimeError && error.problem.code === 'message_too_large') {
+      return this.fail(start, kinds, 'message_too_large', false);
+    }
+    // The frozen version accepted this input at submission. A deterministic
+    // refusal now means drift or invalid stored inputs, not a transient read.
+    if (error instanceof SendMimeError || error instanceof SendMimeInvariantError) return this.breach(start);
+    throw error;
   }
 
   // A release-time failure (section 2.4, step 2); `unusable` also marks the send's

@@ -278,6 +278,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       coverHeld: () => controlAction('cover-held'),
       releaseHeld: () => controlAction('release-held'),
       dropBuilder: (dropped: boolean) => controlAction('drop-builder', String(dropped)),
+      refuseMime: (phase: 'size' | 'build', code: 'invalid_header' | 'message_too_large' | 'invalid_wire') =>
+        controlAction('refuse-mime', JSON.stringify({ phase, code })),
       ids: () => readControl<string[]>('send-ids'),
       rateCap: (binding: 'MAIL_RATE_SENDS' | 'MAIL_RATE_UNDO' | 'MAIL_RATE_UNDO_FLOOD', cap: number) =>
         controlAction('rate-cap', JSON.stringify({ binding, cap })),

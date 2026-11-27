@@ -725,6 +725,34 @@ test('a deploy without the frozen builder version holds the send as an invariant
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
 }));
 
+for (const phase of ['size', 'build'] as const) {
+  for (const code of ['invalid_header', 'invalid_wire'] as const) {
+    test(`a MIME ${phase} refusal (${code}) holds release and raises an invariant alert`, () => withSend(async (h, mail, from) => {
+      const { send: pending } = await send(mail, from, 'mime-refused');
+      await h.sends.refuseMime(phase, code);
+      await h.advance(UNDO);
+      assert.equal((await h.sends.row(pending.id))?.state, 'releasing');
+      assert.deepEqual(await h.sends.breaches(), [pending.id]);
+      assert.equal(await h.sends.registration(pending.id), null);
+      assert.deepEqual(await h.sends.queue(), []);
+      await h.advance(minute);
+      assert.ok((await h.alerts()).includes('mail:send_invariant'));
+    }));
+  }
+
+  test(`a message_too_large MIME ${phase} refusal permanently fails release`, () => withSend(async (h, mail, from) => {
+    const { send: pending } = await send(mail, from, 'mime-too-large');
+    await h.sends.refuseMime(phase, 'message_too_large');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.equal(failed.recipients[0].reason, 'message_too_large');
+    assert.deepEqual(await h.sends.breaches(), []);
+    assert.equal((await h.sends.registration(pending.id))?.key ?? null, null);
+    assert.deepEqual(await h.sends.queue(), []);
+  }));
+}
+
 test('a barrier queued behind a publish that covers its commit answers with the send, not 409', () => withSend(async (h, mail, from) => {
   const draft = await mail.createDraft(draftInput(from), key('draft'));
   await h.sends.stallPublish();

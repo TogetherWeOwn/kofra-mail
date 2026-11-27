@@ -5,7 +5,7 @@
 // sends that recorded it.
 
 import { hasHeaderControl, indexedAttachmentName, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
-import { buildSentCopy, encodedSentCopySize, SEND_MIME_VERSION, type SendMimeAttachment as SendMimeBuiltAttachment } from './send-mime.ts';
+import { buildSentCopy, encodedSentCopySize, SEND_MIME_VERSION, SendMimeInvariantError, type SendMimeAttachment as SendMimeBuiltAttachment } from './send-mime.ts';
 
 export type SendMimeAddress = { email: string; name?: string };
 export type SendMimeAttachment = { name: string; type: string; size: number };
@@ -76,7 +76,7 @@ function cleanMimeMessageV1(message: SendMimeMessage): SendMimeMessage {
 }
 
 function inputFor(message: SendMimeMessage) {
-  if (message.replyTo.length > 1) throw new Error('More than one frozen Reply-To address');
+  if (message.replyTo.length > 1) throw new SendMimeInvariantError('More than one frozen Reply-To address');
   return {
     from: message.from,
     to: message.to,
@@ -104,7 +104,7 @@ const sentCopyMimeBuilder: SendMimeBuilder = {
     const attachments: SendMimeBuiltAttachment[] = [];
     for (const [index, attachment] of message.attachments.entries()) {
       const data = await parts(index);
-      if (data.byteLength !== attachment.size) throw new Error('Send attachment size changed');
+      if (data.byteLength !== attachment.size) throw new SendMimeInvariantError('Send attachment size changed');
       attachments.push({ ...attachment, bytes: data });
     }
     return buildSentCopy({ ...inputFor(message), attachments }).bytes;

@@ -18,6 +18,7 @@ import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
 import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
+import { SendMimeError } from '../../src/send-mime.ts';
 import { builds, fixtureBuilders } from './send-mime.ts';
 import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
@@ -139,6 +140,20 @@ export class HttpMailbox extends Mailbox {
   async coverHeld() { this.held!.cover.resolve(); await this.held!.covered.promise; }
   releaseHeld() { this.held?.release.resolve(); this.held = undefined; }
   dropBuilder(dropped: boolean) { this.sendMime = fixtureBuilders(dropped ? 'dropped' : 'base'); }
+  refuseMime({ phase, code }: { phase: 'size' | 'build'; code: 'invalid_header' | 'message_too_large' | 'invalid_wire' }) {
+    const original = this.sendMime;
+    this.sendMime = { current: original.current, get(version) {
+      const builder = original.get(version);
+      if (!builder) return undefined;
+      return phase === 'size' ? { ...builder, encodedSize(message) {
+        if (code === 'invalid_wire') return builder.encodedSize({ ...message, boundary: 'not-a-safe-boundary' });
+        throw new SendMimeError({ code });
+      } } : { ...builder, build(message, parts) {
+        if (code === 'invalid_wire') return builder.build({ ...message, boundary: 'not-a-safe-boundary' }, parts);
+        throw new SendMimeError({ code });
+      } };
+    } };
+  }
   sendIds() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT id FROM mailbox_sends ORDER BY id').toArray().map(row => row.id); }
   publishFailure(failing: boolean) { this.failPublish = failing; }
   private recorded(table: string): unknown[] {
@@ -668,6 +683,7 @@ export default {
           case '/__fixture/cover-held': await box.coverHeld(); break;
           case '/__fixture/release-held': await box.releaseHeld(); break;
           case '/__fixture/drop-builder': await box.dropBuilder(await req.text() === 'true'); break;
+          case '/__fixture/refuse-mime': await box.refuseMime(await req.json()); break;
           case '/__fixture/send-ids': return Response.json(await box.sendIds());
           case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
           case '/__fixture/send-row': return Response.json(await box.sendRow(await req.text()));
