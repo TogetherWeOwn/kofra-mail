@@ -249,7 +249,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       crashAfter: (step: 'released' | 'stored' | 'queued' | 'enqueued') => controlAction('crash-after', step),
       failNextEpilogue: () => controlAction('fail-next-epilogue'),
       bumpBuilder: () => controlAction('bump-builder'),
-      builds: () => readControl<{ version: number; parts: number[] }[]>('mime-builds'),
+      builds: () => readControl<{ version: number; parts: number[]; types: string[]; inReplyTo?: string }[]>('mime-builds'),
       shortHandlerBudget: () => controlAction('short-handler-budget'),
       row: (id: string) => readControl<{ id: string; state: string; undo_until: number; created_seq: number; release_seq: number | null;
         queued_seq: number | null; terminal_seq: number | null; message_id: string | null; reason: string | null; finish_pending: number;

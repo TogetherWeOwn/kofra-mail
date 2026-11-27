@@ -3,7 +3,7 @@ import { mimeBuilders, stubMimeBuilder, type SendMimeBuilder, type SendMimeBuild
 // Deterministic test builders for the send path's MIME port. Version 1 is the
 // stand-in builder; version 2 writes different bytes for the same input, so a
 // test can bump the deployed builder between a send and its release.
-export const builds: { version: number; parts: number[] }[] = [];
+export const builds: { version: number; parts: number[]; types: string[]; inReplyTo?: string }[] = [];
 
 function recording(builder: SendMimeBuilder): SendMimeBuilder {
   return {
@@ -16,7 +16,8 @@ function recording(builder: SendMimeBuilder): SendMimeBuilder {
         read.push(data.byteLength);
         return data;
       });
-      builds.push({ version: builder.version, parts: read });
+      builds.push({ version: builder.version, parts: read, types: message.attachments.map(({ type }) => type),
+        ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}) });
       return bytes;
     },
   };

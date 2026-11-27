@@ -7,7 +7,10 @@
 // The default builder here is a deterministic stand-in until the MIME builder
 // package (M3-4) replaces it. It writes plain RFC 5322 with base64 parts and
 // never a Bcc header, and folds every header line well under 998 octets; it
-// does not trim threading headers, which is the real builder's job.
+// leaves out unsafe threading ids (cleanMimeMessage).
+
+import { hasHeaderControl, indexedAttachmentName, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
+import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 
 export type SendMimeAddress = { email: string; name?: string };
 export type SendMimeAttachment = { name: string; type: string; size: number };
@@ -83,9 +86,49 @@ const mailbox = ({ email, name }: SendMimeAddress) => name ? `${quoted(name)} <$
 const list = (addresses: SendMimeAddress[]) => addresses.map(mailbox).join(`,${FOLD}`);
 const filename = (name: string) => `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
 
+// Version 1 cleans the values a draft carries before laying them out. This is
+// part of the frozen builder version: a change to it needs a new version, or a
+// rerun after a restore would build other bytes than the registered digest.
+// A failed send does not restore its draft, so a value the user cannot fix is
+// cleaned rather than failing the send:
+// - a file name outside 1 to 255 bytes, with a control character, or with a
+//   lone UTF-16 surrogate (which encodeURIComponent refuses) goes through the
+//   indexed-name cleaning; uploads and parts indexed with the mail API on fit;
+// - a type with a header control, over 255 characters or composite
+//   (multipart/*, message/*: parsers drop such a leaf part) is sent opaque;
+// - threading is optional: an unsafe or over-long In-Reply-To is left out, and
+//   References keeps its safe ids, in order, while it fits headerValueBytes.
+const isFileName = (name: string) => name !== '' && bytes(name) <= 255 && !hasHeaderControl(name) && !name.includes('\t');
+function fileName(name: string): string {
+  const whole = name.toWellFormed();
+  return isFileName(whole) ? whole : indexedAttachmentName(whole);
+}
+function fileType(type: string): string {
+  const whole = type.toWellFormed();
+  return whole.length <= 255 && !hasHeaderControl(whole) && !/^\s*(?:multipart|message)\//i.test(whole) ? whole : 'application/octet-stream';
+}
+function threading(inReplyTo: string | undefined, references: string | undefined): Pick<SendMimeMessage, 'inReplyTo' | 'references'> {
+  const max = LIMITS.headerValueBytes;
+  const fits = (id: string) => isSafeMessageId(id) && bytes(id) <= max;
+  const kept: string[] = [];
+  let total = -1;
+  for (const id of references?.split(' ') ?? []) {
+    if (!fits(id) || total + 1 + id.length > max) continue;
+    kept.push(id);
+    total += 1 + id.length;
+  }
+  return { ...(inReplyTo && fits(inReplyTo) && { inReplyTo }), ...(kept.length && { references: kept.join(' ') }) };
+}
+export function cleanMimeMessage(message: SendMimeMessage): SendMimeMessage {
+  const { inReplyTo: _inReplyTo, references: _references, ...rest } = message;
+  return { ...rest, subject: message.subject.toWellFormed(), ...threading(message.inReplyTo, message.references),
+    attachments: message.attachments.map(({ name, type, size }) => ({ name: fileName(name), type: fileType(type), size })) };
+}
+
 type Segment = string | { part: number; size: number };
 
-function layout(message: SendMimeMessage): Segment[] {
+function layout(raw: SendMimeMessage): Segment[] {
+  const message = cleanMimeMessage(raw);
   const headers = [
     `From: ${mailbox(message.from)}`,
     ...(message.replyTo.length ? [`Reply-To: ${list(message.replyTo)}`] : []),
