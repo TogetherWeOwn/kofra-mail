@@ -15,9 +15,10 @@ const compiled = () => build({ entryPoints: [entry], bundle: true, platform: 'br
   external: ['cloudflare:workers'], write: false });
 let bundle: ReturnType<typeof compiled> | undefined;
 
-export async function startMailSendFixture({ quota = true, environment = 'test' } = {}) {
+export async function startMailSendFixture({ quota = true, email = true, environment = 'test' } = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const notices: ResultNotice[] = [];
+  const noticeStatuses: number[] = [];
   const alerts: { body: string; key: string | null }[] = [];
   const alerted = Promise.withResolvers<void>();
   const alertStatuses: number[] = [];
@@ -27,8 +28,9 @@ export async function startMailSendFixture({ quota = true, environment = 'test' 
     switch (new URL(request.url).pathname) {
       case '/notice': {
         const batch = await request.json() as ResultNotice | ResultNotice[];
-        notices.push(...(Array.isArray(batch) ? batch : [batch]));
-        return new Response(null, { status: 204 });
+        const status = noticeStatuses.shift() ?? 204;
+        if (status === 204) notices.push(...(Array.isArray(batch) ? batch : [batch]));
+        return new Response(null, { status });
       }
       case '/email': {
         emailCalls++;
@@ -52,7 +54,7 @@ export async function startMailSendFixture({ quota = true, environment = 'test' 
       durableObjects: { MAILBOX: { className: 'HttpMailbox', scriptName: 'mail-backend' },
         ...(quota && { SEND_QUOTA: { className: 'FakeSendQuota', scriptName: 'mail-backend' } }) },
       d1Databases: ['DIRECTORY'], serviceBindings: { ALERTS: probe, PROBE: probe },
-      bindings: { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: environment, SEND_QUEUE_NAME: SEND, SEND_DLQ_NAME: DLQ },
+      bindings: { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: environment, SEND_QUEUE_NAME: SEND, SEND_DLQ_NAME: DLQ, FIXTURE_EMAIL: email },
       queueProducers: { SEND, FIXTURE_DLQ: DLQ },
       queueConsumers: { [SEND]: { maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 3, deadLetterQueue: DLQ },
         [DLQ]: { maxBatchSize: 1, maxBatchTimeout: 0 } },
@@ -68,7 +70,7 @@ export async function startMailSendFixture({ quota = true, environment = 'test' 
       return await res.json() as string[];
     },
     submit: (body: SendDispatch) => queue.send(body),
-    alerts, alerted: alerted.promise, alertStatuses, notices, providerErrors,
+    alerts, alerted: alerted.promise, alertStatuses, notices, noticeStatuses, providerErrors,
     providerCalls: () => emailCalls,
   });
 }

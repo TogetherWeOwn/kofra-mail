@@ -3,7 +3,7 @@
 import type { EmailBinding } from '../../src/send-consumer.ts';
 import { consumeBatch, type Env } from '../../../mail-send/src/entry.ts';
 
-type FixtureEnv = Env & { PROBE: Fetcher };
+type FixtureEnv = Env & { PROBE: Fetcher; FIXTURE_EMAIL: boolean };
 const binding = (env: FixtureEnv): EmailBinding => ({ async send(request) {
   const response = await env.PROBE.fetch('https://fixture.internal/email', { method: 'POST', body: JSON.stringify(request) });
   if (!response.ok) throw Object.assign(new Error('Fixture provider rejection'), await response.json());
@@ -11,7 +11,7 @@ const binding = (env: FixtureEnv): EmailBinding => ({ async send(request) {
 } });
 
 function handle(batch: Pick<MessageBatch<unknown>, 'messages' | 'queue'>, env: FixtureEnv, now: () => number) {
-  return consumeBatch(batch, { ...env, EMAIL: binding(env), SEND: { async send(notice) {
+  return consumeBatch(batch, { ...env, EMAIL: env.FIXTURE_EMAIL ? binding(env) : undefined, SEND: { async send(notice) {
     await env.PROBE.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify(notice) });
   } } }, now);
 }

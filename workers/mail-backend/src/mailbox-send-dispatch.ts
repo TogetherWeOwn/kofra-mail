@@ -360,7 +360,7 @@ export class SendDispatcher {
     const event = m.event();
     if (event) {
       ready.index.commitEvents([event]);
-      if (m.terminal) this.stalls.clear(m.row.id);
+      if (m.terminal || !m.openExternals().length) this.stalls.clear(m.row.id);
       this.ports.journalDue(timers);
     }
     if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, Math.max(1, driveAt));
@@ -537,7 +537,7 @@ export class SendDispatcher {
         m.setRecipient(idx, 'attempting');
         m.putMark({ ...fence, idx, outcome: null, providerId: null });
       }
-      this.stalls.mark(id, ctx.now);
+      this.stalls.mark(id);
       m.putFence({ ...current, marked: true, leaseUntil });
       m.d.leaseUntil = leaseUntil;
       // Only the fences the consumer's quota call released leave the list.
@@ -641,6 +641,7 @@ export class SendDispatcher {
       if (m.d.leaseUntil! - ctx.now < DISPATCH_WINDOW_MS + ctx.skew) return stale();
       // The quota object's clock and the consumer's backward step can each differ by clockSkew.
       if (quotaDayEnd - ctx.now < DISPATCH_WINDOW_MS + 2 * ctx.skew) return { status: 'quota_window', retryAfter: quotaDayEnd + ctx.skew };
+      this.stalls.reached(id, ctx.now);
       m.putFence({ ...row, authorized: true });
       this.commit(m, ready, timers, null);
       return { status: 'ok', remainingMs: DISPATCH_WINDOW_MS };
@@ -672,6 +673,7 @@ export class SendDispatcher {
       if (!current) return this.recordStale(m, ready, timers, row, result, ctx);
       // A provider result needs a call, and a call needs the fence's authorization.
       if (!row.authorized) return { status: 'stale' };
+      this.stalls.reached(id, ctx.now);
       const attempting = m.markSet(fence).map(mark => mark.idx)
         .filter(idx => m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence));
       let next: number | null = null;
@@ -827,7 +829,7 @@ export class SendDispatcher {
     for (const { idx } of m.markSet(fence)) if (m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence)) m.setRecipient(idx, 'pending');
     const { outcome, driveAt } = change(m, ctx);
     this.expirePreMark(id, ctx.now, timers);
-    this.stalls.release(id, ctx.now, outcome === 'delayed' ? driveAt : undefined);
+    this.stalls.release(id, ctx.now, !row.marked, outcome === 'delayed' ? driveAt : undefined);
     m.putFence({ ...row, outcome });
     m.addRelease(fence);
     m.endLease();
@@ -1047,7 +1049,10 @@ export class SendDispatcher {
     const m = new SendModel(this.ports.sql, row);
     const r: Ready = { ...ready, index };
     const ctx: Ctx = { now, epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
-    if (this.ports.sending && m.state === 'queued' && m.openExternals().length && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
+    const watch = () => {
+      if (this.ports.sending && m.openExternals().length && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
+    };
+    if (m.state === 'queued' || m.state === 'sending') watch();
     this.expirePreMark(row.id, now, timers);
     if (m.d.heldAt !== null) {
       // Held after repeated crashes of our own: never failed, never claimed; an operator resumes it.
@@ -1092,6 +1097,7 @@ export class SendDispatcher {
       m.state = 'queued';
       m.d.delayedUntil = null;
       this.commit(m, r, timers, null, true);
+      watch();
     }
     // Only internal recipients are open: their handoff (M3-8) ends them. Until it runs, the
     // drive row keeps the backoff its handler set before acting (5 minutes doubling to 1 hour).

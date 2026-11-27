@@ -13,11 +13,11 @@ const run = async (body: (h: Fixture) => Promise<void>, options?: Parameters<typ
   try { await body(h); } finally { await h.close(); }
 };
 const TO = 'person@example.net', SUBJECT = 'Secret project title', BODY = 'Private body sentinel';
-async function queued(h: Fixture, name: string, principal: 'member' | 'other' = 'member') {
+async function queued(h: Fixture, name: string, principal: 'member' | 'other' = 'member', to = [TO]) {
   const mail = h.as(principal);
   const { mailbox } = await mail.getSession();
   assert.ok(mailbox);
-  const draft = await mail.createDraft({ from: mailbox.primaryAddress, to: [{ email: TO }], cc: [], bcc: [],
+  const draft = await mail.createDraft({ from: mailbox.primaryAddress, to: to.map(email => ({ email })), cc: [], bcc: [],
     subject: SUBJECT, body: BODY, attachments: [] }, { idempotencyKey: `draft-${name}` });
   const send = await mail.sendDraft(draft.id, { idempotencyKey: `send-${name}`, ifMatch: draft.revision });
   await h.advance(10_000);
@@ -63,6 +63,25 @@ test('every claim RPC fails until the native queue dead-letters; the drive row s
   const redrives = (await h.sends.queue()).filter(m => m.sendId === id);
   assert.ok(redrives.length > 1, 'drive row sent another dispatch');
   assert.deepEqual(await h.batch(SEND, redrives.at(-1)), ['ack']);
+  assert.equal(h.providerCalls(), 1);
+  await assertSent(h, id);
+}));
+
+test('a dispatch during restore is acknowledged and the drive sends exactly once after recovery', () => run(async h => {
+  const id = await queued(h, 'restore-dispatch');
+  await h.beginRestore();
+  assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+  assert.equal(h.providerCalls(), 0);
+  let redrive;
+  for (let slice = 0; slice < 5 && !redrive; slice++) {
+    const timers = (await h.timers()).filter(timer => timer.kind === 'journal_flush' || timer.ref === id);
+    assert.ok(timers.length, 'restore or drive has a timer');
+    await advanceTo(h, Math.max(await h.sends.now(), Math.min(...timers.map(timer => timer.due_at))));
+    await h.sends.driveIdle();
+    redrive = (await h.sends.queue()).find(entry => entry.sendId === id);
+  }
+  assert.deepEqual(redrive, dispatch(id));
+  assert.deepEqual(await h.batch(SEND, redrive), ['ack']);
   assert.equal(h.providerCalls(), 1);
   await assertSent(h, id);
 }));
@@ -200,6 +219,9 @@ test('mail-send persists a provider fact before noticing it; the notice records 
   assert.deepEqual(await h.batch(SEND, notice), ['ack']);
   await assertSent(h, id);
   assert.equal(h.providerCalls(), 1);
+  await h.backendCron();
+  assert.deepEqual(h.alerts, []);
+  assert.equal((await h.sendState(id)).fences.length, 1, 'no new claim');
 }));
 
 test('dropping every result notice after restore still records the stored fact through the drive row', () => run(async h => {
@@ -210,9 +232,26 @@ test('dropping every result notice after restore still records the stored fact t
   assert.equal(h.notices.length, 1);
   h.notices.length = 0;
   await h.restore();
-  await h.advance(6 * MINUTE);
+  await h.sends.driveIdle();
+  const now = await h.sends.now();
+  await h.directoryChange('UPDATE send_results SET notify_after = ? WHERE send_id = ?', now, id);
+  h.noticeStatuses.push(503);
+  await h.backendCron();
+  // The cron UPDATE committed even though the queue send failed. A second tick
+  // cannot take the same row early; the mailbox drive can still take it at due.
+  assert.deepEqual(await storedRows(h, id), [{ notify_after: now + 5 * MINUTE, notify_failures: 0 }]);
+  await h.backendCron();
+  assert.deepEqual(h.notices, []);
+  await h.advance(4 * MINUTE);
+  await h.backendCron();
+  assert.deepEqual(h.notices, []);
+  await h.advance(2 * MINUTE);
   await assertSent(h, id);
+  await h.backendCron();
+  assert.deepEqual(h.notices, []);
+  assert.deepEqual(h.alerts, []);
   assert.equal(h.providerCalls(), 1);
+  assert.equal((await h.sendState(id)).fences.length, 1, 'the drive never makes an empty claim');
 }));
 
 test('an unbound quota dependency never makes a provider call', () => run(async h => {
@@ -254,6 +293,21 @@ test('every mailbox send-event code reaches the operator, once per UTC day acros
   assertRedacted(h);
 }));
 
+test('a one-shot outbound event survives an unavailable D1 alert insert', () => run(async h => {
+  const id = await queued(h, 'alert-write-fails');
+  await h.directoryChange(`CREATE TRIGGER fixture_no_send_alert BEFORE INSERT ON mail_alerts
+    WHEN NEW.source = 'mail:send_unknown_error' BEGIN SELECT RAISE(ABORT, 'fixture refused send alert'); END`);
+  h.providerErrors.push('E_UNRECOGNIZED');
+  assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+  await h.backendCron();
+  assert.deepEqual(sources(h), []);
+  await h.directoryChange('DROP TRIGGER fixture_no_send_alert');
+  await h.advance(16 * MINUTE);
+  await h.backendCron();
+  assert.deepEqual(sources(h), ['mail:send_unknown_error']);
+  assert.equal(h.providerCalls(), 1);
+}));
+
 test('a rejected operator alert is retried with the same daily key and accepted once', () => run(async h => {
   h.alertStatuses.push(503, 204);
   await h.sendEvent('send_outage');
@@ -274,6 +328,7 @@ async function claim(h: Fixture, id: string) {
 
 test('five consecutive pre-Mark lease expiries raise send_stalled without using the crash cap; Mark clears the condition', () => run(async h => {
   const id = await queued(h, 'stall-count');
+  const releasedAt = await h.sends.now();
   let claimed = await claim(h, id);
   for (let i = 1; i <= 5; i++) {
     await advanceTo(h, claimed.leaseUntil + 30_000);
@@ -286,14 +341,13 @@ test('five consecutive pre-Mark lease expiries raise send_stalled without using 
   assert.equal(stalled.dispatch?.unfinished, 0);
   assert.equal(stalled.ledger[0].state, 'pending');
   assert.ok((await h.sends.activeAlerts()).includes('send_stalled'));
-  const markedAt = await h.sends.now();
   assert.deepEqual(await h.sendRpc('markSend', id, claimed.fence, [0], claimed.release), { status: 'ok' });
   await h.advance(MINUTE);
   assert.ok(!(await h.sends.activeAlerts()).includes('send_stalled'));
-  await advanceTo(h, markedAt + 24 * HOUR - MINUTE);
+  await advanceTo(h, releasedAt + 24 * HOUR - MINUTE);
   await h.backendCron();
   assert.equal(sources(h).filter(source => source === stalledSource).length, 1);
-  await advanceTo(h, markedAt + 24 * HOUR);
+  await advanceTo(h, releasedAt + 24 * HOUR);
   await h.backendCron();
   assert.equal(sources(h).filter(source => source === stalledSource).length, 2);
 }));
@@ -331,6 +385,118 @@ test('24 hours since release raises send_stalled after a late first claim; finis
   await h.advance(MINUTE);
   assert.equal((await h.sendState(id)).row?.state, 'failed');
   assert.ok(!(await h.sends.activeAlerts()).includes('send_stalled'));
+}));
+
+for (const marked of [false, true]) test(`restoring a ${marked ? 'sending' : 'queued'} send starts a fresh advisory stall clock without losing the send`, () => run(async h => {
+  const id = await queued(h, 'stall-restore');
+  if (marked) {
+    const claimed = await claim(h, id);
+    assert.deepEqual(await h.sendRpc('markSend', id, claimed.fence, [0], claimed.release), { status: 'ok' });
+  }
+  const releasedAt = await h.sends.now();
+  await h.advance(23 * HOUR);
+  await h.restore();
+  await h.advance(0);
+  await h.sends.driveIdle();
+  const restoredAt = await h.sends.now();
+  assert.equal((await h.sendState(id)).row?.state, marked ? 'sending' : 'queued');
+  await advanceTo(h, releasedAt + 24 * HOUR);
+  await h.backendCron();
+  assert.ok(!sources(h).includes(stalledSource), 'the pre-restore clock is not carried over');
+  await advanceTo(h, restoredAt + 24 * HOUR);
+  await h.backendCron();
+  assert.deepEqual(sources(h), [stalledSource]);
+  await h.quota('setDay', 'restored-day', await h.sends.now() + 24 * HOUR);
+  assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+  assert.equal(h.providerCalls(), 1);
+  await assertSent(h, id);
+}));
+
+test('mixed sends do not alert after all external recipients are terminal', () => run(async h => {
+  const id = await queued(h, 'stall-mixed', 'member', [TO, 'other@example.com']);
+  assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+  assert.deepEqual((await h.sendState(id)).ledger.map(({ kind, state }) => [kind, state]), [['external', 'sent'], ['internal', 'pending']]);
+  await h.advance(25 * HOUR);
+  await h.backendCron();
+  assert.ok(!sources(h).includes(stalledSource), 'nothing external is stalled');
+}));
+
+test('repeated Mark and abandon without authorization still alerts after 24 hours', () => run(async h => {
+  const id = await queued(h, 'stall-after-mark');
+  for (let hour = 0; hour < 25; hour++) {
+    const claimed = await claim(h, id);
+    assert.deepEqual(await h.sendRpc('markSend', id, claimed.fence, [0], claimed.release), { status: 'ok' });
+    await h.sendRpc('abandonClaim', id, claimed.fence, await h.sends.now() + HOUR);
+    await h.advance(HOUR);
+    await h.backendCron();
+    assert.equal(sources(h).filter(source => source === stalledSource).length, hour >= 23 ? 1 : 0);
+  }
+  assert.equal(h.providerCalls(), 0);
+  assert.equal((await h.sendState(id)).dispatch?.unfinished, 0);
+}));
+
+test('a worker with no EMAIL binding still raises the stall alert', () => run(async h => {
+  const id = await queued(h, 'stall-missing-binding');
+  for (let hour = 0; hour < 25; hour++) {
+    assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+    await h.advance(HOUR);
+    await h.quota('setDay', `binding-hour-${hour}`, await h.sends.now() + 24 * HOUR);
+  }
+  await h.backendCron();
+  assert.ok(sources(h).includes(stalledSource));
+  assert.equal(h.providerCalls(), 0);
+  assert.equal((await h.sendState(id)).ledger[0].state, 'pending');
+}, { email: false }));
+
+test('deliberate quota waits do not count toward the stall age', () => run(async h => {
+  const id = await queued(h, 'stall-delay');
+  const release = await h.sends.now();
+  const claimed = await claim(h, id);
+  const wait = 8 * HOUR;
+  assert.deepEqual(await h.sendRpc('delaySend', id, claimed.fence, 'gate', release + wait - 30_000),
+    { status: 'delayed', until: release + wait });
+  await advanceTo(h, release + 24 * HOUR);
+  await h.backendCron();
+  assert.ok(!sources(h).includes(stalledSource));
+  await advanceTo(h, release + 24 * HOUR + wait);
+  await h.backendCron();
+  assert.ok(sources(h).includes(stalledSource));
+}));
+
+test('a reported abandon breaks the consecutive pre-Mark expiry streak', () => run(async h => {
+  const id = await queued(h, 'stall-broken-streak');
+  let claimed = await claim(h, id);
+  for (let round = 0; round < 4; round++) {
+    await advanceTo(h, claimed.leaseUntil + 30_000);
+    claimed = await claim(h, id);
+  }
+  await h.sendRpc('abandonClaim', id, claimed.fence, await h.sends.now() + MINUTE);
+  await h.advance(MINUTE);
+  claimed = await claim(h, id);
+  await advanceTo(h, claimed.leaseUntil + 30_000);
+  await claim(h, id);
+  await h.advance(MINUTE);
+  await h.backendCron();
+  assert.ok(!sources(h).includes(stalledSource));
+}));
+
+for (const [provider, code, limit] of [
+  ['E_EMAIL_SENDING_NOT_READY', 'send_outage', 1],
+  ['E_UNRECOGNIZED', 'send_unknown_error', 1],
+  ['E_INTERNAL_SERVER_ERROR', 'send_ambiguous_cap', 3],
+  ['E_RATE_LIMIT_EXCEEDED', 'send_deadline', 90],
+] as const) test(`provider outcomes reach the operator as ${code}`, () => run(async h => {
+  const id = await queued(h, code);
+  for (let round = 0; round < limit; round++) {
+    h.providerErrors.push(provider);
+    assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+    const state = await h.sendState(id);
+    if (state.row?.state === 'failed' || round + 1 === limit) break;
+    await advanceTo(h, Number(state.dispatch?.next_attempt_at));
+    await h.quota('setDay', `operator-${round}`, await h.sends.now() + 24 * HOUR);
+  }
+  await h.backendCron();
+  assert.deepEqual(sources(h), [`mail:${code}`]);
 }));
 
 test('outage payloads and logs omit provider data and mail content', () => run(async h => {

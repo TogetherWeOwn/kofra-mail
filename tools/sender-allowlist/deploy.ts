@@ -45,6 +45,14 @@ export async function prepareDeploy(configPath: string, env: NodeJS.ProcessEnv, 
     throw new Error('Unexpected sending worker config');
   }
   configWithSenders(rawConfig, []);
+  const database = env.CLOUDFLARE_D1_DATABASE_ID;
+  const directories = Array.isArray(rawConfig.d1_databases)
+    ? rawConfig.d1_databases.filter(binding => isRecord(binding) && binding.binding === 'DIRECTORY') : [];
+  // The checked-in template cannot deploy. Until preflight supplies the per-
+  // environment ID, refuse before the CLI reads or lowers any directory rows.
+  if (!database || database === '00000000-0000-0000-0000-000000000000' || directories.length !== 1 || directories[0].database_id !== database) {
+    throw new Error('Sending worker directory is not configured');
+  }
   const wrangler = command ?? [process.execPath, fileURLToPath(new URL('./bin/wrangler.js', import.meta.resolve('wrangler/package.json')))];
   const cwd = dirname(configPath);
 

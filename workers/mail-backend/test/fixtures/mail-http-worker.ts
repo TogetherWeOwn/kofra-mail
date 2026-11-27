@@ -824,7 +824,8 @@ export default {
         await handleScheduled({ cron: '* * * * *', scheduledTime: now(env), noRetry() {} }, {
           ...env, SEND: { send: body => probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify(body) }),
             async sendBatch(batch) {
-              await probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify([...batch].map(({ body }) => body)) });
+              const response = await probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify([...batch].map(({ body }) => body)) });
+              if (!response.ok) throw new Error('Fixture result notice queue unavailable');
             } },
         }, () => now(env));
         return new Response(null, { status: 204 });

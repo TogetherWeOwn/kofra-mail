@@ -17,9 +17,14 @@ export class SendStalls {
       ON CONFLICT (send_id) DO UPDATE SET lease_expires_at = excluded.lease_expires_at`, id, now, expiresAt);
   }
 
-  mark(id: string, now: number): void {
+  mark(id: string): void {
+    // Mark proves the lease did not expire pre-Mark, not that dispatch reached EMAIL.
+    this.sql.exec('UPDATE mailbox_send_stalls SET expiries = 0, lease_expires_at = NULL WHERE send_id = ?', id);
+  }
+
+  reached(id: string, now: number): void {
     this.sql.exec(`INSERT INTO mailbox_send_stalls (send_id, stall_since) VALUES (?, ?)
-      ON CONFLICT (send_id) DO UPDATE SET stall_since = excluded.stall_since, expiries = 0, lease_expires_at = NULL`, id, now);
+      ON CONFLICT (send_id) DO UPDATE SET stall_since = excluded.stall_since`, id, now);
   }
 
   // Both the drive and a claim can observe the expired lease. Clearing the
@@ -30,12 +35,13 @@ export class SendStalls {
     return row?.expiries === PRE_MARK_EXPIRIES;
   }
 
-  release(id: string, now: number, quotaUntil?: number): void {
+  release(id: string, now: number, beforeMark: boolean, quotaUntil?: number): void {
     // A deliberate quota wait is not stall time. Do not defer a condition that
     // was already active when the quota wait began.
     this.sql.exec(`UPDATE mailbox_send_stalls SET lease_expires_at = NULL,
-      stall_since = CASE WHEN stall_since + ? > ? AND expiries < ? THEN stall_since + ? ELSE stall_since END WHERE send_id = ?`,
-    STALL_AGE_MS, now, PRE_MARK_EXPIRIES, quotaUntil === undefined ? 0 : Math.max(0, quotaUntil - now), id);
+      expiries = CASE WHEN ? THEN 0 ELSE expiries END,
+      stall_since = CASE WHEN stall_since + ? > ? THEN stall_since + ? ELSE stall_since END WHERE send_id = ?`,
+    beforeMark ? 1 : 0, STALL_AGE_MS, now, quotaUntil === undefined ? 0 : Math.max(0, quotaUntil - now), id);
   }
 
   clear(id: string): void { this.sql.exec('DELETE FROM mailbox_send_stalls WHERE send_id = ?', id); }

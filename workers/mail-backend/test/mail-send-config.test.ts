@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { test } from 'node:test';
-import { URL } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
+import { build } from 'esbuild';
 
 async function config(path: string) {
   return JSON.parse((await readFile(new URL(path, import.meta.url), 'utf8')).replace(/^\s*\/\/[^\n]*/gm, ''));
@@ -30,5 +32,22 @@ for (const local of [false, true]) test(`mail-send ${local ? 'local' : 'producti
     binding === 'SEND' && queue === 'send'));
   assert.deepEqual(send.queues.consumers.map(({ queue }: { queue: string }) => queue), ['send', 'send-dlq']);
   assert.equal(send.queues.consumers[0].dead_letter_queue, 'send-dlq');
+  assert.equal(send.queues.consumers[1].max_retries, 100);
+  assert.equal(send.queues.consumers[1].retry_delay, 3600);
   assert.deepEqual(backend.triggers.crons, ['* * * * *']);
+});
+
+test('the sender allow-list job can bundle mail-send with only root dependencies installed', async () => {
+  const rootRequire = createRequire(new URL('../../../package.json', import.meta.url));
+  await build({ entryPoints: [fileURLToPath(new URL('../../mail-send/src/entry.ts', import.meta.url))],
+    bundle: true, platform: 'browser', format: 'esm', write: false, logLevel: 'silent',
+    plugins: [{ name: 'root-install-only', setup(builder) {
+      // The deploy workflow only runs npm ci at the repo root. Ignore packages
+      // that happen to be installed beside mail-backend in the test checkout.
+      builder.onResolve({ filter: /^[^./]/ }, ({ path }) => {
+        try { rootRequire.resolve(path); }
+        catch { return { errors: [{ text: `${path} is not installed by the root npm ci` }] }; }
+      });
+    } }],
+  });
 });

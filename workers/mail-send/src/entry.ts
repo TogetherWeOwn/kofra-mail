@@ -4,7 +4,7 @@ import { validFence, type QuotaPort, type QuotaScope, type SendFence } from '../
 import { validSendId } from '../../mail-backend/src/mailbox-send-store.ts';
 import { sendAlertEnvironment } from '../../mail-backend/src/send-alert-events.ts';
 import { dispatchSend, storeSendResult, type ConsumerMailbox, type EmailBinding, type ResultNotice } from '../../mail-backend/src/send-consumer.ts';
-import { mailboxName } from '../../mail-backend/src/worker.ts';
+import { mailboxName } from '../../mail-backend/src/mailbox-name.ts';
 
 type Namespace<T> = { getByName(name: string): T };
 type QuotaEvent = 'send_quota_failed' | 'send_stale_release_failed';

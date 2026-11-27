@@ -40,6 +40,11 @@ export async function reconcile(ports: ReconcilePorts): Promise<{ enqueueErrors:
   }
   if (mailAlerts) {
     for (const { key, event } of await mailAlerts.pending(now)) {
+      if (!event) {
+        console.log({ metric: 'mail_alert_invalid' });
+        await mailAlerts.sent(key, ports.now());
+        continue;
+      }
       if ('environment' in event) {
         if (!ports.sendAlert || !await mailAlerts.reserveSend(key, now)) continue;
         try { await ports.sendAlert(event); }

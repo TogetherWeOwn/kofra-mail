@@ -157,7 +157,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
-      ...(send && { MAIL_SEND_ENABLED: 'on', MANUAL_ALARMS: 'on' }),
+      ...(send && { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: 'test', MANUAL_ALARMS: 'on' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
       ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },

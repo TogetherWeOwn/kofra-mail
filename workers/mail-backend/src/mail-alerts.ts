@@ -42,19 +42,17 @@ export class MailAlerts {
       .bind(dailySendAlertKey(environment, code, now), `mail:${code}`, now).run();
   }
 
-  async pending(now: number): Promise<Array<{ key: string; event: AlertEvent | DailySendAlert }>> {
+  async pending(now: number): Promise<Array<{ key: string; event?: AlertEvent | DailySendAlert }>> {
     // One indexed range scan of the unsent outbox, also when the range is empty.
     const { results } = await this.db.withSession('first-primary').prepare(`SELECT key FROM mail_alerts
       WHERE sent_at IS NULL AND created_at BETWEEN 0 AND ? ORDER BY created_at, key LIMIT ?`).bind(now, ALERT_PAGE).all<{ key: string }>();
-    return results.flatMap<{ key: string; event: AlertEvent | DailySendAlert }>(({ key }) => {
-      const send = dailySendAlert(key);
-      if (send) return [{ key, event: send }];
-      if (key.startsWith('send-event:')) return [];
+    return results.map(({ key }) => {
+      if (key.startsWith('send-event:')) return { key, event: dailySendAlert(key) };
       const prefix = [FAILED_PREFIX, STUCK_PREFIX, DLQ_PREFIX].find(p => key.startsWith(p)) ?? DLQ_PREFIX;
       const code = prefix === FAILED_PREFIX ? 'delivery_failed' : prefix === STUCK_PREFIX ? 'delivery_stuck' : 'delivery_dlq';
       const [id, generation] = key.slice(prefix.length).split(':');
       const occurrence = generation && /^[1-9][0-9]{0,8}$/.test(generation) ? Number(generation) : undefined;
-      return [{ key, event: { code, deliveryId: isDeliveryId(id) ? id : undefined, ...(occurrence ? { occurrence } : {}) } }];
+      return { key, event: { code, deliveryId: isDeliveryId(id) ? id : undefined, ...(occurrence ? { occurrence } : {}) } };
     });
   }
 

@@ -7,9 +7,11 @@ import { lookupRecipient } from './directory.ts';
 import { receive, type InboundMail } from './inbound.ts';
 import { kofra, type KofraConfig } from './kofra.ts';
 import { MailAlerts } from './mail-alerts.ts';
+import { mailboxName } from './mailbox-name.ts';
 import { Outbox } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
 import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
+import { sendAlertEnvironment } from './send-alert-events.ts';
 
 export type ObjectReferences = {
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
@@ -53,9 +55,7 @@ export type Env = KofraConfig & {
   MAIL_STATE: R2Bucket;
 };
 
-export function mailboxName(workspaceId: string, mailboxId: string): string {
-  return JSON.stringify([workspaceId, mailboxId]);
-}
+export { mailboxName } from './mailbox-name.ts';
 
 export function enabled(env: { MAIL_BACKEND_ENABLED?: string }): boolean {
   return env.MAIL_BACKEND_ENABLED === 'on';
@@ -65,6 +65,7 @@ function queueNames(env: Partial<Env>): void {
   if (!env.DELIVERY_QUEUE_NAME || !env.DEAD_LETTER_QUEUE_NAME || env.DELIVERY_QUEUE_NAME === env.DEAD_LETTER_QUEUE_NAME) {
     throw new Error('Mail queue names missing or not distinct');
   }
+  if (env.MAIL_SEND_ENABLED === 'on') sendAlertEnvironment(env.MAIL_ENVIRONMENT);
 }
 
 export async function handleEmail(message: InboundMail, env: Partial<Env>): Promise<void> {

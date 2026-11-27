@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
 import { Miniflare } from 'miniflare';
 import { deliver, type AlertEvent, type MailboxOutcome } from '../src/deliver.ts';
+import { MailAlerts } from '../src/mail-alerts.ts';
+import { dailySendAlertKey } from '../src/send-alert-events.ts';
 import { LEASE_MS, Outbox, RECONCILE_PAGE } from '../src/outbox.ts';
 import { reconcile, RETENTION_MS } from '../src/reconcile.ts';
 import { handleScheduled, type Env } from '../src/worker.ts';
@@ -169,6 +171,42 @@ test('a cron holding an older re-drive generation cannot stamp a later failure a
   assert.equal((await db.prepare('SELECT alerted_at AS alertedAt FROM deliveries WHERE id = ?').bind(id(9)).first())?.alertedAt, null);
   await outbox.alerted(id(9), 1, 500);
   assert.equal((await db.prepare('SELECT alerted_at AS alertedAt FROM deliveries WHERE id = ?').bind(id(9)).first())?.alertedAt, 500);
+});
+
+test('an enabled send path rejects an unconfigured alert environment', async () => {
+  const env = { MAIL_BACKEND_ENABLED: 'on', MAIL_SEND_ENABLED: 'on', DIRECTORY: db,
+    DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq' } as Env;
+  await assert.rejects(handleScheduled({} as ScheduledController, env), /Invalid mail alert environment/);
+});
+
+test('a second cron cannot take a daily send alert during the first reservation', async () => {
+  const now = Date.now();
+  const outbox = new MailAlerts(db);
+  await outbox.recordSend('test', 'send_outage', now);
+  const key = dailySendAlertKey('test', 'send_outage', now);
+  assert.equal(await outbox.reserveSend(key, now), true);
+  assert.equal(await outbox.reserveSend(key, now), false);
+  assert.equal(await outbox.reserveSend(key, now + 59_999), false);
+  assert.equal(await outbox.reserveSend(key, now + 60_000), true);
+});
+
+test('a malformed daily send alert cannot pin the bounded outbox page', async () => {
+  const now = Date.now();
+  const seen: string[] = [];
+  for (let i = 0; i < 12; i++) await db.prepare(`INSERT INTO mail_alerts (key, source, created_at)
+    VALUES (?, 'mail:unknown', ?)`).bind(`send-event:invalid:${i}`, now - 1).run();
+  await db.prepare("INSERT INTO mail_alerts (key, source, created_at) VALUES (?, 'mail:delivery_dlq', ?)")
+    .bind(`delivery_dlq:${id(8)}`, now).run();
+  const env = {
+    MAIL_BACKEND_ENABLED: 'on', DIRECTORY: db, DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq',
+    ALERTS: { fetch: async (_url: string, init: RequestInit) => {
+      seen.push(JSON.parse(String(init.body)).source);
+      return new Response(null, { status: 204 });
+    } },
+  } as Env;
+  await handleScheduled({} as ScheduledController, env);
+  await handleScheduled({} as ScheduledController, env);
+  assert.deepEqual(seen, ['mail:delivery_dlq']);
 });
 
 test('a late cron leases deliveries at run time rather than its stale scheduled time', async () => {

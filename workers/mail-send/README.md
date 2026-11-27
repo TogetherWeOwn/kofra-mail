@@ -13,6 +13,6 @@ For each environment, in order:
 1. Create the `send` and `send-dlq` queues.
 2. Apply the directory migrations, including `0009_send_results.sql`.
 3. Deploy `mail-backend` with its `SEND` producer and, after M3-6, the `SendQuota` migration. Both Workers must target the same directory D1 database and alert service.
-4. Use the sender allow-list job to deploy `mail-send`. The job adds the `EMAIL` binding; do not add it manually to the template. The job's preflight check for the deployed `Mailbox` and `SendQuota` classes is a separate package after M3-6 and remains an enablement blocker.
+4. Use the sender allow-list job to deploy `mail-send`. The job adds the `EMAIL` binding; do not add it manually to the template. The job must inject the per-environment resource IDs, including `database_id`, into the config derived from `workers/mail-send/wrangler.jsonc` before deployment. That injection and the preflight check for the deployed `Mailbox` and `SendQuota` classes are a separate package after M3-6 and remain enablement blockers. Deploy mode refuses the placeholder template before any directory request.
 
 Test locally from `workers/mail-backend` with `npm test`. The Miniflare suite uses the real mailbox implementation in a separate Worker, local D1, a local queue/DLQ and fake provider, quota and alert endpoints. No deploy or live service is needed.

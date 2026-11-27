@@ -10,7 +10,7 @@ import { contentRecord, type MailboxContentRecord } from './mailbox-api-messages
 import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
 import { MailAlerts } from './mail-alerts.ts';
-import { isSendEventCode, type SendEventCode } from './send-alert-events.ts';
+import { isSendEventCode, sendAlertEnvironment, type SendEventCode } from './send-alert-events.ts';
 import { kofra } from './kofra.ts';
 import { MailboxIndex, PermanentMailError, storedLifecycle } from './mailbox-index.ts';
 import {
@@ -292,20 +292,31 @@ export class Mailbox extends DurableObject<Env> {
   }
 
   private async enqueueSendEvent(code: SendEventCode, now: number): Promise<void> {
-    if (!this.env.MAIL_ENVIRONMENT) return;
-    await new MailAlerts(this.env.DIRECTORY).recordSend(this.env.MAIL_ENVIRONMENT, code, now);
+    await new MailAlerts(this.env.DIRECTORY).recordSend(sendAlertEnvironment(this.env.MAIL_ENVIRONMENT), code, now);
+  }
+
+  private async flushSendEvent(day: number, code: SendEventCode, occurredAt: number): Promise<void> {
+    await this.enqueueSendEvent(code, occurredAt);
+    this.ctx.storage.sql.exec('DELETE FROM mailbox_send_event_outbox WHERE day = ? AND code = ?', day, code);
   }
 
   private async sendOperatorEvent(code: SendEventCode): Promise<void> {
-    try { await this.enqueueSendEvent(code, this.mailApiNow()); }
-    catch { console.error({ code: 'send_alert_store_failed' }); }
+    const now = this.mailApiNow();
+    const day = Math.floor(now / 86_400_000);
+    try {
+      await this.local(timers => {
+        this.ctx.storage.sql.exec('INSERT OR IGNORE INTO mailbox_send_event_outbox (day, code, occurred_at) VALUES (?, ?, ?)', day, code, now);
+        this.journalDue(timers);
+      });
+      await this.flushSendEvent(day, code, now);
+    } catch { console.error({ code: 'send_alert_store_failed' }); }
   }
 
   // Service-only RPC for errors in the dispatch Worker (quota is called there).
   async recordSendEvent(workspaceId: string, mailboxId: string, code: unknown): Promise<void> {
     this.verifyScope({ workspaceId, mailboxId });
     if (!isSendEventCode(code)) throw new Error('Invalid send alert code');
-    if (enabled(this.env) && this.env.MAIL_SEND_ENABLED === 'on') await this.enqueueSendEvent(code, this.mailApiNow());
+    if (enabled(this.env) && this.env.MAIL_SEND_ENABLED === 'on') await this.sendOperatorEvent(code);
   }
 
   // Shared by the drive handler and result notices; a notice passes its fence,
@@ -1242,6 +1253,14 @@ export class Mailbox extends DurableObject<Env> {
       // A skipped-delivery report is sent once per restore.
       if (code === 'restore_skipped' && index && life?.state === 'ready') index.setLifecycle({ ...life, restoreSkipped: 0 });
       next = Math.min(next, sentAt + ALERT_COOLDOWN_MS);
+    }
+    const pendingPage = 12;
+    const pending = sql.exec<{ day: number; code: SendEventCode; occurred_at: number }>(`SELECT day, code, occurred_at
+      FROM mailbox_send_event_outbox ORDER BY day, code LIMIT ?`, pendingPage).toArray();
+    if (pending.length === pendingPage) next = Math.min(next, now + SETTINGS_FLUSH_MS);
+    for (const { day, code, occurred_at } of pending) {
+      try { await this.flushSendEvent(day, code, occurred_at); }
+      catch { next = Math.min(next, now + HELD_RECHECK_MS); }
     }
     return next;
   }
