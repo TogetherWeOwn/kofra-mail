@@ -1584,7 +1584,7 @@ test('a lost answer during a restore marks the send\'s source unusable at once: 
     // The sweeper retired the revision's generation: its object is gone and confirm answers lost.
     h.objects.delete(objectPath(confirmation.object_key));
     await h.sends.forceLost(confirmation.holder);
-    await h.forceSnapshot();
+    assert.equal(await h.forceSnapshot(), true, 'a snapshot with no deltas after it');
     // The restore's confirmation pass gets the lost answer; afterwards no live confirmation can run before release.
     await h.confirmFailure(false);
     await h.restore();
@@ -1605,11 +1605,11 @@ test('a restore refuses a send row whose undo deadline is earlier than its froze
   const { send: pending } = await send(mail, from, 'one');
   const { undoUntil } = JSON.parse((await h.sends.row(pending.id))!.record) as { undoUntil: number };
   await h.sends.setUndoUntil(pending.id, undoUntil + second);
-  await h.forceSnapshot();
+  assert.equal(await h.forceSnapshot(), true, 'a snapshot with no deltas after it');
   await h.restore();
   assert.equal((await mail.getSend(pending.id)).state, 'pending', 'a later deadline restores');
   await h.sends.setUndoUntil(pending.id, undoUntil - 1);
-  await h.forceSnapshot();
+  assert.equal(await h.forceSnapshot(), true, 'a snapshot with no deltas after it');
   await h.restore();
   // The restore refuses the row: the mailbox stays restoring and the send is never served.
   await rejects(mail.getSend(pending.id), 'mailbox_restoring');
@@ -1621,7 +1621,7 @@ test('a recipient restored as attempting is accepted and reported as pending', (
   await h.advance(UNDO);
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
   await h.sends.setRecipientState(pending.id, 0, 'attempting');
-  await h.forceSnapshot();
+  assert.equal(await h.forceSnapshot(), true, 'a snapshot with no deltas after it');
   await h.restore();
   const restored = await mail.getSend(pending.id);
   assert.deepEqual(restored.recipients.map(({ state }) => state), ['pending']);
@@ -1650,7 +1650,14 @@ test('a covered send answers 202 even when the work-lane wake-up after its publi
   finally { await h.sends.failLaneWakeup(false); }
   assert.equal(response.status, 202);
   assert.equal((await response.json() as Send).state, 'pending');
-  await h.advance(UNDO);
+  // The publish covered the draft holder's confirmation, which the lost wake-up never brought forward.
+  const pending = await h.confirmations();
+  assert.ok(pending.some(({ holder }) => holder.startsWith('draft:')), 'the draft holder confirmation is still pending');
+  const batches = (await h.confirmBatches()).length;
+  // The journal lane's own backup run sends it: a lost wake-up only delays the work.
+  await h.advance(minute);
+  assert.ok((await h.confirmBatches()).length > batches, 'the backup run sent the confirmation');
+  assert.deepEqual(await h.confirmations(), [], 'and cleared it');
   assert.equal((await mail.listSends({})).items.length, 1);
 }));
 
@@ -1662,7 +1669,7 @@ for (const retired of ['deleted', 'still readable'] as const) {
     const [confirmation] = await h.confirmations();
     assert.ok(confirmation.holder.startsWith('draft:'));
     // The snapshot holds the draft; sendDraft is replayed from a later delta.
-    await h.forceSnapshot();
+    assert.equal(await h.forceSnapshot(), true, 'a snapshot with no deltas after it');
     const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
     if (retired === 'deleted') h.objects.delete(objectPath(confirmation.object_key));
     await h.sends.forceLost(confirmation.holder);
