@@ -20,6 +20,9 @@ import {
   validTimerKind, type TimerKind, type TimerRow, type TimerRun,
 } from './mailbox-timers.ts';
 import { MailboxWork } from './mailbox-work.ts';
+import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
+import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
+import { SEND_DRIVE } from './mailbox-send-store.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -58,10 +61,16 @@ export class Mailbox extends DurableObject<Env> {
   // Resolved when a write moves the journal_flush deadline earlier, so a
   // running dispatcher re-evaluates the race it is waiting on.
   private laneMoved: PromiseWithResolvers<void> | null = null;
+  // One publish at a time per mailbox: the backup lane's and every barrier's
+  // (docs/m3-outbound-plan.md, section 2.1), so two never race the manifest ETag.
+  protected readonly publishes = new MailboxWork();
+  // The send path's MIME builders (M3-3's port; M3-4 supplies the real one).
+  protected sendMime: SendMimeBuilders = defaultMimeBuilders();
   protected timerHandlerBudgetMs = TIMER_HANDLER_BUDGET_MS;
   protected timerRunBudgetMs = TIMER_RUN_BUDGET_MS;
   protected timerRetryMs = TIMER_RETRY_MS;
   protected holderIoBudgetMs = PUBLISH_BUDGET_MS;
+  protected barrierBudgetMs = PUBLISH_BUDGET_MS;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -89,6 +98,20 @@ export class Mailbox extends DurableObject<Env> {
     });
     register(UPLOAD_EXPIRY, uploadExpiry(ports));
     this.registerTimerKind(IDEM_EXPIRY, idemExpiry(ports, outbound, HELD_RECHECK_MS));
+    // The send path holds its due drive rows, like other outbound kinds, while it is off,
+    // and marks a held pending send for a fresh undo window when the path is on again.
+    const sending = env.MAIL_SEND_ENABLED === 'on';
+    const drive = sendDrive(this.sendPorts());
+    this.registerTimerKind(SEND_DRIVE, {
+      ...drive,
+      run: sending ? drive.run : timer => timer.local(timers => {
+        const due = timers.due(SEND_DRIVE, timer.ref);
+        if (this.lifecycleState() === 'ready' && due !== null && due <= timer.now + this.timerRetryMs) {
+          timers.set(SEND_DRIVE, timer.ref, timer.now + HELD_RECHECK_MS);
+          markSendHeld(ctx.storage.sql, timer.ref);
+        }
+      }),
+    });
     void ctx.blockConcurrencyWhile(() => this.adoptArmedAlarm());
   }
 
@@ -112,6 +135,127 @@ export class Mailbox extends DurableObject<Env> {
     if (!enabled(this.env)) return;
     const due = timers.earliest();
     if (due !== null && (armed === null || armed > due)) await this.ctx.storage.setAlarm(due);
+  }
+
+  protected sendPorts(): SendPorts {
+    const self = this;
+    return {
+      sql: this.ctx.storage.sql,
+      ready: () => {
+        const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+        if (life?.state !== 'ready') return;
+        return { incarnation: life.incarnation, index: this.index(life.scope.workspaceId),
+          scope: { ...life.scope, holderScope: this.ctx.id.toString() } };
+      },
+      local: this.local,
+      publishThrough: seq => this.publishThrough(seq),
+      journalDue: timers => this.journalDue(timers),
+      sweeper: workspaceId => this.env.SWEEPER.getByName(workspaceId),
+      get directory() { return self.env.DIRECTORY; },
+      get queue() { return self.env.SEND; },
+      get mime() { return self.sendMime; },
+      put: (workspaceId, key, bytes) => kofra(this.env, workspaceId).put(key, bytes),
+      checkpoint: step => this.sendCheckpoint(step),
+    };
+  }
+
+  // A test seam after each release step; does nothing here.
+  protected async sendCheckpoint(_step: SendStep): Promise<void> {}
+
+  private journalDue(timers: TimerTable): void {
+    if (this.lowerJournal(timers, this.timerNow() + SETTINGS_FLUSH_MS - PUBLISH_BUDGET_MS)) this.laneMoved?.resolve();
+  }
+
+  // The publish barrier (section 2.1): resolves true once a publish covers
+  // `seq`. Joins the publish in flight or waits for it, then publishes the
+  // remainder. Never call it inside the work lane: the publish reads the
+  // journal outside the lane, and deliveries must not wait on R2.
+  // `wake` false leaves the covered-work wake-up to the caller (scheduleCoveredWake),
+  // so it can queue its own lane work first.
+  protected async publishThrough(seq: number, wake = true): Promise<boolean> {
+    const journal = () => this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
+    // An answer never waits past this: a stalled publish ahead of the barrier
+    // ends the wait (409 for the API, a later drive run for the handler), and
+    // the publish it joined finishes on its own.
+    const deadline = Date.now() + this.barrierBudgetMs;
+    for (let round = 0; round < 64 && journal() < seq; round++) {
+      let progressed = false;
+      try {
+        const done = await this.beforeDeadline(deadline, () => this.publishes.run(async () => {
+          // The publish this barrier queued behind may already cover it.
+          if (journal() >= seq) { progressed = true; return true; }
+          const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+          if (life?.state !== 'ready') return false;
+          const index = this.index(life.scope.workspaceId);
+          const before = journal();
+          await this.recovery(index).publish(life, Date.now(), async () => { throw new Error('Barrier publishes deltas only'); }, undefined,
+            { deltasOnly: true });
+          progressed = journal() > before;
+          return true;
+        }));
+        // Out of time or not ready: the coverage check below decides, since
+        // the publish ahead may have published this commit before its other work.
+        if (!done) break;
+      } catch { return false; }
+      if (!progressed) break;
+    }
+    if (journal() < seq) return false;
+    if (wake) this.scheduleCoveredWake();
+    return true;
+  }
+
+  // A covered caller never waits for this wake-up or fails on it: a lost one
+  // leaves the work to the backup lane's own run.
+  private scheduleCoveredWake(): void {
+    this.ctx.waitUntil(this.work.run(() => this.wakeCoveredWork()).catch(error =>
+      console.error({ code: 'barrier_lane_wakeup', error: error instanceof Error ? error.message : String(error) })));
+  }
+
+  // In the work lane: confirmations and releases a publish covered are the lane's work; bring it forward.
+  protected async wakeCoveredWork(): Promise<void> {
+    const through = this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
+    if (this.ctx.storage.sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_pending_releases WHERE seq <= ?)
+      OR EXISTS (SELECT 1 FROM mailbox_pending_confirmations WHERE seq <= ?) AS pending`, through, through).one().pending) {
+      await this.lowerLane(this.timerNow() + 60_000);
+    }
+  }
+
+  private async sendApi(scope: Scope, operation: 'sendDraft' | 'undoSend' | 'getSend' | 'listSends', params: Record<string, string>,
+    options: MailboxApiOptions): Promise<MailboxApiResult> {
+    const index = this.index(scope.workspaceId);
+    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit }> => {
+      if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const life = index.lifecycle<Lifecycle>();
+      // Undo and send reads use only send rows, never the message index, so they
+      // serve as soon as a restore is ready: the restored send's fresh undo
+      // window must not run out while restored messages are still reindexed.
+      if (life?.state !== 'ready' || (operation === 'sendDraft' && index.unindexed('', 1).length)) {
+        return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      }
+      const write = operation === 'sendDraft' || operation === 'undoSend';
+      if (write) await this.armFor(SETTINGS_FLUSH_MS);
+      const timers = this.timerTable();
+      try {
+        const api = new SendApi(index, this.ctx.storage.sql, { ...scope, holderScope: this.ctx.id.toString() }, life.incarnation, timers,
+          this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table));
+        if (operation === 'getSend') return { result: { body: api.getSend(params) } };
+        if (operation === 'listSends') return { result: { body: await api.listSends(params, options.cursorScope) } };
+        return { commit: operation === 'sendDraft' ? await api.sendDraft(params, options) : await api.undoSend(params, options) };
+      } finally {
+        timers.revoke();
+        await this.rearm();
+      }
+    });
+    if ('result' in outcome) return outcome.result;
+    // The action has taken effect; until a publish covers it, the client retries the same key.
+    if (!await this.publishThrough(outcome.commit.seq, false)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
+    // The answer is queued in the work lane ahead of the covered-work wake-up, so it never waits for it.
+    const answered = this.work.run(async () => {
+      const { body, status, replayed } = await outcome.commit.answer();
+      return { body, status, ...(replayed && { replayed: true }) };
+    });
+    this.scheduleCoveredWake();
+    return answered;
   }
 
   // Registers a timer kind. Call from the constructor.
@@ -227,6 +371,10 @@ export class Mailbox extends DurableObject<Env> {
             AND NOT EXISTS (SELECT 1 FROM mailbox_api_idempotency r WHERE r.key = p.key AND r.expires_at > ?)`,
           options.idempotencyKey, now, now).toArray().length) {
         return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
+      }
+      if (operation === 'sendDraft' || operation === 'undoSend' || operation === 'getSend' || operation === 'listSends') {
+        if (this.env.MAIL_SEND_ENABLED !== 'on') return { error: { code: 'not_implemented' } };
+        return await this.sendApi(scope, operation, params, options);
       }
       const http = options.httpWrite;
       if (operation === 'createUpload') return await this.createUpload(scope, params, http ?? input as UploadBody, options.idempotencyKey, now, http);
@@ -859,9 +1007,10 @@ export class Mailbox extends DurableObject<Env> {
     const confirmStaleAt = oldestConfirmation === undefined ? Infinity : oldestConfirmation + FLAGS_FLUSH_MS;
     const holderLost = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_unusable_sources)
       OR EXISTS (SELECT 1 FROM mailbox_alerts WHERE code = 'holder_source_lost' AND sent_at IS NULL) AS active`).one().active !== 0;
+    const breach = life?.state === 'ready' && sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_breaches) AS active').one().active !== 0;
     const conditions: Array<[MailboxAlertCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
-      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost]];
+      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach]];
     let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {
@@ -999,11 +1148,17 @@ export class Mailbox extends DurableObject<Env> {
     });
     let published: Awaited<ReturnType<MailboxRecovery['publish']>>;
     try {
-      published = await recovery.publish(life, now, () => this.work.run(async () => {
-        // Every done row at or below the cursor is present in the capture.
-        const deliveryCursor = await outbox.deliveryCursor(workspaceId, mailboxId);
-        return { deliveryCursor, seq: index.captureSnapshot() };
-      }), () => outbox.resetBackupWatermark(workspaceId, mailboxId).catch(() => {}));
+      published = await this.publishes.run(async () => {
+        // A barrier may have published since this run read the lifecycle.
+        const stored = index.lifecycle<Lifecycle>();
+        if (stored?.state !== 'ready' || stored.incarnation !== life.incarnation) throw new Error('Mailbox lifecycle changed');
+        life = stored;
+        return recovery.publish(life, now, () => this.work.run(async () => {
+          // Every done row at or below the cursor is present in the capture.
+          const deliveryCursor = await outbox.deliveryCursor(workspaceId, mailboxId);
+          return { deliveryCursor, seq: index.captureSnapshot() };
+        }), () => outbox.resetBackupWatermark(workspaceId, mailboxId).catch(() => {}));
+      });
     } catch (error) {
       // Never write over a manifest this state cannot have produced; raise an alert.
       if (error instanceof BackupConflict) {
@@ -1062,7 +1217,9 @@ export class Mailbox extends DurableObject<Env> {
     const failures = published.snapshotError ? current.failures : 0;
     if (reindexAfter !== current.reindexAfter || failures !== current.failures ||
         reindexFailures !== (current.reindexFailures ?? 0) || reindexRetryAt !== (current.reindexRetryAt ?? 0)) {
-      current = { ...current, reindexAfter, failures, reindexFailures, reindexRetryAt };
+      // Start from the stored lifecycle: a barrier may have published (and moved its ETag) since.
+      const stored = index.lifecycle<Lifecycle>();
+      current = { ...(stored?.state === 'ready' ? stored : current), reindexAfter, failures, reindexFailures, reindexRetryAt };
       index.setLifecycle(current);
     }
     const soon = Date.now() + 1000;

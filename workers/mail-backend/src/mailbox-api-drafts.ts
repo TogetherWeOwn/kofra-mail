@@ -5,14 +5,18 @@ import { sha256 } from './bytes.ts';
 import { attachmentRow, displayOf, messageRow, partNumber } from './mailbox-api-messages.ts';
 import { fail, invalid, isId, iso, need, object, requireId, text, utf8 } from './mailbox-api-input.ts';
 import type { ApiDraftRef, MailboxIndex } from './mailbox-index.ts';
-import { parseMail } from './parse-mail.ts';
+import { decodedAttachment, MAX_INDEXED_ATTACHMENTS, parseMail, readMailMime } from './parse-mail.ts';
 import { unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
+import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
 
 export type DraftObjectRef = Omit<ApiDraftRef, 'holder'>;
+// A small forwarded part is read from its source raw message; `part` records the
+// decoded bytes' digest and size when it is attached, so release can verify them.
+export type PartFingerprint = { digest: string; size: number };
 type StoredAttachment =
   | { wire: Extract<DraftAttachment, { kind: 'link' }> }
-  | { wire: Exclude<DraftAttachment, { kind: 'link' }>; key: string };
+  | { wire: Exclude<DraftAttachment, { kind: 'link' }>; key: string; part?: PartFingerprint };
 export type DraftObject = { version: 1; fields: Omit<DraftInput, 'attachments'>;
   attachments?: StoredAttachment[]; replyHeaders?: ThreadingHeaders };
 
@@ -53,12 +57,52 @@ async function loadDraft(index: MailboxIndex, ref: DraftObjectRef): Promise<{ dr
   const digest = parsed?.kind === 'raw' ? parsed.digest : /^drafts\/([0-9a-f]{64})$/.exec(ref.rawKey)?.[1];
   if (!digest) throw new Error('Invalid API draft reference');
   const bytes = await index.readObject(ref.rawKey);
+  // The read enforced the declared length, so wrong bytes are corrupt for good.
   if (bytes.byteLength > MAX_DRAFT_OBJECT_BYTES || await sha256(bytes) !== digest) {
-    throw new Error('Invalid API draft object');
+    throw new ObjectInvalidError('Invalid API draft object');
   }
-  const draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject;
-  if (draft.version !== 1 || !draft.fields || typeof draft.fields !== 'object') throw new Error('Unsupported draft object');
+  // The bytes match their content address, so if they do not decode to a
+  // draft object, no retry can change that.
+  let draft: DraftObject;
+  try { draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject; }
+  catch { throw new ObjectInvalidError('Invalid API draft object'); }
+  if (!isRecord(draft) || draft.version !== 1 || !isRecord(draft.fields)) throw new ObjectInvalidError('Unsupported draft object');
   return { draft, bytes: bytes.byteLength };
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const isText = (value: unknown): value is string => typeof value === 'string';
+// A string within `max` UTF-8 bytes, the bound the draft save path applies.
+const isBounded = (value: unknown, max: number, header = false) =>
+  isText(value) && utf8(value).byteLength <= max && !(header && hasHeaderControl(value));
+const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value);
+const isAddress = (value: unknown) => isRecord(value) && isBounded(value.email, LIMITS.addressBytes, true) &&
+  optional(value.name, name => isBounded(name, LIMITS.displayNameBytes, true));
+function isStoredAttachment(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
+  const { wire } = value;
+  if (wire.kind === 'link') return isBounded(wire.url, LIMITS.linkUrlBytes) && isBounded(wire.name, LIMITS.linkNameBytes);
+  // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
+  const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
+  return isText(wire.type) && isCount(wire.size) &&
+    optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
+    (wire.kind === 'upload' ? kind === 'att' && isText(wire.uploadId) : wire.kind === 'message' && !!kind && isText(wire.messageId) && isCount(wire.part));
+}
+// Everything release reads from a decoded draft object, within the bounds the
+// draft save path applies; anything else is unusable for good. The API read
+// paths keep their own answers, so only release applies this check.
+export function sendableDraftObject(draft: DraftObject): boolean {
+  const { fields, attachments, replyHeaders } = draft as unknown as Record<string, unknown> & { fields: Record<string, unknown> };
+  const lists = [fields.to, fields.cc, fields.bcc];
+  return isBounded(fields.from, LIMITS.addressBytes, true) && lists.every(list => Array.isArray(list) && list.every(isAddress)) &&
+    lists.reduce<number>((sum, list) => sum + (list as unknown[]).length, 0) <= LIMITS.recipientsPerMessage &&
+    isBounded(fields.subject, LIMITS.subjectBytes, true) && isBounded(fields.body, LIMITS.bodyBytes) &&
+    optional(fields.inReplyTo, isId) && optional(fields.forwardOf, isId) &&
+    // The save path keeps at most pageSizeMax attachments, links included.
+    optional(attachments, list => Array.isArray(list) && list.length <= LIMITS.pageSizeMax && list.every(isStoredAttachment)) &&
+    // The builder leaves out unsafe threading values (cleanMimeMessage).
+    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
 }
 export async function readDraftObject(index: MailboxIndex, ref: DraftObjectRef): Promise<DraftObject> {
   return (await loadDraft(index, ref)).draft;
@@ -77,6 +121,46 @@ export async function readDraftPage(index: MailboxIndex, refs: ApiDraftRef[], li
   }
   return { items, last: refs[items.length - 1], more: refs.length > items.length };
 }
+// Decodes small forwarded parts kept inside their source raw messages, as the
+// deployed parser reads them. A source can be large, so sources are processed
+// one at a time: each is read and parsed once, only the wanted parts' bytes are
+// copied out, and the parse is dropped before the next source is read. `visit`
+// returning false stops the walk.
+export async function eachForwardedPart<T extends { key: string; part: number }>(read: (key: string) => Promise<Uint8Array<ArrayBuffer>>,
+  wanted: readonly T[], visit: (item: T, bytes: Uint8Array<ArrayBuffer> | undefined) => Promise<boolean | void>): Promise<void> {
+  const sources = new Map<string, T[]>();
+  for (const item of wanted) sources.set(item.key, [...sources.get(item.key) ?? [], item]);
+  for (const [key, items] of sources) {
+    const copies = await (async () => {
+      const parsed = await readMailMime(await read(key), key);
+      const { length } = parsed.attachments;
+      return items.map(({ part }) => {
+        // As the content endpoint does: past the indexed limit, the last indexed part
+        // is the synthetic "(N more attachments)" row, never a real file.
+        if (length > MAX_INDEXED_ATTACHMENTS && part >= MAX_INDEXED_ATTACHMENTS) return undefined;
+        const attachment = parsed.attachments[part - 1];
+        return attachment && decodedAttachment(attachment.content).slice();
+      });
+    })();
+    for (const [i, item] of items.entries()) if (await visit(item, copies[i]) === false) return;
+  }
+}
+export const inlinePart = (key: string) => parseObjectKey(key)?.kind === 'raw';
+
+// Fingerprints the small forwarded parts of a draft that do not carry one yet.
+export async function fingerprintParts(index: MailboxIndex, attachments: StoredAttachment[]): Promise<StoredAttachment[]> {
+  const result = [...attachments];
+  const wanted = attachments.flatMap((attachment, at) => attachment.wire.kind === 'message' && 'key' in attachment && !attachment.part &&
+    inlinePart(attachment.key) ? [{ at, key: attachment.key, part: attachment.wire.part, size: attachment.wire.size }] : []);
+  await eachForwardedPart(key => index.readObject(key), wanted, async (item, bytes) => {
+    // The builder lays out the indexed size. A part that decodes to another size,
+    // such as a synthetic "(N more attachments)" row, cannot be sent.
+    if (!bytes || bytes.byteLength !== item.size) return fail('not_found');
+    result[item.at] = { ...attachments[item.at], part: { digest: await sha256(bytes), size: bytes.byteLength } } as StoredAttachment;
+  });
+  return result;
+}
+
 export function wireDraft(ref: DraftObjectRef, draft: DraftObject): Draft {
   return { ...draft.fields, id: ref.id, revision: ref.revision, updatedAt: iso(ref.updatedAt),
     attachments: draft.attachments?.map(({ wire }) => wire) ?? [] };
@@ -169,5 +253,5 @@ export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: un
     (inReplyTo === undefined ? undefined : previous?.replyHeaders);
   return { version: 1, fields: { from, to, cc, bcc, subject, body,
     ...(inReplyTo !== undefined && { inReplyTo }), ...(forwardOf !== undefined && { forwardOf }) },
-    ...(stored.length && { attachments: stored }), ...(replyHeaders && { replyHeaders }) };
+    ...(stored.length && { attachments: await fingerprintParts(index, stored) }), ...(replyHeaders && { replyHeaders }) };
 }

@@ -519,6 +519,9 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       await rejects(send({ to: [] }, 'empty'), 'invalid_recipients');
       const invalidDraft = await mail.createDraft({ ...input, to: [{ email: 'invalid' }] }, key('draft-invalid'));
       await rejects(mail.sendDraft(invalidDraft.id, { ...key('send-invalid'), ifMatch: invalidDraft.revision }), 'invalid_recipients');
+      // An encoded word is not allowed inside an addr-spec; a standalone "=" or "?" is.
+      await rejects(send({ to: [{ email: '=?utf-8?b?QQ==?=@example.com' }] }, 'encoded'), 'invalid_recipients');
+      assert.equal((await send({ to: [{ email: 'a=b@example.com' }, { email: 'c?d@example.com' }] }, 'plain-signs')).state, 'pending');
       const rawBudget = attachmentBudget(limits, input.body);
       const boundary = await mail.createUpload(upload(new Blob([new Uint8Array(rawBudget)])), key('boundary'));
       const boundaryDraft = await mail.createDraft({ ...input, attachments: [{ kind: 'upload', uploadId: boundary.id }] }, key('draft-fits'));

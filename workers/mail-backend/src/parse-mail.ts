@@ -8,7 +8,7 @@ import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Address as WireAddress } from '../../../contracts/mail-api/src/wire.ts';
 
 const EXTERNAL_ATTACHMENT_BYTES = 256 * 1024;
-const MAX_INDEXED_ATTACHMENTS = 512;
+export const MAX_INDEXED_ATTACHMENTS = 512;
 
 export function decodedAttachment(content: unknown): Uint8Array<ArrayBuffer> {
   if (content instanceof ArrayBuffer) return new Uint8Array(content);
@@ -51,9 +51,14 @@ function wireAddresses(input: Address[] | undefined): WireAddress[] {
     .map(x => ({ email: x.address!.slice(0, 512), name: x.name.slice(0, 512) }));
 }
 
+// Bytes that do not match their raw/ key's digest: with the length enforced by
+// the read, the stored object is corrupt for good.
+export class RawDigestMismatch extends Error { constructor() { super('Raw message digest mismatch'); } }
+
 export async function readMailMime(raw: Uint8Array<ArrayBuffer>, rawKey: string) {
   const key = parseObjectKey(rawKey);
-  if (key?.kind !== 'raw' || await sha256(raw) !== key.digest) throw new Error('Raw message digest mismatch');
+  if (key?.kind !== 'raw') throw new Error('Raw message digest mismatch');
+  if (await sha256(raw) !== key.digest) throw new RawDigestMismatch();
   return PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
 }
 

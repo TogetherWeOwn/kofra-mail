@@ -47,7 +47,7 @@ export interface MailApiEnvironment extends RateLimitBindings {
   DIRECTORY?: DirectoryDatabase;
   MAILBOX?: { getByName(name: string): {
     mailApi(ws: string, mb: string, operation: Operation, params: Record<string, string>, input: unknown,
-      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string;
+      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; userId?: string;
         httpWrite?: { stream: ReadableStream<Uint8Array> | null; mediaType: string; contentLength: string | null;
           query: [string, string][] } }): Promise<OperationResult>;
   } };
@@ -238,12 +238,12 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     } else {
       if (mailbox) {
         const draftWrite = op === 'createDraft' || op === 'replaceDraft';
-        const canSendAs = draftWrite || op === 'getSettings' || op === 'updateSettings'
+        const canSendAs = draftWrite || op === 'sendDraft' || op === 'getSettings' || op === 'updateSettings'
           ? (await directory.identities(mailbox.id)).filter((identity) => draftWrite || identity.sendAs === 'active').map((identity) => identity.email) : [];
         result = await env.MAILBOX.getByName(JSON.stringify([principal.workspaceId, mailbox.id])).mailApi(
           principal.workspaceId, mailbox.id, op,
           { ...Object.fromEntries(Object.entries(query).map(([key, value]) => [key, String(value)])), ...params }, input,
-          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId, ...(httpWrite && { httpWrite }) },
+          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId, userId: principal.userId, ...(httpWrite && { httpWrite }) },
         );
       } else result = { body: { state: 'unprovisioned' } };
       if (!result.error && op === 'getSession') {

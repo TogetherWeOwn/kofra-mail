@@ -6,6 +6,7 @@ import type { JournalEvent } from './mail-journal.ts';
 import { fail, invalid, iso, isId, need, object, requireId, text } from './mailbox-api-input.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY } from './mailbox-schema.ts';
 import { normalizeSearch, type MessageDisplay } from './parse-mail.ts';
+import { sendByMessage, summaryState } from './mailbox-send-store.ts';
 
 const FOLDERS = ['inbox', 'archive', 'spam', 'trash'] as const;
 // M1 uses zero for new inbound mail. Reserve a separate bit range so its
@@ -14,6 +15,10 @@ const FOLDER_SHIFT = 16;
 const FOLDER_MASK = 3 << FOLDER_SHIFT;
 const READ = 1 << 18;
 const STARRED = 1 << 19;
+// A copy this mailbox wrote through the send path; folder changes keep it.
+export const SENT = 1 << 20;
+// The sent copy at release: read, in Archive (the self-send filing into Inbox is M3-8's).
+export const SENT_COPY_FLAGS = SENT | READ | (FOLDERS.indexOf('archive') << FOLDER_SHIFT);
 const DAY = 86_400_000;
 export const folderOf = (flags: number): Folder => FOLDERS[(flags & FOLDER_MASK) >> FOLDER_SHIFT];
 const verdictOf = (flags: number): Verdict => folderOf(flags) === 'spam'
@@ -40,8 +45,7 @@ function viewWhere(alias: string, view: View, values: SqlStorageValue[], now: nu
   switch (view) {
     case 'all': return `${bits} < ${2 << FOLDER_SHIFT}`;
     case 'starred': return `${bits} < ${2 << FOLDER_SHIFT} AND (${alias}.flags & ${STARRED}) != 0`;
-    // M1 only indexes inbound copies. M3 will supply the outbound copy flag.
-    case 'sent': return '0';
+    case 'sent': return `(${alias}.flags & ${SENT}) != 0 AND ${bits} < ${2 << FOLDER_SHIFT}`;
     case 'archive': {
       values.push(now);
       return `${bits} = ${1 << FOLDER_SHIFT} AND NOT EXISTS (SELECT 1 FROM messages inbox
@@ -98,7 +102,7 @@ function qualifies(row: MessageRow, view: View): boolean {
   const folder = folderOf(row.flags);
   if (view === 'all') return !folderHidden(folder);
   if (view === 'starred') return !folderHidden(folder) && starred(row.flags);
-  if (view === 'sent') return false;
+  if (view === 'sent') return !folderHidden(folder) && !!(row.flags & SENT);
   return folder === view;
 }
 const fallbackAddress = (email: string): Address => ({ name: '', email });
@@ -126,7 +130,9 @@ export function getThread(sql: SqlStorage, id: string, now: number, state: strin
   if (!isId(id)) return fail('not_found');
   const rows = threadRows(sql, id, now);
   if (!rows.length) return fail('not_found');
+  const flushed = sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
   const messages = rows.map((row): Message => {
+    const send = row.flags & SENT ? sendByMessage(sql, row.id) : undefined;
     const display = displayOf(row);
     const body = sql.exec<{ body: string }>(`SELECT coalesce(d.body_override, f.body, '') AS body FROM messages m
       LEFT JOIN fts f ON m.rowid = f.rowid LEFT JOIN mailbox_api_display d ON m.id = d.id WHERE m.id = ?`, row.id).one().body;
@@ -138,11 +144,13 @@ export function getThread(sql: SqlStorage, id: string, now: number, state: strin
     const folder = folderOf(row.flags);
     return {
       id: row.id, threadId: row.thread_id, folder, unread: unread(row.flags), starred: starred(row.flags), labelIds: idList(row.labels),
-      sent: false, from: display?.from ?? from(row), to: display?.to ?? emailList(row.recipients), cc: display?.cc ?? emailList(row.cc),
+      sent: !!(row.flags & SENT), from: display?.from ?? from(row), to: display?.to ?? emailList(row.recipients), cc: display?.cc ?? emailList(row.cc),
+      ...(send ? { bcc: send.record.recipients.filter(({ field }) => field === 'bcc').map(({ email, name }) => ({ email, name: name ?? '' })) } : {}),
       ...(display?.replyTo.length ? { replyTo: display.replyTo } : {}), date: iso(Number.isFinite(date) ? date : row.internal_date),
       receivedAt: iso(row.internal_date), subject: row.subject, text: body, textTruncated: display?.textTruncated ?? false,
       hasHtml: display?.hasHtml ?? false, remoteImages: display?.remoteImages ?? false, size: row.size, attachments,
       verdict: verdictOf(row.flags),
+      ...(send ? { send: { id: send.id, state: summaryState(send, flushed) } } : {}),
     };
   });
   return { thread: summarize(rows, rows), messages, state };

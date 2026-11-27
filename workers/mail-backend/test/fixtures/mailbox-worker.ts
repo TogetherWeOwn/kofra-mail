@@ -21,6 +21,8 @@ export class AlarmMailbox extends Mailbox {
       register: async () => { throw new Error('Unexpected alarm fixture registration'); },
       hold: async () => {}, release: async () => {},
       holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
+      registerSend: async () => { throw new Error('Unexpected fixture send registration'); },
+      releaseSend: async () => { throw new Error('Unexpected fixture send release'); },
     }) } });
   }
   async saveDraft(ws: string, mb: string, id: string, bytes: Uint8Array<ArrayBuffer>) {

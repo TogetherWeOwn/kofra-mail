@@ -1,7 +1,7 @@
 import { ulid } from 'ulid';
 import { mailAlert, type AlertBinding } from './alerts.ts';
 import type { ObjectKind } from './object-key.ts';
-import type { ConfirmAnswer, ConfirmEntry, HoldTarget } from './sweep-ledger.ts';
+import type { ConfirmAnswer, ConfirmEntry, HoldTarget, SendHolders, SendRegistration, SendReleaseMode } from './sweep-ledger.ts';
 import { deliver, dlq } from './deliver.ts';
 import { lookupRecipient } from './directory.ts';
 import { receive, type InboundMail } from './inbound.ts';
@@ -20,7 +20,12 @@ export type ObjectReferences = {
 export type SweeperReferences = ObjectReferences & {
   holdProvisional(target: HoldTarget, holder: string): Promise<string>;
   confirm(entries: ConfirmEntry[]): Promise<ConfirmAnswer[]>;
+  // The send registration of section 2.4, release step 3 (M3-3).
+  registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders): Promise<SendRegistration>;
+  releaseSend(mailbox: string, sendId: string, mode: SendReleaseMode): Promise<void>;
 };
+// The send queue's dispatch message (section 1): ids only.
+export type SendDispatch = { kind: 'dispatch'; ws: string; mb: string; sendId: string };
 export type MailboxDelivery = { deliver(id: string): Promise<'indexed' | 'deferred' | 'rejected'> };
 type Namespace<T> = { getByName(name: string): T };
 
@@ -31,6 +36,9 @@ export type Env = KofraConfig & {
   MAIL_CONTENT_ENABLED?: string;
   MAIL_RECOVERY_ENABLED?: string;
   MAIL_SWEEP_ENABLED?: string;
+  // The send path (docs/m3-outbound-plan.md, section 1): off unless 'on'.
+  MAIL_SEND_ENABLED?: string;
+  SEND?: { send(message: SendDispatch): Promise<unknown> };
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;

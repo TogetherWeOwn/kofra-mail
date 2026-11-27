@@ -14,7 +14,9 @@ import type { JournalEvent } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { decodedAttachment, normalizeSearch, readMailMime } from './parse-mail.ts';
 
-export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; httpWrite?: HttpMailboxWrite };
+// userId is the verified account user making the request; a send records it as its submitter.
+export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; userId?: string;
+  httpWrite?: HttpMailboxWrite };
 export type PreparedApiKey = { token: string; fingerprint: string };
 export type MailboxApiResult = { body?: unknown; status?: number; replayed?: boolean; error?: MailboxApiError };
 export type MailContentBody = { html?: string; text?: string; auth: string };
@@ -24,6 +26,7 @@ export type MailSource = { workspaceId: string; mailboxId: string; messageId: st
   ({ remoteImages: boolean } | { part: number; name: string; mediaType: string; sizeBytes: number });
 
 type Event = Exclude<JournalEvent, { type: 'message' }>;
+export const mailboxState = (incarnation: string, revision: number, flushed: number) => `${incarnation}-${revision}-${Math.min(flushed, revision)}`;
 export const isIdempotentCreate = (operation: Operation) => operation === 'createLabel' || operation === 'createDraft' || operation === 'createUpload';
 export const mailApiMutation = (operation: Operation) => isIdempotentCreate(operation) ||
   operation === 'replaceDraft' || operation === 'deleteDraft' || operation === 'updateThreads' ||
@@ -35,7 +38,8 @@ export class MailboxApi {
     private readonly timers?: TimerTable, private readonly preparedKey?: PreparedApiKey,
     private readonly clock: () => number = () => now, private readonly uploadsEnabled = false) {}
 
-  private state() { return `${this.incarnation}-${this.index.journal.revision()}`; }
+  // The published position is part of the state: what a send reports changes when a publish covers it.
+  private state() { return mailboxState(this.incarnation, this.index.journal.revision(), this.index.journal.flushed()); }
 
   private label(name: unknown, id?: string): Label {
     if (typeof name !== 'string' || name.length > LIMITS.labelNameChars * 2 + 1024) return invalid('/name');

@@ -66,6 +66,8 @@ export class RegressionMailbox extends Mailbox {
           release: (key, holder) => refs.release(key, holder),
           holdProvisional: (target, holder) => refs.holdProvisional(target, holder),
           confirm: entries => refs.confirm(entries),
+          registerSend: async () => { throw new Error('Unexpected fixture send registration'); },
+          releaseSend: async () => { throw new Error('Unexpected fixture send release'); },
         };
       } },
     });

@@ -4,6 +4,8 @@ import { fileURLToPath, URL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response, type Request } from 'miniflare';
 import type { SweepRearm } from './fixtures/sweep-rearm.ts';
+// The sweeper's second delete of a retired generation, a day after the first.
+const SECOND_DELETE_MS = 24 * 60 * 60_000;
 
 async function setup(t: TestContext) {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/sweep-rearm.ts', import.meta.url))],
@@ -40,6 +42,7 @@ async function setup(t: TestContext) {
   return {
     box, boxes, key, requests, deleted: deleted.promise,
     offAlarmComplete: alarmComplete['/off'].promise, onAlarmComplete: alarmComplete['/on'].promise,
+    nextOnAlarm: () => (alarmComplete['/on'] = Promise.withResolvers<void>()).promise,
     rearmWorkspace: (workspaceId: string) => runtime.dispatchFetch(`http://fixture.local/rearm/${workspaceId}`, { method: 'POST' }),
   };
 }
@@ -73,7 +76,7 @@ test('an off alarm keeps the ledger armed but never sends DELETE', async t => {
 });
 
 test('a real alarm while the backend is off re-arms and later sweeps without another release', { timeout: 10_000 }, async t => {
-  const { box, key, requests, offAlarmComplete, onAlarmComplete } = await setup(t);
+  const { box, key, requests, offAlarmComplete, onAlarmComplete, nextOnAlarm } = await setup(t);
   // Enable the deletion switch so only the backend kill switch blocks DELETE.
   await box.enableSweeping();
   await box.release(key, 'holder');
@@ -91,6 +94,14 @@ test('a real alarm while the backend is off re-arms and later sweeps without ano
   await box.bringAlarmForward(); // Advance only the already-armed wake-up, not the ledger.
   await onAlarmComplete;
   assert.deepEqual(requests, [`/mail-workspace/${key}`]);
+  // The row stays retired until the second delete, a day after the first.
+  const second = await box.nextSweep();
+  assert.ok(second !== null && second >= Date.now() + SECOND_DELETE_MS - 60_000);
+  assert.equal(await box.alarmAt(), second);
+  const again = nextOnAlarm();
+  await box.bringSecondDeleteForward(key);
+  await again;
+  assert.deepEqual(requests, [`/mail-workspace/${key}`, `/mail-workspace/${key}`]);
   assert.equal(await box.nextSweep(), null, 'confirmed DELETE clears the pending ledger row');
   assert.equal(await box.alarmAt(), null);
 });

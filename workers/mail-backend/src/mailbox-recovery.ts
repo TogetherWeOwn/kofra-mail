@@ -205,12 +205,16 @@ export class MailboxRecovery {
   // onMissing runs once the manifest is confirmed absent, before any
   // re-establishment I/O, so the caller can drop published coverage even if
   // the replacement write then fails.
+  // `deltasOnly` is the send path's publish barrier (docs/m3-outbound-plan.md,
+  // section 2.1): it publishes the deltas through the current revision and does
+  // no snapshot or re-establishment work, which stays with the backup lane.
   async publish(life: ReadyLife, now: number, capture: () => Promise<{ seq: number; deliveryCursor: number }>,
-    onMissing?: () => Promise<void>):
+    onMissing?: () => Promise<void>, { deltasOnly = false }: { deltasOnly?: boolean } = {}):
     Promise<{ life: ReadyLife; more: boolean; snapshotError: unknown; lastSeq: number; reestablishing?: true }> {
     const current = await this.read();
     // Tells the caller the published coverage is gone until the new manifest commits.
     if (!current) {
+      if (deltasOnly) throw new Error('Mailbox backup manifest missing; the backup lane re-establishes it');
       await onMissing?.();
       return { ...await this.reestablish(life, now, capture), reestablishing: true };
     }
@@ -253,6 +257,10 @@ export class MailboxRecovery {
       if (!page) break;
       manifest = { ...manifest, delta_keys: [...manifest.delta_keys, page.key], last_seq: page.last };
       changed = true;
+    }
+    if (deltasOnly) {
+      if (changed) manifest = await commit(manifest);
+      return { life, more: this.index.journal.revision() > manifest.last_seq, snapshotError: null, lastSeq: manifest.last_seq };
     }
     // Commit due deltas before any snapshot I/O, so a slow or stalled snapshot
     // upload can never hold back a draft or settings recovery point.
