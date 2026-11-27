@@ -4,6 +4,7 @@
 // version is frozen too: a deploy that adds a version keeps the old one for
 // sends that recorded it.
 
+import { hasHeaderControl, indexedAttachmentName, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
 import { buildSentCopy, encodedSentCopySize, SEND_MIME_VERSION, type SendMimeAttachment as SendMimeBuiltAttachment } from './send-mime.ts';
 
 export type SendMimeAddress = { email: string; name?: string };
@@ -46,6 +47,34 @@ export function mimeBuilders(...builders: SendMimeBuilder[]): SendMimeBuilders {
   return { current: Math.max(...byVersion.keys()), get: version => byVersion.get(version) };
 }
 
+const encoder = new TextEncoder();
+function fileName(name: string): string {
+  const whole = name.toWellFormed();
+  return whole && encoder.encode(whole).byteLength <= 255 && !hasHeaderControl(whole) && !whole.includes('\t')
+    ? whole : indexedAttachmentName(whole);
+}
+
+function fileType(type: string): string {
+  const whole = type.toWellFormed();
+  return whole.length <= 255 && !hasHeaderControl(whole) && !/^\s*(?:multipart|message)\//i.test(whole)
+    ? whole : 'application/octet-stream';
+}
+
+// Freeze cleanup as part of v1 as well as the byte layout: changing either
+// under an accepted send's version could change its registered digest.
+function cleanMimeMessageV1(message: SendMimeMessage): SendMimeMessage {
+  const { inReplyTo, references, ...rest } = message;
+  const safeReferences = references?.split(' ').filter(isSafeMessageId).join(' ');
+  return {
+    ...rest,
+    subject: message.subject.toWellFormed(),
+    attachments: message.attachments.map(({ name, type, size }) => ({ name: fileName(name), type: fileType(type), size })),
+    ...(inReplyTo && isSafeMessageId(inReplyTo) && { inReplyTo }),
+    // M3-4a selects the first and newest IDs within the byte budget.
+    ...(safeReferences && { references: safeReferences }),
+  };
+}
+
 function inputFor(message: SendMimeMessage) {
   if (message.replyTo.length > 1) throw new Error('More than one frozen Reply-To address');
   return {
@@ -66,10 +95,12 @@ function inputFor(message: SendMimeMessage) {
 
 const sentCopyMimeBuilder: SendMimeBuilder = {
   version: SEND_MIME_VERSION,
-  encodedSize(message) {
+  encodedSize(raw) {
+    const message = cleanMimeMessageV1(raw);
     return encodedSentCopySize({ ...inputFor(message), attachments: message.attachments });
   },
-  async build(message, parts) {
+  async build(raw, parts) {
+    const message = cleanMimeMessageV1(raw);
     const attachments: SendMimeBuiltAttachment[] = [];
     for (const [index, attachment] of message.attachments.entries()) {
       const data = await parts(index);

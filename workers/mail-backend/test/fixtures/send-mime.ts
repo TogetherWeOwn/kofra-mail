@@ -1,8 +1,8 @@
 import { defaultMimeBuilders, mimeBuilders, type SendMimeBuilder, type SendMimeBuilders } from '../../src/mailbox-send-mime.ts';
 
-// Record part reads through the real builder. Version 2 adds a header so
-// the restore test can distinguish the newer builder from the frozen one.
-export const builds: { version: number; parts: number[] }[] = [];
+// Record raw port inputs and part reads through the real builder. Version 2
+// adds a header so the restore test can tell it apart from the frozen one.
+export const builds: { version: number; parts: number[]; types: string[]; inReplyTo?: string }[] = [];
 
 function recording(builder: SendMimeBuilder): SendMimeBuilder {
   return {
@@ -15,7 +15,8 @@ function recording(builder: SendMimeBuilder): SendMimeBuilder {
         read.push(data.byteLength);
         return data;
       });
-      builds.push({ version: builder.version, parts: read });
+      builds.push({ version: builder.version, parts: read, types: message.attachments.map(({ type }) => type),
+        ...(message.inReplyTo ? { inReplyTo: message.inReplyTo } : {}) });
       return bytes;
     },
   };

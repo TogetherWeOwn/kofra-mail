@@ -83,3 +83,21 @@ test('the production MIME port encoded size equals built bytes for all supported
   }
   assert.ok(cases.at(-1)!.references!.length > LIMITS.headerValueBytes);
 });
+
+test('the frozen MIME adapter cleans legacy file and thread metadata identically for sizing and build', async () => {
+  const builder = defaultMimeBuilders().get(SEND_MIME_VERSION);
+  assert.ok(builder);
+  const parentTooLong = `<${'p'.repeat(LIMITS.headerValueBytes)}@example.net>`;
+  const raw: SendMimeMessage = {
+    ...base, subject: 'Legacy subject \ud800', inReplyTo: parentTooLong, references: `<root@example.net> ${parentTooLong}`,
+    attachments: [{ name: 'old/\tfile\ud800.txt', type: 'multipart/mixed', size: parts[0].byteLength }],
+  };
+  const cleaned: SendMimeMessage = {
+    ...raw, subject: 'Legacy subject �', inReplyTo: undefined, references: '<root@example.net>',
+    attachments: [{ name: 'oldfile�.txt', type: 'application/octet-stream', size: parts[0].byteLength }],
+  };
+  const size = builder.encodedSize(raw);
+  const actual = await builder.build(raw, async index => parts[index]);
+  assert.equal(size, actual.byteLength);
+  assert.deepEqual(actual, buildSentCopy(input(cleaned)).bytes);
+});

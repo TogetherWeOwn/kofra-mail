@@ -485,7 +485,8 @@ test('frozen inputs: a rerun of release after a restore rewound it builds the sa
     assert.equal(headers['reply-to'], 'original@example.com');
     assert.equal(headers['content-type'], `multipart/mixed; boundary="${frozen.boundary}"`);
     const builds = await h.sends.builds();
-    assert.deepEqual(builds.slice(-2), Array(2).fill({ version: 1, parts: [uploaded.size] }), 'both runs used the frozen builder and parts');
+    assert.deepEqual(builds.slice(-2), Array(2).fill({ version: 1, parts: [uploaded.size], types: [uploaded.type] }),
+      'both runs used the frozen builder and parts');
     // A send made after the changes freezes the new inputs.
     const { send: later } = await send(mail, from, 'later');
     await h.advance(UNDO);
@@ -583,7 +584,7 @@ test('the send keeps a forwarded part\'s holder through release, builds it throu
     await admin.deleteAlias(alias);
     const builds = (await h.sends.builds()).length;
     await h.advance(UNDO);
-    assert.deepEqual((await h.sends.builds()).slice(builds), [{ version: 1, parts: [part.byteLength] }], 'the release read the part through the port');
+    assert.deepEqual((await h.sends.builds()).slice(builds).map(({ version, parts }) => ({ version, parts })), [{ version: 1, parts: [part.byteLength] }], 'the release read the part through the port');
     assert.equal((await mail.getSend(sendKept.id)).state, 'sending');
     assert.equal((await mail.getSend(sendFailing.id)).state, 'failed');
     const [copy] = await sentCopies(mail);
@@ -1497,3 +1498,18 @@ for (const type of ['multipart/mixed', 'message/rfc822']) {
     assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: 'parts.bin', size: 3 }]);
   }));
 }
+
+test('the frozen builder version owns the cleaning: the MIME port gets the stored type and In-Reply-To unchanged', () => withSend(async (h, mail, from) => {
+  const longId = `<${'a'.repeat(1500)}@example.net>`;
+  const uploaded = await mail.createUpload({ name: 'parts.bin', type: 'multipart/mixed', bytes: new Blob([new Uint8Array([1, 2, 3])]) }, key('upload'));
+  const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+  await rewriteFrozenDraft(h, pending.id, draft => { draft.replyHeaders = { inReplyTo: longId }; });
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  const build = (await h.sends.builds()).at(-1)!;
+  assert.deepEqual(build.types, ['multipart/mixed']);
+  assert.equal(build.inReplyTo, longId);
+  const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+  assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
+  assert.doesNotMatch(text, /^In-Reply-To:/m);
+}));
