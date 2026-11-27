@@ -49,7 +49,11 @@ export async function directoryFixture(t: TestContext) {
         throw new Error('fixture rejects invalid D1 statement');
       }
       calls.push({ sql, params });
-      if (control.failQuery) throw new Error(quotedAddress);
+      if (control.failQuery) {
+        res.statusCode = 400;
+        res.end(JSON.stringify({ success: false, errors: [{ message: quotedAddress }] }));
+        return;
+      }
       const stmt = db.prepare(sql);
       if (/^SELECT/.test(sql)) {
         res.end(JSON.stringify({ success: true, result: [{ success: true, results: stmt.all(...params) }] }));
@@ -58,9 +62,9 @@ export async function directoryFixture(t: TestContext) {
         const { changes } = stmt.run(...params);
         res.end(JSON.stringify({ success: true, result: [{ success: true, results: [], meta: { changes } }] }));
       }
-    } catch (error) {
+    } catch {
       res.statusCode = 400;
-      res.end(JSON.stringify({ success: false, errors: [{ message: String(error) }] }));
+      res.end(JSON.stringify({ success: false, errors: [{ message: 'Invalid fixture query' }] }));
     }
   });
   server.listen(0, '127.0.0.1');

@@ -211,6 +211,30 @@ test('failed REST responses and failed Wrangler output never reach either log st
   assert.equal(fixture.policy(quotedAddress), 'pending');
 });
 
+test('deployment refuses a stale dispatch even when checked out at its original commit', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'velmora-sender-allowlist-ref-'));
+  t.after(() => rm(dir, { recursive: true }));
+  const env = { PATH: process.env.PATH, HOME: dir };
+  const git = async (...args: string[]) => (await runFile('git', args, { cwd: dir, env })).stdout.trim();
+  const commit = (message: string) => git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', message);
+  const guard = fileURLToPath(new URL('./check-main.sh', import.meta.url));
+  const check = (sha: string) => runFile('bash', [guard], { cwd: dir, env: { ...env, GITHUB_SHA: sha } });
+  await git('init', '--initial-branch=main');
+  await git('remote', 'add', 'origin', '.');
+  await commit('original dispatch');
+  const original = await git('rev-parse', 'HEAD');
+  await check(original);
+  await commit('new main head');
+  const current = await git('rev-parse', 'HEAD');
+  await git('checkout', '--detach', original);
+  const stale = { code: 1, stdout: '', stderr: 'Cannot verify this checkout is current main; start a fresh dispatch.\n' };
+  await assert.rejects(check(original), stale);
+  await assert.rejects(check(current), stale);
+  await git('checkout', 'main');
+  await check(current);
+});
+
 async function invokeCli(t: TestContext, origin: string, mode: string, hasConfig: boolean, wranglerMode = 'empty') {
   const dir = await mkdtemp(join(tmpdir(), 'velmora-sender-allowlist-test-'));
   t.after(() => rm(dir, { recursive: true }));
