@@ -60,7 +60,8 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, ancestry
 // Local workerd closes without a half-close after an early answer, unlike the
 // Cloudflare edge (see PR verification). Wait for 100 Continue before streaming
 // so an eager write cannot reset the socket before we see the final response.
-export async function fetchOversizedRequest(req: Request, size: number, signal = AbortSignal.timeout(30_000)): Promise<Response> {
+export async function fetchOversizedRequest(req: Request, size: number): Promise<Response> {
+  const signal = AbortSignal.timeout(30_000);
   assert.ok(req.body instanceof NodeReadableStream);
   const body = Readable.fromWeb(req.body);
   const headers = new Headers(req.headers);
