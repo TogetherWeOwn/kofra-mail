@@ -193,6 +193,9 @@ export class Mailbox extends DurableObject<Env> {
         return { index: this.index(life.scope.workspaceId), epoch: life.epoch ?? 0, restoredAt: life.restoredAt ?? 0 };
       },
       local: this.local,
+      exclusive: (io, step) => this.exclusiveStep(io, step),
+      beforeSenderCheck: () => this.sendSenderCheckpoint(),
+      beforeRecord: fence => this.sendRecordCheckpoint(fence),
       publishThrough: seq => this.publishThrough(seq),
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
@@ -200,6 +203,28 @@ export class Mailbox extends DurableObject<Env> {
       clockSkewMs: this.clockSkewMs(),
       now: () => this.mailApiNow(),
       sending: this.env.MAIL_SEND_ENABLED === 'on',
+    });
+  }
+
+  // A test seam inside the work lane, just before authorizeDispatch's directory statement.
+  protected async sendSenderCheckpoint(): Promise<void> {}
+  // A test seam before recordResult acts.
+  protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
+
+  // Holds the work lane across `io`, then runs `step` in a transaction and
+  // re-arms without reading the alarm first, so `io` is the last await before
+  // the step's commit.
+  private exclusiveStep<A, T>(io: () => Promise<A>, step: (timers: TimerTable, value: A) => T): Promise<T> {
+    return this.work.run(async () => {
+      const value = await io();
+      let result!: T;
+      const timers = this.timerTable();
+      await this.rearm(() => {
+        result = this.ctx.storage.transactionSync(() => {
+          try { return step(timers, value); } finally { timers.revoke(); }
+        });
+      }, true);
+      return result;
     });
   }
 
@@ -214,16 +239,17 @@ export class Mailbox extends DurableObject<Env> {
   }
 
   async authorizeDispatch(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
-    quotaDay: string): Promise<AuthorizeAnswer> {
-    return this.sendDispatcher().authorize({ workspaceId, mailboxId }, sendId, fence, recipients, quotaDay);
+    quotaDayEnd: number): Promise<AuthorizeAnswer> {
+    return this.sendDispatcher().authorize({ workspaceId, mailboxId }, sendId, fence, recipients, quotaDayEnd);
   }
 
   async recordResult(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, result: ProviderResult): Promise<ReportAnswer> {
     return this.sendDispatcher().record({ workspaceId, mailboxId }, sendId, fence, result);
   }
 
-  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence): Promise<DelayAnswer> {
-    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence);
+  // `gate`: our own daily or monthly gate is closed; `provider_daily`: the provider's daily-limit error.
+  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, cause: 'gate' | 'provider_daily'): Promise<DelayAnswer> {
+    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence, cause);
   }
 
   async abandonClaim(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, retryAt: number): Promise<AbandonAnswer> {
@@ -296,10 +322,11 @@ export class Mailbox extends DurableObject<Env> {
     }
   }
 
+  // `published`: a read already waited once for the publish of its sends' consumer changes.
   private async sendApi(scope: Scope, operation: 'sendDraft' | 'undoSend' | 'getSend' | 'listSends', params: Record<string, string>,
-    options: MailboxApiOptions): Promise<MailboxApiResult> {
+    options: MailboxApiOptions, published = false): Promise<MailboxApiResult> {
     const index = this.index(scope.workspaceId);
-    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit }> => {
+    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit } | { reread: number }> => {
       if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
       const life = index.lifecycle<Lifecycle>();
       // Undo and send reads use only send rows, never the message index, so they
@@ -314,8 +341,13 @@ export class Mailbox extends DurableObject<Env> {
       try {
         const api = new SendApi(index, this.ctx.storage.sql, { ...scope, holderScope: this.ctx.id.toString() }, life.incarnation, timers,
           this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table));
-        if (operation === 'getSend') return { result: { body: api.getSend(params) } };
-        if (operation === 'listSends') return { result: { body: await api.listSends(params, options.cursorScope) } };
+        if (operation === 'getSend' || operation === 'listSends') {
+          const body = operation === 'getSend' ? api.getSend(params) : await api.listSends(params, options.cursorScope);
+          // A send's consumer state is reported only once published (section 2.1), like its terminal state.
+          const unpublished = api.unpublishedProgress('items' in body ? body.items.map(({ id }) => id) : [body.id]);
+          if (!unpublished) return { result: { body } };
+          return published ? fail('mailbox_restoring', { retryAfterSeconds: 1 }) : { reread: unpublished };
+        }
         return { commit: operation === 'sendDraft' ? await api.sendDraft(params, options) : await api.undoSend(params, options) };
       } finally {
         timers.revoke();
@@ -323,6 +355,10 @@ export class Mailbox extends DurableObject<Env> {
       }
     });
     if ('result' in outcome) return outcome.result;
+    if ('reread' in outcome) {
+      if (!await this.publishThrough(outcome.reread)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+      return this.sendApi(scope, operation, params, options, true);
+    }
     // The action has taken effect; until a publish covers it, the client retries the same key.
     if (!await this.publishThrough(outcome.commit.seq, false)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
     // The answer is queued in the work lane ahead of the covered-work wake-up, so it never waits for it.

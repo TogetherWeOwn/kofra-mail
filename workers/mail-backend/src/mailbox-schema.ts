@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, sinc
 CREATE TABLE IF NOT EXISTS mailbox_send_dispatch (
   send_id TEXT PRIMARY KEY REFERENCES mailbox_sends(id) ON DELETE CASCADE, attempt INTEGER NOT NULL,
   lease_epoch INTEGER, lease_attempt INTEGER, lease_until INTEGER, next_attempt_at INTEGER NOT NULL, delayed_until INTEGER,
-  ambiguous INTEGER NOT NULL, provider_wait INTEGER NOT NULL, refusals INTEGER NOT NULL, unfinished INTEGER NOT NULL,
+  ambiguous INTEGER NOT NULL, provider_wait INTEGER NOT NULL, refusals INTEGER NOT NULL, outages INTEGER NOT NULL, unfinished INTEGER NOT NULL,
   held_at INTEGER, grace_until INTEGER, grace_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS mailbox_send_held ON mailbox_send_dispatch(held_at) WHERE held_at IS NOT NULL;

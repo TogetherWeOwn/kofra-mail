@@ -84,6 +84,23 @@ export class HttpMailbox extends Mailbox {
   private pausedEnqueue?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
   async enqueuePaused() { await this.pausedEnqueue!.reached.promise; }
   resumeEnqueue() { this.pausedEnqueue?.resume.resolve(); this.pausedEnqueue = undefined; }
+  // Holds the next authorizeDispatch inside the lane, before its directory statement.
+  private senderGate?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pauseSenderCheck() { this.senderGate = { reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }; }
+  async senderCheckPaused() { await this.senderGate!.reached.promise; }
+  resumeSenderCheck() { const gate = this.senderGate; this.senderGate = undefined; gate?.resume.resolve(); }
+  protected override async sendSenderCheckpoint() {
+    const gate = this.senderGate;
+    if (gate) { gate.reached.resolve(); await gate.resume.promise; }
+  }
+  // Fails recordResult once for one fence attempt.
+  private failRecordAttempt?: number;
+  failRecordOnce(attempt: number) { this.failRecordAttempt = attempt; }
+  protected override async sendRecordCheckpoint(fence: { attempt: number }) {
+    if (fence.attempt !== this.failRecordAttempt) return;
+    this.failRecordAttempt = undefined;
+    throw new Error('Fixture record failure');
+  }
   protected override sendQuota() { return (this.env as unknown as FixtureEnv).SEND_QUOTA.getByName('account') as unknown as QuotaPort; }
   // The consumer's side of one send, as stored (M3-5a).
   sendState(id: string) {
@@ -792,9 +809,13 @@ export default {
             break;
           }
           case '/__fixture/send-rpc': {
-            const { method, args } = await req.json<{ method: string; args: unknown[] }>();
-            return Response.json(await box.sendRpc(ws, mailboxId!, method, args) ?? null);
+            const { method, args, mb } = await req.json<{ method: string; args: unknown[]; mb?: string }>();
+            return Response.json(await box.sendRpc(ws, mb ?? mailboxId!, method, args) ?? null);
           }
+          case '/__fixture/pause-sender-check': await box.pauseSenderCheck(); break;
+          case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
+          case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
+          case '/__fixture/fail-record-once': await box.failRecordOnce(Number(await req.text())); break;
           case '/__fixture/quota': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();
             const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;

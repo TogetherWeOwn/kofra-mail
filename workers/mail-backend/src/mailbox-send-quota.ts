@@ -12,11 +12,13 @@ export type SendFence = { epoch: number; attempt: number };
 // indexes, never addresses.
 export type QuotaScope = { workspaceId: string; mailboxId: string; sendId: string };
 
-// `day` names the quota day the charge sits in; `resetAt` is the end of the
-// current quota day on the quota object's clock. `stale`: the fence is older
-// than the newest fence seen for a recipient, or it was released.
+// `day` names the quota day the charge sits in and `dayEnd` is when that day
+// ends on the quota object's clock (the consumer passes it to
+// authorizeDispatch). `exhausted`: a gate (daily or monthly) is closed until
+// `resetAt`. `stale`: the fence is older than the newest fence seen for a
+// recipient, or it was released.
 export type QuotaAnswer =
-  | { status: 'ok'; day: string }
+  | { status: 'ok'; day: string; dayEnd: number }
   | { status: 'exhausted'; resetAt: number }
   | { status: 'stale' };
 
@@ -33,8 +35,12 @@ export interface QuotaPort {
   // and invalidates the fence for later reservations and confirmations.
   // Idempotent.
   release(scope: QuotaScope, fences: SendFence[]): Promise<void>;
-  // The end of the named quota day, or of the current one, on the quota object's clock.
-  resetAt(day?: string): Promise<number>;
+  // The end of the current quota day, on the quota object's clock: the
+  // provider's daily limit resets then.
+  resetAt(): Promise<number>;
+  // When our own closed gate opens again: the daily reset, or the monthly one
+  // while the monthly gate is closed.
+  gateResetAt(): Promise<number>;
 }
 
 export const fenceKey = ({ epoch, attempt }: SendFence) => `${epoch}:${attempt}`;

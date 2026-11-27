@@ -25,8 +25,8 @@ import {
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
-import { delayedUntil, finishReleases, type SendDispatcher } from './mailbox-send-dispatch.ts';
-import type { QuotaPort } from './mailbox-send-quota.ts';
+import { delayedUntil, finishReleases, RELEASE_BATCH, type SendDispatcher } from './mailbox-send-dispatch.ts';
+import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
 import type { JournalEvent, JournalResult, SendFailure, SendPart, SendRecipient, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { ObjectInvalidError } from './object-errors.ts';
@@ -57,7 +57,7 @@ export type SendPorts = {
   mime: SendMimeBuilders;
   put(workspaceId: string, key: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
   // The consumer's side after release (M3-5a): stored results and the drive decisions.
-  dispatcher: Pick<SendDispatcher, 'drive' | 'recordStored'>;
+  dispatcher: Pick<SendDispatcher, 'drive' | 'storedSettled'>;
   quota(): QuotaPort | undefined;
   // Called after each completed release step; tests inject crashes here.
   checkpoint?(step: SendStep): Promise<void>;
@@ -288,6 +288,14 @@ export class SendApi {
     return { seq, answer: async () => ({ body: await readDraft(this.index, ref) satisfies Draft, status: 200 }) };
   }
 
+  // The newest consumer change (M3-5) of these sends that no publish covers yet, or 0.
+  unpublishedProgress(ids: string[]): number {
+    if (!ids.length) return 0;
+    return this.sql.exec<{ seq: number | null }>(`SELECT max(seq) AS seq FROM journal WHERE seq > ?
+      AND json_extract(event, '$.type') = 'send_progress' AND json_extract(event, '$.id') IN (SELECT value FROM json_each(?))`,
+    flushed(this.sql), JSON.stringify(ids)).one().seq ?? 0;
+  }
+
   getSend(params: Record<string, string>): Send {
     if (!validSendId(params.sendId)) return fail('not_found');
     return this.getSendBody(params.sendId);
@@ -511,8 +519,8 @@ export class SendDriver {
     if (row.queuedSeq === null) return;
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
     // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
-    try { await this.ports.dispatcher.recordStored(start.scope, this.ref); }
-    catch (error) { console.error({ code: 'send_result_lookup', error: error instanceof Error ? error.message : String(error) }); }
+    // Until every stored result is recorded, nothing is enqueued: a retry could resend an accepted call.
+    const settled = await this.ports.dispatcher.storedSettled(start.scope, this.ref);
     const decision = await this.commit(start, ['queued', 'sending', 'delayed', ...TERMINAL], (timers, current, index) => {
       if (current.finishPending) return 'finish' as const;
       if (TERMINAL.includes(current.state)) return null;
@@ -520,10 +528,13 @@ export class SendDriver {
       return this.ports.dispatcher.drive(index, current, timers, ready, this.timer.now);
     });
     if (decision === STALE || decision === null) return;
+    if (decision === 'release') return this.releaseHeld(start);
     if (decision === 'finish') {
       const finished = await this.ports.local(() => sendRow(this.ports.sql, this.ref));
       return finished ? this.finish({ ...start, row: finished }) : undefined;
     }
+    // The drive row stays at its backoff and tries the lookup again.
+    if (!settled) return;
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');
@@ -541,11 +552,7 @@ export class SendDriver {
     if (!await ports.local(() => this.current(start) && ports.ready()?.incarnation === start.incarnation)) return;
     // The quota part of step 3: every fence on the release list, in one idempotent call; kept charges stay.
     const fences = await ports.local(() => finishReleases(ports.sql, this.ref));
-    if (fences.length) {
-      const quota = ports.quota();
-      if (!quota) throw new Error('Send quota binding missing');
-      await quota.release({ workspaceId: start.scope.workspaceId, mailboxId: start.scope.mailboxId, sendId: row.id }, fences);
-    }
+    await this.releaseFences(start, fences);
     await ports.sweeper(start.scope.workspaceId).releaseSend(start.scope.mailboxId, row.id, mode);
     await this.commit(start, TERMINAL, (timers, current, index) => {
       if (!current.finishPending) return;
@@ -559,6 +566,22 @@ export class SendDriver {
       ports.sql.exec('DELETE FROM mailbox_send_breaches WHERE send_id = ?', this.ref);
       ports.journalDue(timers);
     });
+  }
+
+  // Releases fences in batches the quota call takes at once; an absent reservation is a no-op.
+  private async releaseFences(start: Start, fences: SendFence[]): Promise<void> {
+    if (!fences.length) return;
+    const quota = this.ports.quota();
+    if (!quota) throw new Error('Send quota binding missing');
+    const scope = { workspaceId: start.scope.workspaceId, mailboxId: start.scope.mailboxId, sendId: this.ref };
+    for (let at = 0; at < fences.length; at += RELEASE_BATCH) await quota.release(scope, fences.slice(at, at + RELEASE_BATCH));
+  }
+
+  // A held send's never-authorized charges go while it waits for an operator; the list stays until finish or Mark.
+  private async releaseHeld(start: Start): Promise<void> {
+    const fences = await this.ports.local(() => finishReleases(this.ports.sql, this.ref));
+    try { await this.releaseFences(start, fences); }
+    catch (error) { console.error({ code: 'send_quota_release', error: error instanceof Error ? error.message : String(error) }); }
   }
 
   private async breach(start: Start): Promise<void> {

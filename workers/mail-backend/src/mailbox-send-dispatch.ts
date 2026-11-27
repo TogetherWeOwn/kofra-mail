@@ -9,7 +9,8 @@ import type { MailboxIndex } from './mailbox-index.ts';
 import { fenceBefore, fenceKey, sameFence, validFence, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
 import { senderActive } from './mailbox-send-sender.ts';
 import {
-  dispatchRow, fenceRows, ledger, markRows, releaseList, SEND_DRIVE, sendRow, sentCopyId, TERMINAL, validProviderId, validReason, validSendId,
+  dispatchRow, fenceRows, ledger, markRows, releaseList, SEND_DRIVE, sendRow, sentCopyId, TERMINAL, validErrorCode, validProviderId, validReason,
+  validSendId,
   type LedgerRow, type SendRow,
 } from './mailbox-send-store.ts';
 import type { TimerRun, TimerTable } from './mailbox-timers.ts';
@@ -42,6 +43,8 @@ export const RESTORING_NOTICE_MS = 5 * 60_000;
 export const NOTICE_BACKOFF_MS = 60_000;
 export const NOTICE_BACKOFF_MAX_MS = 60 * 60_000;
 const STORED_PAGE = 16;
+// Release-list fences a claim hands out, a Mark removes and a quota call releases at once.
+export const RELEASE_BATCH = 64;
 
 export type ProviderResult =
   // `send()` was accepted: every recipient of the call is sent, except those
@@ -57,7 +60,8 @@ export type ClaimedRecipient = SendRecipient & { idx: number };
 export type ClaimAnswer =
   | { status: 'claimed'; fence: SendFence; leaseUntil: number; recipients: ClaimedRecipient[]; release: SendFence[];
       from: SendRecord['from']; replyTo: SendRecord['replyTo']; sentCopyKey: string | null }
-  | { status: 'not_now'; reason: 'restoring' | 'disabled' | 'unpublished' | 'leased' | 'delayed' | 'backoff' | 'held' | 'grace' }
+  // `results`: a stored provider result for this send could not be read or recorded yet.
+  | { status: 'not_now'; reason: 'restoring' | 'disabled' | 'unpublished' | 'leased' | 'delayed' | 'backoff' | 'held' | 'grace' | 'results' }
   // Nothing to send for this send now or ever: the consumer acknowledges.
   | { status: 'refused' }
   // A ready mailbox has no such send.
@@ -81,6 +85,13 @@ export type DispatchPorts = {
   // Synchronous, inside a step: the ready mailbox's index and recovery fences.
   current(): Ready | undefined;
   local: TimerRun['local'];
+  // Holds the work lane across `io` and then runs `step` synchronously in a
+  // transaction, so `io` is the last await before the step's commit.
+  exclusive<A, T>(io: () => Promise<A>, step: (timers: TimerTable, value: A) => T): Promise<T>;
+  // A test seam inside the lane, just before authorizeDispatch's directory statement.
+  beforeSenderCheck?(): Promise<void>;
+  // A test seam before recordResult acts, for fault injection.
+  beforeRecord?(fence: SendFence): Promise<void>;
   publishThrough(seq: number): Promise<boolean>;
   // Moves the journal lane to the settings recovery point, so every commit is published soon.
   journalDue(timers: TimerTable): void;
@@ -92,7 +103,6 @@ export type DispatchPorts = {
 };
 
 type Ctx = { now: number; epoch: number; restoredAt: number; skew: number };
-const ACCEPTED_STATES: readonly string[] = ['sent', 'suppressed'];
 const rank = (state: string) => state === 'sent' ? 3 : state === 'suppressed' ? 2 : state === 'failed' ? 1 : 0;
 const isTerminalRecipient = (state: LedgerRow['state']) => state === 'sent' || state === 'failed' || state === 'suppressed';
 const metric = (name: string) => console.log({ metric: name });
@@ -188,10 +198,11 @@ class SendModel {
 
   endLease(): void { this.d.leaseEpoch = null; this.d.leaseAttempt = null; this.d.leaseUntil = null; }
 
-  // `sent` if every recipient was accepted (sent or suppressed), `failed` if none was, `partial` otherwise.
+  // `sent` if every recipient was sent, `failed` if none was, `partial` otherwise: a
+  // suppressed recipient was accepted but not delivered (M3-9: the send is partial).
   finalState(): 'sent' | 'partial' | 'failed' {
-    const accepted = [...this.rows.values()].filter(entry => ACCEPTED_STATES.includes(entry.state)).length;
-    return accepted === this.rows.size ? 'sent' : accepted === 0 ? 'failed' : 'partial';
+    const sent = [...this.rows.values()].filter(entry => entry.state === 'sent').length;
+    return sent === this.rows.size ? 'sent' : sent === 0 ? 'failed' : 'partial';
   }
 
   event(): Extract<JournalEvent, { type: 'send_progress' }> | null {
@@ -237,6 +248,10 @@ function endLease(m: SendModel, ctx: Ctx): void {
   m.endLease();
 }
 
+// The end of a protected recipient's hold: one lease period from the later of
+// its lease expiry and the end of the latest restore.
+const holdEnd = (fence: SendFenceRow, ctx: Ctx) => Math.max(fence.leaseUntil + ctx.skew, ctx.restoredAt) + LEASE_MS;
+
 // The grace transition (section 2.4): unprotected open external recipients end
 // failed now; protected ones are held one lease period from the later of their
 // lease expiry and the end of the latest restore. Returns the drive time: the
@@ -246,7 +261,7 @@ function grace(m: SendModel, reason: SendFailure, ctx: Ctx): number | null {
   for (const entry of m.openExternals()) {
     const fence = protectedFence(m, entry.idx, ctx);
     if (fence) {
-      holdUntil = Math.max(holdUntil, Math.max(fence.leaseUntil + ctx.skew, ctx.restoredAt) + LEASE_MS);
+      holdUntil = Math.max(holdUntil, holdEnd(fence, ctx));
       continue;
     }
     const attempting = entry.state === 'attempting' ? m.attemptingFence(entry.idx) : undefined;
@@ -277,7 +292,7 @@ function refusalBackoff(refusals: number): number {
 
 export function checkResult(value: unknown): asserts value is ProviderResult {
   const result = (value ?? {}) as Record<string, unknown>;
-  const code = (text: unknown) => typeof text === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(text);
+  const code = validErrorCode;
   const valid = !!value && typeof value === 'object' && (
     (result.kind === 'accepted' && validProviderId(result.messageId ?? null) && (result.messageId === null || typeof result.messageId === 'string') &&
       (result.suppressed === undefined || (Array.isArray(result.suppressed) && result.suppressed.length <= 50 &&
@@ -351,7 +366,7 @@ export class SendDispatcher {
     const { ports } = this;
     if (!ports.sending) return { status: 'not_now', reason: 'disabled' };
     if (!await this.readyFor(scope)) return { status: 'not_now', reason: 'restoring' };
-    const step = (timers: TimerTable, sender?: boolean): ClaimAnswer | { check: SendRow } => {
+    const step = (timers: TimerTable, sender?: boolean): ClaimAnswer | { check: SendRow; mayHaveRun: boolean } => {
       const ready = ports.current();
       if (!ready) return { status: 'not_now', reason: 'restoring' };
       const row = validSendId(id) ? sendRow(ports.sql, id) : undefined;
@@ -366,7 +381,11 @@ export class SendDispatcher {
         if (gated.driveAt !== undefined) timers.set(SEND_DRIVE, id, Math.max(1, gated.driveAt));
         return gated.answer;
       }
-      if (sender === undefined) return { check: m.row };
+      if (sender === undefined) {
+        // A stored acceptance for a recipient whose call may have run is recorded before it is reclaimed.
+        const mayHaveRun = m.externals().some(entry => entry.state === 'attempting' && !!protectedFence(m, entry.idx, ctx));
+        return { check: m.row, mayHaveRun };
+      }
       // The caps and the deadline, normally applied when the result is recorded.
       if (m.d.ambiguous >= AMBIGUOUS_CAP || m.d.providerWait >= DEADLINE_MS) {
         this.commit(m, ready, timers, grace(m, 'delivery_error', ctx), true);
@@ -382,6 +401,12 @@ export class SendDispatcher {
         .map(fence => fenceKey(fence!)));
       m.d.unfinished += unfinished.size;
       if (m.d.unfinished >= CRASH_CAP) {
+        // Held, not resumed: charges of never-authorized fences of this epoch still go (the drive row releases them).
+        for (const entry of expired) {
+          const fence = m.attemptingFence(entry.idx);
+          if (fence && !fence.authorized && fence.epoch === ctx.epoch) m.addRelease(fence);
+        }
+        endLease(m, ctx);
         m.d.heldAt = ctx.now;
         console.error({ code: 'send_held' });
         this.commit(m, ready, timers, ctx.now + HOLD_RECHECK_MS);
@@ -406,13 +431,14 @@ export class SendDispatcher {
       const record = m.row.record;
       const sentCopy = ports.sql.exec<{ key: string }>('SELECT raw_key AS key FROM messages WHERE id = ?', sentCopyId(id)).toArray()[0];
       return {
-        status: 'claimed', fence, leaseUntil, release: m.releaseList(),
+        status: 'claimed', fence, leaseUntil, release: m.releaseList().slice(0, RELEASE_BATCH),
         recipients: m.externals().filter(entry => entry.state === 'pending').map(({ idx }) => ({ idx, ...record.recipients[idx] })),
         from: record.from, replyTo: record.replyTo, sentCopyKey: sentCopy?.key ?? null,
       };
     };
     const first = await ports.local(timers => step(timers));
     if (!('check' in first)) return first;
+    if (first.mayHaveRun && !await this.storedSettled(scope, id)) return { status: 'not_now', reason: 'results' };
     const { record } = first.check;
     // The one directory statement of section 1, on every claim.
     const sender = await senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
@@ -423,7 +449,7 @@ export class SendDispatcher {
   // Consumer step 3: Mark, then the barrier, then the re-check.
   async mark(scope: DispatchScope, id: string, fence: SendFence, recipients: number[], released: SendFence[]): Promise<MarkAnswer> {
     const { ports } = this;
-    if (!validFence(fence) || !Array.isArray(released) || released.length > 64 || !released.every(validFence)) throw new Error('Invalid send mark');
+    if (!validFence(fence) || !Array.isArray(released) || released.length > RELEASE_BATCH || !released.every(validFence)) throw new Error('Invalid send mark');
     checkRecipients(recipients);
     if (!await this.readyFor(scope)) return { status: 'stale' };
     const seq = await ports.local(timers => {
@@ -463,23 +489,24 @@ export class SendDispatcher {
     });
   }
 
-  // Consumer step 4: at most one authorization per fence.
-  async authorize(scope: DispatchScope, id: string, fence: SendFence, recipients: number[], quotaDay: string): Promise<AuthorizeAnswer> {
+  // Consumer step 4: at most one authorization per fence. `quotaDayEnd` is the
+  // end of the quota day the consumer's charge is confirmed in, as `confirm` returned it.
+  async authorize(scope: DispatchScope, id: string, fence: SendFence, recipients: number[], quotaDayEnd: number): Promise<AuthorizeAnswer> {
     const { ports } = this;
-    if (!validFence(fence) || typeof quotaDay !== 'string' || !quotaDay.length || quotaDay.length > 64) throw new Error('Invalid send authorization');
+    if (!validFence(fence) || !Number.isSafeInteger(quotaDayEnd) || quotaDayEnd < 0) throw new Error('Invalid send authorization');
     checkRecipients(recipients);
     if (!ports.sending || !await this.readyFor(scope)) return { status: 'stale' };
-    const record = await ports.local(() => this.load(id)?.row.record);
-    if (!record) return { status: 'stale' };
-    const quota = ports.quota();
-    if (!quota) throw new Error('Send quota binding missing');
-    const sender = await senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
-    const dayEnd = await quota.resetAt(quotaDay);
-    // One synchronous step, with no await, from here to the recorded authorization.
-    return ports.local((timers): AuthorizeAnswer => {
+    // The directory statement runs inside the work lane and is the last await
+    // before the synchronous grant, so no state it checked can change in between.
+    return ports.exclusive(async () => {
+      const record = this.load(id)?.row.record;
+      if (!record) return null;
+      await ports.beforeSenderCheck?.();
+      return senderActive(ports.directory, { ...scope, ownerUserId: record.ownerUserId, from: record.from.email });
+    }, (timers, sender): AuthorizeAnswer => {
       const ready = ports.current();
       const m = ready && this.load(id);
-      if (!ready || !m) return { status: 'stale' };
+      if (!ready || !m || sender === null) return { status: 'stale' };
       const ctx = this.ctx(ready);
       const row = m.fence(fence);
       if (!row) return { status: 'stale' };
@@ -501,7 +528,7 @@ export class SendDispatcher {
       }
       if (m.d.leaseUntil! - ctx.now < DISPATCH_WINDOW_MS + ctx.skew) return stale();
       // The quota object's clock and the consumer's backward step can each differ by clockSkew.
-      if (dayEnd - ctx.now < DISPATCH_WINDOW_MS + 2 * ctx.skew) return { status: 'quota_window', retryAfter: dayEnd + ctx.skew };
+      if (quotaDayEnd - ctx.now < DISPATCH_WINDOW_MS + 2 * ctx.skew) return { status: 'quota_window', retryAfter: quotaDayEnd + ctx.skew };
       m.putFence({ ...row, authorized: true });
       this.commit(m, ready, timers, null);
       return { status: 'ok', remainingMs: DISPATCH_WINDOW_MS };
@@ -514,6 +541,7 @@ export class SendDispatcher {
     if (!validFence(fence)) throw new Error('Invalid send fence');
     checkResult(result);
     if (!await this.readyFor(scope)) return { status: 'restoring' };
+    await ports.beforeRecord?.(fence);
     const outcome = await ports.local((timers): ReportAnswer | { seq: number; refused?: true } => {
       const ready = ports.current();
       if (!ready) return { status: 'restoring' };
@@ -523,9 +551,11 @@ export class SendDispatcher {
       const row = m.fence(fence);
       // An unknown fence never had a published Mark set here.
       if (!row) return { status: 'stale' };
-      // Already recorded under this fence: wait for the publish that covers it.
-      if (row.outcome !== null && row.outcome !== 'abandoned' && row.outcome !== 'delayed') return { seq: ready.index.journal.revision() };
-      const current = !m.finished && fence.epoch === ctx.epoch && sameFence(m.lease(), fence);
+      // Idempotent per fact: a repeat changes nothing and waits for the publish
+      // that covers it, but a confirmed acceptance always upgrades an earlier
+      // non-accepted outcome of the same fence (a late confirmation).
+      if (row.outcome !== null && (result.kind !== 'accepted' || row.outcome === 'accepted')) return { seq: ready.index.journal.revision() };
+      const current = row.outcome === null && !m.finished && fence.epoch === ctx.epoch && sameFence(m.lease(), fence);
       if (!current) return this.recordStale(m, ready, timers, row, result, ctx);
       // A provider result needs a call, and a call needs the fence's authorization.
       if (!row.authorized) return { status: 'stale' };
@@ -541,7 +571,7 @@ export class SendDispatcher {
             m.putMark({ ...mark, outcome, providerId: outcome === 'sent' ? result.messageId : null });
             confirm(m, mark.idx, outcome);
           }
-          m.d.refusals = 0;
+          m.d.refusals = m.d.outages = 0;
           break;
         }
         case 'rejected':
@@ -551,13 +581,13 @@ export class SendDispatcher {
           }
           // The provider refused the call: its charge goes.
           m.addRelease(fence);
-          m.d.refusals = 0;
+          m.d.refusals = m.d.outages = 0;
           break;
         case 'try_later':
         case 'outage': {
           for (const idx of attempting) m.setRecipient(idx, 'pending');
-          const wait = refusalBackoff(m.d.refusals);
-          m.d.refusals++;
+          // Each kind backs off on its own counter, from 1 minute doubling to 1 hour.
+          const wait = refusalBackoff(result.kind === 'try_later' ? m.d.refusals++ : m.d.outages++);
           next = m.d.nextAttemptAt = ctx.now + wait;
           // Only time the provider caused counts toward the deadline; our outages never do.
           if (result.kind === 'try_later') m.d.providerWait += wait;
@@ -572,7 +602,7 @@ export class SendDispatcher {
           m.d.ambiguous++;
           next = m.d.nextAttemptAt = ctx.now + AMBIGUOUS_BACKOFF_MS;
           m.d.providerWait += AMBIGUOUS_BACKOFF_MS;
-          m.d.refusals = 0;
+          m.d.refusals = m.d.outages = 0;
           metric('send_ambiguous_retry');
           if (result.code !== undefined && result.code !== 'timeout') console.error({ code: 'send_unknown_error', provider: result.code });
           break;
@@ -614,15 +644,16 @@ export class SendDispatcher {
     return { seq: this.commit(m, ready, timers, driveAt) || ready.index.journal.revision() };
   }
 
-  // The quota-wait error, or a quota reservation that found the gate closed.
-  async delay(scope: DispatchScope, id: string, fence: SendFence): Promise<DelayAnswer> {
+  // A quota wait: `gate` when our own gate (daily or monthly) is closed,
+  // `provider_daily` for the provider's daily-limit error. The mailbox computes
+  // the wait from the quota object's reset plus clockSkew; the consumer never does.
+  async delay(scope: DispatchScope, id: string, fence: SendFence, cause: 'gate' | 'provider_daily'): Promise<DelayAnswer> {
     const { ports } = this;
-    if (!validFence(fence)) throw new Error('Invalid send fence');
+    if (!validFence(fence) || (cause !== 'gate' && cause !== 'provider_daily')) throw new Error('Invalid send delay');
     if (!await this.readyFor(scope)) return { status: 'restoring' };
     const quota = ports.quota();
     if (!quota) throw new Error('Send quota binding missing');
-    // The mailbox computes the wait from the quota object's reset; the consumer never does.
-    const until = await quota.resetAt() + ports.clockSkewMs;
+    const until = (cause === 'gate' ? await quota.gateResetAt() : await quota.resetAt()) + ports.clockSkewMs;
     const answer = await ports.local(timers => this.report(id, fence, timers, (m, ctx) => {
       m.state = 'delayed';
       m.d.delayedUntil = Math.max(until, ctx.now);
@@ -669,8 +700,9 @@ export class SendDispatcher {
     return { status: 'done', at: driveAt };
   }
 
-  // The immediate release of a refused charge. A failure leaves the fence on
-  // the release list, which the next consumer's quota call or finish drains.
+  // The immediate release of a refused charge. Once the quota object has
+  // released the fence it leaves the release list; a failure leaves it there,
+  // for the next consumer's quota call or finish to drain.
   private async releaseNow(scope: DispatchScope, id: string, fence: SendFence): Promise<void> {
     try {
       const quota = this.ports.quota();
@@ -678,15 +710,36 @@ export class SendDispatcher {
       await quota.release({ ...scope, sendId: id }, [fence]);
     } catch (error) {
       console.error({ code: 'send_quota_release', error: error instanceof Error ? error.message : String(error) });
+      return;
+    }
+    await this.ports.local(timers => {
+      const ready = this.ports.current();
+      const row = validSendId(id) ? sendRow(this.ports.sql, id) : undefined;
+      if (!ready || !row || row.queuedSeq === null || row.state === 'cancelled') return;
+      const m = new SendModel(this.ports.sql, row);
+      m.removeRelease(fence);
+      this.commit(m, ready, timers, null);
+    });
+  }
+
+  // True once no stored result of this send is left unrecorded; a failed lookup is not settled.
+  async storedSettled(scope: DispatchScope, id: string): Promise<boolean> {
+    try {
+      const { status } = await this.recordStored(scope, id);
+      return status === 'none' || status === 'recorded';
+    } catch (error) {
+      console.error({ code: 'send_result_lookup', error: error instanceof Error ? error.message : String(error) });
+      return false;
     }
   }
 
   // Records the stored results of one send (section 2.4, step 6): a point
   // lookup in send_results, each row recorded under its fence and deleted only
-  // after the publish covering it.
+  // after the publish covering it. The scope is checked before any statement.
   async recordStored(scope: DispatchScope, id: string): Promise<StoredAnswer> {
     const { ports } = this;
     if (!validSendId(id)) throw new Error('Invalid send id');
+    const ready = await this.readyFor(scope);
     const db = ports.directory.withSession('first-primary');
     const { results } = await db.prepare(`SELECT fence_epoch AS epoch, fence_attempt AS attempt, kind, message_id AS messageId, detail,
       suppressed, notify_failures AS failures FROM send_results WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ?
@@ -694,9 +747,18 @@ export class SendDispatcher {
       .all<StoredRow>();
     if (!results.length) return { status: 'none', recorded: 0 };
     const where = 'workspace_id = ? AND mailbox_id = ? AND send_id = ? AND fence_epoch = ? AND fence_attempt = ?';
-    let recorded = 0;
-    for (const row of results) {
-      const keys = [scope.workspaceId, scope.mailboxId, id, row.epoch, row.attempt];
+    const keys = (row: StoredRow) => [scope.workspaceId, scope.mailboxId, id, row.epoch, row.attempt];
+    // A restoring mailbox defers every selected row past the restore's next slice; nothing is re-enqueued here.
+    const defer = async (rows: StoredRow[]) => {
+      const at = ports.now() + RESTORING_NOTICE_MS;
+      for (const row of rows) await db.prepare(`UPDATE send_results SET notify_after = max(notify_after, ?) WHERE ${where}`).bind(at, ...keys(row)).run();
+    };
+    if (!ready) {
+      await defer(results);
+      return { status: 'restoring', recorded: 0 };
+    }
+    let recorded = 0, failed = 0;
+    for (const [at, row] of results.entries()) {
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
       catch (error) {
@@ -705,38 +767,46 @@ export class SendDispatcher {
       }
       if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
         if (answer === 'gone') metric('send_result_orphan');
-        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys).run();
+        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
         recorded++;
-        continue;
-      }
-      const now = ports.now();
-      if (answer === 'restoring') {
-        // The restore's next slice comes first; nothing is re-enqueued here.
-        await db.prepare(`UPDATE send_results SET notify_after = max(notify_after, ?) WHERE ${where}`).bind(now + RESTORING_NOTICE_MS, ...keys).run();
+      } else if (answer === 'restoring') {
+        await defer(results.slice(at));
         return { status: 'restoring', recorded };
+      } else {
+        // This row backs off, doubling from 1 minute to 1 hour; the rest of the page goes on.
+        const wait = Math.min(NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS * 2 ** Math.min(row.failures, 16));
+        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
+          .bind(ports.now() + wait, ...keys(row)).run();
+        failed++;
       }
-      const wait = Math.min(NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS * 2 ** Math.min(row.failures, 16));
-      await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
-        .bind(now + wait, ...keys).run();
-      return { status: 'retry', recorded };
     }
-    return { status: 'recorded', recorded };
+    return { status: failed ? 'retry' : 'recorded', recorded };
   }
 
   // The drive handler's decision for a released send (section 2.2's table,
   // from `queued` on), inside its own conditional commit.
-  drive(index: MailboxIndex, row: SendRow, timers: TimerTable, ready: Omit<Ready, 'index'>, now: number): 'enqueue' | 'finish' | null {
+  drive(index: MailboxIndex, row: SendRow, timers: TimerTable, ready: Omit<Ready, 'index'>, now: number): 'enqueue' | 'finish' | 'release' | null {
     const m = new SendModel(this.ports.sql, row);
     const r: Ready = { ...ready, index };
     const ctx: Ctx = { now, epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
     if (m.d.heldAt !== null) {
       // Held after repeated crashes of our own: never failed, never claimed; an operator resumes it.
       timers.set(SEND_DRIVE, row.id, now + HOLD_RECHECK_MS);
-      return null;
+      return releaseList(this.ports.sql, row.id).length ? 'release' : null;
     }
     if (m.d.graceUntil !== null) {
-      if (now < m.d.graceUntil) {
-        timers.set(SEND_DRIVE, row.id, m.d.graceUntil);
+      // A restore that ended since the hold began extends it, as the hold counts from the latest restore.
+      let until = m.d.graceUntil;
+      for (const entry of m.openExternals()) {
+        const fence = protectedFence(m, entry.idx, ctx);
+        if (fence) until = Math.max(until, holdEnd(fence, ctx));
+      }
+      if (until !== m.d.graceUntil) {
+        m.d.graceUntil = until;
+        this.commit(m, r, timers, null);
+      }
+      if (now < until) {
+        timers.set(SEND_DRIVE, row.id, until);
         return null;
       }
       // The hold ended without a result: the protected recipients fail too.
@@ -789,11 +859,13 @@ export function finishReleases(sql: SqlStorage, id: string): SendFence[] { retur
 // The delayed send's wait, for the restore epilogue.
 export function delayedUntil(sql: SqlStorage, id: string): number | null { return dispatchRow(sql, id).delayedUntil; }
 
-type StoredRow = { epoch: number; attempt: number; kind: string; messageId: string | null; detail: string | null; suppressed: string; failures: number };
+type StoredRow = { epoch: number; attempt: number; kind: string; messageId: string | null; detail: string | null; suppressed: number; failures: number };
 
 function storedResult(row: StoredRow): ProviderResult {
   switch (row.kind) {
-    case 'accepted': return { kind: 'accepted', messageId: row.messageId, suppressed: JSON.parse(row.suppressed) as number[] };
+    // `suppressed` is a bit mask of recipient indexes 0 to 49.
+    case 'accepted': return { kind: 'accepted', messageId: row.messageId,
+      suppressed: Array.from({ length: 50 }, (_, idx) => idx).filter(idx => Math.floor(row.suppressed / 2 ** idx) % 2 === 1) };
     case 'rejected': return { kind: 'rejected', reason: row.detail ?? 'rejected' };
     case 'try_later': return { kind: 'try_later' };
     case 'outage': return { kind: 'outage', code: row.detail ?? 'unknown' };

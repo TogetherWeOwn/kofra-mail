@@ -767,9 +767,9 @@ export class MailboxIndex {
           this.sql.exec('UPDATE mailbox_sends SET state = ?, finish_pending = 1, terminal_seq = ? WHERE id = ?', event.state, this.journal.revision() + 1, row.id);
         } else this.sql.exec('UPDATE mailbox_sends SET state = ? WHERE id = ?', event.state, row.id);
         const d = event.dispatch;
-        this.sql.exec(`INSERT OR REPLACE INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, row.id, d.attempt,
-          d.leaseEpoch, d.leaseAttempt, d.leaseUntil, d.nextAttemptAt, d.delayedUntil, d.ambiguous, d.providerWait, d.refusals, d.unfinished,
-          d.heldAt, d.graceUntil, d.graceReason);
+        this.sql.exec(`INSERT OR REPLACE INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, row.id, d.attempt,
+          d.leaseEpoch, d.leaseAttempt, d.leaseUntil, d.nextAttemptAt, d.delayedUntil, d.ambiguous, d.providerWait, d.refusals, d.outages,
+          d.unfinished, d.heldAt, d.graceUntil, d.graceReason);
         for (const { idx, state, reason } of recipients) {
           const updated = this.sql.exec('UPDATE mailbox_send_recipients SET state = ?, reason = ? WHERE send_id = ? AND idx = ? RETURNING idx',
             state, reason, row.id, idx).toArray();
@@ -878,7 +878,7 @@ export class MailboxIndex {
         INSERT INTO backup_capture(kind, value)
         SELECT 'send_dispatch', json_object('sendId', send_id, 'attempt', attempt, 'leaseEpoch', lease_epoch, 'leaseAttempt', lease_attempt,
           'leaseUntil', lease_until, 'nextAttemptAt', next_attempt_at, 'delayedUntil', delayed_until, 'ambiguous', ambiguous,
-          'providerWait', provider_wait, 'refusals', refusals, 'unfinished', unfinished, 'heldAt', held_at, 'graceUntil', grace_until,
+          'providerWait', provider_wait, 'refusals', refusals, 'outages', outages, 'unfinished', unfinished, 'heldAt', held_at, 'graceUntil', grace_until,
           'graceReason', grace_reason) FROM mailbox_send_dispatch;
         INSERT INTO backup_capture(kind, value)
         SELECT 'send_fence', json_object('sendId', send_id, 'epoch', epoch, 'attempt', attempt, 'leaseUntil', lease_until,
@@ -1009,9 +1009,9 @@ export class MailboxIndex {
     if (!send || send.queuedSeq === null) throw new Error('Invalid snapshot send dispatch');
     if (kind === 'send_dispatch') {
       checkDispatch(entry);
-      this.sql.exec('INSERT INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, entry.attempt, entry.leaseEpoch,
+      this.sql.exec('INSERT INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, entry.attempt, entry.leaseEpoch,
         entry.leaseAttempt, entry.leaseUntil, entry.nextAttemptAt, entry.delayedUntil, entry.ambiguous, entry.providerWait, entry.refusals,
-        entry.unfinished, entry.heldAt, entry.graceUntil, entry.graceReason);
+        entry.outages, entry.unfinished, entry.heldAt, entry.graceUntil, entry.graceReason);
     } else if (kind === 'send_fence') {
       checkFence(entry);
       this.sql.exec('INSERT INTO mailbox_send_fences VALUES (?, ?, ?, ?, ?, ?, ?)', send.id, entry.epoch, entry.attempt, entry.leaseUntil,

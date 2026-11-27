@@ -24,7 +24,8 @@ export type SendPart = { messageId: string; part: number; digest: string; size: 
 // hold ends in.
 export type SendDispatchRow = {
   attempt: number; leaseEpoch: number | null; leaseAttempt: number | null; leaseUntil: number | null;
-  nextAttemptAt: number; delayedUntil: number | null; ambiguous: number; providerWait: number; refusals: number;
+  // `refusals` and `outages` count try-later and our-outage results in a row, for their backoffs.
+  nextAttemptAt: number; delayedUntil: number | null; ambiguous: number; providerWait: number; refusals: number; outages: number;
   unfinished: number; heldAt: number | null; graceUntil: number | null; graceReason: SendFailure | null;
 };
 // A reported outcome under a fence; null until one is recorded.

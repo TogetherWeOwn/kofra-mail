@@ -60,12 +60,12 @@ export function ledger(sql: SqlStorage, id: string): LedgerRow[] {
 // A send no claim has reached yet has this dispatch state.
 export const NEW_DISPATCH: SendDispatchRow = {
   attempt: 0, leaseEpoch: null, leaseAttempt: null, leaseUntil: null, nextAttemptAt: 0, delayedUntil: null, ambiguous: 0,
-  providerWait: 0, refusals: 0, unfinished: 0, heldAt: null, graceUntil: null, graceReason: null,
+  providerWait: 0, refusals: 0, outages: 0, unfinished: 0, heldAt: null, graceUntil: null, graceReason: null,
 };
 
 export function dispatchRow(sql: SqlStorage, id: string): SendDispatchRow {
   return sql.exec<SendDispatchRow>(`SELECT attempt, lease_epoch AS leaseEpoch, lease_attempt AS leaseAttempt, lease_until AS leaseUntil,
-    next_attempt_at AS nextAttemptAt, delayed_until AS delayedUntil, ambiguous, provider_wait AS providerWait, refusals, unfinished,
+    next_attempt_at AS nextAttemptAt, delayed_until AS delayedUntil, ambiguous, provider_wait AS providerWait, refusals, outages, unfinished,
     held_at AS heldAt, grace_until AS graceUntil, grace_reason AS graceReason FROM mailbox_send_dispatch WHERE send_id = ?`, id)
     .toArray()[0] ?? { ...NEW_DISPATCH };
 }
@@ -90,10 +90,14 @@ const nullableCount = (value: unknown) => value === null || count(value);
 const FENCE_OUTCOMES: readonly unknown[] = [null, 'accepted', 'rejected', 'try_later', 'outage', 'ambiguous', 'delayed', 'abandoned'];
 const MARK_OUTCOMES: readonly unknown[] = [null, 'sent', 'suppressed', 'failed'];
 export const LEDGER_STATES: readonly string[] = ['pending', 'attempting', 'sent', 'failed', 'suppressed'];
-// Provider message ids are bounded header values; reasons are short provider-neutral codes.
+// Provider message ids are printable ASCII of at most PROVIDER_ID_BYTES; reasons are short
+// provider-neutral codes and error codes short tokens. The send_results CHECKs match these.
+export const PROVIDER_ID_BYTES = 998;
+const PROVIDER_ID = /^[\x20-\x7e]{1,998}$/;
 export const validProviderId = (value: unknown): value is string | null =>
-  value === null || (bounded(value, LIMITS.headerValueBytes) && !hasHeaderControl(value));
+  value === null || (typeof value === 'string' && PROVIDER_ID.test(value));
 export const validReason = (value: unknown): value is string => typeof value === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(value);
+export const validErrorCode = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(value);
 
 // Refuses malformed consumer state before it can enter the state or a replay.
 export function checkDispatch(value: unknown): asserts value is SendDispatchRow {
@@ -102,7 +106,7 @@ export function checkDispatch(value: unknown): asserts value is SendDispatchRow 
   if (!value || typeof value !== 'object' || !count(d.attempt) || !lease.every(nullableCount) ||
       !(lease.every(part => part === null) || (lease.every(part => part !== null) && d.leaseAttempt! >= 1 && d.leaseAttempt! <= d.attempt! &&
         epochMs(d.leaseUntil))) || !epochMs(d.nextAttemptAt) || !nullableMs(d.delayedUntil) || !count(d.ambiguous) ||
-      !count(d.providerWait) || !count(d.refusals) || !count(d.unfinished) || !nullableMs(d.heldAt) || !nullableMs(d.graceUntil) ||
+      !count(d.providerWait) || !count(d.refusals) || !count(d.outages) || !count(d.unfinished) || !nullableMs(d.heldAt) || !nullableMs(d.graceUntil) ||
       (d.graceReason !== null && !SEND_FAILURES.includes(d.graceReason as SendFailure)) || (d.graceUntil === null) !== (d.graceReason === null)) {
     throw new Error('Invalid send dispatch state');
   }

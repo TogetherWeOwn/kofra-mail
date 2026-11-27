@@ -454,6 +454,12 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       seedLegacyLabel: () => readControl<{ id: string; name: string }>('seed-legacy-label'),
       // The mailbox's send consumer RPCs (M3-5a), the fake quota object, and the stored consumer state.
       sendRpc: <T>(method: string, ...args: unknown[]) => readControl<T>('send-rpc', JSON.stringify({ method, args })),
+      // The same call with another mailbox's scope, on the member mailbox's object.
+      sendRpcAs: (mb: string, method: string, ...args: unknown[]) => call('send-rpc', JSON.stringify({ method, args, mb })),
+      pauseSenderCheck: () => controlAction('pause-sender-check'),
+      senderCheckPaused: () => controlAction('sender-check-paused'),
+      resumeSenderCheck: () => controlAction('resume-sender-check'),
+      failRecordOnce: (attempt: number) => controlAction('fail-record-once', String(attempt)),
       quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
       sendState: (id: string) => readControl<SendStateView>('send-state', id),
       pauseNextEnqueue: () => controlAction('pause-enqueue'),
