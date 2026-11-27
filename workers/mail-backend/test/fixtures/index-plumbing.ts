@@ -36,7 +36,9 @@ export class IndexPlumbing extends FixtureMailbox {
       register: async (kind, digest) => `${kind}/${digest}/01KBN8ZJ7G0000000000000000`,
       hold: async () => {}, release: async () => {},
     }, this.ctx.id.toString());
-    await index.ingest(id, key, 100);
+    try { await index.ingest(id, key, 100); }
+    catch (error) { return error instanceof Error ? error.message : String(error); }
+    return 'indexed';
   }
 
   async journalEvents() {

@@ -177,6 +177,22 @@ const EDGE_CASES: Record<string, () => Uint8Array<ArrayBuffer>> = {
     'Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nQUJD=RA==\r\nRUY',
     'Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nQ',
   ])),
+  'unwrapped base64 lines cut where a UTF-8 character or garbage falls': () => {
+    // Over 64 KiB per line, with 8-bit bytes and garbage around each 64 KiB cut.
+    const line = (seed: number) => {
+      let text = b64(fill(200_000 + seed, seed), 1_000_000);
+      for (const at of [65_535, 65_536, 131_071, 196_607, 262_143]) text = text.slice(0, at) + (seed % 2 ? 'é' : '!\u00ff') + text.slice(at);
+      return text;
+    };
+    const prefix = bytesOf(head + mixed('long', [
+      `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=one-line.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${line(1)}\r\n${line(2)}=`,
+      `Content-Type: image/jpeg\r\nContent-Transfer-Encoding: base64\r\n\r\n${line(3).slice(0, -2)}`,
+    ]));
+    // A raw 8-bit byte that is not valid UTF-8, right at a cut.
+    const at = prefix.indexOf(0x21, 300);
+    prefix[at] = 0xc3;
+    return prefix;
+  },
   'more than 512 attachments': () => bytesOf(head + mixed('many', Array.from({ length: 600 }, (_, i) =>
     `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="part-${i}.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64(fill(i, i + 1))}`))),
   'multipart/digest with default message/rfc822 parts': () => bytesOf(head + 'Content-Type: multipart/digest; boundary=dig\r\n\r\n' +

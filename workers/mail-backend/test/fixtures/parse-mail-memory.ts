@@ -1,5 +1,5 @@
 // Run from workers/mail-backend: node --expose-gc test/fixtures/parse-mail-memory.ts <case>
-// Cases: one-attachment, eight-attachments, qp-body.
+// Cases: one-attachment, eight-attachments, unwrapped-base64, qp-body.
 import assert from 'node:assert/strict';
 import { MAX_RAW_BYTES, sha256 } from '../../src/bytes.ts';
 import { installDigestStream } from './digest-stream.ts';
@@ -19,17 +19,17 @@ function filler(size: number, seed: number): Uint8Array<ArrayBuffer> {
   return bytes;
 }
 
-function base64Lines(bytes: Uint8Array): string {
+function base64Lines(bytes: Uint8Array, width: number): string {
   const encoded = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
   const lines: string[] = [];
-  for (let i = 0; i < encoded.length; i += 76) lines.push(encoded.slice(i, i + 76));
+  for (let i = 0; i < encoded.length; i += width) lines.push(encoded.slice(i, i + width));
   return lines.join('\r\n');
 }
 
 // Base64 with CRLF every 76 characters is 4/3 of the decoded size times 78/76.
 const encodedSize = (decoded: number) => Math.ceil(decoded / 3) * 4 * 78 / 76;
 
-function attachmentsMessage(count: number): string {
+function attachmentsMessage(count: number, width = 76): string {
   const head = 'From: Sender <sender@example.test>\r\nTo: rcpt@example.test\r\nSubject: Memory benchmark\r\n' +
     'Message-ID: <memory@example.test>\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nMIME-Version: 1.0\r\n' +
     'Content-Type: multipart/mixed; boundary="=_memory"\r\n\r\n--=_memory\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n' +
@@ -38,7 +38,7 @@ function attachmentsMessage(count: number): string {
   const each = Math.floor((MAX_RAW_BYTES - 4096 * count - head.length) / count * 76 / 78 / 4) * 3;
   const parts = Array.from({ length: count }, (_, i) => `--=_memory\r\nContent-Type: application/octet-stream; name="file-${i}.bin"\r\n` +
     `Content-Disposition: attachment; filename="file-${i}.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\n` +
-    `${base64Lines(filler(each, i + 1))}\r\n`);
+    `${base64Lines(filler(each, i + 1), width)}\r\n`);
   assert.ok(encodedSize(each) * count < MAX_RAW_BYTES);
   return head + parts.join('') + '--=_memory--\r\n';
 }
@@ -62,7 +62,8 @@ function qpMessage(): string {
 // Only the encoded message stays reachable; its source string is dropped.
 const encode = (source: string) => new Uint8Array(new TextEncoder().encode(source));
 let raw: Uint8Array<ArrayBuffer> | null = kind === 'one-attachment' ? encode(attachmentsMessage(1))
-  : kind === 'eight-attachments' ? encode(attachmentsMessage(8)) : kind === 'qp-body' ? encode(qpMessage()) : assert.fail(`unknown case ${kind}`);
+  : kind === 'eight-attachments' ? encode(attachmentsMessage(8))
+  : kind === 'unwrapped-base64' ? encode(attachmentsMessage(1, Number.MAX_SAFE_INTEGER)) : kind === 'qp-body' ? encode(qpMessage()) : assert.fail(`unknown case ${kind}`);
 assert.ok(raw.byteLength <= MAX_RAW_BYTES, `fixture too large: ${raw.byteLength}`);
 const rawBytes = raw.byteLength;
 const rawKey = `raw/${await sha256(raw)}/01KBN8ZJ7G0000000000000000`;

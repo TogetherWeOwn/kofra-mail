@@ -73,7 +73,7 @@ export async function readMailMime(raw: Uint8Array<ArrayBuffer>, rawKey: string)
 type PostalChunk = ArrayBuffer | Uint8Array | string;
 type PostalDecoder = { chunks: PostalChunk[]; decoder?: TextDecoder; update(line: Uint8Array): void; finalize(): Promise<ArrayBuffer> };
 type PostalNode = {
-  state: string; contentDecoder: PostalDecoder | false;
+  state: string; contentDecoder: PostalDecoder | false; contentTransferEncoding?: { encoding?: string };
   contentType: { multipart?: string | false; parsed?: { value?: string | false } };
   contentDisposition?: { parsed?: { value?: string | false } };
 };
@@ -83,7 +83,18 @@ type Parsed = Awaited<ReturnType<typeof PostalMime.parse>>;
 // A decoded part the parse only measured: its body lines in the raw message
 // and the decoder PostalMime chose for them. Decoding them again yields the
 // bytes PostalMime would have returned.
-export type PartSource = { raw: Uint8Array<ArrayBuffer>; start: number; end: number; size: number; decoder: () => PostalDecoder };
+export type PartSource = { raw: Uint8Array<ArrayBuffer>; start: number; end: number; size: number; split: boolean; decoder: () => PostalDecoder };
+
+// PostalMime decodes a part line by line, and one line can hold a whole
+// unwrapped base64 body. Its base64 decoder keeps only ASCII base64 characters
+// and an ASCII byte decodes to itself wherever a line is cut, so feeding a long
+// line in pieces yields the same bytes. Quoted-printable and unencoded parts
+// end each fed piece with a line break, so they are fed whole.
+const PIECE_BYTES = 64 * 1024;
+function* pieces(line: Uint8Array, split: boolean): Generator<Uint8Array> {
+  if (!split || line.byteLength <= PIECE_BYTES) { yield line; return; }
+  for (let offset = 0; offset < line.byteLength; offset += PIECE_BYTES) yield line.subarray(offset, offset + PIECE_BYTES);
+}
 
 class BoundedParseFallback extends Error {}
 
@@ -115,7 +126,8 @@ class MeasuringDecoder {
   private size = 0;
   private readonly parser: BoundedParser;
   private readonly inner: PostalDecoder;
-  constructor(parser: BoundedParser, inner: PostalDecoder) { this.parser = parser; this.inner = inner; }
+  private readonly split: boolean;
+  constructor(parser: BoundedParser, inner: PostalDecoder, split: boolean) { this.parser = parser; this.inner = inner; this.split = split; }
 
   update(line: Uint8Array): void {
     // A leaf's body lines are contiguous; anything else is not the parse this relies on.
@@ -123,8 +135,10 @@ class MeasuringDecoder {
     else if (line.byteOffset !== this.end) throw new BoundedParseFallback('Non-contiguous part');
     // PostalMime has already read past this line's LF.
     this.end = (this.parser as unknown as PostalInternals).readPos;
-    this.inner.update(line);
-    this.drain();
+    for (const piece of pieces(line, this.split)) {
+      this.inner.update(piece);
+      this.drain();
+    }
   }
 
   private drain(): void {
@@ -141,7 +155,7 @@ class MeasuringDecoder {
     const Decoder = inner.constructor as new (options: { decoder?: TextDecoder }) => PostalDecoder;
     const decoder = inner.decoder;
     this.parser.parts.set(token, { raw: this.parser.raw, start: Math.max(this.start, 0), end: Math.max(this.end, 0), size: this.size,
-      decoder: () => new Decoder({ decoder }) });
+      split: this.split, decoder: () => new Decoder({ decoder }) });
     return token;
   }
 }
@@ -162,7 +176,9 @@ class BoundedParser extends PostalMime {
     this.last = node;
     const decoder = node.contentDecoder;
     if (decoder && Array.isArray(decoder.chunks) && !decoder.chunks.length && measuredOnly(node)) {
-      node.contentDecoder = new MeasuringDecoder(this, decoder) as unknown as PostalDecoder;
+      // PostalMime's own test for choosing its base64 decoder.
+      const base64 = /base64/i.test(node.contentTransferEncoding?.encoding ?? '');
+      node.contentDecoder = new MeasuringDecoder(this, decoder, base64) as unknown as PostalDecoder;
     }
   }
 }
@@ -218,10 +234,12 @@ async function* partBlocks(source: PartSource): AsyncGenerator<Uint8Array<ArrayB
       if (c !== 0x0d && c !== 0x0a) stop = pos;
       if (c === 0x0a) break;
     }
-    decoder.update(raw.subarray(start, stop));
-    const { chunks } = decoder;
-    decoder.chunks = [];
-    yield* take(chunks);
+    for (const piece of pieces(raw.subarray(start, stop), source.split)) {
+      decoder.update(piece);
+      const { chunks } = decoder;
+      decoder.chunks = [];
+      yield* take(chunks);
+    }
   }
   const { chunks } = decoder;
   decoder.chunks = [];
@@ -244,6 +262,14 @@ export async function partDigest(source: PartSource): Promise<string> {
 
 // The part's bytes for a PUT under `digest`. The last block is released only
 // once the bytes match the digest, so a mismatch errors the stream before it ends.
+// The whole decoded part, for a part too large for a streamed PUT.
+export async function partBytes(source: PartSource): Promise<Uint8Array<ArrayBuffer>> {
+  const bytes = new Uint8Array(source.size);
+  let offset = 0;
+  for await (const block of partBlocks(source)) { bytes.set(block, offset); offset += block.byteLength; }
+  return bytes;
+}
+
 export function partStream(source: PartSource, digest: string): ReadableStream<Uint8Array> {
   const blocks = partBlocks(source);
   const check = new crypto.DigestStream('SHA-256');

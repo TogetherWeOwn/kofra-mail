@@ -7,6 +7,7 @@ import { runChild } from './fixtures/child-tests.ts';
 const cases = {
   'one-attachment': 'a 25 MiB message with one base64 attachment',
   'eight-attachments': 'a 25 MiB message with eight base64 attachments',
+  'unwrapped-base64': 'a 25 MiB message with one base64 attachment on a single line',
   'qp-body': 'a message with a 1 MiB non-ASCII quoted-printable body',
 };
 

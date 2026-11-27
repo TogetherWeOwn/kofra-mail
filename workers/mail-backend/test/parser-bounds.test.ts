@@ -92,7 +92,7 @@ test('mailbox stores large attachments through the streamed Kofra PUT with the k
   const key = await upload(mime);
   const reference = await referenceParseMail(new Uint8Array(new TextEncoder().encode(mime)), key);
   const box = boxes.getByName('kofra-store');
-  await box.indexThroughKofra(id, key);
+  assert.equal(await box.indexThroughKofra(id, key), 'indexed');
   const rows = JSON.parse(await box.parts()) as Array<{ part: number; size: number; object_key: string | null }>;
   assert.equal(rows.length, 3);
   assert.equal(stored.size, 2);
@@ -103,4 +103,27 @@ test('mailbox stores large attachments through the streamed Kofra PUT with the k
     assert.equal(row.object_key, `att/${await sha256(expected.external)}/${id}`);
     assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), expected.external);
   }
+});
+
+test('mailbox stores an attachment that decodes larger than the raw message cap whole, as before', async () => {
+  // Literal Latin-1 bytes in a quoted-printable part decode to two UTF-8 bytes each.
+  const head = new TextEncoder().encode('Message-ID: <expand@example.test>\r\nContent-Type: multipart/mixed; boundary=grow\r\n\r\n--grow\r\n' +
+    'Content-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=grow.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n');
+  const tail = new TextEncoder().encode('\r\n--grow--\r\n');
+  const lines = Math.floor(13 * 1024 * 1024 / 78);
+  const wire = new Uint8Array(head.byteLength + lines * 78 + tail.byteLength);
+  wire.set(head);
+  for (let i = 0; i < lines; i++) { const at = head.byteLength + i * 78; wire.fill(0xe9, at, at + 76); wire[at + 76] = 13; wire[at + 77] = 10; }
+  wire.set(tail, head.byteLength + lines * 78);
+  const key = `raw/${await sha256(wire)}/${id}`;
+  await raw.put(key, wire);
+  const reference = await referenceParseMail(wire, key);
+  const expected = reference.attachments[0].external!;
+  assert.ok(expected.byteLength > 25 * 1024 * 1024 && wire.byteLength < 25 * 1024 * 1024);
+  const box = boxes.getByName('kofra-expanding');
+  assert.equal(await box.indexThroughKofra(id, key), 'indexed');
+  const [row] = JSON.parse(await box.parts()) as Array<{ size: number; object_key: string }>;
+  assert.equal(row.size, expected.byteLength);
+  assert.equal(row.object_key, `att/${await sha256(expected)}/${id}`);
+  assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), expected);
 });
