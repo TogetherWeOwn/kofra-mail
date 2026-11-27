@@ -410,17 +410,19 @@ for (const recovered of [true, false]) test(`a CID follower ${recovered ? 'recov
   const path = await cidUrl(1);
   const leader = get(path);
   try {
+    const failedLeader = leader.then(async failed => ({ failed, length: (await failed.arrayBuffer()).byteLength }));
+    // The body reads can reject before we await them below.
+    void failedLeader.catch(() => {});
     assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
     const follower = get(path).then(async replacement => ({ replacement, body: new Uint8Array(await replacement.arrayBuffer()) }));
-    // The body read can reject before we await it below.
     void follower.catch(() => {});
     // Keep the source blocked while the real Workerd follower opts into the flight.
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(attempts, 1);
     failLeader.resolve();
-    const [failed, { replacement, body }] = await Promise.all([leader, follower]);
+    const [{ failed, length }, { replacement, body }] = await Promise.all([failedLeader, follower]);
     assert.equal(failed.status, 404);
-    assert.equal((await failed.arrayBuffer()).byteLength, 0);
+    assert.equal(length, 0);
     assert.equal(replacement.status, recovered ? 200 : 503);
     if (recovered) assert.deepEqual(body, png);
     else {
