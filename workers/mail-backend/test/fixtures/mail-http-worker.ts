@@ -101,6 +101,14 @@ export class HttpMailbox extends Mailbox {
     this.crashRelease = false;
     throw new Error('Fixture crash after the release call');
   }
+  // Fails the mailbox once right after a stored result's row is deleted.
+  private crashDelete = false;
+  crashAfterResultDelete() { this.crashDelete = true; }
+  protected override async sendResultDeleteCheckpoint() {
+    if (!this.crashDelete) return;
+    this.crashDelete = false;
+    throw new Error('Fixture crash after the result delete');
+  }
   // Fails recordResult `times` times for one fence attempt.
   private failRecordAttempt?: number;
   private failRecordTimes = 0;
@@ -830,6 +838,7 @@ export default {
             break;
           }
           case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
+          case '/__fixture/crash-after-result-delete': await box.crashAfterResultDelete(); break;
           case '/__fixture/quota': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();
             const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;

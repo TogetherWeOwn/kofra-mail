@@ -100,6 +100,8 @@ export type DispatchPorts = {
   beforeRecord?(fence: SendFence): Promise<void>;
   // A test seam between a claim's release-only quota call and the removal of those fences.
   afterClaimRelease?(): Promise<void>;
+  // A test seam right after a stored result's row is deleted.
+  afterResultDelete?(): Promise<void>;
   publishThrough(seq: number): Promise<boolean>;
   // Moves the journal lane to the settings recovery point, so every commit is published soon.
   journalDue(timers: TimerTable): void;
@@ -791,7 +793,7 @@ export class SendDispatcher {
     const epoch = ready ? ports.current()?.epoch ?? null : null;
     const db = ports.directory.withSession('first-primary');
     const columns = `fence_epoch AS epoch, fence_attempt AS attempt, kind, message_id AS messageId, detail, suppressed,
-      notify_failures AS failures, unapplied`;
+      notify_failures AS failures, unapplied, rechecked_epoch AS rechecked`;
     const sendKey = 'workspace_id = ? AND mailbox_id = ? AND send_id = ?';
     let results: StoredRow[];
     if (fence) {
@@ -799,26 +801,35 @@ export class SendDispatcher {
         .bind(scope.workspaceId, scope.mailboxId, id, fence.epoch, fence.attempt).all<StoredRow>()).results;
     } else {
       // Flagged acceptances from an older recovery epoch first: a restore may have made them apply.
+      // Each is rechecked at once once per epoch; after that it honors notify_after like any row.
       const flagged = epoch === null ? [] : (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 1
-        AND unapplied_epoch < ? ORDER BY fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, epoch, STORED_PAGE)
-        .all<StoredRow>()).results;
+        AND unapplied_epoch < ? AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR notify_after <= ?)
+        ORDER BY notify_after, unapplied_epoch, rechecked_epoch, fence_epoch, fence_attempt LIMIT ?`)
+        .bind(scope.workspaceId, scope.mailboxId, id, epoch, epoch, ports.now(), STORED_PAGE).all<StoredRow>()).results;
       const due = (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 0 AND notify_after <= ?
         ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE)
         .all<StoredRow>()).results;
       results = [...flagged, ...due];
     }
     // Whether a row that can apply is left, and when the earliest is due: one page is never taken for all of them.
-    // A flagged row from an older epoch counts until it is evaluated in this epoch (it is read whatever its
-    // notify_after; after a transient failure it comes back at its backoff).
+    // A flagged row from an older epoch counts until it is evaluated in this epoch: due at once before its
+    // first recheck, then at its backoff. Each lookup is an indexed seek (send_results_send, send_results_flagged).
     const remaining = async (): Promise<number | null> => {
-      const row = await db.prepare(`SELECT (SELECT min(notify_after) FROM send_results WHERE ${sendKey} AND unapplied = 0) AS next,
-        (SELECT min(notify_after) FROM send_results WHERE ${sendKey} AND unapplied = 1 AND unapplied_epoch < ?) AS flagged`)
-        .bind(scope.workspaceId, scope.mailboxId, id, scope.workspaceId, scope.mailboxId, id, epoch ?? -1)
-        .first<{ next: number | null; flagged: number | null }>();
-      const times = [row?.next, row?.flagged].filter((at): at is number => typeof at === 'number');
+      const next = (await db.prepare(`SELECT min(notify_after) AS next FROM send_results WHERE ${sendKey} AND unapplied = 0`)
+        .bind(scope.workspaceId, scope.mailboxId, id).first<{ next: number | null }>())?.next ?? null;
+      if (epoch === null) return next;
+      const unchecked = (await db.prepare(`SELECT EXISTS (SELECT 1 FROM send_results WHERE ${sendKey} AND unapplied = 1 AND unapplied_epoch < ?
+        AND (rechecked_epoch IS NULL OR rechecked_epoch < ?)) AS found`).bind(scope.workspaceId, scope.mailboxId, id, epoch, epoch)
+        .first<{ found: number }>())?.found;
+      const flagged = unchecked ? ports.now() : (await db.prepare(`SELECT notify_after AS at FROM send_results WHERE ${sendKey} AND unapplied = 1
+        AND unapplied_epoch < ? ORDER BY notify_after LIMIT 1`).bind(scope.workspaceId, scope.mailboxId, id, epoch).first<{ at: number }>())?.at;
+      const times = [next, flagged].filter((at): at is number => typeof at === 'number');
       return times.length ? Math.min(...times) : null;
     };
-    // A notice's answer is about its own row only.
+    // A notice's answer is about its own row only; a row already gone also clears its alerts.
+    if (fence && !results.length && ready) {
+      await this.resultAlerts(id, { epoch: fence.epoch, attempt: fence.attempt } as StoredRow, [], ['unapplied', 'stuck']);
+    }
     if (!results.length) {
       const next = fence ? null : await remaining();
       return next === null ? { status: 'none', recorded: 0 } : { status: 'retry', recorded: 0, next };
@@ -837,6 +848,12 @@ export class SendDispatcher {
     let recorded = 0;
     let backoff: number | null = null;
     for (const [at, row] of results.entries()) {
+      // A flagged row's immediate recheck in this epoch is taken once: a concurrent or repeated poll skips it.
+      if (row.unapplied && epoch !== null && (row.rechecked === null || row.rechecked < epoch)) {
+        const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ? WHERE ${where} AND unapplied = 1
+          AND (rechecked_epoch IS NULL OR rechecked_epoch < ?) RETURNING 1`).bind(epoch, ...keys(row), epoch).first();
+        if (!taken) continue;
+      }
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
       catch (error) {
@@ -859,8 +876,10 @@ export class SendDispatcher {
       } else if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
         // Definitive: recorded and published, a result that can never apply, or no such send.
         if (answer === 'gone') metric('send_result_orphan');
-        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
+        // The alert goes first: a crash after the delete cannot leave it active.
         await this.resultAlerts(id, row, [], ['unapplied', 'stuck']);
+        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
+        await ports.afterResultDelete?.();
         recorded++;
       } else {
         // Transient (an error, or not yet published): the row backs off, doubling from 1 minute
@@ -974,7 +993,7 @@ export function finishReleases(sql: SqlStorage, id: string): SendFence[] { retur
 export function delayedUntil(sql: SqlStorage, id: string): number | null { return dispatchRow(sql, id).delayedUntil; }
 
 type StoredRow = { epoch: number; attempt: number; kind: string; messageId: string | null; detail: string | null; suppressed: number; failures: number;
-  unapplied: number };
+  unapplied: number; rechecked: number | null };
 
 function storedResult(row: StoredRow): ProviderResult {
   switch (row.kind) {

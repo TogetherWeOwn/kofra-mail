@@ -1184,3 +1184,51 @@ test('a notice answers about its own row only', () => withSend(async (h, mail, f
   assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'recorded', recorded: 1 });
   assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'none', recorded: 0 });
 }));
+
+test('after a restore a flagged row is rechecked at once only once: two polls at the same time make one attempt', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'recheck-once');
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  const [flagged] = await h.directoryRows('SELECT notify_failures FROM send_results WHERE send_id = ?', id);
+  // Every attempt after the restore fails, so each one shows in notify_failures.
+  await h.failRecordOnce(a.claim.fence.attempt, 5);
+  await h.restore();
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  const [row] = await h.directoryRows('SELECT notify_failures, rechecked_epoch, unapplied FROM send_results WHERE send_id = ?', id);
+  assert.equal(row.notify_failures, Number(flagged.notify_failures) + 1, 'one attempt in this epoch until its backoff');
+  assert.equal(row.rechecked_epoch, Number((await h.sends.lifecycle())?.epoch));
+  assert.equal(row.unapplied, 1, 'the flag stays on a transient failure');
+}));
+
+async function stuckAlert(h: Fixture, id: string) {
+  const a = await attempt(h, id, { stop: 'authorize' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.failRecordOnce(a.claim.fence.attempt, 8);
+  for (let n = 0; n < 8; n++) await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence);
+  await h.advance(minute);
+  assert.ok((await h.sends.activeAlerts()).includes('send_result_stuck'));
+  return a;
+}
+
+test('a crash right after a resolved row is deleted does not leave its alert active', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'alert-crash');
+  const a = await stuckAlert(h, id);
+  await h.crashAfterResultDelete();
+  const crashed = await h.sendRpcAs(MB, 'recordStoredResults', id, a.claim.fence);
+  assert.equal(crashed.status, 500);
+  await crashed.body?.cancel();
+  assert.deepEqual(await storedRows(h, id), []);
+  await h.advance(minute);
+  assert.ok(!(await h.sends.activeAlerts()).includes('send_result_stuck'), 'the alert was cleared before the delete');
+}));
+
+test('a keyed notice that finds its row gone clears that row\'s alert', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'alert-heal');
+  const a = await stuckAlert(h, id);
+  await h.directoryChange('DELETE FROM send_results WHERE send_id = ?', id);
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'none', recorded: 0 });
+  await h.advance(minute);
+  assert.ok(!(await h.sends.activeAlerts()).includes('send_result_stuck'));
+}));

@@ -461,6 +461,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       resumeSenderCheck: () => controlAction('resume-sender-check'),
       failRecordOnce: (attempt: number, times = 1) => controlAction('fail-record-once', `${attempt},${times}`),
       crashAfterClaimRelease: () => controlAction('crash-after-claim-release'),
+      crashAfterResultDelete: () => controlAction('crash-after-result-delete'),
       quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
       sendState: (id: string) => readControl<SendStateView>('send-state', id),
       pauseNextEnqueue: () => controlAction('pause-enqueue'),

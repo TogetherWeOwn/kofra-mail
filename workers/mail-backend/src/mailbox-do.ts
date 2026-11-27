@@ -197,6 +197,7 @@ export class Mailbox extends DurableObject<Env> {
       senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
       beforeRecord: fence => this.sendRecordCheckpoint(fence),
       afterClaimRelease: () => this.sendReleaseCheckpoint(),
+      afterResultDelete: () => this.sendResultDeleteCheckpoint(),
       publishThrough: seq => this.publishThrough(seq),
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
@@ -213,6 +214,8 @@ export class Mailbox extends DurableObject<Env> {
   protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
   // A test seam between a claim's release-only quota call and the removal of those fences.
   protected async sendReleaseCheckpoint(): Promise<void> {}
+  // A test seam right after a stored result's row is deleted.
+  protected async sendResultDeleteCheckpoint(): Promise<void> {}
 
   // Holds the work lane across `io`, then runs `step` in a transaction and
   // re-arms without reading the alarm first, so `io` is the last await before

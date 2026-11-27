@@ -33,6 +33,8 @@ CREATE TABLE send_results (
   -- The mailbox's recovery epoch when the flag was set: a later epoch re-evaluates the row before any reclaim.
   unapplied_epoch INTEGER CHECK ((unapplied = 0 AND unapplied_epoch IS NULL)
     OR (unapplied = 1 AND typeof(unapplied_epoch) = 'integer' AND unapplied_epoch >= 0)),
+  -- The epoch in which a flagged row had its one immediate recheck; after it, the row honors notify_after.
+  rechecked_epoch INTEGER CHECK (rechecked_epoch IS NULL OR (typeof(rechecked_epoch) = 'integer' AND rechecked_epoch >= 0)),
   PRIMARY KEY (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt)
 );
 -- The reconciler's bounded page of rows whose notice is due.
@@ -40,3 +42,6 @@ CREATE INDEX send_results_notify ON send_results (notify_after, workspace_id, ma
 -- One send's due rows that can apply, in order, and the earliest of them: the
 -- drive row's and the claim's page and settled check.
 CREATE INDEX send_results_send ON send_results (workspace_id, mailbox_id, send_id, notify_after, fence_epoch, fence_attempt) WHERE unapplied = 0;
+-- One send's flagged acceptances, for their recheck after a restore and its settled check.
+CREATE INDEX send_results_flagged ON send_results (workspace_id, mailbox_id, send_id, notify_after, unapplied_epoch, rechecked_epoch,
+  fence_epoch, fence_attempt) WHERE unapplied = 1;
