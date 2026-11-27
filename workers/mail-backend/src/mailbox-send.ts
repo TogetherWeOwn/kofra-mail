@@ -9,7 +9,7 @@ import type { Draft, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { normalizeAddress } from './directory.ts';
 import {
-  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject, sendableDraftObject,
+  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject, sendableDraftObject, sendFileName, sendFileType,
   type DraftObject, type DraftObjectRef,
 } from './mailbox-api-drafts.ts';
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
@@ -84,7 +84,7 @@ export function mimeMessage(record: SendRecord, draft: DraftObject): SendMimeMes
     messageId: sentMessageIdHeader(record), boundary: sentBoundary(record), date: record.dateAt,
     from: { email: record.from.email, ...(record.from.name ? { name: record.from.name } : {}) }, replyTo: record.replyTo,
     to: field('to'), cc: field('cc'), subject: draft.fields.subject, text: [draft.fields.body, ...links].join('\r\n'),
-    attachments: files(draft).map(({ wire }) => ({ name: wire.name, type: wire.type, size: wire.size })),
+    attachments: files(draft).map(({ wire }) => ({ name: sendFileName(wire.name), type: sendFileType(wire.type), size: wire.size })),
     ...(draft.replyHeaders?.inReplyTo ? { inReplyTo: draft.replyHeaders.inReplyTo } : {}),
     ...(draft.replyHeaders?.references ? { references: draft.replyHeaders.references } : {}),
   };

@@ -1,4 +1,4 @@
-import { hasHeaderControl, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
+import { hasHeaderControl, indexedAttachmentName, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput, Draft, DraftAttachment, DraftInput } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
@@ -79,19 +79,21 @@ const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as num
 const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value);
 const isAddress = (value: unknown) => isRecord(value) && isBounded(value.email, LIMITS.addressBytes, true) &&
   optional(value.name, name => isBounded(name, LIMITS.displayNameBytes, true));
-// A file name and type the MIME builder accepts: a name of 1 to 255 bytes with
-// no control character (tab included), a type with no header control. Uploads
-// (`uploadName`, `uploadMediaType`) and indexed parts (`indexedAttachmentName`,
-// a type cut to 255) store within these bounds.
-const isFileName = (value: unknown) => isText(value) && value !== '' && isBounded(value, 255, true) && !value.includes('\t');
-const isFileType = (value: unknown) => isText(value) && value.length <= 255 && !hasHeaderControl(value);
+// The file name and type the MIME builder gets. Uploads (`uploadName`,
+// `uploadMediaType`) and parts indexed with the mail API on already fit: a name
+// of 1 to 255 bytes with no control character, a type with no header control.
+// A part indexed before names were cleaned, or a forwarded type holding a
+// control character, is cleaned here instead of failing the send.
+const isFileName = (value: string) => value !== '' && isBounded(value, 255, true) && !value.includes('\t');
+export const sendFileName = (name: string) => isFileName(name) ? name : indexedAttachmentName(name);
+export const sendFileType = (type: string) => type.length <= 255 && !hasHeaderControl(type) ? type : 'application/octet-stream';
 function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
   if (wire.kind === 'link') return isBounded(wire.url, LIMITS.linkUrlBytes) && isBounded(wire.name, LIMITS.linkNameBytes);
   // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
   const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
-  return isFileName(wire.name) && isFileType(wire.type) && isCount(wire.size) &&
+  return isText(wire.type) && isCount(wire.size) &&
     optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
     (wire.kind === 'upload' ? kind === 'att' && isText(wire.uploadId) : wire.kind === 'message' && !!kind && isText(wire.messageId) && isCount(wire.part));
 }

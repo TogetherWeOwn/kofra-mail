@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.ts';
 import { isMailApiError, type MailService } from '../../../contracts/mail-api/src/index.ts';
 import type { DraftInput, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { startMailHttpFixture } from './fixtures/mail-http.ts';
@@ -1297,24 +1298,23 @@ test('getDraft, replaceDraft and sendDraft of a stored draft that does not decod
 }));
 
 // Rewrites a send's frozen draft revision as a digest-valid object with one change to its upload attachment.
-const uploadDraftChanges = [
-  ['a size that differs from its att/ object', (wire: Record<string, unknown>) => { wire.size = (wire.size as number) + 1; }],
-  ['a type holding CR LF', (wire: Record<string, unknown>) => { wire.type = 'text/plain\r\nX-Injected: 1'; }],
-  ['an empty name', (wire: Record<string, unknown>) => { wire.name = ''; }],
-] as const;
+async function sendChangedUpload(h: Fixture, mail: MailService, from: string, change: (wire: Record<string, unknown>) => void) {
+  const uploaded = await mail.createUpload({ name: 'note.txt', type: 'text/plain', bytes: new Blob(['attachment']) }, key('upload'));
+  const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+  const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
+  const draft = JSON.parse(new TextDecoder().decode(h.objects.get(objectPath(rawKey)))) as { attachments: { wire: Record<string, unknown> }[] };
+  change(draft.attachments[0].wire);
+  const bytes = new TextEncoder().encode(JSON.stringify(draft));
+  const [kind, , gen] = rawKey.split('/');
+  const changedKey = `${kind}/${sha256(bytes.buffer as ArrayBuffer)}/${gen}`;
+  h.objects.set(objectPath(changedKey), bytes.slice().buffer);
+  await h.sends.setDraftKey(pending.id, changedKey);
+  return pending;
+}
 
-for (const [label, change] of uploadDraftChanges) {
-  test(`a digest-valid draft revision whose upload has ${label} fails the send with delivery_error, an alert and no MIME`, () => withSend(async (h, mail, from) => {
-    const uploaded = await mail.createUpload({ name: 'note.txt', type: 'text/plain', bytes: new Blob(['attachment']) }, key('upload'));
-    const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
-    const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
-    const draft = JSON.parse(new TextDecoder().decode(h.objects.get(objectPath(rawKey)))) as { attachments: { wire: Record<string, unknown> }[] };
-    change(draft.attachments[0].wire);
-    const bytes = new TextEncoder().encode(JSON.stringify(draft));
-    const [kind, , gen] = rawKey.split('/');
-    const changedKey = `${kind}/${sha256(bytes.buffer as ArrayBuffer)}/${gen}`;
-    h.objects.set(objectPath(changedKey), bytes.slice().buffer);
-    await h.sends.setDraftKey(pending.id, changedKey);
+test('a digest-valid draft revision whose upload size differs from its att/ object fails the send with delivery_error, an alert and no MIME',
+  () => withSend(async (h, mail, from) => {
+    const pending = await sendChangedUpload(h, mail, from, wire => { wire.size = (wire.size as number) + 1; });
     const builds = (await h.sends.builds()).length;
     await h.advance(UNDO);
     const failed = await mail.getSend(pending.id);
@@ -1326,5 +1326,21 @@ for (const [label, change] of uploadDraftChanges) {
     await h.advance(minute);
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
     assert.equal(await h.sends.emailCalls(), 0);
+  }));
+
+for (const [label, name, type, sentName, sentType] of [
+  ['an empty name and a type holding CR LF', '', 'text/plain\r\nX-Injected: 1', 'attachment', 'application/octet-stream'],
+  ['a name indexed before names were cleaned', `a\tb/c\\${'x'.repeat(300)}`, 'text/plain', indexedAttachmentName(`a\tb/c\\${'x'.repeat(300)}`), 'text/plain'],
+] as const) {
+  test(`a stored file with ${label} is sent with a cleaned name and type, never failed`, () => withSend(async (h, mail, from) => {
+    const pending = await sendChangedUpload(h, mail, from, wire => { wire.name = name; wire.type = type; });
+    await h.advance(UNDO);
+    assert.equal((await mail.getSend(pending.id)).state, 'sending');
+    assert.equal((await h.sends.queue()).length, 1);
+    const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+    assert.doesNotMatch(text, /^X-Injected/m);
+    assert.match(text, new RegExp(`^Content-Type: ${sentType.replace('/', '\\/')}\r$`, 'm'));
+    const [copy] = await sentCopies(mail);
+    assert.deepEqual(copy.attachments.map(({ name: sent }) => sent), [sentName]);
   }));
 }
