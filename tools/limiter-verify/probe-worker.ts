@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { EXPECTED_BUCKETS, isBucket } from './expected-buckets.ts';
+import { EXPECTED_BUCKETS, isBucket, refusalBand } from './expected-buckets.ts';
 import { PROBE_PATH, PROBE_SECRET_HEADER } from './probe-protocol.ts';
 
 type BindingName = (typeof EXPECTED_BUCKETS)[keyof typeof EXPECTED_BUCKETS]['binding'];
@@ -21,12 +21,14 @@ export default {
 
     try {
       const { binding, limit } = EXPECTED_BUCKETS[bucket];
+      // At most one call past the band, so an unlimited binding cannot run long.
+      const { max } = refusalBand(limit);
       const limiter = env[binding];
       if (!limiter || typeof limiter.limit !== 'function') return empty(503);
       const key = `r2-probe:${crypto.randomUUID()}`;
       let allowed = 0;
       let refused = false;
-      for (let i = 0; i <= limit; i++) {
+      for (let i = 0; i <= max; i++) {
         const { success } = await limiter.limit({ key });
         if (success === false) { refused = true; break; }
         if (success !== true) return empty(503);

@@ -1,5 +1,5 @@
 import { failures, isEntryPoint, isRecord, report, targetOrigin, type Verdict } from './cli.ts';
-import { EXPECTED_BUCKETS, bucketNames } from './expected-buckets.ts';
+import { EXPECTED_BUCKETS, bucketNames, refusalBand } from './expected-buckets.ts';
 import { PROBE_PATH, PROBE_SECRET_HEADER } from './probe-protocol.ts';
 
 export async function checkProbe(baseUrl: string | undefined, secret: string | undefined, request = fetch): Promise<Verdict[]> {
@@ -19,7 +19,9 @@ export async function checkProbe(baseUrl: string | undefined, secret: string | u
       });
       if (response.status === 200) {
         const result: unknown = await response.json();
-        pass = isRecord(result) && result.allowed === limit && result.refused === true;
+        const { min, max } = refusalBand(limit);
+        pass = isRecord(result) && result.refused === true && typeof result.allowed === 'number'
+          && result.allowed >= min && result.allowed <= max;
       } else await response.body?.cancel();
     } catch {
       // A failed request is a verdict, not a reason to print upstream details.

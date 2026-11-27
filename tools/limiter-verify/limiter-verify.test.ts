@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { checkConfig } from './check-config.ts';
 import { isEntryPoint } from './cli.ts';
-import { EXPECTED_BUCKETS, bucketNames, type Bucket } from './expected-buckets.ts';
+import { EXPECTED_BUCKETS, bucketNames, type Bucket, refusalBand } from './expected-buckets.ts';
 import { checkHttp } from './http-check.ts';
 import { checkProbe } from './probe-client.ts';
 import probe from './probe-worker.ts';
@@ -169,15 +169,16 @@ test('probe answers 404 without its configured secret and cannot address other b
   assert.equal((await probe.fetch(probeRequest('constructor', probeSecret), env)).status, 404);
 });
 
-test('probe caps unlimited bindings at limit plus one and suppresses binding errors', async () => {
+test('probe caps unlimited bindings one call past the band and suppresses binding errors', async () => {
   const { limit, binding } = EXPECTED_BUCKETS.undo;
+  const { max } = refusalBand(limit);
   let calls = 0;
   const env = { R2_PROBE_SECRET: probeSecret, [binding]: {
     async limit() { calls++; return { success: true }; },
   } };
   const response = await probe.fetch(probeRequest('undo', probeSecret), env);
-  assert.deepEqual(await response.json(), { allowed: limit + 1, refused: false });
-  assert.equal(calls, limit + 1);
+  assert.deepEqual(await response.json(), { allowed: max + 1, refused: false });
+  assert.equal(calls, max + 1);
 
   const failure = await probe.fetch(probeRequest('undo', probeSecret), {
     R2_PROBE_SECRET: probeSecret, [binding]: { async limit() { throw new Error(probeSecret); } },
@@ -186,7 +187,7 @@ test('probe caps unlimited bindings at limit plus one and suppresses binding err
   assert.equal(await failure.text(), '');
 });
 
-test('probe client fails early refusals, excess allowances and missing bindings', async () => {
+test('probe client accepts the band edges and fails early refusals, late or no refusals and missing bindings', async () => {
   const seen: string[] = [];
   const result = await checkProbe('https://probe.example.test', probeSecret, async (url, init) => {
     assert.equal(init?.method, 'POST');
@@ -194,13 +195,17 @@ test('probe client fails early refusals, excess allowances and missing bindings'
     const bucket = new URL(String(url)).searchParams.get('bucket') as Bucket;
     seen.push(bucket);
     const { limit } = EXPECTED_BUCKETS[bucket];
-    if (bucket === 'writes') return Response.json({ allowed: limit - 1, refused: true });
-    if (bucket === 'undo') return Response.json({ allowed: limit + 1, refused: false });
+    const { min, max } = refusalBand(limit);
+    if (bucket === 'writes') return Response.json({ allowed: min - 1, refused: true });
+    if (bucket === 'reads') return Response.json({ allowed: max + 1, refused: true });
+    if (bucket === 'undo') return Response.json({ allowed: max + 1, refused: false });
     if (bucket === 'uploads') return new Response(null, { status: 503 });
+    if (bucket === 'sends') return Response.json({ allowed: min, refused: true });
+    if (bucket === 'admin_writes') return Response.json({ allowed: max, refused: true });
     return Response.json({ allowed: limit, refused: true });
   });
   assert.deepEqual(seen, bucketNames);
-  assert.deepEqual(result, verdicts('writes', 'undo', 'uploads'));
+  assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'uploads'));
 });
 
 const routes: [Bucket, string, RegExp, number][] = [
@@ -212,7 +217,7 @@ const routes: [Bucket, string, RegExp, number][] = [
   ['admin_writes', 'POST', /^\/api\/v1\/admin\/domains$/, 428],
 ];
 
-type Mode = 'exact' | 'never' | 'early' | 'wrong period';
+type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong period';
 async function fakeServer(mode: Mode, buckets: Bucket[]) {
   const counts = new Map<string, number>();
   const undoPaths = new Set<string>();
@@ -231,13 +236,17 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
       || request.headers.origin !== `http://${request.headers.host}`
       || request.headers['idempotency-key'] || request.headers['if-match']) { response.writeHead(403).end(); return; }
     const [bucket, , , baseline] = route;
-    const offset = mode === 'early' ? -1 : 0;
+    // The number of requests a bucket admits before its first refusal.
+    const admits = (limit: number) => {
+      const { min, max } = refusalBand(limit);
+      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong period': limit }[mode];
+    };
     let limited = false;
     if (bucket === 'undo') {
       undoPaths.add(path);
-      limited = hit('undo_flood') > EXPECTED_BUCKETS.undo_flood.limit + offset;
+      limited = hit('undo_flood') > admits(EXPECTED_BUCKETS.undo_flood.limit);
     }
-    limited ||= hit(bucket === 'undo' ? path : bucket) > EXPECTED_BUCKETS[bucket].limit + offset;
+    limited ||= hit(bucket === 'undo' ? path : bucket) > admits(EXPECTED_BUCKETS[bucket].limit);
     if (mode === 'never' || !limited) { response.writeHead(baseline).end('{}'); return; }
     const period = mode === 'wrong period' ? 10 : EXPECTED_BUCKETS[bucket].period;
     response.writeHead(429, { 'retry-after': String(period), 'content-type': 'application/problem+json' })
@@ -265,11 +274,23 @@ test('HTTP check passes exact sequences on all enabled buckets and separates the
   assert.equal(flood.undoPaths.size, EXPECTED_BUCKETS.undo_flood.limit + 1);
 });
 
-for (const mode of ['never', 'early', 'wrong period'] as const) {
+for (const mode of ['never', 'early', 'late', 'wrong period'] as const) {
   test(`HTTP check rejects ${mode} rate limiting`, async () => {
+    const { limit } = EXPECTED_BUCKETS.writes;
+    const { min, max } = refusalBand(limit);
     const { result, calls } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
-    assert.equal(calls, EXPECTED_BUCKETS.writes.limit + (mode === 'early' ? 0 : 1));
+    assert.equal(calls, { never: max + 1, early: min, late: max + 1, 'wrong period': limit + 1 }[mode]);
+  });
+}
+
+for (const mode of ['band low', 'band high'] as const) {
+  test(`HTTP check accepts a first refusal at the ${mode === 'band low' ? 'low' : 'high'} edge of the band`, async () => {
+    const { limit } = EXPECTED_BUCKETS.writes;
+    const { min, max } = refusalBand(limit);
+    const { result, calls } = await fakeServer(mode, ['writes']);
+    assert.deepEqual(result, [{ bucket: 'writes', pass: true }]);
+    assert.equal(calls, (mode === 'band low' ? min : max) + 1);
   });
 }
 
