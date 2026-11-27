@@ -93,6 +93,14 @@ export class HttpMailbox extends Mailbox {
     const gate = this.senderGate;
     if (gate?.phase === phase) { gate.reached.resolve(); await gate.resume.promise; }
   }
+  // Fails the mailbox once between a claim's release-only quota call and the removal of those fences.
+  private crashRelease = false;
+  crashAfterClaimRelease() { this.crashRelease = true; }
+  protected override async sendReleaseCheckpoint() {
+    if (!this.crashRelease) return;
+    this.crashRelease = false;
+    throw new Error('Fixture crash after the release call');
+  }
   // Fails recordResult once for one fence attempt.
   private failRecordAttempt?: number;
   failRecordOnce(attempt: number) { this.failRecordAttempt = attempt; }
@@ -117,7 +125,7 @@ export class HttpMailbox extends Mailbox {
     };
   }
   async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
-    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults', 'acknowledgeReleases'];
+    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
     if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
     return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
   }
@@ -816,6 +824,7 @@ export default {
           case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
           case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
           case '/__fixture/fail-record-once': await box.failRecordOnce(Number(await req.text())); break;
+          case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
           case '/__fixture/quota': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();
             const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;

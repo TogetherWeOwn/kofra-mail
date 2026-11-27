@@ -196,6 +196,7 @@ export class Mailbox extends DurableObject<Env> {
       exclusive: (io, step) => this.exclusiveStep(io, step),
       senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
       beforeRecord: fence => this.sendRecordCheckpoint(fence),
+      afterClaimRelease: () => this.sendReleaseCheckpoint(),
       publishThrough: seq => this.publishThrough(seq),
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
@@ -210,6 +211,8 @@ export class Mailbox extends DurableObject<Env> {
   protected async sendSenderCheckpoint(_phase: 'before' | 'after'): Promise<void> {}
   // A test seam before recordResult acts.
   protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
+  // A test seam between a claim's release-only quota call and the removal of those fences.
+  protected async sendReleaseCheckpoint(): Promise<void> {}
 
   // Holds the work lane across `io`, then runs `step` in a transaction and
   // re-arms without reading the alarm first, so `io` is the last await before
@@ -254,18 +257,15 @@ export class Mailbox extends DurableObject<Env> {
     return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence, cause, resetAt);
   }
 
-  // After a release-only quota call for a claim's `release` answer.
-  async acknowledgeReleases(workspaceId: string, mailboxId: string, sendId: string, released: SendFence[]) {
-    return this.sendDispatcher().acknowledgeReleases({ workspaceId, mailboxId }, sendId, released);
-  }
 
   async abandonClaim(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, retryAt: number): Promise<AbandonAnswer> {
     return this.sendDispatcher().abandon({ workspaceId, mailboxId }, sendId, fence, retryAt);
   }
 
-  // Shared by the drive handler and result notices.
-  async recordStoredResults(workspaceId: string, mailboxId: string, sendId: string): Promise<StoredAnswer> {
-    return this.sendDispatcher().recordStored({ workspaceId, mailboxId }, sendId);
+  // Shared by the drive handler and result notices; a notice passes its fence,
+  // and that row is recorded whatever its notify_after.
+  async recordStoredResults(workspaceId: string, mailboxId: string, sendId: string, fence?: SendFence): Promise<StoredAnswer> {
+    return this.sendDispatcher().recordStored({ workspaceId, mailboxId }, sendId, fence);
   }
 
   // A test seam after each release step; does nothing here.
@@ -1140,9 +1140,12 @@ export class Mailbox extends DurableObject<Env> {
     // A send held after repeated crashes of our own waits for an operator.
     const held = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_send_dispatch d JOIN mailbox_sends s ON s.id = d.send_id
       WHERE d.held_at IS NOT NULL AND s.state NOT IN ('sent', 'partial', 'failed', 'cancelled')) AS active`).one().active !== 0;
+    // A stored acceptance that cannot be recorded: an invariant breach.
+    const unapplied = life?.state === 'ready' && sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_unapplied) AS active').one().active !== 0;
     const conditions: Array<[MailboxAlertCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
-      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held]];
+      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held],
+      ['send_result_unapplied', unapplied]];
     let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {

@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS mailbox_send_marks (
   PRIMARY KEY (send_id, epoch, attempt, idx),
   FOREIGN KEY (send_id, epoch, attempt) REFERENCES mailbox_send_fences(send_id, epoch, attempt) ON DELETE CASCADE
 );
+-- Local, like the breaches: stored acceptances (send_results rows) that could not be recorded; raises an alert.
+CREATE TABLE IF NOT EXISTS mailbox_send_unapplied (send_id TEXT NOT NULL, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL, since INTEGER NOT NULL,
+  PRIMARY KEY (send_id, epoch, attempt));
 CREATE TABLE IF NOT EXISTS mailbox_send_release_list (
   send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
   PRIMARY KEY (send_id, epoch, attempt)

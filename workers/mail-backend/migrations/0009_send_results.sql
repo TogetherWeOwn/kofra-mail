@@ -27,7 +27,13 @@ CREATE TABLE send_results (
   created_at INTEGER NOT NULL,
   notify_after INTEGER NOT NULL,
   notify_failures INTEGER NOT NULL DEFAULT 0 CHECK (notify_failures >= 0),
+  -- 1: an acceptance the mailbox could not record; it no longer holds up dispatch
+  -- and waits for a notice or the reconciler (a later restore can let it apply).
+  unapplied INTEGER NOT NULL DEFAULT 0 CHECK (unapplied IN (0, 1) AND (unapplied = 0 OR kind = 'accepted')),
   PRIMARY KEY (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt)
 );
 -- The reconciler's bounded page of rows whose notice is due.
 CREATE INDEX send_results_notify ON send_results (notify_after, workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt);
+-- One send's due rows that can apply, in order, and the earliest of them: the
+-- drive row's and the claim's page and settled check.
+CREATE INDEX send_results_send ON send_results (workspace_id, mailbox_id, send_id, notify_after, fence_epoch, fence_attempt) WHERE unapplied = 0;
