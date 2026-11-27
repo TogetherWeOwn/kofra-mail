@@ -46,7 +46,10 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
       // admitted. A refusal before min fails at once; a later one, or none, may
       // be a counter rollover and gets one retry after a full period.
       const attempt = async (): Promise<Outcome> => {
-        const signal = AbortSignal.timeout(period * 1000);
+        // A bad answer or a failed request ends the attempt at once: it aborts the
+        // requests still in flight instead of waiting for the batch.
+        const stop = new AbortController();
+        const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(period * 1000)]);
         const send = () => {
           const id = bucket === 'undo_flood' ? crypto.randomUUID() : notFoundId;
           const path = route.path.replaceAll(/\{[a-zA-Z]+\}/g, id);
@@ -65,8 +68,16 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
         let admitted = 0;
         let sent = 0;
         while (sent <= max) {
-          const batch = await Promise.allSettled(Array.from({ length: Math.min(batchSize, max + 1 - sent) }, async () =>
-            classify(await send())));
+          const batch = await Promise.allSettled(Array.from({ length: Math.min(batchSize, max + 1 - sent) }, async () => {
+            try {
+              const verdict = await classify(await send());
+              if (verdict === 'bad') stop.abort();
+              return verdict;
+            } catch (error) {
+              stop.abort();
+              throw error;
+            }
+          }));
           sent += batch.length;
           if (batch.some((result) => result.status === 'rejected' || result.value === 'bad')) return 'fail';
           const values = batch.map((result) => (result as PromiseFulfilledResult<'admitted' | 'refused'>).value);

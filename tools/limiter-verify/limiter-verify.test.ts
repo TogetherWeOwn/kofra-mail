@@ -201,6 +201,7 @@ test('probe caps unlimited bindings one call past the band and suppresses bindin
 
 test('probe client accepts the band edges and fails early refusals, late or no refusals and missing bindings', async () => {
   const seen: string[] = [];
+  const waits: number[] = [];
   const result = await checkProbe('https://probe.example.test', probeSecret, async (url, init) => {
     assert.equal(init?.method, 'POST');
     assert.equal(new Headers(init?.headers).get('x-r2-probe-secret'), probeSecret);
@@ -216,10 +217,12 @@ test('probe client accepts the band edges and fails early refusals, late or no r
     if (bucket === 'admin_writes') return Response.json({ allowed: max, refused: true });
     if (bucket === 'undo_flood') return Response.json({ allowed: limit, refused: false });
     return Response.json({ allowed: limit, refused: true });
-  }, async () => {});
-  // Late and missing refusals are retried once; the order of buckets is unchanged.
+  }, async (ms) => { waits.push(ms); });
+  // Late and missing refusals are retried once; an early refusal or a bad answer never is.
   assert.deepEqual([...new Set(seen)], bucketNames);
-  assert.deepEqual(seen.filter((bucket) => bucket === 'reads').length, 2);
+  const calls = Object.fromEntries(bucketNames.map((bucket) => [bucket, seen.filter((b) => b === bucket).length]));
+  assert.deepEqual(calls, { reads: 2, writes: 1, uploads: 1, sends: 1, undo: 2, undo_flood: 2, admin_writes: 1 });
+  assert.deepEqual(waits, [61_000, 61_000, 61_000]);
   assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'undo_flood', 'uploads'));
 });
 
@@ -245,6 +248,32 @@ test('probe client retries a late refusal once after a full period, for a counte
   }, async (ms) => { waits.push(ms); });
   assert.deepEqual(result, verdicts());
   assert.deepEqual(waits, bucketNames.map((bucket) => (EXPECTED_BUCKETS[bucket].period + 1) * 1000));
+});
+
+test('probe client fails only the bucket whose retry wait fails and still checks the rest', async () => {
+  const result = await checkProbe('https://probe.example.test', probeSecret, async (url) => {
+    const bucket = new URL(String(url)).searchParams.get('bucket') as Bucket;
+    const { limit } = EXPECTED_BUCKETS[bucket];
+    return Response.json(bucket === 'reads' ? { allowed: limit, refused: false } : { allowed: limit, refused: true });
+  }, async () => { throw new Error('timer'); });
+  assert.deepEqual(result, verdicts('reads'));
+});
+
+test('HTTP check fails at the first bad answer and aborts the requests still in flight', async () => {
+  let calls = 0;
+  let aborted = 0;
+  const started = Date.now();
+  const result = await checkHttp('https://mail.example.test', ['reads'], session, async (_url, init) => {
+    if (calls++ === 0) return new Response('{}', { status: 500 });
+    // Every other request stalls until the attempt is aborted.
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { aborted++; reject(new Error('aborted')); }, { once: true });
+    });
+  }, async () => assert.fail('a bad answer is never retried'));
+  assert.deepEqual(result, [{ bucket: 'reads', pass: false }]);
+  assert.equal(calls, 8);
+  assert.equal(aborted, 7);
+  assert.ok(Date.now() - started < 5_000);
 });
 
 test('the refusal band is 90% rounded up to 150% rounded down', () => {

@@ -38,8 +38,13 @@ export async function checkProbe(baseUrl: string | undefined, secret: string | u
     };
     let outcome = await attempt();
     if (outcome === 'late') {
-      await sleep((period + 1) * 1000);
-      outcome = await attempt();
+      // A failed wait is this bucket's failure, never a reason to drop the others.
+      try {
+        await sleep((period + 1) * 1000);
+        outcome = await attempt();
+      } catch {
+        outcome = 'fail';
+      }
     }
     verdicts.push({ bucket, pass: outcome === 'pass' });
   }
