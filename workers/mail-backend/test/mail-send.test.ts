@@ -1219,6 +1219,17 @@ for (const target of ['source', 'draft'] as const) {
     }));
 }
 
+test('sendDraft answers 422 invalid_header for /replyTo when the settings Reply-To is defined but not a list', () => withSend(async (h, mail, from) => {
+  await h.sends.setReplyTo({ email: 'bad' });
+  const draft = await mail.createDraft(draftInput(from), key('draft'));
+  const response = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+  assert.equal(response.status, 422);
+  const problem = await response.json() as { code: string; errors?: { field: string }[] };
+  assert.equal(problem.code, 'invalid_header');
+  assert.deepEqual(problem.errors?.map(({ field }) => field), ['/replyTo']);
+  assert.deepEqual(await h.sends.ids(), [], 'no send was accepted');
+}));
+
 test('only the first four settings Reply-To entries are used: an invalid fifth does not block the send', () => withSend(async (h, mail, from) => {
   const valid = [1, 2, 3, 4].map(i => ({ email: `replies${i}@example.com` }));
   await h.sends.setReplyTo([...valid, { email: '=?utf-8?b?QQ==?=@example.com' }]);

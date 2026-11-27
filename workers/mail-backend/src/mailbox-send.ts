@@ -114,7 +114,9 @@ function checkSendable(draft: DraftObject): SendRecipient[] {
 function replyToFromSettings(sql: SqlStorage): SendAddress[] {
   const row = sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
   const value = row ? (JSON.parse(row.definition) as { replyTo?: unknown }).replyTo : undefined;
-  if (!Array.isArray(value)) return [];
+  // Absent means no Reply-To; any other value that is not a list is invalid.
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) return fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
   return value.slice(0, 4).map(entry => {
     const { email, name } = (entry ?? {}) as { email?: unknown; name?: unknown };
     if (typeof email !== 'string' || hasHeaderControl(email) || !validEmail(email) || (name !== undefined &&
