@@ -47,7 +47,7 @@ export interface MailApiEnvironment extends RateLimitBindings {
   DIRECTORY?: DirectoryDatabase;
   MAILBOX?: { getByName(name: string): {
     mailApi(ws: string, mb: string, operation: Operation, params: Record<string, string>, input: unknown,
-      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; userId?: string;
+      options: { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; pendingPrimary?: string; cursorScope?: string; userId?: string;
         httpWrite?: { stream: ReadableStream<Uint8Array> | null; mediaType: string; contentLength: string | null;
           query: [string, string][] } }): Promise<OperationResult>;
   } };
@@ -238,13 +238,16 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     } else {
       if (mailbox) {
         const draftWrite = op === 'createDraft' || op === 'replaceDraft';
-        // sendDraft gets no list: the mailbox checks the sender itself, in one directory statement.
-        const canSendAs = draftWrite || op === 'getSettings' || op === 'updateSettings'
-          ? (await directory.identities(mailbox.id)).filter((identity) => draftWrite || identity.sendAs === 'active').map((identity) => identity.email) : [];
+        const settings = op === 'getSettings' || op === 'updateSettings';
+        // Drafts can retain pending identities. sendDraft gets no list: the
+        // mailbox checks authorization itself in one directory statement.
+        const identities = draftWrite || settings ? await directory.identities(mailbox.id) : [];
+        const canSendAs = identities.filter((identity) => draftWrite || identity.sendAs === 'active').map((identity) => identity.email);
+        const pendingPrimary = settings ? identities.find((identity) => identity.primary && identity.sendAs === 'pending')?.email : undefined;
         result = await env.MAILBOX.getByName(JSON.stringify([principal.workspaceId, mailbox.id])).mailApi(
           principal.workspaceId, mailbox.id, op,
           { ...Object.fromEntries(Object.entries(query).map(([key, value]) => [key, String(value)])), ...params }, input,
-          { idempotencyKey, ifMatch, canSendAs, cursorScope: principal.userId, userId: principal.userId, ...(httpWrite && { httpWrite }) },
+          { idempotencyKey, ifMatch, canSendAs, pendingPrimary, cursorScope: principal.userId, userId: principal.userId, ...(httpWrite && { httpWrite }) },
         );
       } else result = { body: { state: 'unprovisioned' } };
       if (!result.error && op === 'getSession') {

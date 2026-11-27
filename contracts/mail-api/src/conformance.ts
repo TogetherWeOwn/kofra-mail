@@ -27,6 +27,17 @@ const draftInput = (from: string, patch: Partial<DraftInput> = {}): DraftInput =
 });
 const ids = (page: { items: { id: string }[] }) => page.items.map(({ id }) => id);
 
+async function provisionMailbox(h: ConformanceHarness, member: MailService) {
+  const address = requiredMailbox(await member.getSession()).primaryAddress;
+  const mail = h.as('newAdmin');
+  const { user } = await mail.getSession();
+  const { primaryAddress } = await mail.createMailbox({
+    primaryAddress: `conformance-new-admin@${address.split('@').at(-1)}`,
+    displayName: user.name, ownerUserId: user.id,
+  }, key('new-admin-mailbox'));
+  return { mail, primaryAddress };
+}
+
 function requiredMailbox(session: Session): NonNullable<Session['mailbox']> {
   assert.ok(session.mailbox, 'expected this principal to own a mailbox');
   return session.mailbox;
@@ -120,6 +131,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
             deliver: async (...args) => json(await harness.deliver(...args)),
             advance: async (ms) => json(await harness.advance(ms)),
             sentHeaders: async (messageId) => json(await harness.sentHeaders(messageId)),
+            activatePrimary: (address) => harness.activatePrimary(address),
             contentOrigin: harness.contentOrigin,
             ...(harness.credentialEpoch && { credentialEpoch: (principal) => harness.credentialEpoch!(principal) }),
             ...(harness.drivePick && { drivePick: async () => json(await harness.drivePick!()) }),
@@ -155,6 +167,43 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       }, key('new-admin-mailbox'));
       assert.deepEqual((await newAdmin.getSession()).mailbox, { id: created.id, primaryAddress: created.primaryAddress });
     });
+
+    run('a new mailbox lists its primary as pending', async (h, member) => {
+      const { mail, primaryAddress } = await provisionMailbox(h, member);
+      assert.equal((await mail.listIdentities()).items.find((identity) => identity.primary && identity.email === primaryAddress)?.sendAs, 'pending');
+    });
+
+    run('a new mailbox defaults to its pending primary and can save and replace a draft from it', async (h, member) => {
+      const { mail, primaryAddress } = await provisionMailbox(h, member);
+      assert.equal((await mail.getSettings()).defaultFrom, primaryAddress);
+      const draft = await mail.createDraft(draftInput(primaryAddress), key('draft'));
+      assert.equal(draft.from, primaryAddress);
+      const replaced = await mail.replaceDraft(draft.id, draftInput(primaryAddress, { body: 'Edited' }), { ifMatch: draft.revision });
+      assert.equal(replaced.from, primaryAddress);
+      assert.equal((await mail.getDraft(draft.id)).body, 'Edited');
+      assert.equal((await mail.listIdentities()).items.find((identity) => identity.primary)?.sendAs, 'pending');
+    });
+
+    run('a new mailbox cannot explicitly set its pending primary as defaultFrom', async (h, member) => {
+      const { mail, primaryAddress } = await provisionMailbox(h, member);
+      await rejects(mail.updateSettings({ defaultFrom: primaryAddress }), 'invalid_sender');
+    });
+
+    run('1a. a new mailbox cannot send from its pending primary until fixture activation', async (h, member) => {
+      const { mail, primaryAddress } = await provisionMailbox(h, member);
+      const draft = await mail.createDraft(draftInput(primaryAddress), key('draft'));
+      const options = { ...key('send'), ifMatch: draft.revision };
+      await rejects(mail.sendDraft(draft.id, options), 'invalid_sender');
+      assert.deepEqual((await mail.listSends({})).items, []);
+      assert.deepEqual(await mail.getDraft(draft.id), draft);
+
+      await h.activatePrimary(primaryAddress);
+      assert.equal((await mail.listIdentities()).items.find((identity) => identity.primary)?.sendAs, 'active');
+      assert.equal((await mail.updateSettings({ defaultFrom: primaryAddress })).defaultFrom, primaryAddress);
+      const send = await mail.sendDraft(draft.id, options);
+      assert.equal(send.state, 'pending');
+      assert.deepEqual(ids(await mail.listSends({})), [send.id]);
+    }, { requires: 'm3' });
 
     run('2. results are JSON-safe, with null allowed only on the last page cursor', async (h, mail) => {
       const { threadId } = await h.deliver(message());
@@ -1095,6 +1144,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
 
     test('only the named outbound cases require M3', () => {
       assert.deepEqual(m3Cases, [
+        '1a. a new mailbox cannot send from its pending primary until fixture activation',
         '6a. sends and uploads respect mailbox boundaries',
         '11a. upload replays and send retries preserve one action per key',
         '13. send checks enforce valid recipients, size and revision',

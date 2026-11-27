@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, beforeEach, test } from 'node:test';
 import { Miniflare } from 'miniflare';
-import { senderActive, senderState, type SenderCheck } from '../src/mailbox-send-sender.ts';
+import { SENDER_CHECK, senderActive, senderState, type SenderCheck } from '../src/mailbox-send-sender.ts';
 import { migrateDirectory } from './fixtures/directory-db.ts';
 
 // The one directory statement of section 1 (docs/m3-outbound-plan.md): the
@@ -51,6 +51,29 @@ for (const [revocation, statement] of [
     assert.equal(await check(), false);
   });
 }
+
+test('refuses the primary when its directory row is pending, off, moved or missing', async () => {
+  const from = 'owner@example.test';
+  const state = () => senderState(db, { ...send, from });
+  assert.equal(await state(), 'ok');
+  await change("UPDATE addresses SET send_as_policy = 'pending' WHERE address_norm = 'owner@example.test'");
+  assert.equal(await state(), 'inactive');
+  await change("UPDATE addresses SET send_as_policy = 'off' WHERE address_norm = 'owner@example.test'");
+  assert.equal(await state(), 'inactive');
+  await change("UPDATE addresses SET send_as_policy = 'active', target_id = 'm2' WHERE address_norm = 'owner@example.test'");
+  assert.equal(await state(), 'inactive');
+  await change("DELETE FROM addresses WHERE address_norm = 'owner@example.test'");
+  assert.equal(await state(), 'inactive');
+});
+
+test('sender authorization uses an indexed mailbox lookup and an indexed address lookup', async () => {
+  const { results } = await db.prepare(`EXPLAIN QUERY PLAN ${SENDER_CHECK}`)
+    .bind(send.workspaceId, send.mailboxId, send.ownerUserId, send.from).all<{ detail: string }>();
+  const plan = results.map(({ detail }) => detail).join('\n');
+  assert.match(plan, /SEARCH m USING INDEX .*\(workspace_id=\? AND id=\?\)/);
+  assert.match(plan, /SEARCH a USING INDEX .*\(address_norm=\?\)/);
+  assert.doesNotMatch(plan, /\bSCAN\b/);
+});
 
 test('refuses an identity of another mailbox, another owner or another workspace', async () => {
   assert.equal(await check({ from: 'colleague@example.test' }), false, "another mailbox's primary");

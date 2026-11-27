@@ -214,7 +214,8 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 ### 8.3 Drafts, send and undo
 
 **Saving a draft:**
-- `from` must be one of the user's identities, otherwise 422 `invalid_sender`.
+- `from` must be one of the user's identities, including the pending primary, otherwise 422 `invalid_sender`.
+- `getSettings` falls back to the pending primary for `defaultFrom` when there are no active identities; an explicit `updateSettings` of `defaultFrom` still requires an active identity.
 - Recipient and attachment counts may not exceed the send limits.
 - Address syntax is not checked, because drafts may be incomplete, but lengths are: an address over `addressBytes` (254), a link URL over `linkUrlBytes` or a link name over `linkNameBytes` answers 400 `invalid_request` (`too_long`).
 - **Header text:** a subject, display name or address (and, on admin routes, a mailbox `displayName`, which is the From name of its identities) that contains a control character other than tab (CR and LF included) answers 422 `invalid_header`, with the field in `errors`. It is never stripped. `hasHeaderControl` in `src/headers.ts` is the rule. Link names and URLs with control characters answer 400 `invalid_request`; file names are checked when uploaded (section 8.4).
@@ -295,6 +296,7 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 - `createMailbox` needs `ownerUserId` from `listMembers`, an invited or active member without a mailbox.
 - The primary address must be on a primary or secondary domain of the workspace (otherwise 422 `domain_not_in_workspace`) and not already used (409 `address_taken`).
 - A mailbox is never bound to an account by matching email.
+- A new mailbox cannot send, internally or externally, until the allow-list job deploys its primary and marks it `active`.
 
 **Aliases:**
 - `createAlias` adds an address on a primary or secondary domain. An address on an alias domain is implicit: `x@alias.example` reaches `x@primary.example`.

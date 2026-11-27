@@ -645,6 +645,11 @@ async function incoming(req: Request, env: FixtureEnv, to: string, from: string)
   return Response.json(await box.delivered(delivery));
 }
 
+async function activatePrimary(db: D1Database, address: string): Promise<void> {
+  await db.prepare("UPDATE addresses SET send_as_policy = 'active' WHERE address_norm = ? AND kind = 'primary' AND send_as_policy = 'pending'")
+    .bind(address).run();
+}
+
 async function seedHttpDirectory(env: FixtureEnv, migrations: string[][]): Promise<void> {
   const db = env.DIRECTORY;
   for (const statements of migrations) await db.batch(statements.map(statement => db.prepare(statement)));
@@ -654,8 +659,10 @@ async function seedHttpDirectory(env: FixtureEnv, migrations: string[][]): Promi
     await db.batch([
       db.prepare('INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES (?, ?, ?, ?)').bind(principal.mailboxId, principal.ws, principal.userId, principal.address),
       db.prepare('INSERT INTO mailbox_profiles VALUES (?, ?, ?)').bind(principal.ws, principal.mailboxId, principal.name),
-      db.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'primary', 'active')").bind(principal.address, principal.ws, principal.mailboxId),
+      db.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'primary', 'pending')").bind(principal.address, principal.ws, principal.mailboxId),
     ]);
+    // Seeded mailboxes represent provisioned fixtures, unlike those created through the API.
+    await activatePrimary(db, principal.address);
   }
   if (env.DEFAULT_ACCOUNT === 'demo') {
     await db.prepare("INSERT INTO addresses VALUES ('hello@example.com', 'w1', 'mailbox', 'mailbox-demo', 'alias', 'active')").run();
@@ -683,6 +690,10 @@ export default {
       }
       if (url.pathname === '/__fixture/seed-directory') {
         await seedHttpDirectory(env, await req.json<string[][]>());
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/__fixture/activate-primary') {
+        await activatePrimary(env.DIRECTORY, await req.text());
         return new Response(null, { status: 204 });
       }
       if (url.pathname === '/__fixture/directory-change' || url.pathname === '/__fixture/directory-rows') {
