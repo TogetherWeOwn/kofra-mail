@@ -126,24 +126,36 @@ test('a stale fence that was never authorized cannot record even a confirmed res
 test('a terminal or cancelled send is stale for every fence and never gets a drive row back', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'terminal');
   const a = await attempt(h, id, { stop: 'authorize' });
-  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, a.claim.fence, { kind: 'rejected', reason: 'invalid_address' }), { status: 'recorded' });
+  await h.advance(LEASE + SKEW);
+  // Fence B holds a live, marked lease when fence A's confirmed result finishes the send.
+  const b = await attempt(h, id, { stop: 'mark' });
+  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, a.claim.fence, { kind: 'accepted', messageId: 'a' }), { status: 'recorded' });
+  const ended = await h.sendState(id);
+  assert.equal(ended.row?.state, 'sent');
+  const now = await h.sends.now();
+  const staleEverywhere = async (fence: SendFence) => {
+    assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'refused' });
+    assert.deepEqual(await h.sendRpc<MarkAnswer>('markSend', id, fence, [0], []), { status: 'stale' });
+    assert.deepEqual(await h.sendRpc<AuthorizeAnswer>('authorizeDispatch', id, fence, [0], 'day-0'), { status: 'stale' });
+    assert.deepEqual(await h.sendRpc<AbandonAnswer>('abandonClaim', id, fence, now + minute), { status: 'stale' });
+    assert.deepEqual(await h.sendRpc<DelayAnswer>('delaySend', id, fence), { status: 'stale' });
+    for (const result of [{ kind: 'rejected', reason: 'rejected' }, { kind: 'try_later' }, { kind: 'ambiguous' }] as ProviderResult[]) {
+      assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, fence, result), { status: 'stale' }, result.kind);
+    }
+  };
+  await staleEverywhere(b.claim.fence);
+  assert.deepEqual(core(await h.sendState(id)), core(ended), 'no recipient, lease, fence, release entry or timer changed');
   await h.advance(minute);
   const done = await finished(h, id);
-  assert.deepEqual(ledgerOf(done), ['failed:invalid_address']);
-  const now = await h.sends.now();
-  assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'refused' });
-  assert.deepEqual(await h.sendRpc<MarkAnswer>('markSend', id, a.claim.fence, [0], []), { status: 'stale' });
-  assert.deepEqual(await h.sendRpc<AuthorizeAnswer>('authorizeDispatch', id, a.claim.fence, [0], 'day-0'), { status: 'stale' });
-  assert.deepEqual(await h.sendRpc<AbandonAnswer>('abandonClaim', id, a.claim.fence, now + minute), { status: 'stale' });
-  assert.deepEqual(await h.sendRpc<DelayAnswer>('delaySend', id, a.claim.fence), { status: 'stale' });
-  const fresh = { epoch: a.claim.fence.epoch, attempt: a.claim.fence.attempt + 1 };
-  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', id, fresh, { kind: 'try_later' }), { status: 'stale' });
-  assert.deepEqual(core(await h.sendState(id)), core(done));
+  await staleEverywhere(b.claim.fence);
+  await staleEverywhere({ epoch: b.claim.fence.epoch, attempt: b.claim.fence.attempt + 1 });
+  assert.deepEqual(core(await h.sendState(id)), core(done), 'and after cleanup no drive row comes back');
 
   const cancelled = await mail.createDraft(draftInput(from), key('draft-cancel'));
   const pending = await mail.sendDraft(cancelled.id, { ...key('send-cancel'), ifMatch: cancelled.revision });
   await mail.undoSend(pending.id, key('undo'));
   await h.advance(UNDO);
+  const fresh = { epoch: 0, attempt: 1 };
   assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', pending.id), { status: 'refused' });
   assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', pending.id, fresh, { kind: 'accepted', messageId: null }), { status: 'stale' });
   assert.deepEqual(await h.sendRpc<AbandonAnswer>('abandonClaim', pending.id, fresh, now), { status: 'stale' });
