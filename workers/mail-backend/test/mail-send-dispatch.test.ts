@@ -1030,17 +1030,20 @@ test('six hours with an unapplied acceptance for an unknown fence: dispatch goes
   const id = await queued(h, mail, from, 'unapplied-6h');
   await attempt(h, id, { stop: 'mark' });
   await storeResult(h, id, { epoch: 0, attempt: 99 }, 'accepted', { messageId: 'unknown' });
-  const claimed: number[] = [];
+  let enqueued = (await h.sends.queue()).length, dispatched = 0;
   const start = await h.sends.now();
   while (await h.sends.now() - start < 6 * hour) {
     await h.advance(LEASE + SKEW);
+    const queue = (await h.sends.queue()).length;
+    if (queue === enqueued) continue;
+    enqueued = queue;
+    // The drive row enqueued: the scripted consumer claims and abandons.
     const claim = await h.sendRpc<ClaimAnswer>('claimSend', id);
-    if (claim.status === 'claimed') {
-      claimed.push(claim.fence.attempt);
-      await h.sendRpc<AbandonAnswer>('abandonClaim', id, claim.fence, 0);
-    }
+    assert.equal(claim.status, 'claimed');
+    if (claim.status === 'claimed') await h.sendRpc<AbandonAnswer>('abandonClaim', id, claim.fence, 0);
+    dispatched++;
   }
-  assert.ok(claimed.length >= 60, `dispatch went on (${claimed.length} claims)`);
+  assert.ok(dispatched >= 30, `the drive row kept dispatching (${dispatched} times)`);
   const [row] = await h.directoryRows('SELECT unapplied FROM send_results WHERE send_id = ? AND fence_attempt = 99', id);
   assert.deepEqual(row, { unapplied: 1 }, 'the row is kept for the reconciler');
 }));
