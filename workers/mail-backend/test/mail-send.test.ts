@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.ts';
-import { isMailApiError, type MailService } from '../../../contracts/mail-api/src/index.ts';
+import { isMailApiError, LIMITS, type MailService } from '../../../contracts/mail-api/src/index.ts';
 import type { DraftInput, Send } from '../../../contracts/mail-api/src/wire.ts';
+import { parseMail } from '../src/parse-mail.ts';
 import { startMailHttpFixture } from './fixtures/mail-http.ts';
 
 // The send state machine from `pending` to the published release and its
@@ -466,7 +467,12 @@ for (const next of ['finishes', 'releases'] as const) {
 
 test('frozen inputs: a rerun of release after a restore rewound it builds the same bytes and key, with the Reply-To, name and builder changed in between',
   () => withSend(async (h, mail, from) => {
-    const { send: pending } = await send(mail, from, 'one');
+    await h.sends.setReplyTo([{ email: 'original@example.com' }]);
+    const uploaded = await mail.createUpload({ name: 'résumé.txt', type: 'text/plain', bytes: new Blob(['frozen attachment']) }, key('frozen-part'));
+    const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+    const frozen = JSON.parse((await h.sends.row(pending.id))!.record) as { boundary: string; messageId: string; dateAt: number };
+    assert.equal(frozen.boundary, `=_km_${pending.id.toLowerCase()}`);
+    assert.equal(frozen.messageId, `<${pending.id.toLowerCase()}@${from.split('@')[1]}>`);
     await h.sends.crashAfter('stored');
     await h.advance(UNDO);
     const first = await h.sends.registration(pending.id);
@@ -482,9 +488,15 @@ test('frozen inputs: a rerun of release after a restore rewound it builds the sa
     await h.advance(UNDO);
     assert.equal((await mail.getSend(pending.id)).state, 'sending');
     assert.deepEqual(await h.sends.registration(pending.id), first, 'the same digest and key');
-    assert.equal(sha256(h.objects.get(objectPath(first.key))!), first.digest, 'the same bytes');
+    assert.deepEqual(h.objects.get(objectPath(first.key)), bytes, 'the same bytes');
+    const headers = await h.sentHeaders(pending.id);
+    assert.equal(headers['message-id'], frozen.messageId);
+    assert.equal(headers.date, new Date(frozen.dateAt).toUTCString().replace('GMT', '+0000'));
+    assert.equal(headers['reply-to'], 'original@example.com');
+    assert.equal(headers['content-type'], `multipart/mixed; boundary="${frozen.boundary}"`);
     const builds = await h.sends.builds();
-    assert.deepEqual(builds.slice(-2).map(({ version }) => version), [1, 1], 'both runs used the frozen builder version');
+    assert.deepEqual(builds.slice(-2), Array(2).fill({ version: 1, parts: [uploaded.size], types: [uploaded.type] }),
+      'both runs used the frozen builder and parts');
     // A send made after the changes freezes the new inputs.
     const { send: later } = await send(mail, from, 'later');
     await h.advance(UNDO);
@@ -492,7 +504,7 @@ test('frozen inputs: a rerun of release after a restore rewound it builds the sa
     const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(later.id))!.key!)));
     assert.match(text, /^From: "Renamed Owner" </m);
     assert.match(text, /^Reply-To: "Replies" <replies@example\.com>/m);
-    assert.doesNotMatch(new TextDecoder().decode(bytes), /Renamed Owner|Reply-To/);
+    assert.doesNotMatch(new TextDecoder().decode(bytes), /Renamed Owner|replies@example\.com/);
   }));
 
 test('a source the sweeper confirmed lost fails the send at release with delivery_error for every recipient, internal and external', () => withSend(async (h, mail, from) => {
@@ -688,7 +700,7 @@ test('an undo followed by a resend of the restored draft attributes a lost sourc
   assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
 }));
 
-test('the stand-in builder keeps every stored header line under 998 octets', () => withSend(async (h, mail, from) => {
+test('the sent copy keeps every stored header line under 998 octets', () => withSend(async (h, mail, from) => {
   const to = Array.from({ length: 20 }, (_, i) => ({ email: `person${i}@example.net`, name: `${'Långt namn '.repeat(20)}${i}` }));
   const { send: pending } = await send(mail, from, 'long', { subject: 'S'.repeat(998), to });
   await h.advance(UNDO);
@@ -723,6 +735,34 @@ test('a deploy without the frozen builder version holds the send as an invariant
   await h.advance(DRIVE_BACKOFF);
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
 }));
+
+for (const phase of ['size', 'build'] as const) {
+  for (const code of ['invalid_header', 'invalid_wire'] as const) {
+    test(`a MIME ${phase} refusal (${code}) holds release and raises an invariant alert`, () => withSend(async (h, mail, from) => {
+      const { send: pending } = await send(mail, from, 'mime-refused');
+      await h.sends.refuseMime(phase, code);
+      await h.advance(UNDO);
+      assert.equal((await h.sends.row(pending.id))?.state, 'releasing');
+      assert.deepEqual(await h.sends.breaches(), [pending.id]);
+      assert.equal(await h.sends.registration(pending.id), null);
+      assert.deepEqual(await h.sends.queue(), []);
+      await h.advance(minute);
+      assert.ok((await h.alerts()).includes('mail:send_invariant'));
+    }));
+  }
+
+  test(`a message_too_large MIME ${phase} refusal permanently fails release`, () => withSend(async (h, mail, from) => {
+    const { send: pending } = await send(mail, from, 'mime-too-large');
+    await h.sends.refuseMime(phase, 'message_too_large');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.equal(failed.recipients[0].reason, 'message_too_large');
+    assert.deepEqual(await h.sends.breaches(), []);
+    assert.equal((await h.sends.registration(pending.id))?.key ?? null, null);
+    assert.deepEqual(await h.sends.queue(), []);
+  }));
+}
 
 test('a barrier queued behind a publish that covers its commit answers with the send, not 409', () => withSend(async (h, mail, from) => {
   const draft = await mail.createDraft(draftInput(from), key('draft'));
@@ -1159,7 +1199,7 @@ for (const [label, replyTo] of [
   ['a name over displayNameBytes', { email: 'replies@example.com', name: 'n'.repeat(4096) }],
 ] as const) {
   test(`sendDraft answers 422 invalid_header for /replyTo when the settings Reply-To has ${label}, and no send is accepted`, () => withSend(async (h, mail, from) => {
-    await h.sends.setReplyTo([{ email: 'replies@example.com', name: 'Replies' }, replyTo]);
+    await h.sends.setReplyTo([replyTo]);
     const draft = await mail.createDraft(draftInput(from), key('draft'));
     const response = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
     assert.equal(response.status, 422);
@@ -1169,6 +1209,85 @@ for (const [label, replyTo] of [
     assert.deepEqual(await h.sends.ids(), [], 'no send was accepted');
     assert.equal((await mail.getDraft(draft.id)).revision, draft.revision, 'the draft is unchanged');
   }));
+}
+
+test('release rejects a frozen draft whose MIME encoding crosses the size limit before reading its parts', () => withSend(async (h, mail, from) => {
+  const upload = await mail.createUpload({ name: 'large.txt', type: 'text/plain', bytes: new Blob(['file']) }, key('release-limit-file'));
+  const { send: pending } = await send(mail, from, 'release-limit', { attachments: [{ kind: 'upload', uploadId: upload.id }] });
+  let partReads: (() => number) | undefined;
+  await rewriteFrozenDraft(h, pending.id, draft => {
+    const [part] = draft.attachments as { key: string; wire: { size: number } }[];
+    partReads = h.watchObjectReads(objectPath(part.key));
+    part.wire.size = Math.ceil(LIMITS.outboundMessageBytes * 3 / 4);
+  });
+  await h.advance(UNDO);
+  const failed = await mail.getSend(pending.id);
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.recipients[0].reason, 'message_too_large');
+  assert.equal(partReads?.(), 0, 'the oversized send did not read the attachment object');
+  assert.equal((await h.sends.registration(pending.id))?.key ?? null, null);
+  assert.deepEqual(await h.sends.queue(), []);
+}));
+
+test('a Bcc-only send releases and enqueues without writing recipient headers', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'bcc-only', { to: [], bcc: [{ email: 'hidden@example.net' }] });
+  await h.advance(UNDO);
+  const released = await mail.getSend(pending.id);
+  assert.ok(released.messageId);
+  const headers = await h.sentHeaders(released.messageId);
+  for (const name of ['to', 'cc', 'bcc']) assert.ok(!Object.hasOwn(headers, name));
+  assert.equal((await h.sends.queue()).length, 1);
+}));
+
+test('stored sent-header inspection rejects a duplicate singleton header', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'duplicate-header');
+  await h.advance(UNDO);
+  const { messageId } = await mail.getSend(pending.id);
+  assert.ok(messageId);
+  assert.equal((await h.sentHeaders(messageId)).subject, 'Hello');
+  const path = objectPath((await h.sends.registration(pending.id))!.key!);
+  const original = new TextDecoder().decode(h.objects.get(path)!);
+  h.objects.set(path, Uint8Array.from(new TextEncoder().encode(`sUbJeCt: Second\r\n${original}`)).buffer);
+  await assert.rejects(h.sentHeaders(messageId), { actual: 500, expected: 200 });
+}));
+
+test('sendDraft refuses an invalid Bcc address', () => withSend(async (_h, mail, from) => {
+  await rejects(send(mail, from, 'bcc-invalid', { to: [], bcc: [{ email: 'not-an-address' }] }), 'invalid_recipients');
+}));
+
+test('sendDraft reports invalid_sender for a legacy identity the MIME builder refuses', () => withSend(async (h, mail, from) => {
+  const { workspace, mailbox } = await mail.getSession();
+  const legacy = `a..b@${from.split('@')[1]}`;
+  await h.directoryDb.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')")
+    .bind(legacy, workspace.id, mailbox!.id).run();
+  await rejects(send(mail, legacy, 'legacy-identity'), 'invalid_sender');
+  assert.deepEqual(await h.sends.ids(), []);
+}));
+
+test('a malformed Message-ID still deduplicates and threads inbound by its first bracketed id', () => withSend(async (h, mail, from) => {
+  const input = { from: { name: 'Sender', email: 'sender@example.net' }, to: [{ name: '', email: from }],
+    subject: 'Inbound parent', text: 'Body', messageId: '<hostile@example.net>\r\n Extra text' };
+  const parseId = async (messageId: string) => {
+    const raw = Uint8Array.from(new TextEncoder().encode(`Message-ID: ${messageId}\r\n\r\n${input.text}`));
+    return parseMail(raw, `raw/${sha256(raw.buffer)}/01KBN8ZJ7G0000000000000000`, true);
+  };
+  const malformed = await parseId(input.messageId);
+  assert.equal(malformed.dedupeKey, (await parseId('<hostile@example.net>')).dedupeKey);
+  assert.deepEqual(malformed.display?.replyHeaders, {});
+  const parent = await h.deliver(input);
+  const reply = await h.deliver({ ...input, messageId: '<reply@example.net>', subject: 'Re: Inbound parent', text: 'Reply', inReplyTo: parent.messageId });
+  assert.equal(reply.threadId, parent.threadId);
+  assert.equal((await mail.getThread(reply.threadId)).messages.length, 2);
+}));
+
+for (const [label, separator] of [['adjacent', ''], ['comma-separated', ',']] as const) {
+  test(`reply threading preserves ${label} bracketed References IDs`, async () => {
+    const parent = '<parent@example.net>';
+    const chain = ['<root@example.net>', '<earlier@example.net>'];
+    const raw = Uint8Array.from(new TextEncoder().encode(`Message-ID: ${parent}\r\nReferences: ${chain.join(separator)}\r\n\r\nBody`));
+    const parsed = await parseMail(raw, `raw/${sha256(raw.buffer)}/01KBN8ZJ7G0000000000000000`, true);
+    assert.deepEqual(parsed.display?.replyHeaders, { inReplyTo: parent, references: [...chain, parent].join(' ') });
+  });
 }
 
 test('a small forwarded part whose source raw object is changed in place fails the send with delivery_error, an alert and no MIME',
@@ -1246,11 +1365,11 @@ test('sendDraft answers 422 invalid_header for /replyTo when the settings Reply-
   assert.deepEqual(await h.sends.ids(), [], 'no send was accepted');
 }));
 
-test('only the first four settings Reply-To entries are used: an invalid fifth does not block the send', () => withSend(async (h, mail, from) => {
-  const valid = [1, 2, 3, 4].map(i => ({ email: `replies${i}@example.com` }));
-  await h.sends.setReplyTo([...valid, { email: '=?utf-8?b?QQ==?=@example.com' }]);
+test('only the first settings Reply-To entry is used: later entries do not block the send', () => withSend(async (h, mail, from) => {
+  const first = { email: 'replies1@example.com' };
+  await h.sends.setReplyTo([first, { email: 'replies2@example.com' }, { email: '=?utf-8?b?QQ==?=@example.com' }]);
   const { send: pending } = await send(mail, from, 'one');
-  assert.deepEqual((JSON.parse((await h.sends.row(pending.id))!.record) as { replyTo: unknown }).replyTo, valid);
+  assert.deepEqual((JSON.parse((await h.sends.row(pending.id))!.record) as { replyTo: unknown }).replyTo, [first]);
 }));
 
 // Draft objects whose bytes match their content address but are not a draft this code can read.
@@ -1312,10 +1431,10 @@ test('getDraft, replaceDraft and sendDraft of a stored draft that does not decod
     '2 503 unavailable', '2 503 unavailable', '2 503 unavailable']);
 }));
 
-// The stand-in builder's RFC 2231 file name parameter, to read the outgoing MIME
-// directly: the sent copy's projection cleans names again.
-const mimeFilename = (name: string) =>
-  `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
+// Check the raw header, not just the display projection that cleans it again.
+const mimeFilename = (name: string) => /^[\w.-]+$/.test(name)
+  ? `Content-Disposition: attachment; filename=${name}\r\n`
+  : ` filename*=UTF-8''${encodeURIComponent(name)}\r\n`;
 
 // Rewrites a send's frozen draft revision as a digest-valid object with one change.
 async function rewriteFrozenDraft(h: Fixture, sendId: string, change: (draft: Record<string, unknown>) => void) {
@@ -1356,7 +1475,7 @@ test('a digest-valid draft revision whose upload size differs from its att/ obje
 for (const [label, name, type, sentName, sentType] of [
   ['an empty name and a type holding CR LF', '', 'text/plain\r\nX-Injected: 1', 'attachment', 'application/octet-stream'],
   ['a name indexed before names were cleaned', `a\tb/c\\${'x'.repeat(300)}`, 'text/plain', indexedAttachmentName(`a\tb/c\\${'x'.repeat(300)}`), 'text/plain'],
-  ['a lone UTF-16 surrogate in its name and type', 'a\ud800b.txt', 'text/plain\udc00', 'a\ufffdb.txt', 'text/plain\ufffd'],
+  ['a lone UTF-16 surrogate in its name and type', 'a\ud800b.txt', 'text/plain\udc00', 'a\ufffdb.txt', 'application/octet-stream'],
 ] as const) {
   test(`a stored file with ${label} is sent with a cleaned name and type, never failed`, () => withSend(async (h, mail, from) => {
     const pending = await sendChangedUpload(h, mail, from, wire => { wire.name = name; wire.type = type; });

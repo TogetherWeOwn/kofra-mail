@@ -15,7 +15,7 @@ const TITLE: Record<Event['code'], string> = {
   backup_conflict: 'Mailbox state diverged from its backup',
   holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
   holder_source_lost: 'A mailbox source object is missing',
-  send_invariant: 'A send registration did not match its frozen bytes',
+  send_invariant: 'A send is held after a release invariant failed',
 };
 
 export function mailAlert(binding?: AlertBinding) {

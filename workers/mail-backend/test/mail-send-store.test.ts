@@ -20,9 +20,10 @@ const MAX_DATE = 8.64e15;
 const at = Date.UTC(2026, 10, 26);
 const record = (patch: Partial<SendRecord> = {}): SendRecord => ({
   id: '01KBN8ZJ7G0000000000000000', draftId: 'draft-1', createdAt: at, undoUntil: at + 10_000, dateAt: at + 10_000, undoSeconds: 10,
+  messageId: '<01kbn8zj7g0000000000000000@example.com>', boundary: '=_km_01kbn8zj7g0000000000000000',
   ownerUserId: 'member', from: { email: 'member@example.com', name: '' }, replyTo: [], builderVersion: 1,
   draft: { rawKey: `raw/${'a'.repeat(64)}/01KBN8ZJ7G0000000000000001`, holder: 'draft:scope:draft-1:1', revision: 'revision-1', updatedAt: at },
-  attachmentKeys: [], uploadIds: [], recipients: [{ field: 'to', email: 'friend@example.net' }], parts: [], ...patch,
+  attachmentKeys: [], uploadIds: [], recipients: [{ field: 'to' as const, email: 'friend@example.net' }], parts: [], ...patch,
 });
 
 test('a send record with every time inside the Date range is accepted and renders', () => {
@@ -33,6 +34,20 @@ test('a send record with every time inside the Date range is accepted and render
     holder: edge.draft.holder, record: edge, createdSeq: 1, releaseSeq: null, queuedSeq: null, terminalSeq: null, messageId: null,
     reason: null, finishPending: false };
   assert.equal(store.wireSend(row, [], 1, at).undoUntil, new Date(MAX_DATE).toISOString());
+});
+
+test('a send record with more than one Reply-To address is refused', () => {
+  const malformed = { ...record(), replyTo: [{ email: 'first@example.com' }, { email: 'second@example.com' }] };
+  assert.throws(() => store.checkSendRecord(malformed as unknown as SendRecord), /Invalid send record/);
+});
+
+test('a send record refuses malformed frozen wire values', () => {
+  for (const boundary of ['=_km_bad"value', `=_km_${'x'.repeat(66)}`, '=_km_bad\r\n']) {
+    assert.throws(() => store.checkSendRecord(record({ boundary })), /Invalid send record/);
+  }
+  for (const messageId of ['bare@example.com', '<first@example.com> <second@example.com>', '<hello\r\n@example.com>']) {
+    assert.throws(() => store.checkSendRecord(record({ messageId })), /Invalid send record/);
+  }
 });
 
 for (const [field, patch] of [

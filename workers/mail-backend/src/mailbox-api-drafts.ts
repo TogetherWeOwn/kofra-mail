@@ -101,7 +101,7 @@ export function sendableDraftObject(draft: DraftObject): boolean {
     optional(fields.inReplyTo, isId) && optional(fields.forwardOf, isId) &&
     // The save path keeps at most pageSizeMax attachments, links included.
     optional(attachments, list => Array.isArray(list) && list.length <= LIMITS.pageSizeMax && list.every(isStoredAttachment)) &&
-    // The builder leaves out unsafe threading values (cleanMimeMessage).
+    // The v1 builder leaves out unsafe threading values (cleanMimeMessageV1).
     optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
 }
 export async function readDraftObject(index: MailboxIndex, ref: DraftObjectRef): Promise<DraftObject> {

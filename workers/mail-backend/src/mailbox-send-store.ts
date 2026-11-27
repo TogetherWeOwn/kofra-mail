@@ -1,10 +1,11 @@
-import { hasHeaderControl } from '../../../contracts/mail-api/src/headers.ts';
+import { hasHeaderControl, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { RecipientStatus, Send, SendState, SendSummaryState } from '../../../contracts/mail-api/src/wire.ts';
 import { iso } from './mailbox-api-input.ts';
 import type { SendFailure, SendPart, SendRecipientKind, SendRecord } from './mail-journal.ts';
 import { parseObjectKey } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
+import { isSendMimeBoundary } from './send-mime.ts';
 
 // The one timer kind of a send (section 2.2), keyed by send id.
 export const SEND_DRIVE = 'send_drive';
@@ -116,8 +117,10 @@ export function checkSendRecord(record: SendRecord): void {
   const r = record as Partial<SendRecord>;
   const keys = r.attachmentKeys, uploads = r.uploadIds, recipients = r.recipients, parts = r.parts;
   if (!isSendId(r.id) || !bounded(r.draftId, 64) || !epochMs(r.createdAt) || !epochMs(r.undoUntil) || !epochMs(r.dateAt) ||
+      !bounded(r.messageId, LIMITS.headerValueBytes) || !isSafeMessageId(r.messageId) || hasHeaderControl(r.messageId) ||
+      !bounded(r.boundary, 70) || !isSendMimeBoundary(r.boundary) ||
       r.dateAt !== r.undoUntil || !count(r.undoSeconds) || !bounded(r.ownerUserId, 256) || !validAddress(r.from) ||
-      typeof r.from?.name !== 'string' || !Array.isArray(r.replyTo) || r.replyTo.length > LIMITS.recipientsPerMessage ||
+      typeof r.from?.name !== 'string' || !Array.isArray(r.replyTo) || r.replyTo.length > 1 ||
       !r.replyTo.every(value => validAddress(value)) || !count(r.builderVersion) || r.builderVersion < 1 ||
       !r.draft || parseObjectKey(r.draft.rawKey)?.kind !== 'raw' || !bounded(r.draft.holder, 256) || !bounded(r.draft.revision, 64) ||
       !epochMs(r.draft.updatedAt) || !Array.isArray(keys) || keys.length > LIMITS.attachmentsPerMessage ||
@@ -138,5 +141,3 @@ export function checkKinds(kinds: unknown, record: SendRecord): asserts kinds is
 // The send's raw holder and its sent copy's index holder (section 2.4, step 3).
 export const sendRawHolder = (scope: string, id: string) => `send:${scope}:${id}`;
 export const sentCopyId = (id: string) => id;
-export const sentMessageIdHeader = (record: SendRecord) => `<${record.id.toLowerCase()}@${record.from.email.slice(record.from.email.lastIndexOf('@') + 1)}>`;
-export const sentBoundary = (record: SendRecord) => `kofra-${record.id.toLowerCase()}`;

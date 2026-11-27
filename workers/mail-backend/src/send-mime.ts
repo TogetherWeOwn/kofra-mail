@@ -1,4 +1,4 @@
-import { hasHeaderControl, threadingHeaders, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
+import { hasHeaderControl, isSafeMessageId, threadingHeaders, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
 import { canonicalMailText, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput } from '../../../contracts/mail-api/src/wire.ts';
 import type { MailErrorCode, Problem } from '../../../contracts/mail-api/src/errors.ts';
@@ -14,6 +14,9 @@ export class SendMimeError extends Error {
     this.problem = problem;
   }
 }
+
+/** A deterministic violation of the builder's frozen input contract. */
+export class SendMimeInvariantError extends Error {}
 
 function fail(code: MailErrorCode, extra?: Omit<SendMimeProblem, 'code'>): never {
   throw new SendMimeError({ code, ...extra });
@@ -33,7 +36,7 @@ export interface SendMimeAttachment {
 }
 
 /** Inputs from the immutable draft revision and the frozen send record, not live settings. */
-export interface SendMimeInput {
+type MimeFields = {
   readonly from: Readonly<AddressInput>;
   readonly to: readonly Readonly<AddressInput>[];
   readonly cc: readonly Readonly<AddressInput>[];
@@ -44,12 +47,22 @@ export interface SendMimeInput {
   readonly frozenReplyTo?: Readonly<AddressInput>;
   /** Parent id and space-joined References captured when the draft was saved. */
   readonly threading?: Readonly<ThreadingHeaders>;
-  readonly attachments: readonly SendMimeAttachment[];
   /** UTC epoch milliseconds; never the updated undo deadline on restore. */
   readonly dateAt: number;
-  readonly sendId: string;
   readonly builderVersion: number;
-}
+};
+
+// Direct callers can ask for canonical wire values. Release already has both
+// values frozen and must not derive either a second time.
+type WireValues = Readonly<
+  { sendId: string; messageId?: string; boundary?: string } |
+  { sendId?: never; messageId: string; boundary: string }
+>;
+
+type AttachmentHeaders = Pick<SendMimeAttachment, 'name' | 'type'>;
+type MimeInput<Attachment extends AttachmentHeaders> = MimeFields & WireValues & { readonly attachments: readonly Attachment[] };
+export type SendMimeInput = MimeInput<SendMimeAttachment>;
+export type SendMimeSizingInput = MimeInput<AttachmentHeaders & { readonly size: number }>;
 
 export interface SentCopy {
   bytes: Uint8Array<ArrayBuffer>;
@@ -61,6 +74,19 @@ export type SendRequest = EmailMessageBuilder & { headers: SendRequestHeaders };
 
 const CRLF = '\r\n';
 const encoder = new TextEncoder();
+
+export function sendMimeBoundary(sendId: string): string {
+  return `=_km_${sendId}`;
+}
+
+export function sendMimeMessageId(sendId: string, from: Readonly<AddressInput>): string {
+  return `<${sendId}@${from.email.slice(from.email.lastIndexOf('@') + 1)}>`;
+}
+
+export function isSendMimeBoundary(boundary: string): boolean {
+  // RFC 2046 bchars, no trailing space; '=_' cannot occur in encoded body parts.
+  return boundary.includes('=_') && !hasHeaderControl(boundary) && /^[0-9A-Za-z'()+_,./:=? -]{0,69}[0-9A-Za-z'()+_,./:=?-]$/.test(boundary);
+}
 
 function checkHeader(value: string, field: string, allowTab = true) {
   if (hasHeaderControl(value) || (!allowTab && value.includes('\t'))) fail('invalid_header', { errors: [{ field, code: 'invalid' }] });
@@ -139,7 +165,7 @@ function fold(name: string, words: readonly string[]): string {
     }
     line += ` ${word}`;
     encodedLine ||= encodedWord;
-    if (line.length > (encodedLine ? 76 : 998)) throw new Error('MIME header line too long');
+    if (line.length > (encodedLine ? 76 : 998)) throw new SendMimeInvariantError('MIME header line too long');
   }
   lines.push(line);
   return lines.join(CRLF) + CRLF;
@@ -214,7 +240,7 @@ function textPart(value: string, multipart: boolean): [string, string | Uint8Arr
   return qp !== undefined ? [textType + qpHeader, qp] : [textType + base64Header, bytes];
 }
 
-function requestHeaders(input: SendMimeInput): SendRequestHeaders {
+function requestHeaders(input: MimeFields): SendRequestHeaders {
   const chain = input.threading?.references?.split(' ').filter(Boolean) ?? [];
   const parent = input.threading?.inReplyTo ?? '';
   // The stored snapshot may already end in the parent. Keep an empty last
@@ -243,10 +269,13 @@ function storedAttachmentType(type: string): string {
     ? opaqueAttachmentType : type;
 }
 
+type Piece = string | Uint8Array | { part: number; size: number };
+
 // Versioned serialization: leave v1 unchanged when adding another version.
-// String pieces are wire ASCII; byte pieces describe wrapped base64. The
-// request path can check the very same encoded size without encoding files.
-function planV1(input: SendMimeInput) {
+// Strings are wire ASCII; binary text and attachment references are wrapped
+// base64. The same plan gives exact size using only the file metadata.
+function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>,
+  sizeOf: (attachment: Attachment) => number) {
   const { to, cc, bcc, attachments, subject, from, dateAt, sendId } = input;
   checkAddress(from, '/from', 'invalid_sender');
   checkHeader(subject, '/subject');
@@ -259,28 +288,34 @@ function planV1(input: SendMimeInput) {
     list.forEach((address, i) => checkAddress(address, `/${key}/${i}`, 'invalid_recipients'));
   }
   if (attachments.length > LIMITS.attachmentsPerMessage) fail('too_many_attachments', { limit: LIMITS.attachmentsPerMessage });
-  const files: EmailAttachment[] = attachments.map(({ name, type, bytes }, i) => {
+  const files = attachments.map((attachment, i) => {
+    const { name, type } = attachment;
     checkHeader(name, `/attachments/${i}/name`, false);
     if (!name || exceedsUtf8(name, 255)) invalid(`/attachments/${i}/name`);
     checkHeader(type, `/attachments/${i}/type`);
-    return { disposition: 'attachment', filename: name, type: attachmentType(type), content: bytes };
+    const size = sizeOf(attachment);
+    if (!Number.isSafeInteger(size) || size < 0) throw new SendMimeInvariantError('Invalid MIME attachment size');
+    return { name, type: attachmentType(type), size };
   });
 
   const date = new Date(dateAt);
   if (!Number.isSafeInteger(dateAt) || !Number.isFinite(date.getTime()) || date.getUTCFullYear() < 1900 || date.getUTCFullYear() > 9999) {
-    throw new RangeError('Invalid frozen MIME date');
+    throw new SendMimeInvariantError('Invalid frozen MIME date');
   }
-  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(sendId)) throw new TypeError('Invalid frozen send ID');
-  // The '=_' sequence cannot appear in either wrapped base64 or quoted-printable.
-  const boundary = `=_km_${sendId}`;
+  if (sendId !== undefined && !/^[a-zA-Z0-9_-]{1,64}$/.test(sendId)) throw new SendMimeInvariantError('Invalid frozen send ID');
+  const boundary = sendId === undefined ? input.boundary : input.boundary ?? sendMimeBoundary(sendId);
+  const messageId = sendId === undefined ? input.messageId : input.messageId ?? sendMimeMessageId(sendId, from);
+  if (!isSafeMessageId(messageId) || hasHeaderControl(messageId) || !isSendMimeBoundary(boundary)) {
+    throw new SendMimeInvariantError('Invalid frozen MIME wire values');
+  }
   const headers = requestHeaders(input);
-  const pieces: (string | Uint8Array)[] = [
+  const pieces: Piece[] = [
     fold('From', addressWords(from)),
     ...(to.length ? [fold('To', addressList(to))] : []),
     ...(cc.length ? [fold('Cc', addressList(cc))] : []),
     fold('Subject', !subject ? [] : subject.length <= 69 && asciiHeader(subject) ? [subject] : encodedWords(subject)),
     `Date: ${date.toUTCString().replace('GMT', '+0000')}${CRLF}`,
-    `Message-ID: <${sendId}@${from.email.split('@')[1]}>${CRLF}`,
+    `Message-ID: ${messageId}${CRLF}`,
   ];
   for (const name of ['In-Reply-To', 'References'] as const) {
     const value = headers[name];
@@ -293,28 +328,39 @@ function planV1(input: SendMimeInput) {
   pieces.push(textHeader, CRLF, textBody);
   for (const [i, file] of files.entries()) {
     pieces.push(`--${boundary}${CRLF}Content-Type: ${storedAttachmentType(file.type)}${CRLF}`, base64Header,
-      contentDisposition(file.filename), CRLF, attachments[i].bytes);
+      contentDisposition(file.name), CRLF, { part: i, size: file.size });
   }
   if (files.length) pieces.push(`--${boundary}--${CRLF}`);
-  const encodedSize = pieces.reduce((size, piece) => size + (typeof piece === 'string' ? piece.length : base64Size(piece.length)), 0);
-  if (encodedSize > LIMITS.outboundMessageBytes) fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
+  const encodedSize = pieces.reduce((size, piece) => size + (typeof piece === 'string' ? piece.length :
+    base64Size(piece instanceof Uint8Array ? piece.byteLength : piece.size)), 0);
   return { headers, pieces, files, encodedSize };
 }
 
-function plan(input: SendMimeInput) {
+function plan<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>, sizeOf: (attachment: Attachment) => number) {
   switch (input.builderVersion) {
-    case 1: return planV1(input);
-    default: throw new RangeError('Unsupported MIME builder version');
+    case 1: return planV1(input, sizeOf);
+    default: throw new SendMimeInvariantError('Unsupported MIME builder version');
   }
+}
+
+/** Exact wire size, including sizes over the send limit, without loading file bytes. */
+export function encodedSentCopySize(input: SendMimeSizingInput): number {
+  return plan(input, attachment => attachment.size).encodedSize;
+}
+
+function checkedPlan(input: SendMimeInput) {
+  const result = plan(input, attachment => attachment.bytes.byteLength);
+  if (result.encodedSize > LIMITS.outboundMessageBytes) fail('message_too_large', { limit: LIMITS.outboundMessageBytes });
+  return result;
 }
 
 /** Stored copy only. Its bytes never include the Bcc recipients. */
 export function buildSentCopy(input: SendMimeInput): SentCopy {
-  const { pieces, encodedSize } = plan(input);
+  const { pieces, encodedSize } = checkedPlan(input);
   const bytes = new Uint8Array(encodedSize);
   let offset = 0;
   for (const piece of pieces) {
-    const text = typeof piece === 'string' ? piece : wrappedBase64(piece);
+    const text = typeof piece === 'string' ? piece : wrappedBase64(piece instanceof Uint8Array ? piece : input.attachments[piece.part].bytes);
     offset += encoder.encodeInto(text, bytes.subarray(offset)).written;
   }
   return { bytes, encodedSize };
@@ -324,10 +370,13 @@ const destination = ({ name, email }: Readonly<AddressInput>) => name ? { name, 
 
 /** Structured binding payload only: this function never sends mail. */
 export function buildSendRequest(input: SendMimeInput): SendRequest {
-  const { files, headers } = plan(input);
+  const { files, headers } = checkedPlan(input);
   const to = input.to.map(destination), cc = input.cc.map(destination), bcc = input.bcc.map(destination);
+  const attachments: EmailAttachment[] = files.map(({ name, type }, i) => ({
+    disposition: 'attachment', filename: name, type, content: input.attachments[i].bytes,
+  }));
   const message = {
-    from: destination(input.from), subject: input.subject, text: input.text, attachments: files, headers,
+    from: destination(input.from), subject: input.subject, text: input.text, attachments, headers,
     ...(input.frozenReplyTo && { replyTo: destination(input.frozenReplyTo) }),
     ...(cc.length && { cc }), ...(bcc.length && { bcc }),
   };

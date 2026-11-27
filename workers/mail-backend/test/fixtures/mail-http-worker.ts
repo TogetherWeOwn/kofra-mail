@@ -18,6 +18,7 @@ import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
 import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
+import { SendMimeError } from '../../src/send-mime.ts';
 import { builds, fixtureBuilders } from './send-mime.ts';
 import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
@@ -138,6 +139,20 @@ export class HttpMailbox extends Mailbox {
   async coverHeld() { this.held!.cover.resolve(); await this.held!.covered.promise; }
   releaseHeld() { this.held?.release.resolve(); this.held = undefined; }
   dropBuilder(dropped: boolean) { this.sendMime = fixtureBuilders(dropped ? 'dropped' : 'base'); }
+  refuseMime({ phase, code }: { phase: 'size' | 'build'; code: 'invalid_header' | 'message_too_large' | 'invalid_wire' }) {
+    const original = this.sendMime;
+    this.sendMime = { current: original.current, get(version) {
+      const builder = original.get(version);
+      if (!builder) return undefined;
+      return phase === 'size' ? { ...builder, encodedSize(message) {
+        if (code === 'invalid_wire') return builder.encodedSize({ ...message, boundary: 'not-a-safe-boundary' });
+        throw new SendMimeError({ code });
+      } } : { ...builder, build(message, parts) {
+        if (code === 'invalid_wire') return builder.build({ ...message, boundary: 'not-a-safe-boundary' }, parts);
+        throw new SendMimeError({ code });
+      } };
+    } };
+  }
   sendIds() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT id FROM mailbox_sends ORDER BY id').toArray().map(row => row.id); }
   publishFailure(failing: boolean) { this.failPublish = failing; }
   private recorded(table: string): unknown[] {
@@ -154,6 +169,26 @@ export class HttpMailbox extends Mailbox {
     this.sendMime = fixtureBuilders('bumped');
   }
   mimeBuilds() { return builds; }
+  async sentHeaders(workspaceId: string, messageId: string): Promise<Record<string, string>> {
+    const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', messageId).toArray()[0];
+    if (!row) throw new Error('Stored sent copy is missing');
+    const raw = new TextDecoder().decode(await this.fixtureIndex(workspaceId).readObject(row.raw_key));
+    const headers: Record<string, string> = Object.create(null);
+    let current: string | undefined;
+    for (const line of raw.slice(0, raw.indexOf('\r\n\r\n')).split('\r\n')) {
+      if (/^[ \t]/.test(line)) {
+        if (current) headers[current] += ` ${line.trim()}`;
+        continue;
+      }
+      const separator = line.indexOf(':');
+      if (separator < 1) continue;
+      current = line.slice(0, separator).toLowerCase();
+      // Every top-level field the sent-copy builder writes is a singleton.
+      if (Object.hasOwn(headers, current)) throw new Error('Duplicate stored sent header');
+      headers[current] = line.slice(separator + 1).trim();
+    }
+    return { ...headers };
+  }
   shortenHandlerBudget() { this.timerHandlerBudgetMs = 25; this.realtimeHolderClock = true; }
   sendRow(id: string) {
     return this.ctx.storage.sql.exec(`SELECT id, state, undo_until, created_seq, release_seq, queued_seq, terminal_seq, message_id, reason,
@@ -661,6 +696,7 @@ export default {
           case '/__fixture/fail-next-epilogue': await box.failNextEpilogue(); break;
           case '/__fixture/bump-builder': await box.bumpBuilder(); break;
           case '/__fixture/mime-builds': return Response.json(await box.mimeBuilds());
+          case '/__fixture/sent-headers': return Response.json(await box.sentHeaders(ws, await req.text()));
           case '/__fixture/stall-publish': await box.stallPublish(); break;
           case '/__fixture/publish-stalled': await box.publishStalled(); break;
           case '/__fixture/resume-publish': await box.resumePublish(); break;
@@ -669,6 +705,7 @@ export default {
           case '/__fixture/cover-held': await box.coverHeld(); break;
           case '/__fixture/release-held': await box.releaseHeld(); break;
           case '/__fixture/drop-builder': await box.dropBuilder(await req.text() === 'true'); break;
+          case '/__fixture/refuse-mime': await box.refuseMime(await req.json()); break;
           case '/__fixture/send-ids': return Response.json(await box.sendIds());
           case '/__fixture/short-handler-budget': await box.shortenHandlerBudget(); break;
           case '/__fixture/send-row': return Response.json(await box.sendRow(await req.text()));

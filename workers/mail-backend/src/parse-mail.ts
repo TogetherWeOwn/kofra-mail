@@ -3,7 +3,7 @@ import PostalMime, { addressParser, type Address } from 'postal-mime';
 import { sha256 } from './bytes.ts';
 import { bodyForIndex } from './mail-text.ts';
 import { parseObjectKey } from './object-key.ts';
-import { indexedAttachmentName, threadingHeaders, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
+import { indexedAttachmentName, isSafeMessageId, threadingHeaders, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Address as WireAddress } from '../../../contracts/mail-api/src/wire.ts';
 
@@ -96,7 +96,7 @@ export async function parseMail(raw: Uint8Array<ArrayBuffer>, rawKey: string, ma
     attachments.push({ part: kept + 1, name: `(${count - kept} more attachments)`, mimeType: 'application/octet-stream',
       size, external: null });
   }
-  const display: MessageDisplay | undefined = mailApiEnabled ? buildDisplay(parsed, subject, body, messageId, kept) : undefined;
+  const display: MessageDisplay | undefined = mailApiEnabled ? buildDisplay(parsed, subject, body, kept) : undefined;
   return {
     display,
     size: raw.byteLength, sentDate: parsed.date ?? null, sender: addresses(parsed.from ? [parsed.from] : []),
@@ -145,12 +145,18 @@ function hasRemoteImages(html: string): boolean {
   return remote;
 }
 
-function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject: string, body: string,
-  messageId: string | null, kept: number): MessageDisplay {
+function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject: string, body: string, kept: number): MessageDisplay {
   const from = wireAddresses(parsed.from ? [parsed.from] : [])[0] ?? { name: '', email: '' };
   const to = wireAddresses(parsed.to);
   const cc = wireAddresses(parsed.cc);
-  const references = headerIds(parsed.references);
+  // Reply headers only repeat whole, safe IDs, not tokens extracted from
+  // malformed fields as the dedupe and inbound thread index still do.
+  const messageIdFields = parsed.headers.filter(header => header.key === 'message-id');
+  const parent = messageIdFields.length === 1 ? messageIdFields[0].value.trim() : '';
+  // References can have adjacent IDs or separators between them. Start at
+  // bracket boundaries without extracting an ID from a malformed nested token.
+  const references = parsed.references?.slice(0, 8192)
+    .match(/(?<![^\s,)>])<[^<>\s]+>(?![^\s,<(])/g)?.filter(isSafeMessageId) ?? [];
   const encoder = new TextEncoder();
   return {
     from, to, cc, replyTo: wireAddresses(parsed.replyTo), hasHtml: !!parsed.html,
@@ -160,7 +166,7 @@ function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject:
       : encoder.encode(body).byteLength >= LIMITS.messageTextBytes - 3,
     inline: parsed.attachments.slice(0, kept).flatMap((a, i) => a.contentId && a.disposition !== 'attachment' ? [i + 1] : []),
     ...(kept < parsed.attachments.length ? { syntheticPart: kept + 1 } : {}),
-    replyHeaders: threadingHeaders([...references.slice(0, 1), ...references.slice(Math.max(1, references.length - 10)), messageId ?? ''], LIMITS),
+    replyHeaders: threadingHeaders([...references.slice(0, 1), ...references.slice(Math.max(1, references.length - 10)), isSafeMessageId(parent) ? parent : ''], LIMITS),
     searchFrom: normalizeSearch(`${from.name} ${from.email}`),
     searchTo: normalizeSearch([...to, ...cc].map(a => `${a.name} ${a.email}`).join(' ')),
     searchSubject: normalizeSearch(subject),
