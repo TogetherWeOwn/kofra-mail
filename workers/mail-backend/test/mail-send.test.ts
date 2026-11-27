@@ -1258,8 +1258,7 @@ test('sendDraft refuses an invalid Bcc address', () => withSend(async (_h, mail,
 test('sendDraft reports invalid_sender for a legacy identity the MIME builder refuses', () => withSend(async (h, mail, from) => {
   const { workspace, mailbox } = await mail.getSession();
   const legacy = `a..b@${from.split('@')[1]}`;
-  await h.directoryDb.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')")
-    .bind(legacy, workspace.id, mailbox!.id).run();
+  await h.directoryChange("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')", legacy, workspace.id, mailbox!.id);
   await rejects(send(mail, legacy, 'legacy-identity'), 'invalid_sender');
   assert.deepEqual(await h.sends.ids(), []);
 }));
