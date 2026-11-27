@@ -682,11 +682,11 @@ The binding's `allowed_sender_addresses` comes from the directory, and an identi
 ### R2 Limiter verification (Sol, Opus review)
 
 Section 2.8 lets neither flag turn on in a deployed environment until that environment's limiter bindings are configured and verified, with the two-step check it describes. R2 builds the tooling for all three parts:
-- **Configuration check:** a script reads the deployed `mail-web` bindings through the Cloudflare API and checks that every bucket of section 2.8 has its `ratelimits` namespace with the configured limit and the 60 s period. It catches a binding with the wrong limit, which the runtime 503 for a missing binding does not.
-- **Step 1, direct probe (flags off):** an operator probe calls each binding directly with its own test-only key and sees it refuse past its limit.
+- **Configuration check:** a script reads the deployed `mail-web` bindings through the Cloudflare API and checks that every bucket of section 2.8 has its `ratelimits` namespace with the configured limit and the 60 s period. It catches a binding with the wrong limit or period, which the runtime 503 for a missing binding does not. The period is proved here, from the configuration (the binding allows only 10 s or 60 s); the two runtime steps check the limit only.
+- **Step 1, direct probe (flags off):** an operator probe calls each binding directly with its own test-only key and sees it refuse past its limit. The probe's Wrangler configuration is generated from the namespace ids the configuration check read, so it targets the same namespaces by construction; it is never deployed from any other configuration.
 - **Step 2, HTTP check (a flag on, before user traffic is admitted):** for each enabled bucket, a side-effect-free route shows both sides of the limit (428 then 429 for a write missing its required header, 404 then 429 for a read of a not-found id); the undo flood guard uses distinct not-found send ids.
 - **Output:** bucket names and pass or fail only, saved as the environment's receipt.
-- **Acceptance:** each script fails on a missing bucket, a wrong limit and a wrong period (against recorded API responses or a local fixture), and passes on the planned configuration.
+- **Acceptance:** the configuration check fails on a missing bucket, a wrong limit and a wrong period (against recorded API responses); the probe and the HTTP check fail when a bucket allows more or fewer than its limit; all pass on the planned configuration; the generated probe configuration carries exactly the ids that were read.
 
 ### M3-5 enablement prerequisites
 
