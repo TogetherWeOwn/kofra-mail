@@ -43,6 +43,8 @@ export const RESTORING_NOTICE_MS = 5 * 60_000;
 export const NOTICE_BACKOFF_MS = 60_000;
 export const NOTICE_BACKOFF_MAX_MS = 60 * 60_000;
 const STORED_PAGE = 16;
+// Failed attempts (about 4 hours of backoff) after which an applicable stored row raises an alert.
+export const STUCK_FAILURES = 8;
 // A gate's reset is at most this far ahead (a monthly gate resets within a month).
 export const GATE_RESET_MAX_MS = 32 * 24 * 60 * 60_000;
 // Release-list fences a claim hands out, a Mark removes and a quota call releases at once.
@@ -786,24 +788,41 @@ export class SendDispatcher {
     const { ports } = this;
     if (!validSendId(id) || (fence !== undefined && !validFence(fence))) throw new Error('Invalid send result lookup');
     const ready = await this.readyFor(scope);
+    const epoch = ready ? ports.current()?.epoch ?? null : null;
     const db = ports.directory.withSession('first-primary');
     const columns = `fence_epoch AS epoch, fence_attempt AS attempt, kind, message_id AS messageId, detail, suppressed,
-      notify_failures AS failures`;
-    const { results } = fence
-      ? await db.prepare(`SELECT ${columns} FROM send_results WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ? AND fence_epoch = ?
-        AND fence_attempt = ?`).bind(scope.workspaceId, scope.mailboxId, id, fence.epoch, fence.attempt).all<StoredRow>()
-      : await db.prepare(`SELECT ${columns} FROM send_results WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ? AND unapplied = 0
-        AND notify_after <= ? ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`)
-        .bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE).all<StoredRow>();
-    // Whether any row that can apply is left, and when the earliest is due: one page is never taken for all of them.
-    const remaining = async (): Promise<number | null> => (await db.prepare(`SELECT min(notify_after) AS next FROM send_results
-      WHERE workspace_id = ? AND mailbox_id = ? AND send_id = ? AND unapplied = 0`).bind(scope.workspaceId, scope.mailboxId, id)
-      .first<{ next: number | null }>())?.next ?? null;
+      notify_failures AS failures, unapplied`;
+    const sendKey = 'workspace_id = ? AND mailbox_id = ? AND send_id = ?';
+    let results: StoredRow[];
+    if (fence) {
+      results = (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND fence_epoch = ? AND fence_attempt = ?`)
+        .bind(scope.workspaceId, scope.mailboxId, id, fence.epoch, fence.attempt).all<StoredRow>()).results;
+    } else {
+      // Flagged acceptances from an older recovery epoch first: a restore may have made them apply.
+      const flagged = epoch === null ? [] : (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 1
+        AND unapplied_epoch < ? ORDER BY fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, epoch, STORED_PAGE)
+        .all<StoredRow>()).results;
+      const due = (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 0 AND notify_after <= ?
+        ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE)
+        .all<StoredRow>()).results;
+      results = [...flagged, ...due];
+    }
+    // Whether a row that can apply is left, and when the earliest is due: one page is never taken for all of them.
+    // A flagged row from an older epoch counts until it is evaluated in this epoch (it is read whatever its
+    // notify_after; after a transient failure it comes back at its backoff).
+    const remaining = async (): Promise<number | null> => {
+      const row = await db.prepare(`SELECT (SELECT min(notify_after) FROM send_results WHERE ${sendKey} AND unapplied = 0) AS next,
+        (SELECT min(notify_after) FROM send_results WHERE ${sendKey} AND unapplied = 1 AND unapplied_epoch < ?) AS flagged`)
+        .bind(scope.workspaceId, scope.mailboxId, id, scope.workspaceId, scope.mailboxId, id, epoch ?? -1)
+        .first<{ next: number | null; flagged: number | null }>();
+      const times = [row?.next, row?.flagged].filter((at): at is number => typeof at === 'number');
+      return times.length ? Math.min(...times) : null;
+    };
     if (!results.length) {
       const next = await remaining();
       return next === null ? { status: 'none', recorded: 0 } : { status: 'retry', recorded: 0, next };
     }
-    const where = 'workspace_id = ? AND mailbox_id = ? AND send_id = ? AND fence_epoch = ? AND fence_attempt = ?';
+    const where = `${sendKey} AND fence_epoch = ? AND fence_attempt = ?`;
     const keys = (row: StoredRow) => [scope.workspaceId, scope.mailboxId, id, row.epoch, row.attempt];
     // A restoring mailbox defers every selected row past the restore's next slice; nothing is re-enqueued here.
     const defer = async (rows: StoredRow[]) => {
@@ -822,38 +841,54 @@ export class SendDispatcher {
         console.error({ code: 'send_result_record', error: error instanceof Error ? error.message : String(error) });
         answer = 'error';
       }
-      // An accepted fact is deleted only once recorded and published, or when its send is gone.
-      const unapplied = answer === 'stale' && row.kind === 'accepted';
-      if (unapplied) console.error({ code: 'send_result_unapplied' });
-      await this.markUnapplied(id, row, unapplied);
-      if (!unapplied && (answer === 'recorded' || answer === 'stale' || answer === 'gone')) {
-        if (answer === 'gone') metric('send_result_orphan');
-        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
-        recorded++;
-      } else if (answer === 'restoring') {
+      if (answer === 'restoring') {
         await defer(results.slice(at));
         return { status: 'restoring', recorded };
+      }
+      const wait = Math.min(NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS * 2 ** Math.min(row.failures, 16));
+      if (answer === 'stale' && row.kind === 'accepted') {
+        // Definitive: an acceptance that cannot be recorded in this epoch. It is kept, flagged with the
+        // epoch, and alerted; it no longer holds up dispatch until the epoch advances.
+        console.error({ code: 'send_result_unapplied' });
+        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, unapplied = 1, unapplied_epoch = ?
+          WHERE ${where}`).bind(ports.now() + wait, epoch, ...keys(row)).run();
+        await this.resultAlerts(id, row, ['unapplied'], ['stuck']);
+      } else if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
+        // Definitive: recorded and published, a result that can never apply, or no such send.
+        if (answer === 'gone') metric('send_result_orphan');
+        await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();
+        await this.resultAlerts(id, row, [], ['unapplied', 'stuck']);
+        recorded++;
       } else {
-        // This row backs off, doubling from 1 minute to 1 hour; the rest of the page goes on. An
-        // unapplied acceptance is flagged, so it no longer holds up dispatch; a later restore can
-        // make its fence older-epoch, and a notice or the reconciler then applies it.
-        const wait = Math.min(NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS * 2 ** Math.min(row.failures, 16));
-        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, unapplied = ? WHERE ${where}`)
-          .bind(ports.now() + wait, unapplied ? 1 : 0, ...keys(row)).run();
+        // Transient (an error, or not yet published): the row backs off, doubling from 1 minute
+        // to 1 hour, and keeps its flag; the rest of the page goes on. An applicable row that
+        // keeps failing raises an alert.
+        await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
+          .bind(ports.now() + wait, ...keys(row)).run();
+        if (!row.unapplied && row.failures + 1 >= STUCK_FAILURES) await this.resultAlerts(id, row, ['stuck'], []);
       }
     }
     const next = await remaining();
     return next === null ? { status: 'recorded', recorded } : { status: 'retry', recorded, next };
   }
 
-  // The mailbox alert for accepted facts that cannot be recorded (an invariant
-  // breach), as local state: set while such a row is known, cleared when it applies.
-  private async markUnapplied(id: string, row: StoredRow, unapplied: boolean): Promise<void> {
+  // Mailbox alerts for stored results, as local state: `unapplied`, an
+  // acceptance that cannot be recorded (an invariant breach); `stuck`, an
+  // applicable row that keeps failing. Changed only on definitive answers
+  // (and `stuck` at its threshold).
+  private async resultAlerts(id: string, row: StoredRow, set: ('unapplied' | 'stuck')[], clear: ('unapplied' | 'stuck')[]): Promise<void> {
     await this.ports.local(timers => {
-      if (unapplied) {
-        this.ports.sql.exec('INSERT OR IGNORE INTO mailbox_send_unapplied VALUES (?, ?, ?, ?)', id, row.epoch, row.attempt, this.ports.now());
-        this.ports.journalDue(timers);
-      } else this.ports.sql.exec('DELETE FROM mailbox_send_unapplied WHERE send_id = ? AND epoch = ? AND attempt = ?', id, row.epoch, row.attempt);
+      let changed = false;
+      for (const code of clear) {
+        changed = this.ports.sql.exec('DELETE FROM mailbox_send_result_alerts WHERE send_id = ? AND epoch = ? AND attempt = ? AND code = ? RETURNING 1',
+          id, row.epoch, row.attempt, code).toArray().length > 0 || changed;
+      }
+      for (const code of set) {
+        changed = this.ports.sql.exec('INSERT OR IGNORE INTO mailbox_send_result_alerts VALUES (?, ?, ?, ?, ?) RETURNING 1', id, row.epoch, row.attempt,
+          code, this.ports.now()).toArray().length > 0 || changed;
+      }
+      // The backup lane evaluates the alerts: bring it forward when one changed.
+      if (changed) this.ports.journalDue(timers);
     });
   }
 
@@ -933,7 +968,8 @@ export function finishReleases(sql: SqlStorage, id: string): SendFence[] { retur
 // The delayed send's wait, for the restore epilogue.
 export function delayedUntil(sql: SqlStorage, id: string): number | null { return dispatchRow(sql, id).delayedUntil; }
 
-type StoredRow = { epoch: number; attempt: number; kind: string; messageId: string | null; detail: string | null; suppressed: number; failures: number };
+type StoredRow = { epoch: number; attempt: number; kind: string; messageId: string | null; detail: string | null; suppressed: number; failures: number;
+  unapplied: number };
 
 function storedResult(row: StoredRow): ProviderResult {
   switch (row.kind) {

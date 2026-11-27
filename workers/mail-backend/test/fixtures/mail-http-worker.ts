@@ -101,12 +101,13 @@ export class HttpMailbox extends Mailbox {
     this.crashRelease = false;
     throw new Error('Fixture crash after the release call');
   }
-  // Fails recordResult once for one fence attempt.
+  // Fails recordResult `times` times for one fence attempt.
   private failRecordAttempt?: number;
-  failRecordOnce(attempt: number) { this.failRecordAttempt = attempt; }
+  private failRecordTimes = 0;
+  failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
   protected override async sendRecordCheckpoint(fence: { attempt: number }) {
-    if (fence.attempt !== this.failRecordAttempt) return;
-    this.failRecordAttempt = undefined;
+    if (fence.attempt !== this.failRecordAttempt || this.failRecordTimes <= 0) return;
+    this.failRecordTimes--;
     throw new Error('Fixture record failure');
   }
   protected override sendQuota() { return (this.env as unknown as FixtureEnv).SEND_QUOTA.getByName('account') as unknown as QuotaPort; }
@@ -823,7 +824,11 @@ export default {
           case '/__fixture/pause-sender-check': await box.pauseSenderCheck(await req.text() || 'before'); break;
           case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
           case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
-          case '/__fixture/fail-record-once': await box.failRecordOnce(Number(await req.text())); break;
+          case '/__fixture/fail-record-once': {
+            const [attempt, times] = (await req.text()).split(',').map(Number);
+            await box.failRecordOnce(attempt, times || 1);
+            break;
+          }
           case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
           case '/__fixture/quota': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();

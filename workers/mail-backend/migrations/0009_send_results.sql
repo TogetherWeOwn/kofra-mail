@@ -30,6 +30,9 @@ CREATE TABLE send_results (
   -- 1: an acceptance the mailbox could not record; it no longer holds up dispatch
   -- and waits for a notice or the reconciler (a later restore can let it apply).
   unapplied INTEGER NOT NULL DEFAULT 0 CHECK (unapplied IN (0, 1) AND (unapplied = 0 OR kind = 'accepted')),
+  -- The mailbox's recovery epoch when the flag was set: a later epoch re-evaluates the row before any reclaim.
+  unapplied_epoch INTEGER CHECK ((unapplied = 0 AND unapplied_epoch IS NULL)
+    OR (unapplied = 1 AND typeof(unapplied_epoch) = 'integer' AND unapplied_epoch >= 0)),
   PRIMARY KEY (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt)
 );
 -- The reconciler's bounded page of rows whose notice is due.

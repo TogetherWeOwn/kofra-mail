@@ -459,7 +459,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       pauseSenderCheck: (phase: 'before' | 'after' = 'before') => controlAction('pause-sender-check', phase),
       senderCheckPaused: () => controlAction('sender-check-paused'),
       resumeSenderCheck: () => controlAction('resume-sender-check'),
-      failRecordOnce: (attempt: number) => controlAction('fail-record-once', String(attempt)),
+      failRecordOnce: (attempt: number, times = 1) => controlAction('fail-record-once', `${attempt},${times}`),
       crashAfterClaimRelease: () => controlAction('crash-after-claim-release'),
       quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
       sendState: (id: string) => readControl<SendStateView>('send-state', id),

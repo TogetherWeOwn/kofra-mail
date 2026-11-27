@@ -1141,11 +1141,15 @@ export class Mailbox extends DurableObject<Env> {
     const held = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_send_dispatch d JOIN mailbox_sends s ON s.id = d.send_id
       WHERE d.held_at IS NOT NULL AND s.state NOT IN ('sent', 'partial', 'failed', 'cancelled')) AS active`).one().active !== 0;
     // A stored acceptance that cannot be recorded: an invariant breach.
-    const unapplied = life?.state === 'ready' && sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_unapplied) AS active').one().active !== 0;
+    const resultAlert = (code: string) => life?.state === 'ready' &&
+      sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_result_alerts WHERE code = ?) AS active', code).one().active !== 0;
+    const unapplied = resultAlert('unapplied');
+    // A stored result that can apply but keeps failing to record.
+    const stuck = resultAlert('stuck');
     const conditions: Array<[MailboxAlertCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
       ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held],
-      ['send_result_unapplied', unapplied]];
+      ['send_result_unapplied', unapplied], ['send_result_stuck', stuck]];
     let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {

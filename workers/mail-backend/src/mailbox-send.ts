@@ -515,21 +515,10 @@ export class SendDriver {
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
     // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
     // Until every stored result is recorded, nothing is enqueued: a retry could resend an accepted call.
+    // First, best effort, every stored result that can apply now: a terminal
+    // decision below then sees it. A later one still corrects a recipient through
+    // late confirmation (notices or the reconciler, also after cleanup).
     const stored = await this.ports.dispatcher.storedSettled(start.scope, this.ref);
-    // Rows remain: no decision acts on the send (a grace hold, a cap or the
-    // deadline must not fail a recipient whose acceptance is stored) and nothing
-    // is enqueued; the drive row comes back when the earliest row is due (after
-    // a failed lookup it keeps its backoff). A send those rows finished still finishes.
-    if (!stored.settled) {
-      const next = stored.next;
-      const finishing = await this.ports.local(timers => {
-        if (!this.current(start)) return false;
-        if (sendRow(this.ports.sql, this.ref)?.finishPending) return true;
-        if (next !== null) timers.set(SEND_DRIVE, this.ref, Math.max(1, next, this.timer.now));
-        return false;
-      });
-      if (!finishing) return;
-    }
     const decision = await this.commit(start, ['queued', 'sending', 'delayed', ...TERMINAL], (timers, current, index) => {
       if (current.finishPending) return 'finish' as const;
       if (TERMINAL.includes(current.state)) return null;
@@ -542,7 +531,13 @@ export class SendDriver {
       const finished = await this.ports.local(() => sendRow(this.ports.sql, this.ref));
       return finished ? this.finish({ ...start, row: finished }) : undefined;
     }
-    if (!stored.settled) return;
+    // Unresolved stored results gate only reclaim and enqueue: the drive row comes
+    // back when the earliest is due (after a failed lookup it keeps its backoff).
+    if (!stored.settled) {
+      const next = stored.next;
+      if (next !== null) await this.ports.local(timers => { if (this.current(start)) timers.lower(SEND_DRIVE, this.ref, Math.max(1, next, this.timer.now)); });
+      return;
+    }
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');
