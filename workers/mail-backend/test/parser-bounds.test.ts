@@ -193,7 +193,10 @@ for (const mode of ['overlong', 'digest'] as const) test(`a ${mode === 'overlong
   assert.notEqual(result.error, 'stored');
   assert.deepEqual(result.unhandled, []);
   assert.equal(stored.size, before);
-  // The digest case fails after the store has received all but the last 64 KiB block.
-  if (mode === 'digest') assert.ok(lastPutBytes >= binary.byteLength - 64 * 1024, `received ${lastPutBytes}`);
+  // The caller sees the body's own failure, not a store answer such as BadDigest ('failed (400)').
+  assert.equal(result.error, mode === 'overlong' ? 'Attachment size changed on decode' : 'Attachment digest changed on decode');
+  // The digest case fails after the store has received all but the last
+  // block, which is held back until the digest check.
+  if (mode === 'digest') assert.ok(lastPutBytes >= binary.byteLength - 64 * 1024 && lastPutBytes < binary.byteLength, `received ${lastPutBytes}`);
   else assert.equal(lastPutBytes, 0);
 });
