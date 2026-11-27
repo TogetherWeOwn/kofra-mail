@@ -317,6 +317,21 @@ test('HTTP check fails a bad answer even in the batch with a valid refusal, or a
   }
 });
 
+test('HTTP check counts only admissions before the first refusal in a batch', async () => {
+  const { limit, period } = EXPECTED_BUCKETS.writes;
+  const { min } = refusalBand(limit);
+  let calls = 0;
+  // Refuse request min (one short of the band), then admit the rest of its batch, as a rollover would.
+  const result = await checkHttp('https://mail.example.test', ['writes'], session, async () => {
+    const index = calls++;
+    if (index === min - 1) {
+      return Response.json({ code: 'rate_limited', retryAfterSeconds: period }, { status: 429, headers: { 'retry-after': String(period) } });
+    }
+    return new Response(null, { status: 428 });
+  }, async () => {});
+  assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
+});
+
 test('HTTP check fails an attempt whose requests hang past its deadline', async () => {
   const started = Date.now();
   const result = await checkHttp('https://mail.example.test', ['reads'], session, async (_url, init) =>

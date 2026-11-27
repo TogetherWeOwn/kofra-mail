@@ -81,8 +81,11 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
           sent += batch.length;
           if (batch.some((result) => result.status === 'rejected' || result.value === 'bad')) return 'fail';
           const values = batch.map((result) => (result as PromiseFulfilledResult<'admitted' | 'refused'>).value);
-          admitted += values.filter((value) => value === 'admitted').length;
-          if (values.includes('refused')) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
+          // Requests leave in index order. Only admissions before the first refusal
+          // count: one admitted after it (a rollover mid-batch) must not lift an early refusal.
+          const first = values.indexOf('refused');
+          admitted += (first === -1 ? values : values.slice(0, first)).filter((value) => value === 'admitted').length;
+          if (first !== -1) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
         }
         return 'late';
       };
