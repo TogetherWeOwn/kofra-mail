@@ -692,7 +692,7 @@ Section 2.8 lets neither flag turn on in a deployed environment until that envir
 
 Before `MAIL_SEND_ENABLED` turns on in any deployed environment:
 1. R1, M3-3, M3-4 and M3-7a are merged (done for R1, M3-3 and M3-4).
-2. R2's receipt for that environment.
+2. R2's configuration check and step 1 probe for that environment. R2's step 2 HTTP check runs right after the flag turns on and before user traffic is admitted (the users' access stays closed until it passes), and its receipt completes the enablement.
 3. M3-0's receipts, from the approved test route: the size limit, the error codes, the clock skew, whether the returned `messageId` is the delivered `Message-ID`, the accepted size of `allowed_sender_addresses`, and what an empty list does.
 4. M3-5, M3-6 and M3-8 merged; internal-only sends stay `queued` until M3-8.
 5. M3-7b's first run in that environment, so the senders are listed and `active`.
