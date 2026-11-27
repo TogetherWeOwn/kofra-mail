@@ -893,7 +893,9 @@ export class MailboxIndex {
         terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number };
       checkSendRecord(send.record);
       const seqs = [send.releaseSeq, send.queuedSeq, send.terminalSeq];
+      // send_window events only extend the undo deadline, so a restored row never has an earlier one than its record.
       if (send.id !== send.record.id || send.draftId !== send.record.draftId || send.holder !== send.record.draft.holder ||
+          !epochMs(send.undoUntil) || send.undoUntil < send.record.undoUntil ||
           !['pending', 'releasing', 'queued', 'sending', 'delayed', ...TERMINAL].includes(send.state) || !count(send.createdSeq) ||
           !epochMs(send.createdAt) || !epochMs(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
           (send.messageId !== null && send.messageId !== sentCopyId(send.id)) ||

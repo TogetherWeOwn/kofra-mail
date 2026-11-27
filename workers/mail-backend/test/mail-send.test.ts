@@ -1466,3 +1466,18 @@ test('a lost answer during a restore marks the send\'s source unusable at once: 
     await h.advance(minute);
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
   }));
+
+test('a restore refuses a send row whose undo deadline is earlier than its frozen one, and accepts an equal or later one', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  const { undoUntil } = JSON.parse((await h.sends.row(pending.id))!.record) as { undoUntil: number };
+  await h.sends.setUndoUntil(pending.id, undoUntil + second);
+  await h.forceSnapshot();
+  await h.restore();
+  assert.equal((await mail.getSend(pending.id)).state, 'pending', 'a later deadline restores');
+  await h.sends.setUndoUntil(pending.id, undoUntil - 1);
+  await h.forceSnapshot();
+  await h.restore();
+  // The restore refuses the row: the mailbox stays restoring and the send is never served.
+  await rejects(mail.getSend(pending.id), 'mailbox_restoring');
+  assert.equal((await h.sends.lifecycle())?.state, 'restoring');
+}));
