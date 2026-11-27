@@ -127,13 +127,16 @@ test('store-then-notice: the result is stored when recordResult cannot complete,
   assert.deepEqual(await dispatchSend(message, failed.ports), { ack: false, step: 'store_failed', fence: { epoch: 0, attempt: 1 } });
 });
 
-test('a stale answer to a refusal releases that fence once; a stale accepted or ambiguous result releases nothing; a failed release keeps the charge', async () => {
-  for (const [code, released] of [['E_RATE_LIMIT_EXCEEDED', true], ['E_SENDER_NOT_VERIFIED', true], ['E_VALIDATION_ERROR', true],
-    ['E_INTERNAL_SERVER_ERROR', false], [undefined, false]] as const) {
-    const { ports, events } = stubPorts({ email: () => ({ send: async () => code === undefined ? { messageId: 'id' } : Promise.reject(coded(code)) }) },
-      { recordResult: async () => ({ status: 'stale' }) });
-    assert.equal((await dispatchSend(message, ports)).step, 'unrecorded');
-    assert.equal(events.includes('release'), released, String(code));
+test('a stale or gone refusal releases that fence once; a stale ambiguous result releases nothing; a stale or gone acceptance is stored; a failed release keeps the charge', async () => {
+  for (const status of ['stale', 'gone'] as const) {
+    for (const [code, expected] of [['E_RATE_LIMIT_EXCEEDED', ['release']], ['E_SENDER_NOT_VERIFIED', ['release']], ['E_VALIDATION_ERROR', ['release']],
+      ['E_INTERNAL_SERVER_ERROR', []], [undefined, ['store', 'notify']]] as const) {
+      const { ports, events } = stubPorts({ email: () => ({ send: async () => code === undefined ? { messageId: 'id' } : Promise.reject(coded(code)) }) },
+        { recordResult: async () => ({ status }) });
+      const outcome = await dispatchSend(message, ports);
+      assert.equal(outcome.step, code === undefined ? 'stored' : 'unrecorded', `${status} ${code}`);
+      assert.deepEqual(events.filter(event => event !== 'authorize'), expected, `${status} ${code}`);
+    }
   }
   const failing = stubPorts({ email: () => ({ send: async () => { throw coded('E_RATE_LIMIT_EXCEEDED'); } }) }, { recordResult: async () => ({ status: 'stale' }) });
   failing.ports.quota = () => ({ ...stubPorts().ports.quota(), release: async () => { throw new Error('quota'); } });

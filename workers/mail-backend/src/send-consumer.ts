@@ -17,6 +17,8 @@ import type { SendDispatch } from './worker.ts';
 export const RESERVATION_GRACE_MS = 2 * 60_000;
 // abandonClaim's retry for an error before send(); the mailbox clamps it to 1 minute .. 1 hour.
 export const ABANDON_RETRY_MS = 60_000;
+// abandonClaim's retry after a request the frozen inputs can no longer build (the mailbox's maximum).
+export const INVALID_RETRY_MS = 60 * 60_000;
 // A stored result's first notify_after: the reconciler's independent retry path (step 6).
 export const STORED_NOTIFY_MS = 5 * 60_000;
 // The ambiguous code for a rejection without a usable error code: the mailbox alerts on it.
@@ -205,7 +207,9 @@ export async function dispatchSend(message: unknown, ports: ConsumerPorts): Prom
     return abandon('request');
   }
   if (built.status === 'stale') return stale();
-  if (built.status !== 'ok') return abandon('request_invalid');
+  // Our own invariant breach (the mailbox logs send_request_invalid): never a failure of the send,
+  // retried at the longest backoff so it cannot loop every minute.
+  if (built.status !== 'ok') return abandon('request_invalid', ports.now() + INVALID_RETRY_MS);
 
   // Step 4: the clock is read just before the call, so the deadline is never
   // later than the grant plus the window.
@@ -257,7 +261,8 @@ async function record(message: SendDispatch, ports: ConsumerPorts, mailbox: Cons
   try { answer = await mailbox.recordResult(ws, mb, sendId, fence, result); }
   catch (error) { log('send_record_failed', error); }
   if (answer?.status === 'recorded') return { ack: true, step: 'recorded', fence };
-  if (answer?.status === 'stale' && (result.kind === 'try_later' || result.kind === 'outage' || result.kind === 'rejected')) {
+  const final = answer?.status === 'stale' || answer?.status === 'gone';
+  if (final && (result.kind === 'try_later' || result.kind === 'outage' || result.kind === 'rejected')) {
     // A refused call is not charged: one idempotent release of this fence's
     // reservation, which never touches a newer fence's charge. A failure keeps
     // the charge, as an ambiguous result's is kept.
@@ -265,8 +270,10 @@ async function record(message: SendDispatch, ports: ConsumerPorts, mailbox: Cons
     catch (error) { log('send_stale_release_failed', error); }
     return { ack: true, step: 'unrecorded', fence };
   }
-  // Stale or gone: nothing of this result can apply.
-  if (answer?.status === 'stale' || answer?.status === 'gone') return { ack: true, step: 'unrecorded', fence };
+  // A stale or gone ambiguous result changes nothing. A stale or gone
+  // acceptance is a provider fact: it is stored, so the mailbox flags and
+  // alerts it (or counts it as an orphan) instead of it being dropped.
+  if (final && result.kind === 'ambiguous') return { ack: true, step: 'unrecorded', fence };
   try { await ports.storeResult({ workspaceId: ws, mailboxId: mb, sendId, fence, result, createdAt: ports.now() }); }
   catch (error) {
     // Not acknowledged: the queue retries the message. A result lost this way is an ambiguous event.

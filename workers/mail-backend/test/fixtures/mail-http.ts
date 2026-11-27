@@ -136,6 +136,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
+  // Holds the next object GET whose path matches, until released.
+  let nextGet: { match: RegExp; start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
   let watchedBody: PromiseWithResolvers<void> | undefined;
   let contentRawReads = 0;
   let cidAdmissions = 0;
@@ -176,6 +178,12 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
           return new LocalResponse(null, { status: 201 });
         }
         case 'GET': {
+          const held = nextGet && nextGet.match.test(pathname) ? nextGet : undefined;
+          if (held) {
+            nextGet = undefined;
+            held.start.resolve();
+            await held.resume.promise;
+          }
           const reads = watchedReads.get(pathname);
           if (reads !== undefined) watchedReads.set(pathname, reads + 1);
           if (failingReads.has(pathname)) return new LocalResponse('<Error><Code>ServiceUnavailable</Code></Error>', { status: 503 });
@@ -285,6 +293,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     const stallConfirmation = () => controlAction('stall-confirmation');
     const stallRelease = (holder: string) => controlAction('stall-release', holder);
     const expireUploadLease = (key: string) => controlAction('expire-upload-lease', key);
+    const pauseNextGet = (match: RegExp) => {
+      const gate = nextGet = { match, start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+      return { started: gate.start.promise, release: gate.resume.resolve };
+    };
     const pauseNextPut = () => {
       const gate = nextPut = { start: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
       return { started: gate.start.promise, release: gate.resume.resolve };
@@ -446,7 +458,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
-      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
+      stallConfirmation, stallRelease, expireUploadLease, pauseNextPut, pauseNextGet,
       watchBodyRead: () => (watchedBody = Promise.withResolvers<void>()).promise,
       watchObjectReads(path: string) {
         watchedReads.set(path, 0);

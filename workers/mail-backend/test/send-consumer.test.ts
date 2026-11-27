@@ -777,8 +777,8 @@ test('without the EMAIL binding the consumer abandons before the authorization a
   assert.deepEqual((await drain(h)).map(step).filter(acted), ['recorded']);
 }));
 
-test('a refusal under a stale fence releases only that fence\'s reservation, also after the send finished', () => withConsumer(async (h, mail, from) => {
-  for (const [token, finish] of [['stale-open', false], ['stale-finished', true]] as const) {
+test('a refusal under a stale fence releases only that fence\'s reservation, once, also after the send finished; a failed release keeps the charge', () => withConsumer(async (h, mail, from) => {
+  for (const [token, finish, failing] of [['stale-open', false, false], ['stale-finished', true, false], ['stale-failing', false, true]] as const) {
     const id = await queued(h, mail, from, token);
     const charge = async (fence: { epoch: number; attempt: number }) => (await h.quota<{ sendId: string; epoch: number; attempt: number; charges: number }[]>('balances'))
       .filter(row => row.sendId === id && row.epoch === fence.epoch && row.attempt === fence.attempt).reduce((sum, row) => sum + row.charges, 0);
@@ -802,9 +802,21 @@ test('a refusal under a stale fence releases only that fence\'s reservation, als
     assert.equal(await charge(old), 1);
     const nextCharge = await charge(next);
     assert.equal(nextCharge, 1);
+    const callsBefore = (await h.quota<unknown[]>('calls')).length;
+    const failedBefore = logged(h, 'send_stale_release_failed').length;
+    if (failing) await h.consumer('failNext', 'release');
     await resumeAt(h, 'email');
     assert.equal(step(await slow), 'unrecorded', 'the stale fence records nothing');
-    assert.equal(await charge(old), 0, 'its refused call is not charged');
+    const released = (await h.quota<{ method: string; scope: { sendId: string }; fences: { epoch: number; attempt: number }[] }[]>('calls')).slice(callsBefore);
+    if (failing) {
+      assert.deepEqual(released, [], 'the failed release reached nothing');
+      assert.equal(await charge(old), 1, 'a failed release keeps the charge');
+      assert.equal(logged(h, 'send_stale_release_failed').length, failedBefore + 1);
+    } else {
+      assert.deepEqual(released, [{ method: 'release', scope: { workspaceId: WS, mailboxId: MB, sendId: id }, fences: [{ epoch: old.epoch, attempt: old.attempt }] }],
+        'exactly one release, of the stale fence');
+      assert.equal(await charge(old), 0, 'its refused call is not charged');
+    }
     assert.equal(await charge(next), nextCharge, 'the newer fence keeps its charge');
     assert.deepEqual(core(await h.sendState(id)), core(state), 'no recipient, lease, timer or release entry changed');
     if (!finish) {
@@ -812,4 +824,63 @@ test('a refusal under a stale fence releases only that fence\'s reservation, als
       assert.equal(step(await newer), 'recorded');
     }
   }
+}));
+
+test('a refusal stored while it cannot be recorded, then replayed after a restore, releases its fence\'s reservation', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'stored-refusal');
+  await script(h, { result: 'reject', code: 'E_RATE_LIMIT_EXCEEDED' });
+  await h.consumer('failNext', 'recordResult');
+  const stored = await consume(h, id);
+  assert.equal(step(stored), 'stored');
+  const fence = fenceOf(stored);
+  const charge = async () => (await h.quota<{ sendId: string; epoch: number; attempt: number; charges: number }[]>('balances'))
+    .filter(row => row.sendId === id && row.epoch === fence.epoch && row.attempt === fence.attempt).reduce((sum, row) => sum + row.charges, 0);
+  assert.equal(await charge(), 1, 'storing a refusal releases nothing yet');
+  // The restore raises the epoch, so the replayed refusal is stale; its notice replays it.
+  await restore(h);
+  assert.deepEqual(await h.sendRpc('recordStoredResults', id, fence), { status: 'recorded', recorded: 1 });
+  assert.deepEqual(await h.directoryRows('SELECT 1 FROM send_results WHERE send_id = ?', id), [], 'replayed and deleted');
+  assert.equal(await charge(), 0, 'the stale refusal released its own fence');
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['attempting'], 'and changed no recipient');
+}));
+
+test('the sendRequest answer is checked again after its reads: a fence that expires while the draft is read gets no request', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'request-expiry');
+  const claim = await h.sendRpc<{ status: string; fence: { epoch: number; attempt: number }; leaseUntil: number; release: unknown[] }>('claimSend', id);
+  await h.quota('reserve', scope(id), claim.fence, [0], claim.release, claim.leaseUntil + 2 * minute);
+  assert.deepEqual(await h.sendRpc('markSend', id, claim.fence, [0], claim.release), { status: 'ok' });
+  const leaseUntil = (await h.sendState(id)).fences.at(-1)!.lease_until;
+  const { draft } = JSON.parse((await h.sends.row(id))!.record) as { draft: { rawKey: string } };
+  const read = h.pauseNextGet(new RegExp(`/${draft.rawKey}$`));
+  const pending = h.sendRpc<{ status: string }>('sendRequest', id, claim.fence);
+  await read.started;
+  await until(h, leaseUntil);
+  read.release();
+  assert.deepEqual(await pending, { status: 'stale' }, 'the in-flight request answers stale once its lease ran out');
+  assert.deepEqual(await h.sendRpc('sendRequest', id, claim.fence), { status: 'stale' }, 'as a fresh one does');
+}));
+
+test('the deadline check and the call have no await between them: a clock that reaches the deadline on the next tick never delays the call past it', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'no-yield');
+  await h.consumer('trapYieldAfterCheck', true);
+  assert.equal(step(await consume(h, id)), 'recorded');
+  const [call] = await calls(h);
+  assert.ok(call.consumerNow < call.deadline!, `the call started at ${call.consumerNow}, before its deadline ${call.deadline}`);
+  assert.equal((await h.consumer<{ consumerNow: number }>('leads')).consumerNow, call.deadline, 'the trap moved the clock to the deadline right after the check');
+}));
+
+test('a request the frozen inputs can no longer build is abandoned with the longest retry and never sent', () => withConsumer(async (h, mail, from) => {
+  const parent = await h.deliver({ from: { name: 'Mira Chen', email: 'mira@example.net' }, to: [{ name: 'Jordan Member', email: from }], subject: 'Plans',
+    text: 'See attached', attachments: [{ name: 'plan.txt', type: 'text/plain', bytes: new TextEncoder().encode('plan bytes') }] });
+  const part = (await mail.getThread(parent.threadId)).messages[0].attachments[0].part;
+  const id = await queued(h, mail, from, 'invalid-request', { attachments: [{ kind: 'message', messageId: parent.messageId, part }] });
+  // The frozen digest of the forwarded part no longer matches its source: an invariant breach after release.
+  await h.sends.changePartDigest(id);
+  const outcome = await consume(h, id);
+  assert.deepEqual(outcome, { ack: true, step: 'abandoned', fence: fenceOf(outcome), cause: 'request_invalid' });
+  const state = await h.sendState(id);
+  assert.equal(state.dispatch?.next_attempt_at, await h.sends.now() + hour, 'retried at the one-hour maximum, not every minute');
+  assert.deepEqual(ledgerOf(state), ['pending'], 'never failed by our own breach');
+  assert.equal(logged(h, 'send_request_invalid').length, 1);
+  assert.equal((await calls(h)).length, 0);
 }));

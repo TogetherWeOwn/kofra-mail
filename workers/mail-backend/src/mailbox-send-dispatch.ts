@@ -556,7 +556,8 @@ export class SendDispatcher {
     const { ports } = this;
     if (!validFence(fence)) throw new Error('Invalid send request');
     if (!ports.sending || !await this.readyFor(scope)) return { status: 'stale' };
-    const claimed = await ports.local(() => {
+    // The fence's attempting Mark set, or null when the fence is not the current, live, marked lease.
+    const claimed = () => ports.local(() => {
       const ready = ports.current();
       const m = ready && this.load(id);
       if (!ready || !m) return null;
@@ -567,11 +568,20 @@ export class SendDispatcher {
         .filter(idx => m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence));
       return recipients.length ? { record: m.row.record, recipients } : null;
     });
-    if (!claimed) return { status: 'stale' };
-    const request = await ports.buildRequest(claimed.record, claimed.recipients);
-    if (request) return { status: 'ok', request };
-    console.error({ code: 'send_request_invalid' });
-    return { status: 'invalid' };
+    const before = await claimed();
+    if (!before) return { status: 'stale' };
+    const request = await ports.buildRequest(before.record, before.recipients);
+    if (!request) {
+      console.error({ code: 'send_request_invalid' });
+      return { status: 'invalid' };
+    }
+    // The reads took time: the answer holds only if the fence and its Mark set are unchanged now.
+    if (!await this.readyFor(scope)) return { status: 'stale' };
+    const after = await claimed();
+    if (!after || after.recipients.length !== before.recipients.length || !after.recipients.every((idx, i) => idx === before.recipients[i])) {
+      return { status: 'stale' };
+    }
+    return { status: 'ok', request };
   }
 
   // Consumer step 4: at most one authorization per fence. `quotaDayEnd` is the
@@ -941,6 +951,17 @@ export class SendDispatcher {
       } else if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
         // Definitive: recorded and published, a result that can never apply, or no such send.
         if (answer === 'gone') metric('send_result_orphan');
+        // A refused call is not charged: a refusal that can never apply releases only its own
+        // fence's reservation (never a newer fence's). A failure keeps the charge.
+        if (answer !== 'recorded' && (row.kind === 'rejected' || row.kind === 'try_later' || row.kind === 'outage')) {
+          try {
+            const quota = ports.quota();
+            if (!quota) throw new Error('Send quota binding missing');
+            await quota.release({ ...scope, sendId: id }, [{ epoch: row.epoch, attempt: row.attempt }]);
+          } catch (error) {
+            console.error({ code: 'send_stale_release_failed', error: error instanceof Error ? error.message : String(error) });
+          }
+        }
         // The alert goes first: a crash after the delete cannot leave it active.
         await this.resultAlerts(id, row, [], ['unapplied', 'stuck']);
         await db.prepare(`DELETE FROM send_results WHERE ${where}`).bind(...keys(row)).run();

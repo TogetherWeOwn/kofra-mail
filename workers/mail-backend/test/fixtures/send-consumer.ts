@@ -36,7 +36,7 @@ export type EmailCall = {
 };
 
 class FixtureCrash extends Error { constructor() { super('Fixture consumer crashed'); } }
-type Run = { dead: boolean; auth: { fence: SendFence; deadline: number; lead: number } | null };
+type Run = { dead: boolean; auth: { fence: SendFence; deadline: number; lead: number } | null; checked?: boolean };
 // `wait`: the run waits there until resumed; `crash`: the run dies there (at once, or when resumed).
 type Gate = { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void>; wait: boolean; crash: boolean; taken?: boolean };
 
@@ -78,6 +78,11 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
     }
     resultNotices() { return this.notices; }
     failNext(method: string, times = 1) { this.failures.set(method, times); }
+    // Arms a trap on the deadline check: the first clock read after the authorization schedules
+    // a microtask that moves the consumer's clock to the deadline, so any yield between that check
+    // and the call lets the call start at the deadline.
+    private yieldTrap = false;
+    trapYieldAfterCheck(armed: boolean) { this.yieldTrap = armed; }
     // An environment without the send_email binding.
     private bindingMissing = false;
     removeBinding(missing: boolean) { this.bindingMissing = missing; }
@@ -159,7 +164,15 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
         email: () => this.bindingMissing ? undefined : { send(request: SendRequest) { return self.email(run, message, request); } },
         storeResult: row => this.step(run, 'storeResult', () => storeSendResult(this.env.DIRECTORY, row)),
         notify: notice => this.step(run, 'notify', async () => { this.notices.push(notice); }),
-        now: () => this.consumerNow(),
+        now: () => {
+          const now = this.consumerNow();
+          if (this.yieldTrap && run.auth && !run.checked) {
+            run.checked = true;
+            const { deadline } = run.auth;
+            queueMicrotask(() => { this.consumerLead += deadline - this.consumerNow(); });
+          }
+          return now;
+        },
       };
     }
 
