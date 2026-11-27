@@ -1245,7 +1245,8 @@ const undecodable = (from: string) => [
   ['attachments that are not a list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined }, attachments: 'x' }))],
   ['an attachment whose key is not an object key', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined },
     attachments: [{ wire: { kind: 'upload', uploadId: 'u1', name: 'a.txt', type: 'text/plain', size: 1 }, key: 'att/not-a-key' }] }))],
-  ['no to list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { subject: 'x', body: 'x' } }))],
+  // Only `to` is missing: from, cc and bcc are valid, so the recipient check itself refuses it.
+  ['no to list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined, to: undefined } }))],
   ['a cc that is not a list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined, cc: 'friend@example.net' } }))],
   ['a recipient without an email', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined, to: [{ name: 'No Address' }] } }))],
   ['more recipients than recipientsPerMessage', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined,
