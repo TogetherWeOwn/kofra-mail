@@ -285,6 +285,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       activeAlerts: () => readControl<string[]>('active-alerts'),
       breaches: () => readControl<string[]>('send-breaches'),
       changePartDigest: (sendId: string) => controlAction('change-part-digest', sendId),
+      setRecipientState: (sendId: string, idx: number, state: string) =>
+        controlAction('set-recipient-state', JSON.stringify({ sendId, idx, state })),
       setUndoUntil: (sendId: string, undoUntil: number) => controlAction('set-send-undo-until', JSON.stringify({ sendId, undoUntil })),
       setDraftKey: (sendId: string, rawKey: string) => controlAction('set-send-draft-key', JSON.stringify({ sendId, rawKey })),
       changeAttachmentSize: (messageId: string, part: number, delta: number) =>

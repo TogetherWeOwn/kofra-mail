@@ -1481,3 +1481,15 @@ test('a restore refuses a send row whose undo deadline is earlier than its froze
   await rejects(mail.getSend(pending.id), 'mailbox_restoring');
   assert.equal((await h.sends.lifecycle())?.state, 'restoring');
 }));
+
+test('a recipient restored as attempting is accepted and reported as pending', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+  await h.sends.setRecipientState(pending.id, 0, 'attempting');
+  await h.forceSnapshot();
+  await h.restore();
+  const restored = await mail.getSend(pending.id);
+  assert.deepEqual(restored.recipients.map(({ state }) => state), ['pending']);
+  assert.deepEqual((await mail.listSends({})).items.map(({ id }) => id), [pending.id]);
+}));

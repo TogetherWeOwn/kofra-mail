@@ -199,6 +199,10 @@ export class HttpMailbox extends Mailbox {
   activeAlerts() { return this.ctx.storage.sql.exec<{ code: string }>('SELECT code FROM mailbox_alerts ORDER BY code').toArray().map(row => row.code); }
   sendBreaches() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT send_id AS id FROM mailbox_send_breaches').toArray().map(row => row.id); }
   // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
+  // A recipient row in the state the M3-5 consumer writes while it calls the provider.
+  setRecipientState(sendId: string, idx: number, state: string) {
+    this.ctx.storage.sql.exec('UPDATE mailbox_send_recipients SET state = ? WHERE send_id = ? AND idx = ?', state, sendId, idx);
+  }
   // Moves a send row's undo deadline, as a corrupt snapshot row would carry it.
   setSendUndoUntil(sendId: string, undoUntil: number) {
     this.ctx.storage.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', undoUntil, sendId);
@@ -662,6 +666,11 @@ export default {
           case '/__fixture/active-alerts': return Response.json(await box.activeAlerts());
           case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
           case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
+          case '/__fixture/set-recipient-state': {
+            const { sendId, idx, state } = await req.json<{ sendId: string; idx: number; state: string }>();
+            await box.setRecipientState(sendId, idx, state);
+            break;
+          }
           case '/__fixture/set-send-undo-until': {
             const { sendId, undoUntil } = await req.json<{ sendId: string; undoUntil: number }>();
             await box.setSendUndoUntil(sendId, undoUntil);
