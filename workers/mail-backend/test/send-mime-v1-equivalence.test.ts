@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { hasHeaderControl, isSafeMessageId, threadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
 import { canonicalMailText, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
@@ -225,6 +226,7 @@ const builder = defaultMimeBuilders().get(1)!;
 
 test('both v1 sent-copy paths match the legacy bytes for 64 seeded messages', async () => {
   assert.equal(SEND_MIME_VERSION, 1);
+  const corpus = createHash('sha256');
   const lineEdges = [0, 1, 2, 3, 55, 56, 57, 58, 59, 112, 113, 114, 115, 116, 170, 171, 172];
   for (let i = 0; i < 64; i++) {
     const size = i <= lineEdges.length ? lineEdges[i - 1] : i >= 61 ? (i - 60) * 1024 ** 2 + (i % 3) : random() % (128 * 1024);
@@ -238,7 +240,10 @@ test('both v1 sent-copy paths match the legacy bytes for 64 seeded messages', as
     assert.equal(builder.encodedSize(message), expected.byteLength, label);
     assert.equal(Buffer.compare(actual.bytes, expected), 0, `direct: ${label}`);
     assert.equal(Buffer.compare(await builder.build(message, async n => parts[n]), expected), 0, `mailbox: ${label}`);
+    corpus.update(`${actual.bytes.byteLength}:`).update(actual.bytes);
   }
+  // Pinned against the v1 builder at a0fd496, independent of shared helpers.
+  assert.equal(corpus.digest('hex'), '6ed0d98036ebcbd1d653a5622223741abaafd1f4fe7a922ec314372c7d4c5d03');
 });
 
 test('the mailbox builder writes a part before reading the next part', async () => {
