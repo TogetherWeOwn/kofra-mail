@@ -68,16 +68,18 @@ export class IndexPlumbing extends FixtureMailbox {
   }
 
   // Streams a stored message's first measured part through the Kofra adapter
-  // with a measured size the replay overruns, and reports what the caller saw
-  // and any unhandled rejection that followed.
-  async overlongThroughKofra(rawKey: string) {
+  // so that the body fails: 'overlong' claims a size the replay overruns, so it
+  // fails before any byte; 'digest' claims another digest, so every block but
+  // the last is sent first. Reports what the caller saw and any unhandled
+  // rejection that followed.
+  async overlongThroughKofra(rawKey: string, mode: 'overlong' | 'digest' = 'overlong') {
     const object = await this.env.RAW.get(rawKey);
     if (!object) throw new Error('Missing fixture raw object');
     const { contents } = await boundedMime(new Uint8Array(await object.arrayBuffer()));
     const source = contents.find(content => !(content instanceof Uint8Array));
     if (!source || source instanceof Uint8Array) throw new Error('No measured part');
     const digest = 'a'.repeat(64);
-    const short = { ...source, size: 64 * 1024 };
+    const short = mode === 'overlong' ? { ...source, size: 64 * 1024 } : source;
     unhandled.length = 0;
     let error = 'stored';
     try { await kofra(this.env as unknown as KofraConfig, 'workspace').putStream(`att/${digest}/01KBN8ZJ7G0000000000000000`, partStream(short, digest), short.size, digest); }

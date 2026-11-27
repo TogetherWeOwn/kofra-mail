@@ -16,6 +16,8 @@ let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
 const stored = new Map<string, Uint8Array>();
 // Set to fail the next attachment PUT after reading part of its body.
 let failNextPut = false;
+// Body bytes the store received for the last PUT, also when the body failed.
+let lastPutBytes = 0;
 before(async () => {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/index-plumbing.ts', import.meta.url))],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
@@ -31,7 +33,12 @@ before(async () => {
         await request.body?.getReader().read();
         return new Response(null, { status: 500 });
       }
-      const body = new Uint8Array(await request.arrayBuffer());
+      const chunks: Uint8Array[] = [];
+      lastPutBytes = 0;
+      const reader = request.body!.getReader();
+      for (let next = await reader.read(); !next.done; next = await reader.read()) { chunks.push(next.value); lastPutBytes += next.value.byteLength; }
+      const body = new Uint8Array(lastPutBytes);
+      chunks.reduce((offset, chunk) => { body.set(chunk, offset); return offset + chunk.byteLength; }, 0);
       if (request.headers.get('x-amz-content-sha256') !== await sha256(body)) return new Response('<Error><Code>BadDigest</Code></Error>', { status: 400 });
       stored.set(url.pathname, body);
       return new Response(null, { status: 200 });
@@ -175,14 +182,18 @@ test('an attachment PUT that fails midway is retried from a fresh decode and sto
   assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), binary);
 });
 
-test('a replay that overruns its measured size fails the Kofra PUT with no unhandled rejection', async () => {
+for (const mode of ['overlong', 'digest'] as const) test(`a ${mode === 'overlong' ? 'replay that overruns its measured size' : 'body that fails its digest after most of it was sent'} fails the Kofra PUT with no unhandled rejection`, async () => {
   const binary = new Uint8Array(300 * 1024).map((_, i) => (i * 2654435761) >>> 24);
   const key = await upload(multipart('overlong', [
     `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=over.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(binary).toString('base64').match(/.{1,76}/g)!.join('\r\n')}`,
   ]));
   const before = stored.size;
-  const result = JSON.parse(await boxes.getByName('kofra-overlong').overlongThroughKofra(key)) as { error: string; unhandled: string[] };
+  lastPutBytes = 0;
+  const result = JSON.parse(await boxes.getByName(`kofra-${mode}`).overlongThroughKofra(key, mode)) as { error: string; unhandled: string[] };
   assert.notEqual(result.error, 'stored');
   assert.deepEqual(result.unhandled, []);
   assert.equal(stored.size, before);
+  // The digest case fails after the store has received all but the last 64 KiB block.
+  if (mode === 'digest') assert.ok(lastPutBytes >= binary.byteLength - 64 * 1024, `received ${lastPutBytes}`);
+  else assert.equal(lastPutBytes, 0);
 });
