@@ -5,7 +5,7 @@ import { sendEventTitle, type DailySendAlert } from './send-alert-events.ts';
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
   'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant';
-type Event = AlertEvent | { code: MailboxAlertCode; key: string };
+type Event = AlertEvent | { code: MailboxAlertCode | 'send_quota_gate_hit'; key: string };
 type SendAlert = DailySendAlert | { code: 'send_dlq'; environment: string; time: number; occurrence: string };
 
 const TITLE: Record<Event['code'], string> = {
@@ -19,6 +19,7 @@ const TITLE: Record<Event['code'], string> = {
   holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
   holder_source_lost: 'A mailbox source object is missing',
   send_invariant: 'A send is held after a release invariant failed',
+  send_quota_gate_hit: 'A mail account quota gate was reached',
 };
 
 export function mailAlert(binding?: AlertBinding) {

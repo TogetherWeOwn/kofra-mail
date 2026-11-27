@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { build } from 'esbuild';
-import { Miniflare } from 'miniflare';
+import { Miniflare, Response as LocalResponse, type Request as LocalRequest } from 'miniflare';
 import type { FixtureSendQuota } from './fixtures/send-quota-worker.ts';
 
 const at = (s: string) => Date.parse(s);
@@ -12,9 +13,11 @@ const NOW = at('2026-11-30T14:59:00Z');
 const TODAY = at('2026-11-30T15:00:00Z');
 const DEC = at('2026-12-01T15:00:00Z');
 const JAN = at('2027-01-01T15:00:00Z');
-const scope = (sendId: string, mailboxId = 'mb') => ({ workspaceId: 'ws', mailboxId, sendId });
+const scope = (name: string, mailboxId = 'mb') => ({ workspaceId: 'ws', mailboxId,
+  sendId: `01${createHash('sha256').update(name).digest('hex').slice(0, 24).toUpperCase()}` });
 const fence = (attempt = 1, epoch = 0) => ({ epoch, attempt });
-type ObjectMethods = Pick<InstanceType<typeof FixtureSendQuota>, 'reserve' | 'confirm' | 'release' | 'resetAt' | 'setTime' | 'balances'>;
+type ObjectMethods = Pick<InstanceType<typeof FixtureSendQuota>, 'reserve' | 'confirm' | 'release' | 'resetAt' | 'setTime' | 'balances' |
+  'retained' | 'runAlarm' | 'alarmDue'>;
 const stub = (mf: Miniflare) => {
   const call = <K extends keyof ObjectMethods>(method: K) => async (...args: Parameters<ObjectMethods[K]>): Promise<Awaited<ReturnType<ObjectMethods[K]>>> => {
     const response = await mf.dispatchFetch('http://quota.test', { method: 'POST', body: JSON.stringify({ method, args }) });
@@ -22,13 +25,15 @@ const stub = (mf: Miniflare) => {
     return response.json() as Promise<Awaited<ReturnType<ObjectMethods[K]>>>;
   };
   return { reserve: call('reserve'), confirm: call('confirm'), release: call('release'), resetAt: call('resetAt'),
-    setTime: call('setTime'), balances: call('balances') };
+    setTime: call('setTime'), balances: call('balances'), retained: call('retained'), runAlarm: call('runAlarm'), alarmDue: call('alarmDue') };
 };
 const entry = fileURLToPath(new NodeURL('./fixtures/send-quota-worker.ts', import.meta.url));
 let bundle: ReturnType<typeof build> | undefined;
 
 async function withQuota(run: (quota: ReturnType<typeof stub>, restart: () => Promise<ReturnType<typeof stub>>, logs: string[]) => Promise<void>,
-  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00' } = {}) {
+  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00', alert }: {
+    daily?: string; monthly?: string; now?: number; persist?: boolean; reset?: string; alert?: (body: unknown) => number;
+  } = {}) {
   const { outputFiles } = await (bundle ??= build({ entryPoints: [entry], bundle: true, write: false, format: 'esm', external: ['cloudflare:workers'] }));
   const directory = persist ? await mkdtemp('/var/tmp/velmora-riaklo-m3-6-quota-') : undefined;
   const logs: string[] = [];
@@ -38,6 +43,7 @@ async function withQuota(run: (quota: ReturnType<typeof stub>, restart: () => Pr
     durableObjects: { SEND_QUOTA: { className: 'FixtureSendQuota', useSQLite: true } },
     durableObjectsPersist: directory && join(directory, 'do'),
     bindings: { INITIAL_TIME: now, MAIL_SEND_DAILY_QUOTA: daily, MAIL_SEND_MONTHLY_CEILING: monthly, MAIL_SEND_DAILY_RESET_UTC: reset },
+    ...(alert && { serviceBindings: { ALERTS: async (req: LocalRequest) => new LocalResponse(null, { status: alert(await req.json()) }) } }),
   });
   let runtime = start();
   try {
@@ -142,3 +148,147 @@ test('resetAt follows the supplied hour and minute', () => withQuota(async quota
 test('missing monthly ceiling fails closed without inventing an allowance', () => withQuota(async quota => {
   await assert.rejects(quota.reserve(scope('config'), fence(), [0], [], NOW + 1), /Invalid send quota configuration/);
 }, { monthly: '' }));
+
+test('simultaneously full gates refuse until the monthly reset and name the monthly gate', () => withQuota(async (quota, _, logs) => {
+  assert.equal((await quota.reserve(scope('both-fill'), fence(), [0], [], NOW + 1000)).status, 'ok');
+  assert.deepEqual(await quota.reserve(scope('both-refused'), fence(), [0], [], NOW + 1000), { status: 'exhausted', resetAt: DEC });
+  assert.equal(logs.filter(line => line.includes('send_quota_gate_hit') && line.includes("'monthly'")).length, 1);
+}, { daily: '2', monthly: '1' }));
+
+test('alarm submits only redacted gate alerts and marks them sent only after a 2xx', async () => {
+  const deliveries: unknown[] = [];
+  await withQuota(async (quota, restart) => {
+    assert.equal((await quota.reserve(scope('alert-fill'), fence(), [0], [], NOW + 2000)).status, 'ok');
+    for (const name of ['alert-refuse-first', 'alert-refuse-again']) {
+      assert.equal((await quota.reserve(scope(name), fence(), [0], [], NOW + 2000)).status, 'exhausted');
+    }
+    assert.notEqual(await quota.alarmDue(), null, 'a durable refusal arms delivery');
+    await quota.runAlarm();
+    assert.equal(deliveries.length, 1);
+    assert.equal((await quota.retained()).alerts[0].sent_at, null, 'a non-2xx cannot acknowledge delivery');
+    assert.notEqual(await quota.alarmDue(), null, 'non-2xx keeps a retry scheduled');
+    const reopened = await restart();
+    await reopened.runAlarm();
+    const payload = { source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' };
+    assert.deepEqual(deliveries, [payload, payload]);
+    assert.equal((await reopened.retained()).alerts[0].sent_at, NOW);
+    await reopened.runAlarm();
+    assert.equal(deliveries.length, 2, 'already acknowledged alerts are not posted again');
+  }, { daily: '2', persist: true, alert(body) { deliveries.push(body); return deliveries.length === 1 ? 503 : 204; } });
+});
+
+test('missing alert binding preserves the undelivered alert and the quota refusal', () => withQuota(async quota => {
+  assert.equal((await quota.reserve(scope('missing-fill'), fence(), [0], [], NOW + 1000)).status, 'ok');
+  assert.deepEqual(await quota.reserve(scope('missing-refuse'), fence(), [0], [], NOW + 1000), { status: 'exhausted', resetAt: TODAY });
+  await quota.runAlarm();
+  assert.equal((await quota.retained()).alerts[0].sent_at, null);
+  assert.notEqual(await quota.alarmDue(), null);
+}, { daily: '2' }));
+
+test('pruning removes only old month charges and retains confirmed charges in this and the previous month', () => withQuota(async quota => {
+  for (const [name, clock] of [['old', '2026-10-10T16:00:00Z'], ['previous', '2026-11-10T16:00:00Z'], ['current', '2026-12-16T16:00:00Z']] as const) {
+    await quota.setTime(at(clock));
+    assert.equal((await quota.reserve(scope(name), fence(), [0], [], at(clock) + 1000)).status, 'ok');
+    assert.equal((await quota.confirm(scope(name), fence(), [0])).status, 'ok');
+  }
+  assert.deepEqual((await quota.retained()).charges.map(row => row.sendId), [scope('previous').sendId, scope('current').sendId]);
+  assert.deepEqual(await quota.confirm(scope('previous'), fence(), [0]), { status: 'stale' }, 'a retained charge cannot be confirmed after its fence ages out');
+}));
+
+test('pruning expires old provisional records but keeps live and recently expired ones', () => withQuota(async quota => {
+  const old = scope('expired-old');
+  const recent = scope('expired-recent');
+  const live = scope('provisional-live');
+  await quota.reserve(old, fence(), [0], [], NOW + 1000);
+  const now = NOW + 60 * 60_000 + 2000;
+  await quota.setTime(now - 2000);
+  await quota.reserve(recent, fence(), [0], [], now - 1000);
+  await quota.reserve(live, fence(), [0], [], now + 1000);
+  await quota.setTime(now);
+  assert.deepEqual(await quota.confirm(old, fence(), [0]), { status: 'stale' });
+  assert.deepEqual(new Set((await quota.retained()).charges.map(row => row.sendId)), new Set([live.sendId, recent.sendId]));
+  assert.equal((await quota.confirm(recent, fence(), [0])).status, 'ok');
+  assert.equal((await quota.confirm(live, fence(), [0])).status, 'ok');
+}));
+
+test('pruning drops alerts after two days but preserves a more recent refusal', () => withQuota(async quota => {
+  const start = at('2026-11-26T16:00:00Z');
+  const day = 24 * 60 * 60_000;
+  for (const [name, clock] of [['old-alert', start], ['new-alert', start + 2 * day]] as const) {
+    await quota.setTime(clock);
+    assert.equal((await quota.reserve(scope(name), fence(), [0, 1], [], clock + 1000)).status, 'exhausted');
+  }
+  await quota.setTime(start + 2 * day + 1);
+  await quota.release(scope('prune-alerts'), []);
+  assert.deepEqual((await quota.retained()).alerts.map(row => row.day), ['2026-11-28']);
+}, { daily: '2' }));
+
+test('pruning keeps fence rows observed again within 35 days', () => withQuota(async quota => {
+  const day = 24 * 60 * 60_000;
+  const old = scope('forget-fence');
+  const fresh = scope('refresh-fence');
+  for (const send of [old, fresh]) {
+    await quota.reserve(send, fence(2), [0], [], NOW + 1000);
+    await quota.release(send, [fence(1)]);
+  }
+  await quota.setTime(NOW + 34 * day);
+  assert.deepEqual(await quota.reserve(fresh, fence(1), [0], [], NOW + 34 * day + 1000), { status: 'stale' });
+  await quota.setTime(NOW + 36 * day);
+  await quota.release(scope('prune-fences'), []);
+  const retained = await quota.retained();
+  assert.deepEqual(retained.newest, [fresh.sendId]);
+  assert.deepEqual(retained.released, [fresh.sendId]);
+}));
+
+test('pruning uses a bounded page even when many fences age out at once', () => withQuota(async quota => {
+  const sends = Array.from({ length: 40 }, (_, i) => scope(`old-page-${i}`));
+  for (const send of sends) {
+    await quota.reserve(send, fence(2), [0], [], NOW + 1000);
+    await quota.release(send, [fence(1)]);
+  }
+  await quota.setTime(NOW + 36 * 24 * 60 * 60_000);
+  await quota.release(scope('run-one-page'), []);
+  const partial = await quota.retained();
+  assert.equal(partial.newest.length, 8, 'only 32 rows in the first newest-fence page');
+  assert.equal(partial.released.length, 8, 'only 32 rows in the first released-fence page');
+  await quota.release(scope('run-next-page'), []);
+  const remaining = await quota.retained();
+  assert.deepEqual(remaining.newest, []);
+  assert.deepEqual(remaining.released, []);
+}));
+
+test('rejects oversized or invalid input without touching quota state', async t => {
+  const s = scope('input');
+  const release = Array.from({ length: 65 }, (_, i) => fence(i + 2));
+  for (const [name, attempt] of [
+    ['reserve release list', (q: ReturnType<typeof stub>) => q.reserve(s, fence(), [0], release, NOW + 1000)],
+    ['release fence list', (q: ReturnType<typeof stub>) => q.release(s, release)],
+    ['invalid send id', (q: ReturnType<typeof stub>) => q.reserve({ ...s, sendId: 'not-a-send-id' }, fence(), [0], [], NOW + 1000)],
+    ['workspace length', (q: ReturnType<typeof stub>) => q.reserve({ ...s, workspaceId: 'w'.repeat(59) }, fence(), [0], [], NOW + 1000)],
+    ['mailbox length', (q: ReturnType<typeof stub>) => q.reserve({ ...s, mailboxId: 'm'.repeat(129) }, fence(), [0], [], NOW + 1000)],
+    ['expiry upper bound', (q: ReturnType<typeof stub>) => q.reserve(s, fence(), [0], [], NOW + 8 * 60_000 + 1)],
+  ] as const) await t.test(name, () => withQuota(async quota => {
+    await assert.rejects(attempt(quota), /Invalid send quota request/);
+    assert.deepEqual(await quota.retained(), { charges: [], newest: [], released: [], alerts: [] });
+  }));
+});
+
+test('moved charges compete for the new daily gate after 20 concurrent reservations', () => withQuota(async quota => {
+  const old = scope('old-provisional');
+  assert.equal((await quota.reserve(old, fence(), [0, 1, 2, 3, 4, 5, 6, 7], [], TODAY + 1000)).status, 'ok');
+  await quota.setTime(TODAY);
+  const answers = await Promise.all(Array.from({ length: 20 }, (_, i) => quota.reserve(scope(`after-reset-${i}`), fence(), [0], [], TODAY + 1000)));
+  assert.equal(answers.filter(result => result.status === 'ok').length, 8);
+  assert.deepEqual(await quota.confirm(old, fence(), [0, 1, 2, 3, 4, 5, 6, 7]), { status: 'exhausted', resetAt: DEC });
+  const chargedToday = (await quota.balances()).filter(row => row.day === '2026-11-30');
+  assert.equal(chargedToday.reduce((sum, row) => sum + row.charges, 0), 8);
+}));
+
+test('a release by fence cannot delete the same send id and fence from another mailbox', () => withQuota(async quota => {
+  const a = scope('collision', 'mailbox-a');
+  const b = scope('collision', 'mailbox-b');
+  for (const s of [a, b]) assert.equal((await quota.reserve(s, fence(), [0], [], NOW + 1000)).status, 'ok');
+  await quota.release(a, [fence()]);
+  assert.deepEqual((await quota.balances()).map(row => row.mb), ['mailbox-b']);
+  assert.equal((await quota.confirm(b, fence(), [0])).status, 'ok');
+}));

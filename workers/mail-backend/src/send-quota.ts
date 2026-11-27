@@ -1,14 +1,27 @@
 import { DurableObject } from 'cloudflare:workers';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
-import { fenceBefore, validFence, type QuotaAnswer, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
+import { mailAlert, type AlertBinding } from './alerts.ts';
+import { LEASE_MS, RELEASE_BATCH, sendClockSkewMs } from './mailbox-send-dispatch.ts';
+import { fenceBefore, sameFence, validFence, type QuotaAnswer, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
+import { validSendId } from './mailbox-send-store.ts';
+import { MailboxWork } from './mailbox-work.ts';
+import { RESERVATION_GRACE_MS } from './send-consumer.ts';
 
 export type SendQuotaConfig = {
   MAIL_SEND_DAILY_QUOTA?: string;
   MAIL_SEND_MONTHLY_CEILING?: string;
   MAIL_SEND_DAILY_RESET_UTC?: string;
+  MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
+  ALERTS?: AlertBinding;
 };
 
-const DAY_MS = 24 * 60 * 60_000;
+const HOUR_MS = 60 * 60_000;
+const DAY_MS = 24 * HOUR_MS;
+const FENCE_RETENTION_MS = 35 * DAY_MS;
+const ALERT_RETENTION_MS = 2 * DAY_MS;
+const ALERT_RETRY_MS = 60_000;
+const PRUNE_PAGE = 32;
+const ALERT_CODE = 'send_quota_gate_hit';
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS quota_charges (
   ws TEXT NOT NULL, mb TEXT NOT NULL, send_id TEXT NOT NULL,
@@ -18,20 +31,26 @@ CREATE TABLE IF NOT EXISTS quota_charges (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS quota_charges_by_day ON quota_charges (day, expires_at);
 CREATE INDEX IF NOT EXISTS quota_charges_by_month ON quota_charges (month, expires_at);
+CREATE INDEX IF NOT EXISTS quota_charges_by_expiry ON quota_charges (expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS quota_newest (
   ws TEXT NOT NULL, mb TEXT NOT NULL, send_id TEXT NOT NULL, recipient INTEGER NOT NULL,
-  epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+  epoch INTEGER NOT NULL, attempt INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
   PRIMARY KEY (ws, mb, send_id, recipient)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS quota_newest_by_seen ON quota_newest (last_seen_at);
 CREATE TABLE IF NOT EXISTS quota_released (
   ws TEXT NOT NULL, mb TEXT NOT NULL, send_id TEXT NOT NULL, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL,
   PRIMARY KEY (ws, mb, send_id, epoch, attempt)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS quota_gate_alerts (day TEXT PRIMARY KEY) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS quota_released_by_seen ON quota_released (last_seen_at);
+CREATE TABLE IF NOT EXISTS quota_gate_alerts (day TEXT PRIMARY KEY, created_at INTEGER NOT NULL, sent_at INTEGER) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS quota_alerts_by_age ON quota_gate_alerts (created_at);
+CREATE INDEX IF NOT EXISTS quota_alerts_pending ON quota_gate_alerts (created_at) WHERE sent_at IS NULL;
 `;
 
 type Charge = { day: string; month: string; expires_at: number | null };
-type Window = { day: string; dayEnd: number; month: string; monthEnd: number };
+type Window = { day: string; dayEnd: number; month: string; monthEnd: number; previousMonth: string };
 type Gate = 'daily' | 'monthly';
 const scopeKey = ({ workspaceId, mailboxId, sendId }: QuotaScope) => [workspaceId, mailboxId, sendId] as const;
 const attemptKey = (scope: QuotaScope, { epoch, attempt }: SendFence) => [...scopeKey(scope), epoch, attempt] as const;
@@ -45,8 +64,11 @@ function ceiling(value: string | undefined, min: number) {
 }
 
 function validate(scope: QuotaScope, fences: SendFence[], recipients?: number[]) {
-  if (!scopeKey(scope).every(v => typeof v === 'string' && v.length > 0) || !fences.every(validFence) ||
-      (recipients !== undefined && (!recipients.length || recipients.length > LIMITS.recipientsPerMessage ||
+  // A workspace ID must fit the mail bucket suffix; allow at most 128 characters for a mailbox ID.
+  if (!scope || typeof scope.workspaceId !== 'string' || !scope.workspaceId.length || scope.workspaceId.length > 58 ||
+      typeof scope.mailboxId !== 'string' || !scope.mailboxId.length || scope.mailboxId.length > 128 || !validSendId(scope.sendId) ||
+      !Array.isArray(fences) || fences.length > RELEASE_BATCH || !fences.every(validFence) ||
+      (recipients !== undefined && (!Array.isArray(recipients) || !recipients.length || recipients.length > LIMITS.recipientsPerMessage ||
         new Set(recipients).size !== recipients.length || recipients.some(i => !Number.isSafeInteger(i) || i < 0 || i >= LIMITS.recipientsPerMessage)))) {
     throw new Error('Invalid send quota request');
   }
@@ -56,6 +78,7 @@ function validate(scope: QuotaScope, fences: SendFence[], recipients?: number[])
 // charge writes share one synchronous transaction, including releases on a refusal.
 export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPort {
   private readonly sql: SqlStorage;
+  private readonly alertWork = new MailboxWork();
 
   constructor(ctx: DurableObjectState, env: SendQuotaConfig) {
     super(ctx, env);
@@ -64,6 +87,7 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
   }
 
   protected now() { return Date.now(); }
+  protected async armAlert(at: number) { await this.ctx.storage.setAlarm(at); }
 
   private window(now: number): Window {
     const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(this.env.MAIL_SEND_DAILY_RESET_UTC ?? '');
@@ -72,74 +96,123 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
     const start = Math.floor((now - offset) / DAY_MS) * DAY_MS;
     const date = new Date(start);
     const day = date.toISOString().slice(0, 10);
+    const year = date.getUTCFullYear(), month = date.getUTCMonth();
     // The calendar month belongs to the quota day's start: both roll at the
     // configured reset on the first, not at UTC midnight unless configured so.
-    return { day, dayEnd: start + offset + DAY_MS, month: day.slice(0, 7),
-      monthEnd: Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) + offset };
+    return { day, dayEnd: start + offset + DAY_MS, month: day.slice(0, 7), monthEnd: Date.UTC(year, month + 1, 1) + offset,
+      previousMonth: new Date(Date.UTC(year, month - 1, 1)).toISOString().slice(0, 7) };
   }
 
-  private drop(scope: QuotaScope, fence: SendFence) {
+  private drop(scope: QuotaScope, fence: SendFence, now: number) {
     const key = attemptKey(scope, fence);
     this.sql.exec('DELETE FROM quota_charges WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ?', ...key);
-    // Tombstone even a fence that never reserved: a delayed call must not
-    // recreate it after finish, regardless of the quota day.
-    this.sql.exec('INSERT OR IGNORE INTO quota_released VALUES (?, ?, ?, ?, ?)', ...key);
+    // Tombstone even a fence that never reserved, for much longer than an active lease.
+    this.sql.exec(`INSERT INTO quota_released VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (ws, mb, send_id, epoch, attempt) DO UPDATE SET last_seen_at = max(last_seen_at, excluded.last_seen_at)`, ...key, now);
   }
 
-  private stale(scope: QuotaScope, fence: SendFence, recipients: number[]) {
-    if (this.sql.exec('SELECT 1 FROM quota_released WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ?',
-      ...attemptKey(scope, fence)).toArray().length) return true;
-    return recipients.some(i => {
-      const newest = this.sql.exec<SendFence>('SELECT epoch, attempt FROM quota_newest WHERE ws = ? AND mb = ? AND send_id = ? AND recipient = ?',
-        ...scopeKey(scope), i).toArray()[0];
-      return newest !== undefined && fenceBefore(fence, newest);
-    });
+  private stale(scope: QuotaScope, fence: SendFence, recipients: number[], confirm: boolean, now: number) {
+    const released = this.sql.exec(`UPDATE quota_released SET last_seen_at = max(last_seen_at, ?)
+      WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ? RETURNING 1`, now, ...attemptKey(scope, fence)).toArray().length > 0;
+    let stale = released;
+    for (const i of recipients) {
+      const newest = this.sql.exec<SendFence>(`UPDATE quota_newest SET last_seen_at = max(last_seen_at, ?)
+        WHERE ws = ? AND mb = ? AND send_id = ? AND recipient = ? RETURNING epoch, attempt`, now, ...scopeKey(scope), i).toArray()[0];
+      // Confirm needs the exact newest fence, even after a retained charge's fence metadata has aged out.
+      if (confirm ? !sameFence(fence, newest) : newest && fenceBefore(fence, newest)) stale = true;
+    }
+    return stale;
   }
 
   private count(period: 'day' | 'month', key: string, now: number) {
-    // Use two indexed ranges so a churn of expired provisional charges does
-    // not make current admissions scan that history.
+    // Two indexed ranges avoid scanning expired provisional charges.
     return this.sql.exec<{ n: number }>(`SELECT
       (SELECT count(*) FROM quota_charges WHERE ${period} = ? AND expires_at IS NULL) +
       (SELECT count(*) FROM quota_charges WHERE ${period} = ? AND expires_at > ?) AS n`, key, key, now).one().n;
   }
 
-  private admit(scope: QuotaScope, fence: SendFence, recipients: number[], release: SendFence[], expiresAt: number | null): QuotaAnswer {
-    validate(scope, [fence, ...release], recipients);
-    if (expiresAt !== null && !Number.isSafeInteger(expiresAt)) throw new Error('Invalid send quota request');
-    const daily = Math.floor(ceiling(this.env.MAIL_SEND_DAILY_QUOTA, 1) * 0.8);
-    const monthly = ceiling(this.env.MAIL_SEND_MONTHLY_CEILING, 0);
+  private pruneAlerts(now: number) {
+    this.sql.exec(`DELETE FROM quota_gate_alerts WHERE day IN (SELECT day FROM quota_gate_alerts
+      WHERE created_at < ? ORDER BY created_at LIMIT ?)`, now - ALERT_RETENTION_MS, PRUNE_PAGE);
+  }
+
+  private prune(now: number, previousMonth?: string) {
+    const chargeKey = 'ws, mb, send_id, epoch, attempt, recipient';
+    if (previousMonth !== undefined) this.sql.exec(`DELETE FROM quota_charges WHERE (${chargeKey}) IN (SELECT ${chargeKey} FROM quota_charges
+      WHERE month < ? ORDER BY month LIMIT ?)`, previousMonth, PRUNE_PAGE);
+    this.sql.exec(`DELETE FROM quota_charges WHERE (${chargeKey}) IN (SELECT ${chargeKey} FROM quota_charges
+      WHERE expires_at < ? ORDER BY expires_at LIMIT ?)`, now - HOUR_MS, PRUNE_PAGE);
+    const cutoff = now - FENCE_RETENTION_MS;
+    this.sql.exec(`DELETE FROM quota_newest WHERE (ws, mb, send_id, recipient) IN (SELECT ws, mb, send_id, recipient FROM quota_newest
+      WHERE last_seen_at < ? ORDER BY last_seen_at LIMIT ?)`, cutoff, PRUNE_PAGE);
+    this.sql.exec(`DELETE FROM quota_released WHERE (ws, mb, send_id, epoch, attempt) IN (SELECT ws, mb, send_id, epoch, attempt FROM quota_released
+      WHERE last_seen_at < ? ORDER BY last_seen_at LIMIT ?)`, cutoff, PRUNE_PAGE);
+    this.pruneAlerts(now);
+  }
+
+  private async queueAlert(day: string, gate: Gate, now: number) {
+    await this.alertWork.run(async () => {
+      if (this.sql.exec('SELECT 1 FROM quota_gate_alerts WHERE day = ?', day).toArray().length) return;
+      // Arm before the insert so a durable alert cannot be stranded without a wake-up.
+      // The alarm uses the same work lane for its read, not for the network call.
+      await this.armAlert(now + 1000);
+      this.sql.exec('INSERT INTO quota_gate_alerts (day, created_at) VALUES (?, ?)', day, now);
+      console.error({ code: ALERT_CODE, gate });
+    });
+  }
+
+  async alarm() {
     const now = this.now();
-    const { day, dayEnd, month, monthEnd } = this.window(now);
+    const pending = await this.alertWork.run(async () => {
+      this.pruneAlerts(now);
+      const rows = this.sql.exec<{ day: string }>(`SELECT day FROM quota_gate_alerts
+        WHERE sent_at IS NULL ORDER BY created_at LIMIT ?`, PRUNE_PAGE).toArray();
+      if (rows.length) await this.armAlert(now + ALERT_RETRY_MS);
+      return rows;
+    });
+    const deliver = mailAlert(this.env.ALERTS);
+    for (const { day } of pending) {
+      try { await deliver({ code: ALERT_CODE, key: `send_quota_gate:${day}` }); }
+      catch { continue; } // Missing binding or non-2xx: never acknowledge, retry on the next alarm.
+      this.sql.exec('UPDATE quota_gate_alerts SET sent_at = ? WHERE day = ? AND sent_at IS NULL', this.now(), day);
+    }
+  }
+
+  private async admit(scope: QuotaScope, fence: SendFence, recipients: number[], release: SendFence[], expiresAt: number | null): Promise<QuotaAnswer> {
+    validate(scope, release, recipients);
+    if (!validFence(fence)) throw new Error('Invalid send quota request');
+    const now = this.now();
+    if (expiresAt !== null && expiresAt > now + LEASE_MS + RESERVATION_GRACE_MS + 2 * sendClockSkewMs(this.env.MAIL_SEND_CLOCK_SKEW_SECONDS)) {
+      throw new Error('Invalid send quota request');
+    }
+    const dailyQuota = ceiling(this.env.MAIL_SEND_DAILY_QUOTA, 1);
+    const daily = dailyQuota - Math.ceil(dailyQuota / 5);
+    const monthly = ceiling(this.env.MAIL_SEND_MONTHLY_CEILING, 0);
+    const { day, dayEnd, month, monthEnd, previousMonth } = this.window(now);
     const key = attemptKey(scope, fence);
-    let alert: { code: 'send_quota_gate_hit'; gate: Gate; resetAt: number } | undefined;
+    const confirm = expiresAt === null;
+    let refusedGate: Gate | undefined;
     const answer = this.ctx.storage.transactionSync((): QuotaAnswer => {
-      for (const entry of release) this.drop(scope, entry);
-      if (this.stale(scope, fence, recipients) || (expiresAt !== null && expiresAt <= now)) return { status: 'stale' };
+      this.prune(now, previousMonth);
+      for (const entry of release) this.drop(scope, entry, now);
+      if ((!confirm && expiresAt <= now) || this.stale(scope, fence, recipients, confirm, now)) return { status: 'stale' };
       const rows = recipients.map(i => this.sql.exec<Charge>(`SELECT day, month, expires_at FROM quota_charges
         WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ? AND recipient = ?`, ...key, i).toArray()[0]);
-      // An expired row still proves this fence reserved. A direct confirmation
-      // without a successful reserve (including a refused reserve) is stale.
-      if (expiresAt === null && rows.some(row => row === undefined)) return { status: 'stale' };
-      if (expiresAt !== null) {
+      // A recent expired row can be re-admitted, but neither a missing row nor a refused reserve can be confirmed.
+      if (confirm && rows.some(row => row === undefined || (row.expires_at !== null && row.expires_at < now - HOUR_MS))) return { status: 'stale' };
+      if (!confirm) {
         for (const i of recipients) {
           // A refused claim still fences off older calls for these recipients.
-          this.sql.exec(`INSERT INTO quota_newest VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT (ws, mb, send_id, recipient) DO UPDATE SET epoch = excluded.epoch, attempt = excluded.attempt`,
-            ...scopeKey(scope), i, fence.epoch, fence.attempt);
+          this.sql.exec(`INSERT INTO quota_newest VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (ws, mb, send_id, recipient) DO UPDATE SET epoch = excluded.epoch, attempt = excluded.attempt,
+              last_seen_at = max(last_seen_at, excluded.last_seen_at)`, ...scopeKey(scope), i, fence.epoch, fence.attempt, now);
         }
       }
       const addDay = rows.filter(row => !(active(row, now) && row.day === day)).length;
       const addMonth = rows.filter(row => !(active(row, now) && row.month === month)).length;
-      const gate = addDay && this.count('day', day, now) + addDay > daily ? 'daily'
-        : addMonth && this.count('month', month, now) + addMonth > monthly ? 'monthly' : null;
-      if (gate !== null) {
-        const resetAt = gate === 'daily' ? dayEnd : monthEnd;
-        if (this.sql.exec('INSERT OR IGNORE INTO quota_gate_alerts VALUES (?) RETURNING day', day).toArray().length) {
-          alert = { code: 'send_quota_gate_hit', gate, resetAt };
-        }
-        return { status: 'exhausted', resetAt };
-      }
+      if (addMonth && this.count('month', month, now) + addMonth > monthly) refusedGate = 'monthly';
+      else if (addDay && this.count('day', day, now) + addDay > daily) refusedGate = 'daily';
+      if (refusedGate) return { status: 'exhausted', resetAt: refusedGate === 'monthly' ? monthEnd : dayEnd };
       for (const [index, i] of recipients.entries()) {
         // Once confirmed, a repeated reserve cannot make the charge provisional.
         const expiry = rows[index]?.expires_at === null ? null : expiresAt;
@@ -149,11 +222,12 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
       }
       return { status: 'ok', day, dayEnd };
     });
-    if (alert) console.warn(alert);
+    if (refusedGate) await this.queueAlert(day, refusedGate, now);
     return answer;
   }
 
   async reserve(scope: QuotaScope, fence: SendFence, recipients: number[], release: SendFence[], expiresAt: number): Promise<QuotaAnswer> {
+    if (!Number.isSafeInteger(expiresAt)) throw new Error('Invalid send quota request');
     return this.admit(scope, fence, recipients, release, expiresAt);
   }
 
@@ -163,7 +237,12 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
 
   async release(scope: QuotaScope, fences: SendFence[]): Promise<void> {
     validate(scope, fences);
-    this.ctx.storage.transactionSync(() => { for (const fence of fences) this.drop(scope, fence); });
+    const now = this.now();
+    this.ctx.storage.transactionSync(() => {
+      // A reset misconfiguration cannot block release or time-based pruning.
+      this.prune(now);
+      for (const fence of fences) this.drop(scope, fence, now);
+    });
   }
 
   async resetAt(): Promise<number> { return this.window(this.now()).dayEnd; }

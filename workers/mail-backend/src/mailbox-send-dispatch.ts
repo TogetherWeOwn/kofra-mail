@@ -27,6 +27,12 @@ import type {
 export const LEASE_MS = 5 * 60_000;
 // The default bound on clock differences between the objects of the send path (configuration).
 export const CLOCK_SKEW_MS = 30_000;
+export function sendClockSkewMs(configured?: string): number {
+  if (configured === undefined || configured === '') return CLOCK_SKEW_MS;
+  const seconds = Number(configured);
+  if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) throw new Error('Invalid send clock skew');
+  return seconds * 1000;
+}
 // What one authorization grants: a `send()` call must start within it.
 export const DISPATCH_WINDOW_MS = 10_000;
 // Provider-reported ambiguous errors that end a send's remaining external recipients.

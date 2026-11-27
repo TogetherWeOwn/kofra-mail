@@ -10,6 +10,19 @@ export function quotaFixture<Env extends QuotaFixtureEnv>(clock: (env: Env) => n
     constructor(ctx: DurableObjectState, private readonly fixtureEnv: Env) { super(ctx, fixtureEnv); }
     protected override now() { return this.clockOverride ?? clock(this.fixtureEnv); }
     setTime(now: number) { this.clockOverride = now; }
+    private alarmAt: number | null = null;
+    protected override async armAlert(at: number) { this.alarmAt = at; }
+    alarmDue() { return this.alarmAt; }
+    async runAlarm() { this.alarmAt = null; await super.alarm(); }
+    retained() {
+      const sql = this.ctx.storage.sql;
+      return {
+        charges: sql.exec('SELECT send_id AS sendId, day, expires_at FROM quota_charges ORDER BY day, send_id').toArray(),
+        newest: sql.exec<{ sendId: string }>('SELECT DISTINCT send_id AS sendId FROM quota_newest').toArray().map(r => r.sendId),
+        released: sql.exec<{ sendId: string }>('SELECT DISTINCT send_id AS sendId FROM quota_released').toArray().map(r => r.sendId),
+        alerts: sql.exec('SELECT * FROM quota_gate_alerts ORDER BY day').toArray(),
+      };
+    }
     failNext(method: string, times = 1) { this.failures.set(method, times); }
     private fail(method: string) {
       const count = this.failures.get(method) ?? 0;

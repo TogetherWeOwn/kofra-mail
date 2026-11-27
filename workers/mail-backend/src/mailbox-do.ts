@@ -27,7 +27,7 @@ import { markSendHeld, SendApi, sendDrive, sendRequestFor, type SendCommit, type
 import { SEND_DRIVE, UnpublishedSend, unpublishedProgress, validSendId } from './mailbox-send-store.ts';
 import { SendStalls } from './mailbox-send-stalls.ts';
 import {
-  CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
+  SendDispatcher, sendClockSkewMs, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
 import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
@@ -176,15 +176,6 @@ export class Mailbox extends DurableObject<Env> {
     return SEND_QUOTA && accountSendQuota(SEND_QUOTA);
   }
 
-  // clockSkew (section 2.4, step 5) is configuration, used only on the mailbox side.
-  private clockSkewMs(): number {
-    const configured = this.env.MAIL_SEND_CLOCK_SKEW_SECONDS;
-    if (configured === undefined || configured === '') return CLOCK_SKEW_MS;
-    const seconds = Number(configured);
-    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) throw new Error('Invalid send clock skew');
-    return seconds * 1000;
-  }
-
   private sendDispatcher(): SendDispatcher {
     return new SendDispatcher({
       sql: this.ctx.storage.sql,
@@ -222,7 +213,7 @@ export class Mailbox extends DurableObject<Env> {
         };
         return sendRequestFor(sources, this.sendMime, record, recipients);
       },
-      clockSkewMs: this.clockSkewMs(),
+      clockSkewMs: sendClockSkewMs(this.env.MAIL_SEND_CLOCK_SKEW_SECONDS),
       now: () => this.mailApiNow(),
       sending: this.env.MAIL_SEND_ENABLED === 'on',
     });

@@ -1406,7 +1406,7 @@ test('a real quota refusal still releases the listed fences; they stay listed un
   assert.equal(await balanceOf(h, a.fence), 2, 'a live, listed charge');
   await h.advance(2 * minute);
   // The old charges are still live but belong to yesterday; one of today's two slots is taken.
-  const filler = { ...scope('filler'), mailboxId: 'mailbox-b' };
+  const filler = { ...scope('01ARZ3NDEKTSV4RRFFQ69G5FAV'), mailboxId: 'mailbox-b' };
   const fillerFence = { epoch: 1, attempt: 1 };
   assert.equal((await h.quota<QuotaAnswer>('reserve', filler, fillerFence, [0], [], await h.sends.now() + minute)).status, 'ok');
   const b = await h.sendRpc<ClaimAnswer>('claimSend', id);
