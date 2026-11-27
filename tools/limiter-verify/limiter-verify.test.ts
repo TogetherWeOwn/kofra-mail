@@ -371,10 +371,44 @@ test('HTTP check fails an attempt whose requests hang past its deadline', async 
   assert.ok(Date.now() - started < 5_000);
 });
 
+test('probe client fails a negative or malformed count at once, with no retry', async () => {
+  for (const body of ['{"allowed":-1,"refused":true}', '{"allowed":"1","refused":true}', 'not json']) {
+    let calls = 0;
+    const waits: number[] = [];
+    const result = await checkProbe('https://probe.example.test', probeSecret, async () => {
+      calls++;
+      return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+    }, async (ms) => { waits.push(ms); });
+    assert.deepEqual(result, verdicts(...bucketNames), body);
+    assert.equal(calls, bucketNames.length, body);
+    assert.deepEqual(waits, [], body);
+  }
+});
+
+test('HTTP check retries when the only admissions share the refusal\'s parallel batch', async () => {
+  const { period } = EXPECTED_BUCKETS.reads;
+  let calls = 0;
+  let retried = false;
+  const waits: number[] = [];
+  const result = await checkHttp('https://mail.example.test', ['reads'], session, async () => {
+    const index = calls++;
+    // First attempt: a saturated window refuses four, then a reset admits four, all in batch one.
+    // Retry: admissions, then a refusal at request 11.
+    const refuse = retried ? index === 8 + 10 : index < 4;
+    if (refuse) {
+      return Response.json({ code: 'rate_limited', retryAfterSeconds: period }, { status: 429, headers: { 'retry-after': String(period) } });
+    }
+    return new Response(null, { status: 404 });
+  }, async (ms) => { waits.push(ms); retried = true; });
+  assert.deepEqual(result, [{ bucket: 'reads', pass: true }]);
+  assert.deepEqual(waits, [(period + 1) * 1000]);
+});
+
 test('the refusal band is one admission up to 150% of the limit rounded down', () => {
   assert.deepEqual(refusalBand(EXPECTED_BUCKETS.writes.limit), { min: 1, max: 180 });
   assert.deepEqual(refusalBand(EXPECTED_BUCKETS.uploads.limit), { min: 1, max: 96 });
   assert.deepEqual(refusalBand(EXPECTED_BUCKETS.undo.limit), { min: 1, max: 15 });
+  assert.deepEqual(refusalBand(7), { min: 1, max: 10 });
 });
 
 const routes: [Bucket, string, RegExp, number][] = [

@@ -89,10 +89,13 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
           sent += batch.length;
           if (batch.some((result) => result.status === 'rejected' || result.value === 'bad')) return 'fail';
           const values = batch.map((result) => (result as PromiseFulfilledResult<'admitted' | 'refused'>).value);
-          // Inside a parallel batch the limiter's order is unknown, so every
-          // admission in the refusal's batch counts towards the band.
+          // Inside a parallel batch the limiter's order is unknown, so the
+          // admission that must precede the refusal has to come from an earlier
+          // batch; an admission only inside the refusal's batch is ambiguous and
+          // retried. Every admission in that batch still counts towards the cap.
+          const before = admitted;
           admitted += values.filter((value) => value === 'admitted').length;
-          if (values.includes('refused')) return admitted < min || admitted > max ? 'late' : 'pass';
+          if (values.includes('refused')) return before < min || admitted > max ? 'late' : 'pass';
         }
         return 'late';
       };

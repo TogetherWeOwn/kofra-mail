@@ -28,7 +28,7 @@ export async function checkProbe(baseUrl: string | undefined, secret: string | u
         });
         if (response.status !== 200) { await response.body?.cancel(); return 'fail'; }
         const result: unknown = await response.json();
-        if (!isRecord(result) || !Number.isInteger(result.allowed) || typeof result.refused !== 'boolean') return 'fail';
+        if (!isRecord(result) || !Number.isInteger(result.allowed) || (result.allowed as number) < 0 || typeof result.refused !== 'boolean') return 'fail';
         const allowed = result.allowed as number;
         if (!result.refused || allowed > max) return 'late';
         return allowed < min ? 'late' : 'pass';
