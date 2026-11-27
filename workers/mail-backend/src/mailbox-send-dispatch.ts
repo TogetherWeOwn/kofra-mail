@@ -45,6 +45,8 @@ export const NOTICE_BACKOFF_MAX_MS = 60 * 60_000;
 const STORED_PAGE = 16;
 // Failed attempts (about 4 hours of backoff) after which an applicable stored row raises an alert.
 export const STUCK_FAILURES = 8;
+// How long a poll that took a flagged row's recheck keeps it from other polls.
+export const RECHECK_LEASE_MS = 5 * 60_000;
 // A gate's reset is at most this far ahead (a monthly gate resets within a month).
 export const GATE_RESET_MAX_MS = 32 * 24 * 60 * 60_000;
 // Release-list fences a claim hands out, a Mark removes and a quota call releases at once.
@@ -102,6 +104,8 @@ export type DispatchPorts = {
   afterClaimRelease?(): Promise<void>;
   // A test seam right after a stored result's row is deleted.
   afterResultDelete?(): Promise<void>;
+  // A test seam right after a poll selected its stored rows.
+  afterStoredSelect?(): Promise<void>;
   publishThrough(seq: number): Promise<boolean>;
   // Moves the journal lane to the settings recovery point, so every commit is published soon.
   journalDue(timers: TimerTable): void;
@@ -810,6 +814,7 @@ export class SendDispatcher {
         ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE)
         .all<StoredRow>()).results;
       results = [...flagged, ...due];
+      await ports.afterStoredSelect?.();
     }
     // Whether a row that can apply is left, and when the earliest is due: one page is never taken for all of them.
     // A flagged row from an older epoch counts until it is evaluated in this epoch: due at once before its
@@ -848,10 +853,14 @@ export class SendDispatcher {
     let recorded = 0;
     let backoff: number | null = null;
     for (const [at, row] of results.entries()) {
-      // A flagged row's immediate recheck in this epoch is taken once: a concurrent or repeated poll skips it.
-      if (row.unapplied && epoch !== null && (row.rechecked === null || row.rechecked < epoch)) {
-        const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ? WHERE ${where} AND unapplied = 1
-          AND (rechecked_epoch IS NULL OR rechecked_epoch < ?) RETURNING 1`).bind(epoch, ...keys(row), epoch).first();
+      // A flagged row's recheck is taken by one poll: the same conditional update marks this epoch's
+      // immediate recheck as used and moves notify_after one lease ahead, so a concurrent or repeated
+      // poll skips the row, and a crash leaves it retryable once the lease runs out.
+      if (row.unapplied && epoch !== null) {
+        const now = ports.now();
+        const taken = await db.prepare(`UPDATE send_results SET rechecked_epoch = ?, notify_after = ? WHERE ${where} AND unapplied = 1
+          AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR notify_after <= ?) RETURNING 1`)
+          .bind(epoch, now + RECHECK_LEASE_MS, ...keys(row), epoch, now).first();
         if (!taken) continue;
       }
       let answer: ReportAnswer['status'] | 'error';

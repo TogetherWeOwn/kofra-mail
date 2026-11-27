@@ -1248,3 +1248,56 @@ test('a stored result due before the send\'s next wait brings the drive row back
   await h.advance(0);
   assert.deepEqual((await h.sendState(id)).drive, [due]);
 }));
+
+// A flagged acceptance for a marked fence, then a restore: the row is due for its one recheck.
+async function flaggedAfterRestore(h: Fixture, id: string) {
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.failRecordOnce(a.claim.fence.attempt, 5);
+  await h.restore();
+  // Due for its recheck by both the epoch and notify_after.
+  await h.directoryChange('UPDATE send_results SET notify_after = 0, rechecked_epoch = NULL WHERE send_id = ?', id);
+  const [row] = await h.directoryRows('SELECT notify_failures FROM send_results WHERE send_id = ?', id);
+  return { a, failures: Number(row.notify_failures) };
+}
+
+test('two concurrent polls make one recheck attempt: the second runs while the first waits at its record', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'recheck-concurrent');
+  const { a, failures } = await flaggedAfterRestore(h, id);
+  await h.pauseAt(`record:${a.claim.fence.attempt}`);
+  const first = h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.pausedAt(`record:${a.claim.fence.attempt}`);
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.resumeAt(`record:${a.claim.fence.attempt}`);
+  await first;
+  const [row] = await h.directoryRows('SELECT notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.equal(row.notify_failures, failures + 1, 'one attempt');
+}));
+
+test('two concurrent polls make one recheck attempt: both selected the row before either took it', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'recheck-race');
+  const { failures } = await flaggedAfterRestore(h, id);
+  await h.pauseAt('select');
+  const first = h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.pausedAt('select');
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.resumeAt('select');
+  await first;
+  const [row] = await h.directoryRows('SELECT notify_failures FROM send_results WHERE send_id = ?', id);
+  assert.equal(row.notify_failures, failures + 1, 'one attempt');
+}));
+
+test('a rechecked older-epoch flagged row still holds a reclaim until its notify_after', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'reclaim-hold');
+  const a = await attempt(h, id, { stop: 'mark' });
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'stored' });
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.restore();
+  await h.failRecordOnce(a.claim.fence.attempt, 1);
+  await h.sendRpc<StoredAnswer>('recordStoredResults', id);
+  await h.failRecordOnce(a.claim.fence.attempt, 2);
+  await h.advance(LEASE + SKEW);
+  assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'not_now', reason: 'results' });
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['attempting']);
+}));

@@ -113,7 +113,22 @@ export class HttpMailbox extends Mailbox {
   private failRecordAttempt?: number;
   private failRecordTimes = 0;
   failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
+  // Holds the next record of one fence attempt, or the next poll right after its select, until resumed.
+  private gates = new Map<string, { taken: boolean; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> }>();
+  pauseAt(point: string) { this.gates.set(point, { taken: false, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }); }
+  async pausedAt(point: string) { await this.gates.get(point)!.reached.promise; }
+  resumeAt(point: string) { const gate = this.gates.get(point); this.gates.delete(point); gate?.resume.resolve(); }
+  // Only the first pass through an armed seam waits.
+  private async gate(point: string) {
+    const gate = this.gates.get(point);
+    if (!gate || gate.taken) return;
+    gate.taken = true;
+    gate.reached.resolve();
+    await gate.resume.promise;
+  }
+  protected override async sendStoredSelectCheckpoint() { await this.gate('select'); }
   protected override async sendRecordCheckpoint(fence: { attempt: number }) {
+    await this.gate(`record:${fence.attempt}`);
     if (fence.attempt !== this.failRecordAttempt || this.failRecordTimes <= 0) return;
     this.failRecordTimes--;
     throw new Error('Fixture record failure');
@@ -839,6 +854,9 @@ export default {
           }
           case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
           case '/__fixture/crash-after-result-delete': await box.crashAfterResultDelete(); break;
+          case '/__fixture/pause-at': await box.pauseAt(await req.text()); break;
+          case '/__fixture/paused-at': await box.pausedAt(await req.text()); break;
+          case '/__fixture/resume-at': await box.resumeAt(await req.text()); break;
           case '/__fixture/quota': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();
             const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
