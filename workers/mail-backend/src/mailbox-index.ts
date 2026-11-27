@@ -429,25 +429,47 @@ export class MailboxIndex {
       const counts = { holder_rehold: 0, holder_released: 0, holder_lost_unreferenced: 0 };
       for (const [i, { seq, key, holder }] of rows.entries()) {
         const answer = answers[i];
-        // Recovery must not write an event into the restored journal history.
+        // Recovery must not write an event into the restored journal history,
+        // but release must never read a lost source: mark it unusable in local
+        // state now, without the event or the alert. After ready, the live
+        // confirmation of this row journals the loss and raises the alert.
         if (answer === 'lost' && restoring) {
           this.sql.exec(`UPDATE mailbox_pending_confirmations SET lost_at = ?
             WHERE seq = ? AND object_key = ? AND holder = ? AND lost_at IS NULL`, Date.now(), seq, key, holder);
+          const source = this.lostSource(key, holder);
+          if (source) {
+            const table = source.kind === 'draft' ? 'drafts' : source.kind === 'send' ? 'mailbox_sends' : 'mailbox_api_uploads';
+            this.sql.exec(`INSERT OR IGNORE INTO mailbox_unusable_sources(kind, id, holder)
+              SELECT ?, id, holder FROM ${table} WHERE id = ? AND holder = ?`, source.kind, source.id, holder);
+          }
           continue;
         }
-        const removed = this.sql.exec(`DELETE FROM mailbox_pending_confirmations
-          WHERE seq = ? AND object_key = ? AND holder = ?`, seq, key, holder).rowsWritten;
-        if (removed !== 1) continue;
+        const removed = this.sql.exec<{ lostAt: number | null }>(`DELETE FROM mailbox_pending_confirmations
+          WHERE seq = ? AND object_key = ? AND holder = ? RETURNING lost_at AS lostAt`, seq, key, holder).toArray();
+        if (removed.length !== 1) continue;
         if (answer === 'rehold') counts.holder_rehold++;
         else if (answer === 'released') counts.holder_released++;
-        else if (answer === 'lost' && !this.markLostSource(key, holder)) counts.holder_lost_unreferenced++;
+        // A loss a restore marked only locally is journalled now.
+        else if (answer === 'lost' && !this.markLostSource(key, holder, removed[0].lostAt !== null)) counts.holder_lost_unreferenced++;
       }
       return counts;
     });
     for (const [code, total] of Object.entries(metrics)) if (total) console.info({ code, count: total });
   }
 
-  private markLostSource(key: string, holder: string): boolean {
+  private markLostSource(key: string, holder: string, restoreMarked = false): boolean {
+    const source = this.lostSource(key, holder);
+    if (!source) return false;
+    if (restoreMarked || !this.unusable(source.kind, source.id, holder)) this.commitEvents([{ type: 'api_source_lost', ...source, holder }]);
+    return true;
+  }
+
+  private unusable(kind: 'upload' | 'draft' | 'send', id: string, holder: string): boolean {
+    return this.sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ? AND holder = ?', kind, id, holder).toArray().length > 0;
+  }
+
+  // The upload, draft or unfinished send that a lost object and holder belong to.
+  private lostSource(key: string, holder: string): { kind: 'upload' | 'draft' | 'send'; id: string } | undefined {
     const upload = this.sql.exec<{ id: string }>('SELECT id FROM mailbox_api_uploads WHERE holder = ? AND object_key = ?', holder, key).toArray().at(0);
     const draft = !upload && this.sql.exec<{ id: string }>(`SELECT d.id FROM drafts d WHERE d.holder = ? AND
       (d.raw_key = ? OR EXISTS (SELECT 1 FROM mailbox_api_draft_objects a WHERE a.draft_id = d.id AND a.object_key = ?))`, holder, key, key).toArray()[0];
@@ -458,12 +480,8 @@ export class MailboxIndex {
       AND (json_extract(s.record, '$.draft.rawKey') = ? OR EXISTS (SELECT 1 FROM json_each(s.record, '$.attachmentKeys') k WHERE k.value = ?))`,
     holder, key, key).toArray()[0];
     const id = upload?.id ?? (draft ? draft.id : send ? send.id : undefined);
-    if (!id) return false;
-    const kind = upload ? 'upload' : draft ? 'draft' : 'send';
-    if (!this.sql.exec('SELECT 1 FROM mailbox_unusable_sources WHERE kind = ? AND id = ? AND holder = ?', kind, id, holder).toArray().length) {
-      this.commitEvents([{ type: 'api_source_lost', kind, id, holder }]);
-    }
-    return true;
+    if (!id) return undefined;
+    return { kind: upload ? 'upload' : draft ? 'draft' : 'send', id };
   }
 
   private deferDraftRelease(id: string): void {

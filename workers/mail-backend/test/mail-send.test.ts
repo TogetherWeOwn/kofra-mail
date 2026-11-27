@@ -1438,3 +1438,31 @@ test('the frozen builder version owns the cleaning: the MIME port gets the store
   assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
   assert.doesNotMatch(text, /^In-Reply-To:/m);
 }));
+
+test('a lost answer during a restore marks the send\'s source unusable at once: release fails it with delivery_error without reading the object',
+  () => withSend(async (h, mail, from) => {
+    await h.confirmFailure(true);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    await h.advance(minute);
+    const [confirmation] = await h.confirmations();
+    assert.ok(confirmation.holder.startsWith('draft:'));
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    // The sweeper retired the revision's generation: its object is gone and confirm answers lost.
+    h.objects.delete(objectPath(confirmation.object_key));
+    await h.sends.forceLost(confirmation.holder);
+    await h.forceSnapshot();
+    // The restore's confirmation pass gets the lost answer; afterwards no live confirmation can run before release.
+    await h.confirmFailure(false);
+    await h.restore();
+    await h.confirmFailure(true);
+    assert.equal((await mail.getSend(pending.id)).state, 'pending');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.deepEqual(await h.sends.queue(), []);
+    // The live confirmation then journals the loss and raises the alert.
+    await h.confirmFailure(false);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+  }));

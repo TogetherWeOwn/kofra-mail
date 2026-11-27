@@ -705,10 +705,12 @@ test('a lost generation does not block restore and is journalled as unusable onl
   await h.sweepAt(holder.expires_at + RETENTION_MS + 24 * 60 * 60_000);
   assert.deepEqual(await h.holderDetails(objectKey), []);
   await h.confirmFailure(false);
+  // The restore marks the source unusable locally, which raises the alert once
+  // ready; keep it undelivered so the deletion below meets a pending alert.
+  await h.alertFailure(true);
   await h.restore();
   assert.equal((await h.confirmations()).length, 1);
   assert.equal(await h.eventCount('api_source_lost'), 0);
-  await h.alertFailure(true);
   await h.advance(60_000);
   assert.deepEqual(await h.confirmations(), []);
   assert.equal(await h.eventCount('api_source_lost'), 1);
