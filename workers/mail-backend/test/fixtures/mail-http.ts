@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response as LocalResponse, type Request as LocalRequest, type WorkerOptions } from 'miniflare';
@@ -7,7 +6,7 @@ import { createHttpMailService } from '../../../../contracts/mail-api/src/http-c
 import type { Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
 import { isSafeMessageId } from '../../../../contracts/mail-api/src/headers.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
-import { migrateDirectory } from './directory-db.ts';
+import { directoryMigrationBatches } from './directory-db.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
 
 const entry = fileURLToPath(new NodeURL('./mail-http-worker.ts', import.meta.url));
@@ -188,21 +187,6 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     const origin = ready.origin;
     const contentOrigin = realContent?.contentOrigin ?? `http://localhost:${ready.port}`;
     const contentWorker = realContent && await mf.getWorker('mail-content');
-    const db = await mf.getD1Database('DIRECTORY', 'mail-backend') as unknown as D1Database;
-    await migrateDirectory(db);
-    const sql = await readFile(new NodeURL('../../migrations/0008_local_mail_api.sql', import.meta.url), 'utf8');
-    await db.batch(sql.split(/;\s*\n(?=\s*(?:CREATE |--|$))/).filter((s) => s.trim()).map((s) => db.prepare(s)));
-    await db.batch(['w1:example.com', 'w2:example.net'].map((row) => {
-      const [ws, domain] = row.split(':');
-      return db.prepare("INSERT INTO domains VALUES (?, ?, ?, 'primary', NULL, 'active', 'active')").bind(ws, ws, domain);
-    }));
-    for (const principal of Object.values(accounts).filter((a) => a.mailboxId && !a.stale)) {
-      await db.batch([
-        db.prepare('INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES (?, ?, ?, ?)').bind(principal.mailboxId, principal.ws, principal.userId, principal.address),
-        db.prepare('INSERT INTO mailbox_profiles VALUES (?, ?, ?)').bind(principal.ws, principal.mailboxId, principal.name),
-        db.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'primary', 'active')").bind(principal.address, principal.ws, principal.mailboxId),
-      ]);
-    }
     const call = (name: string, body: string, extra: Record<string, string> = {}) => fetch(`${origin}/__fixture/${name}`, {
       method: 'POST', headers: { 'x-fixture-control': control, ...extra }, body,
     });
@@ -223,6 +207,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       const res = await call(path, body);
       assert.equal(res.status, 204, res.status === 204 ? undefined : await res.text());
     };
+    // Wait for native D1 setup in the fixture worker rather than going through
+    // Miniflare's synchronous Node binding proxy for each prepared statement.
+    await controlAction('seed-directory', JSON.stringify(await directoryMigrationBatches({ localApi: true })));
+    const directoryChange = (statement: string, ...binds: unknown[]) => controlAction('directory-change', JSON.stringify({ statement, binds }));
+    const directoryRows = (statement: string, ...binds: unknown[]) => readControl<Record<string, unknown>[]>('directory-rows', JSON.stringify({ statement, binds }));
     const hasIdempotency = (key: string) => readControl<boolean>('has-idempotency', key);
     const confirmations = () => readControl<{ seq: number; object_key: string; holder: string }[]>('confirmations');
     const holderDetails = (key: string) => readControl<{ holder: string; state: string; expires_at: number | null }[]>('holder-details', key);
@@ -271,7 +260,6 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       activateAlias: (address: string) => controlAction('activate-alias', address),
       // Runs one directory statement on the next sendDraft, after the API layer's reads and before the mailbox's.
       beforeMailboxSend: (statement: string, ...binds: unknown[]) => controlAction('before-mailbox-send', JSON.stringify({ statement, binds })),
-      directoryChange: (statement: string, ...binds: unknown[]) => controlAction('directory-change', JSON.stringify({ statement, binds })),
       forceLost: (holder: string) => controlAction('force-lost', holder),
       stallPublish: () => controlAction('stall-publish'),
       publishStalled: () => controlAction('publish-stalled'),
@@ -356,7 +344,6 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       return result;
     };
     if (demo) {
-      await db.prepare("INSERT INTO addresses VALUES ('hello@example.com', 'w1', 'mailbox', 'mailbox-demo', 'alias', 'active')").run();
       const mail = as('demo');
       for (const name of ['Finance', 'Projects']) await mail.createLabel({ name }, { idempotencyKey: crypto.randomUUID() });
       const message: TestMessage = { from: { name: 'Mira Chen', email: 'mira@example.net' }, to: [{ name: 'Alex Morgan', email: 'hello@example.com' }],
@@ -385,7 +372,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, directoryDb: db, as, deliver, advance, objects, failingReads, writes, holders, timers, pendingReleases, releaseRetryAt, restore,
+    return { origin, contentOrigin, directoryChange, directoryRows, as, deliver, advance, objects, failingReads, writes, holders, timers, pendingReleases, releaseRetryAt, restore,
       forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,

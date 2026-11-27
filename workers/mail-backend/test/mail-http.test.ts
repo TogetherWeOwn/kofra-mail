@@ -15,10 +15,9 @@ test('an existing alias whose local part contains =? can still be deleted', asyn
     assert.ok(mailbox);
     // Stored before the directory refused encoded-word local parts.
     const legacy = `a=?b@${mailbox.primaryAddress.split('@')[1]}`;
-    await fixture.directoryDb.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')")
-      .bind(legacy, 'w1', mailbox.id).run();
+    await fixture.directoryChange("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'alias', 'active')", legacy, 'w1', mailbox.id);
     await admin.deleteAlias(legacy);
-    assert.equal((await fixture.directoryDb.prepare('SELECT 1 FROM addresses WHERE address_norm = ?').bind(legacy).all()).results.length, 0);
+    assert.equal((await fixture.directoryRows('SELECT 1 FROM addresses WHERE address_norm = ?', legacy)).length, 0);
   } finally { await fixture.close(); }
 });
 

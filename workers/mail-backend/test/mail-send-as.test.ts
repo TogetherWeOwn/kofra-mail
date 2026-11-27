@@ -106,7 +106,7 @@ for (const change of ['set back to pending', 'moved to another mailbox'] as cons
     const draft = await mail.createDraft(draftInput(from), key('draft'));
     const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
     const [statement, ...binds] = revocations[change];
-    await h.sends.directoryChange(statement, ...binds);
+    await h.directoryChange(statement, ...binds);
     await h.advance(UNDO);
     const failed = await mail.getSend(pending.id);
     assert.equal(failed.state, 'failed');

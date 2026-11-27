@@ -645,6 +645,23 @@ async function incoming(req: Request, env: FixtureEnv, to: string, from: string)
   return Response.json(await box.delivered(delivery));
 }
 
+async function seedHttpDirectory(env: FixtureEnv, migrations: string[][]): Promise<void> {
+  const db = env.DIRECTORY;
+  for (const statements of migrations) await db.batch(statements.map(statement => db.prepare(statement)));
+  await db.batch([['w1', 'example.com'], ['w2', 'example.net']].map(([ws, domain]) =>
+    db.prepare("INSERT INTO domains VALUES (?, ?, ?, 'primary', NULL, 'active', 'active')").bind(ws, ws, domain)));
+  for (const principal of Object.values(env.ACCOUNTS).filter(a => a.mailboxId && !a.stale)) {
+    await db.batch([
+      db.prepare('INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES (?, ?, ?, ?)').bind(principal.mailboxId, principal.ws, principal.userId, principal.address),
+      db.prepare('INSERT INTO mailbox_profiles VALUES (?, ?, ?)').bind(principal.ws, principal.mailboxId, principal.name),
+      db.prepare("INSERT INTO addresses VALUES (?, ?, 'mailbox', ?, 'primary', 'active')").bind(principal.address, principal.ws, principal.mailboxId),
+    ]);
+  }
+  if (env.DEFAULT_ACCOUNT === 'demo') {
+    await db.prepare("INSERT INTO addresses VALUES ('hello@example.com', 'w1', 'mailbox', 'mailbox-demo', 'alias', 'active')").run();
+  }
+}
+
 export default {
   async fetch(req: Request, env: FixtureEnv): Promise<Response> {
     const url = new URL(req.url);
@@ -664,9 +681,15 @@ export default {
         beforeMailboxSend = await req.json<{ statement: string; binds: unknown[] }>();
         return new Response(null, { status: 204 });
       }
-      if (url.pathname === '/__fixture/directory-change') {
+      if (url.pathname === '/__fixture/seed-directory') {
+        await seedHttpDirectory(env, await req.json<string[][]>());
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/__fixture/directory-change' || url.pathname === '/__fixture/directory-rows') {
         const { statement, binds } = await req.json<{ statement: string; binds: unknown[] }>();
-        await env.DIRECTORY.prepare(statement).bind(...binds).run();
+        const query = env.DIRECTORY.prepare(statement).bind(...binds);
+        if (url.pathname === '/__fixture/directory-rows') return Response.json((await query.all()).results);
+        await query.run();
         return new Response(null, { status: 204 });
       }
       if (url.pathname === '/__fixture/holders') {
