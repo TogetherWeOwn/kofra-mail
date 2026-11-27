@@ -110,19 +110,19 @@ function checkSendable(draft: DraftObject): SendRecipient[] {
 }
 
 // A settings Reply-To that the MIME builder would refuse answers invalid_header
-// for /replyTo, as the builder does; it is never dropped.
+// for /replyTo, as the builder does; it is never dropped. Only the first four are used.
 function replyToFromSettings(sql: SqlStorage): SendAddress[] {
   const row = sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
   const value = row ? (JSON.parse(row.definition) as { replyTo?: unknown }).replyTo : undefined;
   if (!Array.isArray(value)) return [];
-  return value.map(entry => {
+  return value.slice(0, 4).map(entry => {
     const { email, name } = (entry ?? {}) as { email?: unknown; name?: unknown };
     if (typeof email !== 'string' || hasHeaderControl(email) || !validEmail(email) || (name !== undefined &&
         (typeof name !== 'string' || hasHeaderControl(name) || byteLength(name) > LIMITS.displayNameBytes))) {
       return fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
     }
     return { email, ...(typeof name === 'string' && name ? { name } : {}) };
-  }).slice(0, 4);
+  });
 }
 
 function settingsUndoSeconds(sql: SqlStorage): number {

@@ -78,9 +78,11 @@ function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
   if (wire.kind === 'link') return isText(wire.url);
-  return isText(value.key) && isText(wire.type) && isCount(wire.size) &&
+  // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
+  const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
+  return isText(wire.type) && isCount(wire.size) &&
     optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
-    (wire.kind === 'upload' ? isText(wire.uploadId) : wire.kind === 'message' && isText(wire.messageId) && isCount(wire.part));
+    (wire.kind === 'upload' ? kind === 'att' && isText(wire.uploadId) : wire.kind === 'message' && !!kind && isText(wire.messageId) && isCount(wire.part));
 }
 // The parts of a decoded draft object that release turns into MIME. The API
 // read paths keep their own answers, so only release applies this check.

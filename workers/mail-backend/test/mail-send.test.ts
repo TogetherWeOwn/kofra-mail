@@ -1219,15 +1219,24 @@ for (const target of ['source', 'draft'] as const) {
     }));
 }
 
+test('only the first four settings Reply-To entries are used: an invalid fifth does not block the send', () => withSend(async (h, mail, from) => {
+  const valid = [1, 2, 3, 4].map(i => ({ email: `replies${i}@example.com` }));
+  await h.sends.setReplyTo([...valid, { email: '=?utf-8?b?QQ==?=@example.com' }]);
+  const { send: pending } = await send(mail, from, 'one');
+  assert.deepEqual((JSON.parse((await h.sends.row(pending.id))!.record) as { replyTo: unknown }).replyTo, valid);
+}));
+
 // Draft objects whose bytes match their content address but are not a draft this code can read.
 const undecodable = (from: string) => [
   ['invalid UTF-8', new Uint8Array([0x7b, 0xff, 0xfe, 0x7d])],
   ['not JSON', new TextEncoder().encode('not a draft')],
   ['an unsupported version', new TextEncoder().encode(JSON.stringify({ version: 2, fields: draftInput(from) }))],
   ['attachments that are not a list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined }, attachments: 'x' }))],
+  ['an attachment whose key is not an object key', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined },
+    attachments: [{ wire: { kind: 'upload', uploadId: 'u1', name: 'a.txt', type: 'text/plain', size: 1 }, key: 'att/not-a-key' }] }))],
 ] as const;
 
-for (const index of [0, 1, 2, 3]) {
+for (const index of undecodable('').keys()) {
   test(`a digest-verified draft revision object with ${undecodable('').at(index)![0]} fails the send with delivery_error, an alert and no MIME`,
     () => withSend(async (h, mail, from) => {
       const [, bytes] = undecodable(from)[index];
