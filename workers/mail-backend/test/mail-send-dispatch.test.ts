@@ -853,6 +853,7 @@ test('send_results refuses rows the mailbox would refuse', () => withSend(async 
     ['a message id over 998 bytes', ['accepted', 'x'.repeat(999), null]],
     ['a message id on a non-accepted result', ['try_later', 'id', null]],
     ['a suppressed index past 49', ['accepted', null, null, 2 ** 50]],
+    ['a fractional suppressed mask', ['accepted', null, null, 1.5]],
     ['suppressed indexes on a non-accepted result', ['ambiguous', null, null, 1]],
   ] as [string, [string, string | null, string | null, number?]][]) {
     await assert.rejects(insert(...row), Error, name);

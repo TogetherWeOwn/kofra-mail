@@ -7,8 +7,8 @@ CREATE TABLE send_results (
   workspace_id TEXT NOT NULL,
   mailbox_id TEXT NOT NULL,
   send_id TEXT NOT NULL,
-  fence_epoch INTEGER NOT NULL CHECK (fence_epoch >= 0),
-  fence_attempt INTEGER NOT NULL CHECK (fence_attempt >= 1),
+  fence_epoch INTEGER NOT NULL CHECK (typeof(fence_epoch) = 'integer' AND fence_epoch >= 0),
+  fence_attempt INTEGER NOT NULL CHECK (typeof(fence_attempt) = 'integer' AND fence_attempt >= 1),
   kind TEXT NOT NULL CHECK (kind IN ('accepted', 'rejected', 'try_later', 'outage', 'ambiguous')),
   -- The provider's message id of an accepted call (printable ASCII, at most 998
   -- bytes); null when it returned none.
@@ -22,7 +22,8 @@ CREATE TABLE send_results (
     (kind IN ('outage', 'ambiguous') AND detail IS NOT NULL AND length(detail) BETWEEN 1 AND 64 AND NOT detail GLOB '*[^A-Za-z0-9_.-]*') OR
     (kind = 'ambiguous' AND detail IS NULL)),
   -- The recipient indexes (0 to 49) the provider reported suppressed, as a bit mask.
-  suppressed INTEGER NOT NULL DEFAULT 0 CHECK (suppressed BETWEEN 0 AND 1125899906842623 AND (suppressed = 0 OR kind = 'accepted')),
+  suppressed INTEGER NOT NULL DEFAULT 0 CHECK (typeof(suppressed) = 'integer' AND suppressed BETWEEN 0 AND 1125899906842623
+    AND (suppressed = 0 OR kind = 'accepted')),
   created_at INTEGER NOT NULL,
   notify_after INTEGER NOT NULL,
   notify_failures INTEGER NOT NULL DEFAULT 0 CHECK (notify_failures >= 0),
