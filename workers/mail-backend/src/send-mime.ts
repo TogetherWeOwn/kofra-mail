@@ -381,8 +381,11 @@ function checkedPlan<Attachment extends AttachmentHeaders>(input: MimeInput<Atta
 }
 
 function writePiece(piece: string | Uint8Array, bytes: Uint8Array, offset: number): number {
-  return typeof piece === 'string' ? offset + encoder.encodeInto(piece, bytes.subarray(offset)).written
-    : writeBase64(piece, bytes, offset);
+  if (typeof piece !== 'string') return writeBase64(piece, bytes, offset);
+  const { read, written } = encoder.encodeInto(piece, bytes.subarray(offset));
+  // A truncated final string can fill the output without advancing past it.
+  if (read !== piece.length) throw new SendMimeInvariantError('MIME size plan mismatch');
+  return offset + written;
 }
 
 /** Stored copy only. Its bytes never include the Bcc recipients. */
@@ -393,6 +396,7 @@ export function buildSentCopy(input: SendMimeInput): SentCopy {
   for (const piece of pieces) {
     offset = writePiece(typeof piece === 'string' || piece instanceof Uint8Array ? piece : input.attachments[piece.part].bytes, bytes, offset);
   }
+  if (offset !== encodedSize) throw new SendMimeInvariantError('MIME size plan mismatch');
   return { bytes, encodedSize };
 }
 
@@ -411,6 +415,7 @@ export async function buildSentCopyFromParts(input: SendMimeSizingInput,
       offset = writeBase64(data, bytes, offset);
     }
   }
+  if (offset !== encodedSize) throw new SendMimeInvariantError('MIME size plan mismatch');
   return bytes;
 }
 

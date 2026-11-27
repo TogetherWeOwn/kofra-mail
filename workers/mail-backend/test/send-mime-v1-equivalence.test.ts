@@ -5,7 +5,7 @@ import { hasHeaderControl, isSafeMessageId, threadingHeaders } from '../../../co
 import { canonicalMailText, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput } from '../../../contracts/mail-api/src/wire.ts';
 import { defaultMimeBuilders, type SendMimeMessage } from '../src/mailbox-send-mime.ts';
-import { buildSentCopy, SEND_MIME_VERSION, type SendMimeInput } from '../src/send-mime.ts';
+import { buildSentCopy, SEND_MIME_VERSION, SendMimeInvariantError, type SendMimeInput } from '../src/send-mime.ts';
 
 // Frozen v1 reference from a0fd496. Only the stored-copy path for valid inputs
 // is copied here; the production input validation has its own tests. In
@@ -255,3 +255,21 @@ test('the mailbox builder writes a part before reading the next part', async () 
   });
   assert.equal(Buffer.compare(actual, expected), 0);
 });
+
+for (const kind of ['short', 'truncated'] as const) {
+  test(`both v1 writers reject a ${kind} MIME write instead of returning bytes`, async t => {
+    const { message, input, parts } = messageFor(2, [0]);
+    const finalDelimiter = `--${message.boundary}--${CRLF}`;
+    const encodeInto = TextEncoder.prototype.encodeInto;
+    t.mock.method(TextEncoder.prototype, 'encodeInto', function (this: TextEncoder, source: string, destination: Uint8Array) {
+      if (source !== finalDelimiter) return encodeInto.call(this, source, destination);
+      // Simulate dropping the final write, or a last piece whose UTF-8 bytes
+      // don't fit the plan even though encodeInto fills its remaining space.
+      return kind === 'short' ? { read: source.length, written: 0 }
+        : encodeInto.call(this, `é${source.slice(1)}`, destination);
+    });
+    const mismatch = (error: unknown) => error instanceof SendMimeInvariantError && error.message === 'MIME size plan mismatch';
+    assert.throws(() => buildSentCopy(input), mismatch);
+    await assert.rejects(builder.build(message, async index => parts[index]), mismatch);
+  });
+}
