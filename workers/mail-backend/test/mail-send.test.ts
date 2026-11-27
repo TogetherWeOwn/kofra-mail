@@ -1516,7 +1516,7 @@ test('a covered send answers 202 while the work-lane wake-up after its publish i
   try {
     const answer = post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
     await within(h.sends.laneWakeupEntered(), 10 * second, 'the wake-up');
-    // The wake-up is still held: the answer must not wait for it.
+    // The wake-up holds the work lane: the answer, queued ahead of it, must not wait for it.
     response = await within(answer, 10 * second, 'the covered send');
   } finally { await h.sends.openLaneWakeup(); }
   assert.equal(response.status, 202);

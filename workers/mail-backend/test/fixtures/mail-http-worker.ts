@@ -198,10 +198,10 @@ export class HttpMailbox extends Mailbox {
   activeAlerts() { return this.ctx.storage.sql.exec<{ code: string }>('SELECT code FROM mailbox_alerts ORDER BY code').toArray().map(row => row.code); }
   sendBreaches() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT send_id AS id FROM mailbox_send_breaches').toArray().map(row => row.id); }
   // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
-  // Makes the barrier's work-lane wake-up throw, as a failed alarm update would.
+  // Makes the barrier's work-lane wake-up throw inside the lane, as a failed alarm update would.
   private wakeupFailure = false;
   failLaneWakeup(failing: boolean) { this.wakeupFailure = failing; }
-  // Holds the next barrier wake-up before it runs, until the test opens it.
+  // Holds the next barrier wake-up inside the work lane, until the test opens it.
   private wakeupGate?: { entered: PromiseWithResolvers<void>; open: PromiseWithResolvers<void> };
   gateLaneWakeup() { this.wakeupGate = { entered: Promise.withResolvers<void>(), open: Promise.withResolvers<void>() }; }
   async laneWakeupEntered() { await this.wakeupGate?.entered.promise; }

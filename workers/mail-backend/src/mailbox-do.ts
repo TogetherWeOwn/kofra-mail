@@ -170,7 +170,9 @@ export class Mailbox extends DurableObject<Env> {
   // `seq`. Joins the publish in flight or waits for it, then publishes the
   // remainder. Never call it inside the work lane: the publish reads the
   // journal outside the lane, and deliveries must not wait on R2.
-  protected async publishThrough(seq: number): Promise<boolean> {
+  // `wake` false leaves the covered-work wake-up to the caller (scheduleCoveredWake),
+  // so it can queue its own lane work first.
+  protected async publishThrough(seq: number, wake = true): Promise<boolean> {
     const journal = () => this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
     // An answer never waits past this: a stalled publish ahead of the barrier
     // ends the wait (409 for the API, a later drive run for the handler), and
@@ -198,22 +200,24 @@ export class Mailbox extends DurableObject<Env> {
       if (!progressed) break;
     }
     if (journal() < seq) return false;
-    // A covered caller never waits for this wake-up or fails on it: a lost one
-    // leaves the work to the backup lane's own run.
-    this.ctx.waitUntil(this.wakeCoveredWork().catch(error =>
-      console.error({ code: 'barrier_lane_wakeup', error: error instanceof Error ? error.message : String(error) })));
+    if (wake) this.scheduleCoveredWake();
     return true;
   }
 
-  // Confirmations and releases a publish covered are the lane's work; bring it forward.
+  // A covered caller never waits for this wake-up or fails on it: a lost one
+  // leaves the work to the backup lane's own run.
+  private scheduleCoveredWake(): void {
+    this.ctx.waitUntil(this.work.run(() => this.wakeCoveredWork()).catch(error =>
+      console.error({ code: 'barrier_lane_wakeup', error: error instanceof Error ? error.message : String(error) })));
+  }
+
+  // In the work lane: confirmations and releases a publish covered are the lane's work; bring it forward.
   protected async wakeCoveredWork(): Promise<void> {
-    await this.work.run(async () => {
-      const through = this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
-      if (this.ctx.storage.sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_pending_releases WHERE seq <= ?)
-        OR EXISTS (SELECT 1 FROM mailbox_pending_confirmations WHERE seq <= ?) AS pending`, through, through).one().pending) {
-        await this.lowerLane(this.timerNow() + 60_000);
-      }
-    });
+    const through = this.ctx.storage.sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
+    if (this.ctx.storage.sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_pending_releases WHERE seq <= ?)
+      OR EXISTS (SELECT 1 FROM mailbox_pending_confirmations WHERE seq <= ?) AS pending`, through, through).one().pending) {
+      await this.lowerLane(this.timerNow() + 60_000);
+    }
   }
 
   private async sendApi(scope: Scope, operation: 'sendDraft' | 'undoSend' | 'getSend' | 'listSends', params: Record<string, string>,
@@ -244,11 +248,14 @@ export class Mailbox extends DurableObject<Env> {
     });
     if ('result' in outcome) return outcome.result;
     // The action has taken effect; until a publish covers it, the client retries the same key.
-    if (!await this.publishThrough(outcome.commit.seq)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
-    return this.work.run(async () => {
+    if (!await this.publishThrough(outcome.commit.seq, false)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
+    // The answer is queued in the work lane ahead of the covered-work wake-up, so it never waits for it.
+    const answered = this.work.run(async () => {
       const { body, status, replayed } = await outcome.commit.answer();
       return { body, status, ...(replayed && { replayed: true }) };
     });
+    this.scheduleCoveredWake();
+    return answered;
   }
 
   // Registers a timer kind. Call from the constructor.
