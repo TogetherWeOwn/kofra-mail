@@ -655,6 +655,11 @@ export class MailboxIndex {
         for (const id of new Set(send.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);
         // The send keeps the revision, its objects and their pending
         // confirmations: deleting the draft row releases nothing (section 2.7).
+        // A draft marked unusable (live sendDraft refuses one; a restore can mark it
+        // before replaying this event) passes its mark to the send, as send_undo passes it back.
+        this.sql.exec(`INSERT OR REPLACE INTO mailbox_unusable_sources(kind, id, holder)
+          SELECT 'send', ?, holder FROM mailbox_unusable_sources WHERE kind = 'draft' AND id = ? AND holder = ?`,
+        send.id, send.draftId, send.draft.holder);
         this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'draft' AND id = ?", send.draftId);
         this.sql.exec('DELETE FROM drafts WHERE id = ?', send.draftId);
         this.apply({ type: 'api_result', ...result });

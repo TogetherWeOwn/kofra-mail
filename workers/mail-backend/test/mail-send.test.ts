@@ -1520,3 +1520,28 @@ test('a covered send answers 202 even when the work-lane wake-up after its publi
   await h.advance(UNDO);
   assert.equal((await mail.listSends({})).items.length, 1);
 }));
+
+for (const retired of ['deleted', 'still readable'] as const) {
+  test(`a draft marked lost during a restore keeps the mark on a send created in a later delta (object ${retired})`, () => withSend(async (h, mail, from) => {
+    await h.confirmFailure(true);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    await h.advance(minute);
+    const [confirmation] = await h.confirmations();
+    assert.ok(confirmation.holder.startsWith('draft:'));
+    // The snapshot holds the draft; sendDraft is replayed from a later delta.
+    await h.forceSnapshot();
+    const pending = await mail.sendDraft(draft.id, { ...key('send'), ifMatch: draft.revision });
+    if (retired === 'deleted') h.objects.delete(objectPath(confirmation.object_key));
+    await h.sends.forceLost(confirmation.holder);
+    await h.confirmFailure(false);
+    await h.restore();
+    await h.confirmFailure(true);
+    assert.equal((await mail.getSend(pending.id)).state, 'pending');
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+}
