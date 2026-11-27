@@ -808,10 +808,13 @@ export class SendDispatcher {
     } else {
       // Flagged acceptances from an older recovery epoch first: a restore may have made them apply.
       // Each is rechecked at once once per epoch; after that it honors notify_after like any row.
+      // The page holds only rows this poll can take (the take's own condition): rows another attempt
+      // holds a live lease on are left out, so they cannot fill the page ahead of a runnable row.
       const flagged = epoch === null ? [] : (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 1
-        AND unapplied_epoch < ? AND (rechecked_epoch IS NULL OR rechecked_epoch < ? OR notify_after <= ?)
+        AND unapplied_epoch < ? AND (rechecked_epoch IS NULL OR rechecked_epoch < ?
+          OR (notify_after <= ? AND (recheck_lease_until IS NULL OR recheck_lease_until <= ?)))
         ORDER BY notify_after, unapplied_epoch, rechecked_epoch, fence_epoch, fence_attempt LIMIT ?`)
-        .bind(scope.workspaceId, scope.mailboxId, id, epoch, epoch, ports.now(), STORED_PAGE).all<StoredRow>()).results;
+        .bind(scope.workspaceId, scope.mailboxId, id, epoch, epoch, ports.now(), ports.now(), STORED_PAGE).all<StoredRow>()).results;
       const due = (await db.prepare(`SELECT ${columns} FROM send_results WHERE ${sendKey} AND unapplied = 0 AND notify_after <= ?
         ORDER BY notify_after, fence_epoch, fence_attempt LIMIT ?`).bind(scope.workspaceId, scope.mailboxId, id, ports.now(), STORED_PAGE)
         .all<StoredRow>()).results;

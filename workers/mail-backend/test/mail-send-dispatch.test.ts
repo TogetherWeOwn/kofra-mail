@@ -1480,6 +1480,28 @@ test('an attempt whose lease expired writes no retry state over its successor\'s
   await second;
 }));
 
+test('rows held by crashed attempts do not fill the poll page ahead of a runnable row', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'leased-page');
+  const { a } = await flaggedAfterRestore(h, id);
+  // Records succeed from here on (no fence has attempt 0).
+  await h.failRecordOnce(0);
+  const epoch = Number((await h.sends.lifecycle())?.epoch);
+  const now = await h.sends.now();
+  // The runnable row: rechecked in this epoch, due now, no holder.
+  await h.directoryChange('UPDATE send_results SET notify_after = ?, rechecked_epoch = ?, recheck_lease_until = NULL WHERE send_id = ?', now, epoch, id);
+  // A full page of rows due earlier, each held by an attempt that crashed with five minutes of lease left.
+  for (let attempt = 100; attempt < 116; attempt++) {
+    await h.directoryChange(`INSERT INTO send_results (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt, kind, message_id,
+      created_at, notify_after, notify_failures, unapplied, unapplied_epoch, rechecked_epoch, recheck_lease_until)
+      VALUES (?, ?, ?, 0, ?, 'accepted', 'x', 0, 0, 1, 1, 0, ?, ?)`, WS, MB, id, attempt, epoch, now + 5 * minute);
+  }
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id), { status: 'retry', recorded: 1, next: now + 5 * minute },
+    'one poll records the runnable row and next wakes when the leases end, not at once');
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
+  assert.equal((await storedRows(h, id)).length, 16, 'the held rows stay for their holders');
+  assert.ok(a.claim.fence.attempt < 100);
+}));
+
 test('the settled lookahead reports the earliest effective time over all flagged rows', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'lookahead-min');
   await h.restore();
