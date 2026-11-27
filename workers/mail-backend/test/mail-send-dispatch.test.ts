@@ -1171,3 +1171,16 @@ test('an applicable stored row that keeps failing raises send_result_stuck at ei
   await h.advance(minute);
   assert.ok(!(await h.sends.activeAlerts()).includes('send_result_stuck'), 'cleared once it records');
 }));
+
+test('a notice answers about its own row only', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'notice-own', TWO);
+  const a = await attempt(h, id, { stop: 'authorize', mark: [0] });
+  await h.advance(LEASE + SKEW);
+  const b = await attempt(h, id, { stop: 'authorize', mark: [1] });
+  const now = await h.sends.now();
+  await h.directoryChange(`INSERT INTO send_results (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt, kind, created_at, notify_after)
+    VALUES (?, ?, ?, ?, ?, 'try_later', 0, ?)`, WS, MB, id, b.claim.fence.epoch, b.claim.fence.attempt, now + hour);
+  await storeResult(h, id, a.claim.fence, 'accepted', { messageId: 'a' });
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'recorded', recorded: 1 });
+  assert.deepEqual(await h.sendRpc<StoredAnswer>('recordStoredResults', id, a.claim.fence), { status: 'none', recorded: 0 });
+}));

@@ -818,8 +818,9 @@ export class SendDispatcher {
       const times = [row?.next, row?.flagged].filter((at): at is number => typeof at === 'number');
       return times.length ? Math.min(...times) : null;
     };
+    // A notice's answer is about its own row only.
     if (!results.length) {
-      const next = await remaining();
+      const next = fence ? null : await remaining();
       return next === null ? { status: 'none', recorded: 0 } : { status: 'retry', recorded: 0, next };
     }
     const where = `${sendKey} AND fence_epoch = ? AND fence_attempt = ?`;
@@ -834,6 +835,7 @@ export class SendDispatcher {
       return { status: 'restoring', recorded: 0 };
     }
     let recorded = 0;
+    let backoff: number | null = null;
     for (const [at, row] of results.entries()) {
       let answer: ReportAnswer['status'] | 'error';
       try { answer = (await this.record(scope, id, { epoch: row.epoch, attempt: row.attempt }, storedResult(row))).status; }
@@ -852,6 +854,7 @@ export class SendDispatcher {
         console.error({ code: 'send_result_unapplied' });
         await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1, unapplied = 1, unapplied_epoch = ?
           WHERE ${where}`).bind(ports.now() + wait, epoch, ...keys(row)).run();
+        backoff = ports.now() + wait;
         await this.resultAlerts(id, row, ['unapplied'], ['stuck']);
       } else if (answer === 'recorded' || answer === 'stale' || answer === 'gone') {
         // Definitive: recorded and published, a result that can never apply, or no such send.
@@ -865,9 +868,11 @@ export class SendDispatcher {
         // keeps failing raises an alert.
         await db.prepare(`UPDATE send_results SET notify_after = ?, notify_failures = notify_failures + 1 WHERE ${where}`)
           .bind(ports.now() + wait, ...keys(row)).run();
+        backoff = ports.now() + wait;
         if (!row.unapplied && row.failures + 1 >= STUCK_FAILURES) await this.resultAlerts(id, row, ['stuck'], []);
       }
     }
+    if (fence) return backoff === null ? { status: 'recorded', recorded } : { status: 'retry', recorded, next: backoff };
     const next = await remaining();
     return next === null ? { status: 'recorded', recorded } : { status: 'retry', recorded, next };
   }
