@@ -343,6 +343,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 - **Quota:** the daily quota's reset time.
 - **Headers:** whether `References` at 2,048 bytes is accepted.
 - **Message-ID:** whether the `messageId` that `send()` returns is exactly the `Message-ID` header the recipient receives. Until this receipt confirms it, replies are not threaded by that id; if it differs, M3-5 records the delivered id instead.
+- **Sender allow-list:** whether the binding accepts `allowed_sender_addresses` of 500 and 2,000 addresses with `send()` working from the last listed one; what an empty list does; and what `send()` from an address on a domain that is not onboarded returns (M3-7b).
 - **Clock skew:** the difference between a Durable Object's clock and the consumer Worker's clock, over at least 100 paired samples in different locations. It checks the `clockSkew` assumption of section 2.4.
 
 **Stop rule:** at most 20 sends, only to the approved test addresses. If a result contradicts the contract (for example the limit is under 5 MiB), stop and report it.
@@ -536,7 +537,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Change:**
 - **The check:** `from` must be an identity of the mailbox with `sendAs: 'active'`. It is checked on `sendDraft` and again at release, at each claim and at `authorizeDispatch`, always as the one directory statement of section 1.
-- **The allow-list:** the `send_email` binding's `allowed_sender_addresses` is generated in CI from the directory. A second plain variable from the same source lets `mail-web` mark an identity `active` only once the deployed list contains it.
+- **The allow-list:** the `send_email` binding's `allowed_sender_addresses` is generated in CI from the directory, and an identity becomes `active` only once the deployed list contains it (M3-7b in section 6; no Worker variable carries the list).
 - **Headers:** a user-supplied `Sender`, `From`, `Return-Path` or `Reply-To` header is never accepted. `Reply-To` comes only from settings or group rules.
 
 **Acceptance:**
@@ -635,7 +636,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 ## 4. Done
 
 M3 is done when all of the following hold:
-- R1, M3-0 to M3-9, M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
+- R1, R2, M3-0 to M3-9 (M3-7 as M3-7a and M3-7b), M3-11, M3-12 and M3-13 are merged with their acceptance receipts;
 - the conformance suite passes against the backend;
 - the end-to-end matrix shows zero lost messages.
 
@@ -668,3 +669,41 @@ The security review of R1, M3-2, M3-3, M3-5, M3-6, M3-7, M3-8 and M3-13 checks a
    - No message content, subject, address or token in logs, alerts or errors.
    - `EMAIL` and storage credentials are never echoed.
 9. **Input bounds:** every limit in `LIMITS` is enforced server-side before any storage write.
+
+## 6. Enablement and follow-ups
+
+### M3-7b Sender allow-list job (Sol, Opus review; design summary)
+
+The binding's `allowed_sender_addresses` comes from the directory, and an identity's `send_as_policy = 'active'` means "in the deployed allow-list". No Worker variable carries the list: a variable is capped at 5 KB, about 150 addresses.
+- **Primaries too:** a new mailbox's primary address starts `pending`, like an alias, and the section 1 statement requires its row to be `active`. Compose keeps working: the default From falls back to the pending primary, and drafts accept it; `sendDraft` and `updateSettings` still require `active`. A new mailbox cannot send, internally or externally, until the job runs.
+- **Bounded reads:** addresses and domains are read in primary-key order with a hard row cap, and the domain filter (same workspace, not an alias domain, sending active) runs in the job. The job aborts at the cap. With an empty list it never deploys an empty `allowed_sender_addresses` (which may mean unrestricted): it deploys the sending worker without the `send_email` binding, so code-only fixes still ship and nothing can be sent.
+- **One run:** lower `active` rows that are no longer listed to `pending`; deploy the sending worker with exactly the list; check that the active deployment is the version this run deployed; then promote only the deployed addresses, each only while its row is still `pending` (a conditional update, bound parameters, in chunks), so an address revoked or changed after the read is never set back to `active`. Directory writes use bound parameters only, never SQL built from addresses.
+- **Single deployer:** this job is the only way the sending worker is deployed (code deploys run the same steps; a rollback is a revert on `main` and a re-run). One run at a time; `workflow_dispatch` on `main` only, in the protected environment, dry run by default. Deploy output never reaches the log (Wrangler prints the senders); the log shows counts only.
+- **Gate:** M3-7b merges before M3-12 and before any M3 flag turns on in a deployed environment. Its deploy mode fails closed until the sending worker (M3-5) exists, and its first production run needs the owner's approval.
+
+### R2 Limiter verification (Sol, Opus review)
+
+Section 2.8 lets neither flag turn on in a deployed environment until that environment's limiter bindings are configured and verified, with the two-step check it describes. R2 builds the tooling for all three parts:
+- **Configuration check:** a script reads the deployed `mail-web` bindings through the Cloudflare API and checks that every bucket of section 2.8 has its `ratelimits` namespace with the configured limit and the 60 s period. It catches a binding with the wrong limit or period, which the runtime 503 for a missing binding does not. The period is proved here, from the configuration (the binding allows only 10 s or 60 s); the two runtime steps check the limit only.
+- **Step 1, direct probe (flags off):** an operator probe calls each binding directly with its own test-only key and sees it refuse past its limit. The probe's Wrangler configuration is generated from the namespace ids the configuration check read, so it targets the same namespaces by construction; it is never deployed from any other configuration.
+- **Step 2, HTTP check (a flag on, before user traffic is admitted):** for each enabled bucket, a side-effect-free route shows both sides of the limit (428 then 429 for a write missing its required header, 404 then 429 for a read of a not-found id); the undo flood guard uses distinct not-found send ids.
+- **Output:** bucket names and pass or fail only, saved as the environment's receipt.
+- **Acceptance:** the configuration check fails on a missing bucket, a wrong limit and a wrong period (against recorded API responses); the probe and the HTTP check confirm only that each bucket is wired and enforcing (at least one admission, then a refusal by 150% of the limit, rounded down), because the binding's counters are approximate and an attempt can straddle a counter window; one attempt sends at most 150% + 1 requests, so it fits inside one period, and no admission, a later refusal or none is retried once after waiting a full period, the retry deciding; the exact limit and period are proved only by the configuration check. Known limits: an HTTP 429 shows the route is limited, not which bucket refused (the route-to-bucket mapping is proved by R1's gateway tests), and two attempts that both straddle a counter window can fail a healthy bucket, so a bucket's runtime FAIL is rerun once, for that bucket's runtime check only (the configuration check cannot straddle a window), before it is treated as a defect (the exact limit is proved by the configuration check); all pass on the planned configuration; the generated probe configuration carries exactly the ids that were read.
+
+### M3-5 enablement prerequisites
+
+Before `MAIL_SEND_ENABLED` turns on in any deployed environment:
+1. R1, M3-3, M3-4 and M3-7a are merged (done for R1, M3-3 and M3-4).
+2. R2's configuration check and step 1 probe for that environment. R2's step 2 HTTP check runs right after the flag turns on and before user traffic is admitted (the users' access stays closed until it passes), and its receipt completes the enablement.
+3. M3-0's receipts, from the approved test route: the size limit, the error codes, the clock skew, whether the returned `messageId` is the delivered `Message-ID`, the accepted size of `allowed_sender_addresses`, and what an empty list does.
+4. M3-5, M3-6 and M3-8 merged; internal-only sends stay `queued` until M3-8.
+5. M3-7b's first run in that environment, so the senders are listed and `active`.
+6. The owner's approval for the first production deploy.
+7. No open durability flake: every intermittent CI failure in a send-path or holder-release test (currently "a stalled release does not lose sibling acknowledgements or starve later rows") is root-caused and resolved, with a test that fails first if it was a product race.
+
+### Follow-ups
+
+- **CFWS in Message-ID and References (measure first):** reply threading accepts a Message-ID field only when it is one msg-id with surrounding whitespace, and References only as bracketed ids; an id with RFC 5322 comments loses threading (it can never inject a header). First measure, in a sample of real inbound mail, how many Message-ID or References fields carry comments or other CFWS beyond whitespace; build CFWS support as a small separate PR only if that number matters.
+- **Per-version MIME adapters (F2):** the first step of any MIME builder version 2, as noted in M3-4: register an adapter and its cleaning per version, keep version 1, and test replay of each supported version from its frozen inputs.
+- **Wake-up test gate:** the test that holds the barrier's covered-work wake-up should hold it inside the work lane in both code shapes, so it fails against the old ordering.
+- **Playwright and Vite re-optimization:** a compose test once got `fetch failed` right after Vite re-optimized its dependencies in CI; pin the optimized dependencies or wait for the dev server before the first request.
