@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 import { isMailApiError, LIMITS } from '../../../contracts/mail-api/src/index.ts';
 import type { Draft, DraftInput } from '../../../contracts/mail-api/src/wire.ts';
-import { startMailHttpFixture } from './fixtures/mail-http.ts';
+import { fetchOversizedRequest, startMailHttpFixture } from './fixtures/mail-http.ts';
 
 const day = 86_400_000;
 const PROVISIONAL_TTL = 7 * day;
@@ -144,8 +144,8 @@ test('R3: an oversized JSON request with a committed key compares before the cap
   const input = draftInput(mailbox.primaryAddress);
   await mail.createDraft(input, key('draft'));
   const oversized = new Blob([JSON.stringify({ ...input, body: 'x'.repeat(6 * LIMITS.bodyBytes + 512 * 1024) })]);
-  const request = (key: string) => fetch(`${h.origin}/api/v1/drafts`, { method: 'POST', body: oversized,
-    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken, 'idempotency-key': key, 'content-type': 'application/json' } });
+  const request = (key: string) => fetchOversizedRequest(new Request(`${h.origin}/api/v1/drafts`, { method: 'POST', body: oversized,
+    headers: { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken, 'idempotency-key': key, 'content-type': 'application/json' } }), oversized.size);
   assert.equal((await request('draft')).status, 422);
   assert.equal((await request('fresh')).status, 413);
 }));

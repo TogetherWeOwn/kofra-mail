@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
+import { arrayBuffer } from 'node:stream/consumers';
+import { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { fileURLToPath, URL as NodeURL } from 'node:url';
 import { build } from 'esbuild';
 import { Miniflare, Response as LocalResponse, type Request as LocalRequest, type WorkerOptions } from 'miniflare';
 import { createHttpMailService } from '../../../../contracts/mail-api/src/http-client.ts';
 import type { Principal, TestMessage } from '../../../../contracts/mail-api/src/harness.ts';
 import { isSafeMessageId } from '../../../../contracts/mail-api/src/headers.ts';
+import { LIMITS } from '../../../../contracts/mail-api/src/limits.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
 import { directoryMigrationBatches } from './directory-db.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
@@ -50,6 +55,43 @@ function buildMime(message: TestMessage, sentAt: number, msgId: string, ancestry
     ...(part.inline ? [`Content-ID: <part-${index}@fixture.test>`] : []), 'Content-Transfer-Encoding: base64', '', base64(part.bytes),
   ].join(CRLF));
   return [...header, `Content-Type: multipart/mixed; boundary="${boundary}"`, '', ...[html ?? plain, ...parts].flatMap((part) => [`--${boundary}`, part]), `--${boundary}--`, ''].join(CRLF);
+}
+
+// Local workerd closes without a half-close after an early answer, unlike the
+// Cloudflare edge (see PR verification). Wait for 100 Continue before streaming
+// so an eager write cannot reset the socket before we see the final response.
+export async function fetchOversizedRequest(req: Request, size: number): Promise<Response> {
+  assert.ok(req.body instanceof NodeReadableStream);
+  const body = Readable.fromWeb(req.body);
+  const headers = new Headers(req.headers);
+  headers.set('content-length', String(size));
+  headers.set('expect', '100-continue');
+  const request = httpRequest(req.url, { method: req.method, headers: Object.fromEntries(headers), agent: false });
+  try {
+    const response = await new Promise<IncomingMessage>((resolve, reject) => {
+      request.once('response', (reply) => {
+        body.unpipe(request);
+        body.destroy();
+        resolve(reply);
+      });
+      request.once('error', reject);
+      body.once('error', reject);
+      request.once('continue', () => body.pipe(request));
+      request.flushHeaders();
+    });
+    const responseHeaders = new Headers();
+    for (let i = 0; i < response.rawHeaders.length; i += 2) {
+      responseHeaders.append(response.rawHeaders[i], response.rawHeaders[i + 1]);
+    }
+    const bytes = await arrayBuffer(response);
+    return new Response(bytes.byteLength ? bytes : null, {
+      status: response.statusCode, statusText: response.statusMessage, headers: responseHeaders,
+    });
+  } finally {
+    // Destroying ClientRequest earlier would also close the socket we are reading.
+    body.destroy();
+    request.destroy();
+  }
 }
 
 interface FixtureOptions {
@@ -322,6 +364,9 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
         const req = new Request(input, init);
         req.headers.set('x-fixture-account', principal);
         if (req.method !== 'GET') req.headers.set('origin', origin);
+        if (init?.body instanceof Blob && init.body.size > LIMITS.uploadBytes) {
+          return fetchOversizedRequest(req, init.body.size);
+        }
         return fetch(req);
       } });
       clients.set(principal, client);
