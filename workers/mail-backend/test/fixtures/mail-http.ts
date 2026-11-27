@@ -71,6 +71,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
   const objects = new Map<string, ArrayBuffer>();
   // Object paths whose GET answers 503, a transient object store failure.
   const failingReads = new Set<string>();
+  const watchedReads = new Map<string, number>();
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
@@ -113,6 +114,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
           return new LocalResponse(null, { status: 201 });
         }
         case 'GET': {
+          const reads = watchedReads.get(pathname);
+          if (reads !== undefined) watchedReads.set(pathname, reads + 1);
           if (failingReads.has(pathname)) return new LocalResponse('<Error><Code>ServiceUnavailable</Code></Error>', { status: 503 });
           const object = objects.get(pathname);
           return object ? new LocalResponse(object, { headers: { 'content-length': String(object.byteLength) } })
@@ -376,6 +379,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,
       stallConfirmation, stallRelease, expireUploadLease, pauseNextPut,
       watchBodyRead: () => (watchedBody = Promise.withResolvers<void>()).promise,
+      watchObjectReads(path: string) {
+        watchedReads.set(path, 0);
+        return () => watchedReads.get(path)!;
+      },
       failNextConfirmation: () => controlAction('fail-next-confirmation'),
       blockLaterDelta: (after: number) => controlAction('block-later-delta', String(after)),
       exposesLegacyWriter: () => readControl<boolean>('exposes-legacy-writer'),

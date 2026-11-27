@@ -159,7 +159,7 @@ export class HttpMailbox extends Mailbox {
     const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', messageId).toArray()[0];
     if (!row) throw new Error('Stored sent copy is missing');
     const raw = new TextDecoder().decode(await this.fixtureIndex(workspaceId).readObject(row.raw_key));
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = Object.create(null);
     let current: string | undefined;
     for (const line of raw.slice(0, raw.indexOf('\r\n\r\n')).split('\r\n')) {
       if (/^[ \t]/.test(line)) {
@@ -169,9 +169,11 @@ export class HttpMailbox extends Mailbox {
       const separator = line.indexOf(':');
       if (separator < 1) continue;
       current = line.slice(0, separator).toLowerCase();
+      // Every top-level field the sent-copy builder writes is a singleton.
+      if (Object.hasOwn(headers, current)) throw new Error('Duplicate stored sent header');
       headers[current] = line.slice(separator + 1).trim();
     }
-    return headers;
+    return { ...headers };
   }
   shortenHandlerBudget() { this.timerHandlerBudgetMs = 25; this.realtimeHolderClock = true; }
   sendRow(id: string) {

@@ -1171,13 +1171,17 @@ for (const [label, replyTo] of [
 test('release rejects a frozen draft whose MIME encoding crosses the size limit before reading its parts', () => withSend(async (h, mail, from) => {
   const upload = await mail.createUpload({ name: 'large.txt', type: 'text/plain', bytes: new Blob(['file']) }, key('release-limit-file'));
   const { send: pending } = await send(mail, from, 'release-limit', { attachments: [{ kind: 'upload', uploadId: upload.id }] });
+  let partReads: (() => number) | undefined;
   await rewriteFrozenDraft(h, pending.id, draft => {
-    (draft.attachments as { wire: { size: number } }[])[0].wire.size = Math.ceil(LIMITS.outboundMessageBytes * 3 / 4);
+    const [part] = draft.attachments as { key: string; wire: { size: number } }[];
+    partReads = h.watchObjectReads(objectPath(part.key));
+    part.wire.size = Math.ceil(LIMITS.outboundMessageBytes * 3 / 4);
   });
   await h.advance(UNDO);
   const failed = await mail.getSend(pending.id);
   assert.equal(failed.state, 'failed');
   assert.equal(failed.recipients[0].reason, 'message_too_large');
+  assert.equal(partReads?.(), 0, 'the oversized send did not read the attachment object');
   assert.equal((await h.sends.registration(pending.id))?.key ?? null, null);
   assert.deepEqual(await h.sends.queue(), []);
 }));
@@ -1190,6 +1194,18 @@ test('a Bcc-only send releases and enqueues without writing recipient headers', 
   const headers = await h.sentHeaders(released.messageId);
   for (const name of ['to', 'cc', 'bcc']) assert.ok(!Object.hasOwn(headers, name));
   assert.equal((await h.sends.queue()).length, 1);
+}));
+
+test('stored sent-header inspection rejects a duplicate singleton header', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'duplicate-header');
+  await h.advance(UNDO);
+  const { messageId } = await mail.getSend(pending.id);
+  assert.ok(messageId);
+  assert.equal((await h.sentHeaders(messageId)).subject, 'Hello');
+  const path = objectPath((await h.sends.registration(pending.id))!.key!);
+  const original = new TextDecoder().decode(h.objects.get(path)!);
+  h.objects.set(path, Uint8Array.from(new TextEncoder().encode(`sUbJeCt: Second\r\n${original}`)).buffer);
+  await assert.rejects(h.sentHeaders(messageId), { actual: 500, expected: 200 });
 }));
 
 test('sendDraft refuses an invalid Bcc address', () => withSend(async (_h, mail, from) => {
