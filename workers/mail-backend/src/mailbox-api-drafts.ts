@@ -61,9 +61,34 @@ async function loadDraft(index: MailboxIndex, ref: DraftObjectRef): Promise<{ dr
   if (bytes.byteLength > MAX_DRAFT_OBJECT_BYTES || await sha256(bytes) !== digest) {
     throw new ObjectInvalidError('Invalid API draft object');
   }
-  const draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject;
-  if (draft.version !== 1 || !draft.fields || typeof draft.fields !== 'object') throw new Error('Unsupported draft object');
+  // The bytes match their content address, so if they do not decode to a
+  // draft object, no retry can change that.
+  let draft: DraftObject;
+  try { draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject; }
+  catch { throw new ObjectInvalidError('Invalid API draft object'); }
+  if (!isRecord(draft) || draft.version !== 1 || !isRecord(draft.fields)) throw new ObjectInvalidError('Unsupported draft object');
   return { draft, bytes: bytes.byteLength };
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const isText = (value: unknown): value is string => typeof value === 'string';
+const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value);
+function isStoredAttachment(value: unknown): boolean {
+  if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
+  const { wire } = value;
+  if (wire.kind === 'link') return isText(wire.url);
+  return isText(value.key) && isText(wire.type) && isCount(wire.size) &&
+    optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
+    (wire.kind === 'upload' ? isText(wire.uploadId) : wire.kind === 'message' && isText(wire.messageId) && isCount(wire.part));
+}
+// The parts of a decoded draft object that release turns into MIME. The API
+// read paths keep their own answers, so only release applies this check.
+export function sendableDraftObject(draft: DraftObject): boolean {
+  const { fields, attachments, replyHeaders } = draft as unknown as Record<string, unknown> & { fields: Record<string, unknown> };
+  return isText(fields.subject) && isText(fields.body) &&
+    optional(attachments, list => Array.isArray(list) && list.every(isStoredAttachment)) &&
+    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
 }
 export async function readDraftObject(index: MailboxIndex, ref: DraftObjectRef): Promise<DraftObject> {
   return (await loadDraft(index, ref)).draft;

@@ -1136,14 +1136,24 @@ test('sendDraft answers 422 invalid_recipients for a local part holding "=?", an
   assert.equal((await mail.getSend(pending.id)).state, 'sending');
 }));
 
-test('a settings Reply-To whose local part holds "=?" is left out of the frozen send record', () => withSend(async (h, mail, from) => {
-  await h.sends.setReplyTo([{ email: '=?utf-8?b?QQ==?=@example.com' }, { email: 'replies@example.com', name: 'Replies' }]);
-  const { send: pending } = await send(mail, from, 'one');
-  const record = JSON.parse((await h.sends.row(pending.id))!.record) as { replyTo: unknown };
-  assert.deepEqual(record.replyTo, [{ email: 'replies@example.com', name: 'Replies' }]);
-  await h.advance(UNDO);
-  assert.equal((await mail.getSend(pending.id)).state, 'sending');
-}));
+for (const [label, replyTo] of [
+  ['a local part holding "=?"', { email: '=?utf-8?b?QQ==?=@example.com' }],
+  ['an invalid address', { email: 'not an address' }],
+  ['a control character in its name', { email: 'replies@example.com', name: 'Line\r\nBcc: x@example.net' }],
+  ['a name over displayNameBytes', { email: 'replies@example.com', name: 'n'.repeat(4096) }],
+] as const) {
+  test(`sendDraft answers 422 invalid_header for /replyTo when the settings Reply-To has ${label}, and no send is accepted`, () => withSend(async (h, mail, from) => {
+    await h.sends.setReplyTo([{ email: 'replies@example.com', name: 'Replies' }, replyTo]);
+    const draft = await mail.createDraft(draftInput(from), key('draft'));
+    const response = await post(h, mail, `/drafts/${draft.id}/send`, 'send', draft.revision);
+    assert.equal(response.status, 422);
+    const problem = await response.json() as { code: string; errors?: { field: string }[] };
+    assert.equal(problem.code, 'invalid_header');
+    assert.deepEqual(problem.errors?.map(({ field }) => field), ['/replyTo']);
+    assert.deepEqual(await h.sends.ids(), [], 'no send was accepted');
+    assert.equal((await mail.getDraft(draft.id)).revision, draft.revision, 'the draft is unchanged');
+  }));
+}
 
 test('a small forwarded part whose source raw object is changed in place fails the send with delivery_error, an alert and no MIME',
   () => withSend(async (h, mail, from) => {
@@ -1208,3 +1218,54 @@ for (const target of ['source', 'draft'] as const) {
       assert.equal((await h.sends.queue()).length, 1);
     }));
 }
+
+// Draft objects whose bytes match their content address but are not a draft this code can read.
+const undecodable = (from: string) => [
+  ['invalid UTF-8', new Uint8Array([0x7b, 0xff, 0xfe, 0x7d])],
+  ['not JSON', new TextEncoder().encode('not a draft')],
+  ['an unsupported version', new TextEncoder().encode(JSON.stringify({ version: 2, fields: draftInput(from) }))],
+  ['attachments that are not a list', new TextEncoder().encode(JSON.stringify({ version: 1, fields: { ...draftInput(from), attachments: undefined }, attachments: 'x' }))],
+] as const;
+
+for (const index of [0, 1, 2, 3]) {
+  test(`a digest-verified draft revision object with ${undecodable('').at(index)![0]} fails the send with delivery_error, an alert and no MIME`,
+    () => withSend(async (h, mail, from) => {
+      const [, bytes] = undecodable(from)[index];
+      const { send: pending } = await send(mail, from, 'one', { to: [{ email: 'friend@example.net' }, { email: 'other@example.com' }] });
+      const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
+      const [kind, , gen] = rawKey.split('/');
+      const badKey = `${kind}/${sha256(bytes.buffer as ArrayBuffer)}/${gen}`;
+      h.objects.set(objectPath(badKey), bytes.slice().buffer);
+      await h.sends.setDraftKey(pending.id, badKey);
+      const builds = (await h.sends.builds()).length;
+      await h.advance(UNDO);
+      const failed = await mail.getSend(pending.id);
+      assert.equal(failed.state, 'failed');
+      assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), Array(2).fill({ state: 'failed', reason: 'delivery_error' }));
+      assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+      assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+      assert.deepEqual(await h.sends.queue(), []);
+      assert.deepEqual(await sentCopies(mail), []);
+      await h.advance(minute);
+      assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+      assert.equal(await h.sends.emailCalls(), 0);
+    }));
+}
+
+// The answers 25594d0 gave, before release learned to fail an undecodable draft.
+test('getDraft, replaceDraft and sendDraft of a stored draft that does not decode answer as before', () => withSend(async (h, mail, from) => {
+  const answers: string[] = [];
+  for (const [i, draft] of [{ version: 2, fields: draftInput(from) }, { version: 1, fields: draftInput(from), attachments: 'x' }, 'not a draft'].entries()) {
+    const legacy = await h.sends.seedLegacyDraft(draft);
+    const { csrfToken } = await mail.getSession();
+    const headers = { origin: h.origin, 'x-fixture-account': 'member', 'x-csrf-token': csrfToken };
+    const read = await fetch(`${h.origin}/api/v1/drafts/${legacy.id}`, { headers });
+    const replaced = await fetch(`${h.origin}/api/v1/drafts/${legacy.id}`, { method: 'PUT',
+      headers: { ...headers, 'content-type': 'application/json', 'idempotency-key': `replace-${i}`, 'if-match': legacy.revision },
+      body: JSON.stringify(draftInput(from)) });
+    const sent = await post(h, mail, `/drafts/${legacy.id}/send`, `send-${i}`, legacy.revision);
+    for (const response of [read, replaced, sent]) answers.push(`${i} ${response.status} ${((await response.json()) as { code?: string }).code ?? ''}`);
+  }
+  assert.deepEqual(answers, ['0 503 unavailable', '0 503 unavailable', '0 503 unavailable', '1 503 unavailable', '1 200 ', '1 412 revision_mismatch',
+    '2 503 unavailable', '2 503 unavailable', '2 503 unavailable']);
+}));

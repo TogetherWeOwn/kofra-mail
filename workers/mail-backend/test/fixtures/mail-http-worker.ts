@@ -199,6 +199,10 @@ export class HttpMailbox extends Mailbox {
   activeAlerts() { return this.ctx.storage.sql.exec<{ code: string }>('SELECT code FROM mailbox_alerts ORDER BY code').toArray().map(row => row.code); }
   sendBreaches() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT send_id AS id FROM mailbox_send_breaches').toArray().map(row => row.id); }
   // Stands in for a parser change since the part was attached: the frozen digest no longer matches.
+  // Points a send's frozen draft revision at another stored object.
+  setSendDraftKey(sendId: string, rawKey: string) {
+    this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.draft.rawKey', ?) WHERE id = ?`, rawKey, sendId);
+  }
   changePartDigest(sendId: string) {
     this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.parts[0].digest', ?) WHERE id = ?`, '0'.repeat(64), sendId);
   }
@@ -650,6 +654,11 @@ export default {
           case '/__fixture/active-alerts': return Response.json(await box.activeAlerts());
           case '/__fixture/send-breaches': return Response.json(await box.sendBreaches());
           case '/__fixture/change-part-digest': await box.changePartDigest(await req.text()); break;
+          case '/__fixture/set-send-draft-key': {
+            const { sendId, rawKey } = await req.json<{ sendId: string; rawKey: string }>();
+            await box.setSendDraftKey(sendId, rawKey);
+            break;
+          }
           case '/__fixture/change-attachment-size': {
             const { messageId, part, delta } = await req.json<{ messageId: string; part: number; delta: number }>();
             await box.changeAttachmentSize(messageId, part, delta);

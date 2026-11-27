@@ -9,7 +9,7 @@ import type { Draft, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { normalizeAddress } from './directory.ts';
 import {
-  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject,
+  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject, sendableDraftObject,
   type DraftObject, type DraftObjectRef,
 } from './mailbox-api-drafts.ts';
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
@@ -109,14 +109,19 @@ function checkSendable(draft: DraftObject): SendRecipient[] {
   return all.map(({ email, name, field }) => ({ field, email, ...(name ? { name } : {}) }));
 }
 
+// A settings Reply-To that the MIME builder would refuse answers invalid_header
+// for /replyTo, as the builder does; it is never dropped.
 function replyToFromSettings(sql: SqlStorage): SendAddress[] {
   const row = sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
   const value = row ? (JSON.parse(row.definition) as { replyTo?: unknown }).replyTo : undefined;
   if (!Array.isArray(value)) return [];
-  return value.flatMap(entry => {
+  return value.map(entry => {
     const { email, name } = (entry ?? {}) as { email?: unknown; name?: unknown };
-    if (typeof email !== 'string' || !validEmail(email) || (name !== undefined && (typeof name !== 'string' || hasHeaderControl(name)))) return [];
-    return [{ email, ...(typeof name === 'string' && name ? { name } : {}) }];
+    if (typeof email !== 'string' || hasHeaderControl(email) || !validEmail(email) || (name !== undefined &&
+        (typeof name !== 'string' || hasHeaderControl(name) || byteLength(name) > LIMITS.displayNameBytes))) {
+      return fail('invalid_header', { errors: [{ field: '/replyTo', code: 'invalid' }] });
+    }
+    return { email, ...(typeof name === 'string' && name ? { name } : {}) };
   }).slice(0, 4);
 }
 
@@ -510,16 +515,19 @@ export class SendDriver {
   }
 
   // Null when the stored revision is invalid for good: declared empty, over the
-  // cap or not matching its digest. A missing object or a failed read still retries.
+  // cap, not matching its digest, or digest-verified bytes that do not decode
+  // to a draft object release can build. A missing object or a failed read still retries.
   private async draftOf(start: Start, record: SendRecord): Promise<DraftObject | null> {
     const ready = this.ports.ready();
     if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
+    let draft: DraftObject;
     try {
-      return await readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
+      draft = await readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
     } catch (error) {
       if (error instanceof ObjectInvalidError) return null;
       throw error;
     }
+    return sendableDraftObject(draft) ? draft : null;
   }
 
   // Reads the small forwarded parts, one source at a time, and checks each against
