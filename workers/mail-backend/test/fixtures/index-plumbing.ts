@@ -1,6 +1,6 @@
 import { kofra, type KofraConfig } from '../../src/kofra.ts';
 import { MailboxIndex, PermanentMailError } from '../../src/mailbox-index.ts';
-import { FixtureMailbox, fixturePutUpload } from './mailbox-worker.ts';
+import { FixtureMailbox, fixturePutStream } from './mailbox-worker.ts';
 export { FixtureSweeper } from './mailbox-worker.ts';
 
 export class IndexPlumbing extends FixtureMailbox {
@@ -12,7 +12,7 @@ export class IndexPlumbing extends FixtureMailbox {
         return new Uint8Array(await object.arrayBuffer());
       },
       put: async (objectKey, bytes) => { await this.env.RAW.put(objectKey, bytes); },
-      putUpload: fixturePutUpload(this.env.RAW),
+      putStream: fixturePutStream(this.env.RAW),
       register: async (kind, digest) => `${kind}/${digest}/01KBN8ZJ7G0000000000000000`,
       hold: async () => {}, release: async () => {},
     }, this.ctx.id.toString());

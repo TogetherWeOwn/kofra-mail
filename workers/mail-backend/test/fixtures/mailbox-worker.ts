@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { MailboxIndex } from '../../src/mailbox-index.ts';
 import { journalPrefix, replayJournal, writeDelta } from '../../src/journal-backup.ts';
-import { sha256 } from '../../src/bytes.ts';
+import { MAX_PARSED_PART_BYTES, sha256 } from '../../src/bytes.ts';
 import { parseObjectKey, type ObjectKind } from '../../src/object-key.ts';
 import { SweepLedger } from '../../src/sweep-ledger.ts';
 import { MailboxRecovery, readyLife, restoringLife, SETTINGS_FLUSH_MS, type Lifecycle, type ReadyLife } from '../../src/mailbox-recovery.ts';
@@ -62,9 +62,11 @@ export class FixtureSweeper extends DurableObject {
   async candidates(now: number) { return new SweepLedger(this.ctx.storage).candidates(now); }
 }
 
-// The streamed attachment PUT, checked as the object store checks it.
-export function fixturePutUpload(bucket: R2Bucket) {
+// The streamed attachment PUT, bounded as the Kofra adapter bounds it and
+// checked as the object store checks it.
+export function fixturePutStream(bucket: R2Bucket) {
   return async (key: string, content: ReadableStream<Uint8Array>, size: number, digest: string) => {
+    if (!Number.isSafeInteger(size) || size < 0 || size > MAX_PARSED_PART_BYTES) throw new Error('Invalid attachment PUT');
     const bytes = new Uint8Array(await new Response(content).arrayBuffer());
     if (bytes.byteLength !== size || await sha256(bytes) !== digest) throw new Error('Fixture attachment PUT mismatch');
     await bucket.put(key, bytes);
@@ -85,7 +87,7 @@ export class FixtureMailbox extends DurableObject<Env> {
         return new Uint8Array(await object.arrayBuffer());
       },
       put: async (key, bytes) => { await this.env.RAW.put(key, bytes); },
-      putUpload: fixturePutUpload(this.env.RAW),
+      putStream: fixturePutStream(this.env.RAW),
       register: (kind, digest, holder) => refs.register(kind, digest, holder),
       hold: (key, holder) => refs.hold(key, holder),
       release: (key, holder) => refs.release(key, holder),

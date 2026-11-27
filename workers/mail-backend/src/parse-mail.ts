@@ -196,7 +196,7 @@ export async function boundedMime(raw: Uint8Array<ArrayBuffer>) {
     if (!(error instanceof BoundedParseFallback)) throw error;
     // Not the parse this relies on: keep every part, as an unbounded parse does.
     console.error({ code: 'mail_parse_fallback' });
-    parsed = await PostalMime.parse(raw, MIME_OPTIONS);
+    parsed = await PostalMime.parse(input, MIME_OPTIONS);
     return { parsed, contents: parsed.attachments.map(attachment => decodedAttachment(attachment.content)) };
   }
   const contents = parsed.attachments.map((attachment): Uint8Array<ArrayBuffer> | PartSource =>
@@ -216,6 +216,8 @@ async function* partBlocks(source: PartSource): AsyncGenerator<Uint8Array<ArrayB
     for (const chunk of chunks) {
       const bytes = chunkBytes(chunk);
       total += bytes.byteLength;
+      // No byte past the measured size is ever released.
+      if (total > source.size) throw new Error('Attachment size changed on decode');
       for (let offset = 0; offset < bytes.byteLength;) {
         const count = Math.min(block.byteLength - used, bytes.byteLength - offset);
         block.set(bytes.subarray(offset, offset + count), used);
@@ -262,37 +264,38 @@ export async function partDigest(source: PartSource): Promise<string> {
 
 // The part's bytes for a PUT under `digest`. The last block is released only
 // once the bytes match the digest, so a mismatch errors the stream before it ends.
-// The whole decoded part, for a part too large for a streamed PUT.
-export async function partBytes(source: PartSource): Promise<Uint8Array<ArrayBuffer>> {
-  const bytes = new Uint8Array(source.size);
-  let offset = 0;
-  for await (const block of partBlocks(source)) { bytes.set(block, offset); offset += block.byteLength; }
-  return bytes;
-}
-
 export function partStream(source: PartSource, digest: string): ReadableStream<Uint8Array> {
   const blocks = partBlocks(source);
   const check = new crypto.DigestStream('SHA-256');
   const writer = check.getWriter();
+  // Read only after a clean close; an abort rejects it with nobody waiting.
+  const checked = check.digest;
+  checked.catch(() => {});
   let held: Uint8Array<ArrayBuffer> | null = null;
+  const stop = (reason: unknown) => writer.abort(reason).catch(() => {});
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      for (;;) {
-        const next = await blocks.next();
-        if (next.done) {
-          await writer.close();
-          if (hex(await check.digest) !== digest) throw new Error('Attachment digest changed on decode');
-          if (held) controller.enqueue(held);
-          controller.close();
-          return;
+      try {
+        for (;;) {
+          const next = await blocks.next();
+          if (next.done) {
+            await writer.close();
+            if (hex(await checked) !== digest) throw new Error('Attachment digest changed on decode');
+            if (held) controller.enqueue(held);
+            controller.close();
+            return;
+          }
+          await writer.write(next.value);
+          const previous = held;
+          held = next.value;
+          if (previous) { controller.enqueue(previous); return; }
         }
-        await writer.write(next.value);
-        const previous = held;
-        held = next.value;
-        if (previous) { controller.enqueue(previous); return; }
+      } catch (error) {
+        await stop(error);
+        throw error;
       }
     },
-    async cancel() { await blocks.return(undefined); await writer.abort().catch(() => {}); },
+    async cancel(reason) { await blocks.return(undefined); await stop(reason); },
   }, { highWaterMark: 0 });
 }
 

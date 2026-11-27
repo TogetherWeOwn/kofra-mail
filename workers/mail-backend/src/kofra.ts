@@ -1,5 +1,5 @@
 import { AwsClient } from 'aws4fetch';
-import { MAX_RAW_BYTES, readExact, sha256 } from './bytes.ts';
+import { MAX_PARSED_PART_BYTES, MAX_RAW_BYTES, readExact, sha256 } from './bytes.ts';
 import { workspaceMailBucket } from './directory.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { isObjectDigest, parseObjectKey } from './object-key.ts';
@@ -101,6 +101,21 @@ export function kofra(config: KofraConfig, workspaceId: string) {
     }
     return response;
   }
+  async function streamPut(key: string, bytes: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number,
+    limit: number): Promise<void> {
+    if (parseObjectKey(key)?.kind !== 'att' || !Number.isSafeInteger(size) || size < 0 || size > limit) {
+      throw new Error('Invalid attachment PUT');
+    }
+    const stream = new FixedLengthStream(size);
+    const pipe = new AbortController();
+    const copied = bytes.pipeTo(stream.writable, { signal: pipe.signal });
+    try {
+      const [response] = await Promise.all([request('PUT', key, stream.readable, digest, Math.min(60_000, timeoutMs)), copied]);
+      await response.body?.cancel();
+    } finally {
+      pipe.abort();
+    }
+  }
   return {
     async deleteGeneration(key: string): Promise<void> {
       if (!parseObjectKey(key)) throw new Error('Invalid mail generation key');
@@ -113,19 +128,12 @@ export function kofra(config: KofraConfig, workspaceId: string) {
       const response = await request('PUT', key, bytes);
       await response.body?.cancel();
     },
-    async putUpload(key: string, bytes: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void> {
-      if (parseObjectKey(key)?.kind !== 'att' || !Number.isSafeInteger(size) || size < 0 || size > MAX_RAW_BYTES) {
-        throw new Error('Invalid attachment PUT');
-      }
-      const stream = new FixedLengthStream(size);
-      const pipe = new AbortController();
-      const copied = bytes.pipeTo(stream.writable, { signal: pipe.signal });
-      try {
-        const [response] = await Promise.all([request('PUT', key, stream.readable, digest, Math.min(60_000, timeoutMs)), copied]);
-        await response.body?.cancel();
-      } finally {
-        pipe.abort();
-      }
+    putUpload(key: string, bytes: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void> {
+      return streamPut(key, bytes, size, digest, timeoutMs, MAX_RAW_BYTES);
+    },
+    // An attachment decoded from a stored message, which can be larger than the message.
+    putStream(key: string, bytes: ReadableStream<Uint8Array>, size: number, digest: string): Promise<void> {
+      return streamPut(key, bytes, size, digest, 60_000, MAX_PARSED_PART_BYTES);
     },
     async get(key: string): Promise<Uint8Array<ArrayBuffer>> {
       let response: Response;

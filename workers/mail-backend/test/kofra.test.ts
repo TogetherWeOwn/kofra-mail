@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
+import { MAX_PARSED_PART_BYTES, MAX_RAW_BYTES } from '../src/bytes.ts';
 import { kofra } from '../src/kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from '../src/object-errors.ts';
 
@@ -135,4 +136,16 @@ test('Kofra rejects unqualified raw keys, invalid workspace IDs and arbitrary pa
   await assert.rejects(kofra(config, 'workspace').get('../other/file'), /Invalid mail object key/);
   await assert.rejects(kofra(config, 'workspace').get(key.slice(0, key.lastIndexOf('/'))), /Invalid mail object key/);
   assert.equal(fake.mock.callCount(), 0);
+});
+
+test('a streamed PUT of a parsed attachment is bounded by what a parse can produce, an upload by the raw cap', async t => {
+  const fake = t.mock.method(globalThis, 'fetch', async () => new Response(null, { status: 200 }));
+  const store = kofra(config, 'workspace');
+  const attachment = `att/${digest}/${generation}`;
+  const body = () => new ReadableStream<Uint8Array>();
+  await assert.rejects(store.putStream(attachment, body(), MAX_PARSED_PART_BYTES + 1, digest), /Invalid attachment PUT/);
+  await assert.rejects(store.putUpload(attachment, body(), MAX_RAW_BYTES + 1, digest, 60_000), /Invalid attachment PUT/);
+  await assert.rejects(store.putStream(key, body(), 3, digest), /Invalid attachment PUT/);
+  assert.equal(fake.mock.callCount(), 0);
+  assert.equal(MAX_PARSED_PART_BYTES, 3 * MAX_RAW_BYTES + 1);
 });

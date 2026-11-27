@@ -1,5 +1,5 @@
-// Run from workers/mail-backend: node --expose-gc test/fixtures/parse-mail-memory.ts <case>
-// Cases: one-attachment, eight-attachments, unwrapped-base64, qp-body.
+// Run from workers/mail-backend: node --expose-gc test/fixtures/parse-mail-memory.ts <case> [--report-only]
+// Cases: see CASES below. --report-only prints the peak without the 64 MiB assertion.
 import assert from 'node:assert/strict';
 import { MAX_RAW_BYTES, sha256 } from '../../src/bytes.ts';
 import { installDigestStream } from './digest-stream.ts';
@@ -10,6 +10,7 @@ assert.ok(globalThis.gc, 'run with --expose-gc');
 installDigestStream();
 const MiB = 1024 ** 2;
 const kind = process.argv[2];
+const reportOnly = process.argv.includes('--report-only');
 
 // A deterministic, incompressible-looking byte stream.
 function filler(size: number, seed: number): Uint8Array<ArrayBuffer> {
@@ -29,13 +30,13 @@ function base64Lines(bytes: Uint8Array, width: number): string {
 // Base64 with CRLF every 76 characters is 4/3 of the decoded size times 78/76.
 const encodedSize = (decoded: number) => Math.ceil(decoded / 3) * 4 * 78 / 76;
 
-function attachmentsMessage(count: number, width = 76): string {
+function attachmentsMessage(count: number, width = 76, room = 0): string {
   const head = 'From: Sender <sender@example.test>\r\nTo: rcpt@example.test\r\nSubject: Memory benchmark\r\n' +
     'Message-ID: <memory@example.test>\r\nDate: Thu, 01 Jan 2026 00:00:00 +0000\r\nMIME-Version: 1.0\r\n' +
     'Content-Type: multipart/mixed; boundary="=_memory"\r\n\r\n--=_memory\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n' +
     'One body and large attachments.\r\n';
   // Leave room for the part headers and the closing boundary.
-  const each = Math.floor((MAX_RAW_BYTES - 4096 * count - head.length) / count * 76 / 78 / 4) * 3;
+  const each = Math.floor((MAX_RAW_BYTES - room - 4096 * count - head.length) / count * 76 / 78 / 4) * 3;
   const parts = Array.from({ length: count }, (_, i) => `--=_memory\r\nContent-Type: application/octet-stream; name="file-${i}.bin"\r\n` +
     `Content-Disposition: attachment; filename="file-${i}.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\n` +
     `${base64Lines(filler(each, i + 1), width)}\r\n`);
@@ -59,11 +60,41 @@ function qpMessage(): string {
     'MIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n' + encoded + '\r\n';
 }
 
+const head = 'From: sender@example.test\r\nTo: rcpt@example.test\r\nSubject: Memory benchmark\r\nMIME-Version: 1.0\r\n';
+// Near-25 MiB shapes that M3-14 leaves unbounded (M3-14b): PostalMime holds
+// text bodies, calendar parts and inline message/rfc822 parts whole.
+const textBody = () => `${head}Content-Type: text/plain; charset=utf-8\r\n\r\n` +
+  'Plain text line of an enormous body.\r\n'.repeat(Math.floor((MAX_RAW_BYTES - 4096) / 38));
+const calendar = () => `${head}Content-Type: multipart/mixed; boundary=cal\r\n\r\n--cal\r\nContent-Type: text/plain\r\n\r\nInvite.\r\n` +
+  '--cal\r\nContent-Type: text/calendar; method=REQUEST\r\nContent-Disposition: attachment; filename=invite.ics\r\n\r\n' +
+  `BEGIN:VCALENDAR\r\n${'DESCRIPTION:An ASCII calendar line\r\n'.repeat(Math.floor((MAX_RAW_BYTES - 8192) / 36))}END:VCALENDAR\r\n--cal--\r\n`;
+const inlineForward = () => `${head}Content-Type: multipart/mixed; boundary=fwd\r\n\r\n--fwd\r\nContent-Type: message/rfc822\r\n\r\n` +
+  `${attachmentsMessage(1, 76, 4096)}\r\n--fwd--\r\n`;
+
+// An 8-bit or quoted-printable attachment in 1 MB lines, which are fed whole.
+function longLines(cte: string): string {
+  const line = 'x'.repeat(1_000_000);
+  const body = Array.from({ length: Math.floor((MAX_RAW_BYTES - 1024 * 1024) / 1_000_002) }, () => line).join('\r\n');
+  return `${head}Content-Type: multipart/mixed; boundary=o\r\n\r\n--o\r\nContent-Type: application/octet-stream\r\n` +
+    `Content-Disposition: attachment; filename=o.bin\r\nContent-Transfer-Encoding: ${cte}\r\n\r\n${body}\r\n--o--\r\n`;
+}
+
 // Only the encoded message stays reachable; its source string is dropped.
 const encode = (source: string) => new Uint8Array(new TextEncoder().encode(source));
-let raw: Uint8Array<ArrayBuffer> | null = kind === 'one-attachment' ? encode(attachmentsMessage(1))
-  : kind === 'eight-attachments' ? encode(attachmentsMessage(8))
-  : kind === 'unwrapped-base64' ? encode(attachmentsMessage(1, Number.MAX_SAFE_INTEGER)) : kind === 'qp-body' ? encode(qpMessage()) : assert.fail(`unknown case ${kind}`);
+const width = /^base64-width-(\d+)$/.exec(kind ?? '');
+const CASES: Record<string, () => string> = {
+  'one-attachment': () => attachmentsMessage(1),
+  'eight-attachments': () => attachmentsMessage(8),
+  'unwrapped-base64': () => attachmentsMessage(1, Number.MAX_SAFE_INTEGER),
+  'qp-body': qpMessage,
+  '8bit-long-lines': () => longLines('8bit'),
+  'qp-long-lines': () => longLines('quoted-printable'),
+  'plain-text-body': textBody,
+  calendar,
+  'inline-forward': inlineForward,
+};
+let raw: Uint8Array<ArrayBuffer> | null = width ? encode(attachmentsMessage(1, Number(width[1])))
+  : CASES[kind] ? encode(CASES[kind]()) : assert.fail(`unknown case ${kind}`);
 assert.ok(raw.byteLength <= MAX_RAW_BYTES, `fixture too large: ${raw.byteLength}`);
 const rawBytes = raw.byteLength;
 const rawKey = `raw/${await sha256(raw)}/01KBN8ZJ7G0000000000000000`;
@@ -79,7 +110,10 @@ const baseline = process.memoryUsage();
 let peak = baseline;
 let sumPeak = sum(baseline);
 let samples = 0;
+// Two full collections: after one, the backing stores of buffers that just
+// died (such as streamed 64 KiB blocks) can still count as external memory.
 const sample = () => {
+  gc();
   gc();
   samples++;
   const current = process.memoryUsage();
@@ -163,4 +197,4 @@ console.log(JSON.stringify({ case: kind, node: process.version, rawBytes, rawMiB
   heapUsedMiB: mib(peak.heapUsed), externalMiB: mib(peak.external), arrayBuffersMiB: mib(peak.arrayBuffers),
   literalSumPeakMiB: mib(sumPeak), maxRssMiB: mib(process.resourceUsage().maxRSS * 1024),
 }));
-assert.ok(used(peak) <= 64 * MiB, `${kind} parse peak ${mib(used(peak))} MiB exceeds the 64 MiB budget`);
+if (!reportOnly) assert.ok(used(peak) <= 64 * MiB, `${kind} parse peak ${mib(used(peak))} MiB exceeds the 64 MiB budget`);

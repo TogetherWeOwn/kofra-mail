@@ -14,6 +14,8 @@ let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThr
 let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
 // The object store behind the Kofra adapter; a PUT is kept only if its body matches its signed digest.
 const stored = new Map<string, Uint8Array>();
+// Set to fail the next attachment PUT after reading part of its body.
+let failNextPut = false;
 before(async () => {
   const bundle = await build({ entryPoints: [fileURLToPath(new URL('./fixtures/index-plumbing.ts', import.meta.url))],
     bundle: true, external: ['cloudflare:workers'], format: 'esm', platform: 'browser', write: false });
@@ -24,6 +26,11 @@ before(async () => {
     outboundService: async (request: Request) => {
       const url = new URL(request.url);
       if (request.method !== 'PUT' || url.origin !== 'https://storage.example.test') return new Response(null, { status: 403 });
+      if (failNextPut) {
+        failNextPut = false;
+        await request.body?.getReader().read();
+        return new Response(null, { status: 500 });
+      }
       const body = new Uint8Array(await request.arrayBuffer());
       if (request.headers.get('x-amz-content-sha256') !== await sha256(body)) return new Response('<Error><Code>BadDigest</Code></Error>', { status: 400 });
       stored.set(url.pathname, body);
@@ -105,25 +112,61 @@ test('mailbox stores large attachments through the streamed Kofra PUT with the k
   }
 });
 
-test('mailbox stores an attachment that decodes larger than the raw message cap whole, as before', async () => {
-  // Literal Latin-1 bytes in a quoted-printable part decode to two UTF-8 bytes each.
+// A message whose one quoted-printable attachment is filled with `unit`
+// repeated, in 76-byte lines, up to `rawBytes` of body.
+function expanding(charset: string, unit: number[], rawBytes: number): Uint8Array<ArrayBuffer> {
   const head = new TextEncoder().encode('Message-ID: <expand@example.test>\r\nContent-Type: multipart/mixed; boundary=grow\r\n\r\n--grow\r\n' +
-    'Content-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=grow.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n');
+    `Content-Type: application/octet-stream; charset=${charset}\r\nContent-Disposition: attachment; filename=grow.bin\r\n` +
+    'Content-Transfer-Encoding: quoted-printable\r\n\r\n');
   const tail = new TextEncoder().encode('\r\n--grow--\r\n');
-  const lines = Math.floor(13 * 1024 * 1024 / 78);
+  const lines = Math.floor(rawBytes / 78);
+  const line = new Uint8Array(78);
+  for (let i = 0; i < 76; i++) line[i] = unit[i % unit.length];
+  line[76] = 13; line[77] = 10;
   const wire = new Uint8Array(head.byteLength + lines * 78 + tail.byteLength);
   wire.set(head);
-  for (let i = 0; i < lines; i++) { const at = head.byteLength + i * 78; wire.fill(0xe9, at, at + 76); wire[at + 76] = 13; wire[at + 77] = 10; }
+  for (let i = 0; i < lines; i++) wire.set(line, head.byteLength + i * 78);
   wire.set(tail, head.byteLength + lines * 78);
+  return wire;
+}
+
+async function assertStoredLikeBefore(name: string, wire: Uint8Array<ArrayBuffer>, decodedAtLeast: number) {
   const key = `raw/${await sha256(wire)}/${id}`;
   await raw.put(key, wire);
   const reference = await referenceParseMail(wire, key);
   const expected = reference.attachments[0].external!;
-  assert.ok(expected.byteLength > 25 * 1024 * 1024 && wire.byteLength < 25 * 1024 * 1024);
-  const box = boxes.getByName('kofra-expanding');
+  assert.ok(wire.byteLength < 25 * 1024 * 1024 && expected.byteLength >= decodedAtLeast, `${wire.byteLength} -> ${expected.byteLength}`);
+  const box = boxes.getByName(name);
   assert.equal(await box.indexThroughKofra(id, key), 'indexed');
   const [row] = JSON.parse(await box.parts()) as Array<{ size: number; object_key: string }>;
   assert.equal(row.size, expected.byteLength);
   assert.equal(row.object_key, `att/${await sha256(expected)}/${id}`);
   assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), expected);
+}
+
+test('mailbox streams an attachment that decodes to 3 bytes per raw byte, past the raw message cap', async () => {
+  // Each invalid UTF-8 byte decodes to U+FFFD: a 9 MiB part becomes over 27 MB.
+  await assertStoredLikeBefore('kofra-expanding-utf8', expanding('utf-8', [0x80], 9 * 1024 * 1024), 27_000_000);
+});
+
+test('mailbox streams a UTF-16 attachment that decodes past the raw message cap', async () => {
+  // Each 2 raw bytes decode to one CJK character of 3 UTF-8 bytes: 20.9 MB becomes over 30 MB.
+  await assertStoredLikeBefore('kofra-expanding-utf16', expanding('utf-16le', [0x00, 0x4e], 20_900_000), 30_000_000);
+});
+
+test('an attachment PUT that fails midway is retried from a fresh decode and stores the same bytes', async () => {
+  const binary = new Uint8Array(400 * 1024).map((_, i) => (i * 2246822519) >>> 24);
+  const mime = multipart('retry', [
+    'Content-Type: text/plain\r\n\r\nOne file.',
+    `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=retry.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(binary).toString('base64').match(/.{1,76}/g)!.join('\r\n')}`,
+  ]);
+  const key = await upload(mime);
+  const box = boxes.getByName('kofra-retry');
+  failNextPut = true;
+  assert.equal(await box.indexThroughKofra(id, key), 'Kofra object PUT failed (500)');
+  assert.equal(failNextPut, false);
+  assert.equal(await box.indexThroughKofra(id, key), 'indexed');
+  const [row] = JSON.parse(await box.parts()) as Array<{ size: number; object_key: string }>;
+  assert.equal(row.object_key, `att/${await sha256(binary)}/${id}`);
+  assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), binary);
 });

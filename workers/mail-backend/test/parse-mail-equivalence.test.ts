@@ -267,3 +267,36 @@ test('a stored part whose bytes no longer match the registered digest errors bef
   // A different size errors too.
   await assert.rejects(partDigest({ ...source, size: source.size + 1 }), /Attachment size changed on decode/);
 });
+
+test('a replay longer than the measured size releases no byte past that size, at an exact 64 KiB multiple', async () => {
+  const raw = EDGE_CASES['a single-part binary message']();
+  const { contents: [source] } = await boundedMime(raw);
+  assert.ok(source && !(source instanceof Uint8Array) && source.size > 3 * 65_536);
+  const short = { ...source, size: 65_536 };
+  const reader = partStream(short, '0'.repeat(64)).getReader();
+  let delivered = 0;
+  await assert.rejects(async () => { for (let next = await reader.read(); !next.done; next = await reader.read()) delivered += next.value.byteLength; },
+    /Attachment size changed on decode/);
+  assert.ok(delivered <= short.size, `delivered ${delivered} of ${short.size}`);
+});
+
+test('a stored part stream that fails or is cancelled leaves no unhandled digest rejection', async () => {
+  const raw = EDGE_CASES['a single-part binary message']();
+  const { contents: [source] } = await boundedMime(raw);
+  assert.ok(source && !(source instanceof Uint8Array));
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    // A decode failure midway, as an overlong replay.
+    await assert.rejects(drain(partStream({ ...source, size: 65_536 }, '0'.repeat(64))), /Attachment size changed on decode/);
+    // A consumer that stops midway, as a failed upload does.
+    const reader = partStream(source, await partDigest(source)).getReader();
+    await reader.read();
+    await reader.cancel(new Error('upload failed'));
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+});
