@@ -343,6 +343,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 - **Quota:** the daily quota's reset time.
 - **Headers:** whether `References` at 2,048 bytes is accepted.
 - **Message-ID:** whether the `messageId` that `send()` returns is exactly the `Message-ID` header the recipient receives. Until this receipt confirms it, replies are not threaded by that id; if it differs, M3-5 records the delivered id instead.
+- **Sender allow-list:** whether the binding accepts `allowed_sender_addresses` of 500 and 2,000 addresses with `send()` working from the last listed one; what an empty list does; and what `send()` from an address on a domain that is not onboarded returns (M3-7b).
 - **Clock skew:** the difference between a Durable Object's clock and the consumer Worker's clock, over at least 100 paired samples in different locations. It checks the `clockSkew` assumption of section 2.4.
 
 **Stop rule:** at most 20 sends, only to the approved test addresses. If a result contradicts the contract (for example the limit is under 5 MiB), stop and report it.
@@ -536,7 +537,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 
 **Change:**
 - **The check:** `from` must be an identity of the mailbox with `sendAs: 'active'`. It is checked on `sendDraft` and again at release, at each claim and at `authorizeDispatch`, always as the one directory statement of section 1.
-- **The allow-list:** the `send_email` binding's `allowed_sender_addresses` is generated in CI from the directory. A second plain variable from the same source lets `mail-web` mark an identity `active` only once the deployed list contains it.
+- **The allow-list:** the `send_email` binding's `allowed_sender_addresses` is generated in CI from the directory, and an identity becomes `active` only once the deployed list contains it (M3-7b in section 6; no Worker variable carries the list).
 - **Headers:** a user-supplied `Sender`, `From`, `Return-Path` or `Reply-To` header is never accepted. `Reply-To` comes only from settings or group rules.
 
 **Acceptance:**
@@ -680,10 +681,12 @@ The binding's `allowed_sender_addresses` comes from the directory, and an identi
 
 ### R2 Limiter verification (Sol, Opus review)
 
-Section 2.8 lets neither flag turn on in a deployed environment until that environment's limiter bindings are configured and verified. R2 is that verification, as an operator script and a rollout rule:
-- **Script:** reads the deployed `mail-web` bindings through the Cloudflare API and checks that every bucket of section 2.8 has its `ratelimits` namespace with the configured limit and the 60 s period. It prints the bucket names and pass or fail only.
-- **Two steps:** deploy with both flags off, run the script and save its output as the receipt, then turn a flag on. A missing binding already answers 503 at runtime (R1); R2 also catches a binding with the wrong limit.
-- **Acceptance:** the script fails on a missing bucket, a wrong limit and a wrong period (against recorded API responses), and passes on the planned configuration.
+Section 2.8 lets neither flag turn on in a deployed environment until that environment's limiter bindings are configured and verified, with the two-step check it describes. R2 builds the tooling for all three parts:
+- **Configuration check:** a script reads the deployed `mail-web` bindings through the Cloudflare API and checks that every bucket of section 2.8 has its `ratelimits` namespace with the configured limit and the 60 s period. It catches a binding with the wrong limit, which the runtime 503 for a missing binding does not.
+- **Step 1, direct probe (flags off):** an operator probe calls each binding directly with its own test-only key and sees it refuse past its limit.
+- **Step 2, HTTP check (a flag on, before user traffic is admitted):** for each enabled bucket, a side-effect-free route shows both sides of the limit (428 then 429 for a write missing its required header, 404 then 429 for a read of a not-found id); the undo flood guard uses distinct not-found send ids.
+- **Output:** bucket names and pass or fail only, saved as the environment's receipt.
+- **Acceptance:** each script fails on a missing bucket, a wrong limit and a wrong period (against recorded API responses or a local fixture), and passes on the planned configuration.
 
 ### M3-5 enablement prerequisites
 
