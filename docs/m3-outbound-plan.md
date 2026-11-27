@@ -336,7 +336,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
 ### M3-0 Measurements (Sol)
 
 **Acceptance:** a receipt with the raw results for:
-- **Size:** the real outbound limit, from sends of 4.9, 5.1, 6, 18, 24 and 25 MiB encoded (just under and over each documented value). It sets `LIMITS.outboundMessageBytes`.
+- **Size:** the provider-safe outbound ceiling, from sends of 4.9, 5.1, 6, 18, 24 and 25 MiB encoded (just under and over each documented value). Raising `LIMITS.outboundMessageBytes` also requires the serializer and parser to meet the memory budget.
 - **Envelope:** whether `send()` accepts envelope recipients separately from the visible To and Cc lists (for partial retries).
 - **Suppression:** how a dropped (suppressed) recipient is reported in the `send()` result.
 - **Errors:** the error codes for quota, header-size and invalid-recipient failures.
