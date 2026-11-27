@@ -19,7 +19,7 @@ type Outcome = 'pass' | 'early' | 'late' | 'fail';
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export async function checkHttp(baseUrl: string | undefined, buckets: readonly Bucket[], session: Session,
-  request = fetch, sleep = wait): Promise<Verdict[]> {
+  request = fetch, sleep = wait, attemptMs?: (period: number) => number): Promise<Verdict[]> {
   const origin = targetOrigin(baseUrl);
   if (!origin || !session.cookie || !session.csrf) return failures(buckets);
   // Every undo request also spends the account user's flood budget. Do not let
@@ -49,7 +49,7 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
         // A bad answer or a failed request ends the attempt at once: it aborts the
         // requests still in flight instead of waiting for the batch.
         const stop = new AbortController();
-        const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(period * 1000)]);
+        const signal = AbortSignal.any([stop.signal, AbortSignal.timeout(attemptMs?.(period) ?? period * 1000)]);
         const send = () => {
           const id = bucket === 'undo_flood' ? crypto.randomUUID() : notFoundId;
           const path = route.path.replaceAll(/\{[a-zA-Z]+\}/g, id);

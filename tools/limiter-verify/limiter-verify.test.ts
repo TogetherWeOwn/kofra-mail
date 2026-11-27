@@ -262,6 +262,7 @@ test('probe client fails only the bucket whose retry wait fails and still checks
 test('HTTP check fails at the first bad answer and aborts the requests still in flight', async () => {
   let calls = 0;
   let aborted = 0;
+  const waits: number[] = [];
   const started = Date.now();
   const result = await checkHttp('https://mail.example.test', ['reads'], session, async (_url, init) => {
     if (calls++ === 0) return new Response('{}', { status: 500 });
@@ -269,10 +270,60 @@ test('HTTP check fails at the first bad answer and aborts the requests still in 
     return new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => { aborted++; reject(new Error('aborted')); }, { once: true });
     });
-  }, async () => assert.fail('a bad answer is never retried'));
+  }, async (ms) => { waits.push(ms); });
   assert.deepEqual(result, [{ bucket: 'reads', pass: false }]);
   assert.equal(calls, 8);
   assert.equal(aborted, 7);
+  assert.ok(Date.now() - started < 5_000);
+  assert.deepEqual(waits, []);
+});
+
+test('HTTP check fails at the first failed request and aborts the requests still in flight', async () => {
+  let calls = 0;
+  let aborted = 0;
+  const waits: number[] = [];
+  const started = Date.now();
+  const result = await checkHttp('https://mail.example.test', ['reads'], session, async (_url, init) => {
+    if (calls++ === 0) throw new TypeError('fetch failed');
+    return new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => { aborted++; reject(new Error('aborted')); }, { once: true });
+    });
+  }, async (ms) => { waits.push(ms); });
+  assert.deepEqual(result, [{ bucket: 'reads', pass: false }]);
+  assert.equal(calls, 8);
+  assert.equal(aborted, 7);
+  assert.ok(Date.now() - started < 5_000);
+  assert.deepEqual(waits, []);
+});
+
+test('HTTP check fails a bad answer even in the batch with a valid refusal, or as the last request', async () => {
+  const { limit, period } = EXPECTED_BUCKETS.writes;
+  const { max } = refusalBand(limit);
+  const refusal = () => Response.json({ code: 'rate_limited', retryAfterSeconds: period }, {
+    status: 429, headers: { 'retry-after': String(period) },
+  });
+  for (const badAt of [limit + 1, max]) {
+    let calls = 0;
+    const waits: number[] = [];
+    const result = await checkHttp('https://mail.example.test', ['writes'], session, async () => {
+      const index = calls++;
+      if (index === badAt) return new Response('{}', { status: 500 });
+      // A valid refusal in the same batch as the bad answer (first case), or none at all (second case).
+      if (badAt === limit + 1 && index === limit) return refusal();
+      return new Response(null, { status: 428 });
+    }, async (ms) => { waits.push(ms); });
+    assert.deepEqual(result, [{ bucket: 'writes', pass: false }], `bad answer at request ${badAt + 1}`);
+    assert.deepEqual(waits, []);
+  }
+});
+
+test('HTTP check fails an attempt whose requests hang past its deadline', async () => {
+  const started = Date.now();
+  const result = await checkHttp('https://mail.example.test', ['reads'], session, async (_url, init) =>
+    new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('timeout')), { once: true });
+    }), async () => {}, () => 50);
+  assert.deepEqual(result, [{ bucket: 'reads', pass: false }]);
   assert.ok(Date.now() - started < 5_000);
 });
 
