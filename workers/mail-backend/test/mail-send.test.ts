@@ -1297,6 +1297,11 @@ test('getDraft, replaceDraft and sendDraft of a stored draft that does not decod
     '2 503 unavailable', '2 503 unavailable', '2 503 unavailable']);
 }));
 
+// The stand-in builder's RFC 2231 file name parameter, to read the outgoing MIME
+// directly: the sent copy's projection cleans names again.
+const mimeFilename = (name: string) =>
+  `filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`)}`;
+
 // Rewrites a send's frozen draft revision as a digest-valid object with one change.
 async function rewriteFrozenDraft(h: Fixture, sendId: string, change: (draft: Record<string, unknown>) => void) {
   const { draft: { rawKey } } = JSON.parse((await h.sends.row(sendId))!.record) as { draft: { rawKey: string } };
@@ -1346,6 +1351,7 @@ for (const [label, name, type, sentName, sentType] of [
     const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
     assert.doesNotMatch(text, /^X-Injected/m);
     assert.match(text, new RegExp(`^Content-Type: ${sentType.replace('/', '\\/')}\r$`, 'm'));
+    assert.ok(text.includes(mimeFilename(sentName)), 'the outgoing MIME carries the cleaned file name');
     const [copy] = await sentCopies(mail);
     assert.deepEqual(copy.attachments.map(({ name: sent }) => sent), [sentName]);
   }));
@@ -1367,6 +1373,7 @@ test('a forwarded part indexed with an uncleaned name and a control character in
     assert.equal((await mail.getSend(pending.id)).state, 'sending');
     const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
     assert.match(text, /^Content-Type: application\/octet-stream\r$/m);
+    assert.ok(text.includes(mimeFilename(indexedAttachmentName(legacyName))), 'the outgoing MIME carries the cleaned file name');
     const [copy] = await sentCopies(mail);
     assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: indexedAttachmentName(legacyName), size: bytes.byteLength }]);
   }));
