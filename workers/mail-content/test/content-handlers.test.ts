@@ -370,7 +370,9 @@ test('workerd still serves a live CID follower after the stalled read leader can
   const leader = mf.dispatchFetch(new URL(path, origin), { headers: { 'x-fixture-cancel-leader': '1' } });
   try {
     assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
-    const follower = get(path);
+    const follower = get(path).then(async live => ({ live, body: new Uint8Array(await live.arrayBuffer()) }));
+    // The body read can reject before we await it below.
+    void follower.catch(() => {});
     // The origin remains blocked while the second HTTP request joins the flight.
     await new Promise(resolve => setTimeout(resolve, 200));
     await set('cancel-flight-leader', null);
@@ -378,9 +380,9 @@ test('workerd still serves a live CID follower after the stalled read leader can
     const stopped = await leader;
     assert.equal(stopped.status, 404);
     void stopped.body?.cancel().catch(() => {});
-    const live = await follower;
+    const { live, body } = await follower;
     assert.equal(live.status, 200);
-    assert.deepEqual(new Uint8Array(await live.arrayBuffer()), png);
+    assert.deepEqual(body, png);
     assert.deepEqual(reads.slice(start).filter(read => read === rawPath), [rawPath]);
     assert.equal((await (await get('/__mime-budget')).json() as { inFlight: number }).inFlight, 0);
   } finally {
@@ -408,16 +410,19 @@ for (const recovered of [true, false]) test(`a CID follower ${recovered ? 'recov
   const path = await cidUrl(1);
   const leader = get(path);
   try {
+    const failedLeader = leader.then(async failed => ({ failed, length: (await failed.arrayBuffer()).byteLength }));
+    // The body reads can reject before we await them below.
+    void failedLeader.catch(() => {});
     assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
-    const follower = get(path);
+    const follower = get(path).then(async replacement => ({ replacement, body: new Uint8Array(await replacement.arrayBuffer()) }));
+    void follower.catch(() => {});
     // Keep the source blocked while the real Workerd follower opts into the flight.
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(attempts, 1);
     failLeader.resolve();
-    const [failed, replacement] = await Promise.all([leader, follower]);
+    const [{ failed, length }, { replacement, body }] = await Promise.all([failedLeader, follower]);
     assert.equal(failed.status, 404);
-    assert.equal((await failed.arrayBuffer()).byteLength, 0);
-    const body = new Uint8Array(await replacement.arrayBuffer());
+    assert.equal(length, 0);
     assert.equal(replacement.status, recovered ? 200 : 503);
     if (recovered) assert.deepEqual(body, png);
     else {
@@ -443,18 +448,33 @@ test('an unread large CID has no MIME charge and does not delay another mailbox'
   assert.ok(store.get(objectPath('alpha', rawKey))!.byteLength + store.get(objectPath('beta', otherKey))!.byteLength > 25 * 1024 * 1024);
   const start = reads.length;
   const image = await get(await cidUrl(1));
+  // Miniflare wraps Undici's response around the same stream. Lock it without
+  // reading so Undici cannot cancel it when the original response is collected.
+  const reader = image.body?.getReader();
+  let drained = 0;
   try {
     assert.equal(image.status, 200);
     assert.equal(image.headers.get('content-type'), 'image/png');
+    assert.ok(reader);
     const budget = await (await get('/__mime-budget')).json() as { inFlight: number };
     assert.equal(budget.inFlight, 0, 'returning response headers ends the raw MIME reservation');
     assert.deepEqual(reads.slice(start), [objectPath('alpha', rawKey), objectPath('alpha', key)]);
     await status(await sign('body', { ...beta, ri: false }), 200);
+    assert.equal(image.bodyUsed, false, 'the CID must stay unread through the other mailbox request');
   } finally {
-    // Drain the first stream rather than testing cancel propagation by accident.
-    await image.arrayBuffer();
-    for (const path of [objectPath('alpha', rawKey), objectPath('alpha', key), objectPath('beta', otherKey)]) store.delete(path);
+    try {
+      // Drain the first stream rather than testing cancel propagation by accident.
+      if (reader) {
+        for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+          drained += chunk.value.byteLength;
+        }
+      }
+    } finally {
+      reader?.releaseLock();
+      for (const path of [objectPath('alpha', rawKey), objectPath('alpha', key), objectPath('beta', otherKey)]) store.delete(path);
+    }
   }
+  assert.equal(drained, large.byteLength);
 });
 
 test('saturated raw MIME admission returns 503 with Retry-After and the complete security headers', async () => {
