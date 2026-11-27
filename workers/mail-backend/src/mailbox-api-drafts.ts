@@ -79,13 +79,19 @@ const isCount = (value: unknown) => Number.isSafeInteger(value) && (value as num
 const optional = (value: unknown, check: (value: unknown) => boolean) => value === undefined || check(value);
 const isAddress = (value: unknown) => isRecord(value) && isBounded(value.email, LIMITS.addressBytes, true) &&
   optional(value.name, name => isBounded(name, LIMITS.displayNameBytes, true));
+// A file name and type the MIME builder accepts: a name of 1 to 255 bytes with
+// no control character (tab included), a type with no header control. Uploads
+// (`uploadName`, `uploadMediaType`) and indexed parts (`indexedAttachmentName`,
+// a type cut to 255) store within these bounds.
+const isFileName = (value: unknown) => isText(value) && value !== '' && isBounded(value, 255, true) && !value.includes('\t');
+const isFileType = (value: unknown) => isText(value) && value.length <= 255 && !hasHeaderControl(value);
 function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
   if (wire.kind === 'link') return isBounded(wire.url, LIMITS.linkUrlBytes) && isBounded(wire.name, LIMITS.linkNameBytes);
   // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
   const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
-  return isText(wire.type) && isCount(wire.size) &&
+  return isFileName(wire.name) && isFileType(wire.type) && isCount(wire.size) &&
     optional(value.part, part => isRecord(part) && isText(part.digest) && isCount(part.size)) &&
     (wire.kind === 'upload' ? kind === 'att' && isText(wire.uploadId) : wire.kind === 'message' && !!kind && isText(wire.messageId) && isCount(wire.part));
 }

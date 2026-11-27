@@ -1294,3 +1294,36 @@ test('getDraft, replaceDraft and sendDraft of a stored draft that does not decod
   assert.deepEqual(answers, ['0 503 unavailable', '0 503 unavailable', '0 503 unavailable', '1 503 unavailable', '1 200 ', '1 412 revision_mismatch',
     '2 503 unavailable', '2 503 unavailable', '2 503 unavailable']);
 }));
+
+// Rewrites a send's frozen draft revision as a digest-valid object with one change to its upload attachment.
+const uploadDraftChanges = [
+  ['a size that differs from its att/ object', (wire: Record<string, unknown>) => { wire.size = (wire.size as number) + 1; }],
+  ['a type holding CR LF', (wire: Record<string, unknown>) => { wire.type = 'text/plain\r\nX-Injected: 1'; }],
+  ['an empty name', (wire: Record<string, unknown>) => { wire.name = ''; }],
+] as const;
+
+for (const [label, change] of uploadDraftChanges) {
+  test(`a digest-valid draft revision whose upload has ${label} fails the send with delivery_error, an alert and no MIME`, () => withSend(async (h, mail, from) => {
+    const uploaded = await mail.createUpload({ name: 'note.txt', type: 'text/plain', bytes: new Blob(['attachment']) }, key('upload'));
+    const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+    const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
+    const draft = JSON.parse(new TextDecoder().decode(h.objects.get(objectPath(rawKey)))) as { attachments: { wire: Record<string, unknown> }[] };
+    change(draft.attachments[0].wire);
+    const bytes = new TextEncoder().encode(JSON.stringify(draft));
+    const [kind, , gen] = rawKey.split('/');
+    const changedKey = `${kind}/${sha256(bytes.buffer as ArrayBuffer)}/${gen}`;
+    h.objects.set(objectPath(changedKey), bytes.slice().buffer);
+    await h.sends.setDraftKey(pending.id, changedKey);
+    const builds = (await h.sends.builds()).length;
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+    assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+    assert.deepEqual(await h.sends.queue(), []);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+}

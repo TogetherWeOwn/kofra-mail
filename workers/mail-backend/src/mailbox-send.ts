@@ -590,7 +590,7 @@ export class SendDriver {
         return new Uint8Array(0);
       }
       const raw = await this.readSource(ready.index, key);
-      if (await sha256(raw) !== parsed.digest) throw new SourceMismatch();
+      if (raw.byteLength !== wire.size || await sha256(raw) !== parsed.digest) throw new SourceMismatch();
       return raw;
     };
   }
