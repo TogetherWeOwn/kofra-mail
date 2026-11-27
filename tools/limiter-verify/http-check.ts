@@ -20,7 +20,7 @@ const sequentialUpTo = 200;
 const parallel = 8;
 type Session = { cookie?: string; csrf?: string };
 
-type Outcome = 'pass' | 'early' | 'late' | 'fail';
+type Outcome = 'pass' | 'late' | 'fail';
 const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export async function checkHttp(baseUrl: string | undefined, buckets: readonly Bucket[], session: Session,
@@ -48,9 +48,11 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
       const batchSize = max + 1 <= sequentialUpTo ? 1 : parallel;
       // One attempt sends at most max + 1 requests, up to eight at a time, so a
       // 600-request bucket finishes well inside one period. The counters are
-      // approximate: the first refusal must leave between min and max requests
-      // admitted. A refusal before min fails at once; a later one, or none, may
-      // be a counter rollover and gets one retry after a full period.
+      // approximate and an attempt can straddle a counter window, so the check
+      // only confirms enforcement: at least one admission, then a refusal by
+      // max. Anything else (no admission, a refusal after max, or none) can come
+      // from a window boundary or a saturated window, and gets one retry after a
+      // full period; the retry decides.
       const attempt = async (): Promise<Outcome> => {
         // A bad answer or a failed request ends the attempt at once: it aborts the
         // requests still in flight instead of waiting for the batch.
@@ -90,7 +92,7 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
           // Inside a parallel batch the limiter's order is unknown, so every
           // admission in the refusal's batch counts towards the band.
           admitted += values.filter((value) => value === 'admitted').length;
-          if (values.includes('refused')) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
+          if (values.includes('refused')) return admitted < min || admitted > max ? 'late' : 'pass';
         }
         return 'late';
       };

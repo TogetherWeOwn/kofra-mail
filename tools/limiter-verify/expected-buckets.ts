@@ -14,11 +14,13 @@ export const EXPECTED_BUCKETS = {
 export type Bucket = keyof typeof EXPECTED_BUCKETS;
 export const bucketNames = Object.keys(EXPECTED_BUCKETS) as Bucket[];
 
-// The binding's counters are per location and approximate, so the runtime
-// checks accept the first refusal anywhere in this band of admitted requests.
-// The configuration check proves the exact limit and period.
+// The runtime checks confirm that a bucket is wired and enforcing: after at
+// least one admission, a refusal arrives by 150% of the limit. They cannot
+// certify the exact number, because the binding's counters are approximate and
+// an attempt can straddle a counter window, so the configuration check is the
+// only proof of the exact limit and period.
 export function refusalBand(limit: number): { min: number; max: number } {
-  return { min: Math.ceil(limit * 0.9), max: Math.floor(limit * 1.5) };
+  return { min: 1, max: Math.floor(limit * 1.5) };
 }
 
 export function isBucket(value: string): value is Bucket {

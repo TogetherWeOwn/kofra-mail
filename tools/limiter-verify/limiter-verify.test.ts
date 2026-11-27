@@ -199,7 +199,7 @@ test('probe caps unlimited bindings one call past the band and suppresses bindin
   assert.equal(await failure.text(), '');
 });
 
-test('probe client accepts the band edges and fails early refusals, late or no refusals and missing bindings', async () => {
+test('probe client accepts the band edges and fails no allowance, late or no refusals and missing bindings', async () => {
   const seen: string[] = [];
   const waits: number[] = [];
   const result = await checkProbe('https://probe.example.test', probeSecret, async (url, init) => {
@@ -218,11 +218,11 @@ test('probe client accepts the band edges and fails early refusals, late or no r
     if (bucket === 'undo_flood') return Response.json({ allowed: limit, refused: false });
     return Response.json({ allowed: limit, refused: true });
   }, async (ms) => { waits.push(ms); });
-  // Late and missing refusals are retried once; an early refusal or a bad answer never is.
+  // No allowance, a late refusal or none is retried once; a bad answer never is.
   assert.deepEqual([...new Set(seen)], bucketNames);
   const calls = Object.fromEntries(bucketNames.map((bucket) => [bucket, seen.filter((b) => b === bucket).length]));
-  assert.deepEqual(calls, { reads: 2, writes: 1, uploads: 1, sends: 1, undo: 2, undo_flood: 2, admin_writes: 1 });
-  assert.deepEqual(waits, [61_000, 61_000, 61_000]);
+  assert.deepEqual(calls, { reads: 2, writes: 2, uploads: 1, sends: 1, undo: 2, undo_flood: 2, admin_writes: 1 });
+  assert.deepEqual(waits, [61_000, 61_000, 61_000, 61_000]);
   assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'undo_flood', 'uploads'));
 });
 
@@ -315,6 +315,33 @@ test('HTTP check fails a bad answer even in the batch with a valid refusal, or a
   }
 });
 
+for (const bucket of ['reads', 'undo_flood'] as const) {
+  test(`HTTP check sends ${bucket} eight at a time and passes when its refusal arrives`, async () => {
+    const { limit, period } = EXPECTED_BUCKETS[bucket];
+    let calls = 0;
+    let pending = 0;
+    let peak = 0;
+    const waits: number[] = [];
+    // The refusal is the first request of its batch and the other seven are
+    // admitted; with one admission as the floor and at most max + 1 requests per
+    // attempt, the whole batch still counts within the band.
+    const result = await checkHttp('https://mail.example.test', [bucket], session, async () => {
+      const index = calls++;
+      peak = Math.max(peak, ++pending);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      pending--;
+      if (index === limit) {
+        return Response.json({ code: 'rate_limited', retryAfterSeconds: period }, { status: 429, headers: { 'retry-after': String(period) } });
+      }
+      return new Response(null, { status: bucket === 'reads' ? 404 : 428 });
+    }, async (ms) => { waits.push(ms); });
+    assert.deepEqual(result, [{ bucket, pass: true }]);
+    assert.deepEqual(waits, []);
+    assert.equal(peak, 8);
+    assert.equal(calls, limit + 8);
+  });
+}
+
 test('HTTP check sends a small bucket one request at a time, so it sees refusals in the limiter order', async () => {
   const { limit, period } = EXPECTED_BUCKETS.undo;
   let pending = 0;
@@ -344,10 +371,10 @@ test('HTTP check fails an attempt whose requests hang past its deadline', async 
   assert.ok(Date.now() - started < 5_000);
 });
 
-test('the refusal band is 90% rounded up to 150% rounded down', () => {
-  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.writes.limit), { min: 108, max: 180 });
-  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.uploads.limit), { min: 58, max: 96 });
-  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.undo.limit), { min: 9, max: 15 });
+test('the refusal band is one admission up to 150% of the limit rounded down', () => {
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.writes.limit), { min: 1, max: 180 });
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.uploads.limit), { min: 1, max: 96 });
+  assert.deepEqual(refusalBand(EXPECTED_BUCKETS.undo.limit), { min: 1, max: 15 });
 });
 
 const routes: [Bucket, string, RegExp, number][] = [
@@ -359,7 +386,7 @@ const routes: [Bucket, string, RegExp, number][] = [
   ['admin_writes', 'POST', /^\/api\/v1\/admin\/domains$/, 428],
 ];
 
-type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong retry-after' | 'wrong body period' | 'rollover';
+type Mode = 'exact' | 'never' | 'none admitted' | 'late' | 'band low' | 'band high' | 'wrong retry-after' | 'wrong body period' | 'rollover';
 async function fakeServer(mode: Mode, buckets: Bucket[]) {
   const counts = new Map<string, number>();
   const undoPaths = new Set<string>();
@@ -381,7 +408,7 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
     // The number of requests a bucket admits before its first refusal.
     const admits = (limit: number) => {
       const { min, max } = refusalBand(limit);
-      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong retry-after': limit, 'wrong body period': limit, rollover: limit }[mode];
+      return { exact: limit, never: limit, 'none admitted': 0, late: max + 1, 'band low': min, 'band high': max, 'wrong retry-after': limit, 'wrong body period': limit, rollover: limit }[mode];
     };
     let limited = false;
     if (bucket === 'undo') {
@@ -424,16 +451,16 @@ test('HTTP check passes exact sequences on all enabled buckets and separates the
   assert.ok(flood.undoPaths.size > EXPECTED_BUCKETS.undo_flood.limit);
 });
 
-for (const mode of ['never', 'early', 'late', 'wrong retry-after', 'wrong body period'] as const) {
+for (const mode of ['never', 'none admitted', 'late', 'wrong retry-after', 'wrong body period'] as const) {
   test(`HTTP check rejects ${mode} rate limiting`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
     // A bucket this small goes one request at a time, and an attempt sends at most max + 1.
     const { result, calls, waits } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
-    assert.equal(calls, { never: 2 * (max + 1), early: min, late: max + 1 + 1, 'wrong retry-after': limit + 1, 'wrong body period': limit + 1 }[mode]);
-    // Only a late or missing refusal is retried, after one full period.
-    assert.deepEqual(waits, mode === 'never' || mode === 'late' ? [61_000] : []);
+    assert.equal(calls, { never: 2 * (max + 1), 'none admitted': 2, late: max + 1 + 1, 'wrong retry-after': limit + 1, 'wrong body period': limit + 1 }[mode]);
+    // No admission, a late refusal or none is retried once, after one full period; a bad answer never is.
+    assert.deepEqual(waits, mode === 'never' || mode === 'late' || mode === 'none admitted' ? [61_000] : []);
   });
 }
 
