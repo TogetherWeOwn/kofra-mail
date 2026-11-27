@@ -73,8 +73,9 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
   }
 
   async reserve(scope: QuotaScope, fence: SendFence, recipients: number[], release: SendFence[], _expiresAt: number): Promise<QuotaAnswer> {
-    this.log('reserve', scope, [fence, ...release]);
+    // Only calls that went through are logged.
     this.fail('reserve');
+    this.log('reserve', scope, [fence, ...release]);
     return this.ctx.storage.transactionSync((): QuotaAnswer => {
       for (const entry of release) this.dropFence(scope, entry);
       if (this.released(scope, fence) || this.superseded(scope, fence, recipients)) return { status: 'stale' };
@@ -92,8 +93,8 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
   }
 
   async confirm(scope: QuotaScope, fence: SendFence, recipients: number[]): Promise<QuotaAnswer> {
-    this.log('confirm', scope, [fence]);
     this.fail('confirm');
+    this.log('confirm', scope, [fence]);
     return this.ctx.storage.transactionSync((): QuotaAnswer => {
       if (this.released(scope, fence) || this.superseded(scope, fence, recipients)) return { status: 'stale' };
       const { day } = this.config();
@@ -114,8 +115,8 @@ export class FakeSendQuota extends DurableObject<{ INITIAL_TIME: number }> imple
   }
 
   async release(scope: QuotaScope, fences: SendFence[]): Promise<void> {
-    this.log('release', scope, fences);
     this.fail('release');
+    this.log('release', scope, fences);
     this.ctx.storage.transactionSync(() => { for (const fence of fences) this.dropFence(scope, fence); });
   }
 

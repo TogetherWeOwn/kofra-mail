@@ -983,6 +983,8 @@ export class SendDispatcher {
       m.d.delayedUntil = null;
       this.commit(m, r, timers, null, true);
     }
+    // Only internal recipients are open: their handoff (M3-8) ends them. Until it runs, the
+    // drive row keeps the backoff its handler set before acting (5 minutes doubling to 1 hour).
     if (!m.openExternals().length) return null;
     if (m.lease() && leaseLive(m.d.leaseUntil, ctx)) {
       timers.set(SEND_DRIVE, row.id, m.d.leaseUntil! + ctx.skew);

@@ -144,7 +144,8 @@ const resultOf = (operation: 'sendDraft' | 'undoSend', key: string, fingerprint:
 
 export type SendOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; userId?: string; cursorScope?: string };
 // A committed (or replayed) API write, answered only after `seq` is published.
-export type SendCommit = { seq: number; answer: () => Promise<{ body: unknown; status: number; replayed?: boolean }> };
+// `sendId`: the send the answer reports, whose consumer changes must be published before it is shown.
+export type SendCommit = { seq: number; sendId?: string; answer: () => Promise<{ body: unknown; status: number; replayed?: boolean }> };
 
 // The API half: each call runs inside the mailbox work lane.
 export class SendApi {
@@ -181,7 +182,7 @@ export class SendApi {
       if (!validSendId(id)) throw new Error('Invalid stored send result');
       // Wait for the publish of the original commit only, not of later unrelated changes.
       const original = sendRow(this.sql, id)?.createdSeq ?? revision(this.sql);
-      return { seq: original, answer: async () => ({ body: this.getSendBody(id), status: 202, replayed: true }) };
+      return { seq: original, sendId: id, answer: async () => ({ body: this.getSendBody(id), status: 202, replayed: true }) };
     }
     if (!options.ifMatch) return fail('precondition_required');
     const ref = need(draftRef(this.sql, params.draftId));
@@ -252,7 +253,7 @@ export class SendApi {
       if (staged) await this.index.releaseDraft(staged, attachmentKeys);
       throw error;
     }
-    return { seq, answer: async () => ({ body: this.getSendBody(record.id), status: 202 }) };
+    return { seq, sendId: record.id, answer: async () => ({ body: this.getSendBody(record.id), status: 202 }) };
   }
 
   async undoSend(params: Record<string, string>, options: SendOptions): Promise<SendCommit> {

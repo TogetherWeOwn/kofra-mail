@@ -27,6 +27,8 @@ export interface QuotaPort {
   // `release` (an absent one is a no-op), advances the newest fence of each
   // recipient to `fence` and reserves every recipient under it, all or
   // nothing. A reservation expires by itself at `expiresAt` unless confirmed.
+  // The releases take effect also when the reservation is refused: the fences
+  // stay listed until a Mark acknowledges them, and releasing again is a no-op.
   reserve(scope: QuotaScope, fence: SendFence, recipients: number[], release: SendFence[], expiresAt: number): Promise<QuotaAnswer>;
   // Consumer step 3a: confirms the fence's reservation, re-reserving an
   // expired one and moving a charge from an ended quota day to the current one.

@@ -691,10 +691,13 @@ async function overflow(h: Fixture, id: string): Promise<SendFence[]> {
     const claim = await h.sendRpc<ClaimAnswer>('claimSend', id);
     if (claim.status !== 'claimed') throw new Error(`round ${round}: ${claim.status}`);
     abandoned.push(claim.fence);
+    // A live charge under each fence, never released by the reservations here.
+    assert.equal((await h.quota<QuotaAnswer>('reserve', scope(id), claim.fence, [0], [], 0)).status, 'ok');
     assert.deepEqual(await h.sendRpc<AbandonAnswer>('abandonClaim', id, claim.fence, 0), { status: 'ok' });
     await h.advance(minute);
   }
   assert.equal((await h.sendState(id)).release.length, 65, 'every failed release stayed listed');
+  for (const fence of abandoned) assert.equal(await balanceOf(h, fence), 1);
   return abandoned;
 }
 
@@ -711,8 +714,18 @@ test('a release list longer than one page is released by the mailbox before any 
   const id = await queued(h, mail, from, 'overflow');
   const abandoned = await overflow(h, id);
   // The claim releases the oldest page itself and takes those fences off the list only after the quota call succeeded.
-  const b = await attempt(h, id, { stop: 'authorize' });
-  assert.deepEqual(b.claim.release, abandoned.slice(64), 'the rest fits in the reservation call');
+  const claim = await h.sendRpc<ClaimAnswer>('claimSend', id);
+  if (claim.status !== 'claimed') return assert.fail(claim.status);
+  for (const fence of abandoned.slice(0, 64)) assert.equal(await balanceOf(h, fence), 0, 'the page was released before any new charge');
+  assert.equal(await balanceOf(h, abandoned[64]), 1);
+  assert.deepEqual(claim.release, abandoned.slice(64), 'the rest fits in the reservation call');
+  assert.equal((await h.quota<QuotaAnswer>('reserve', scope(id), claim.fence, [0], claim.release, 0)).status, 'ok');
+  assert.equal(await balanceOf(h, abandoned[64]), 0, 'the reservation call released the rest first');
+  assert.deepEqual(await h.sendRpc<MarkAnswer>('markSend', id, claim.fence, [0], claim.release), { status: 'ok' });
+  const confirmed = await h.quota<QuotaAnswer>('confirm', scope(id), claim.fence, [0]);
+  assert.deepEqual(await h.sendRpc<AuthorizeAnswer>('authorizeDispatch', id, claim.fence, [0], confirmed.status === 'ok' ? confirmed.dayEnd : 0),
+    { status: 'ok', remainingMs: 10 * second });
+  const b = { claim };
   const pages = (await h.quota<{ method: string; fences: SendFence[] }[]>('calls')).filter(({ method, fences }) => method === 'release' && fences.length === 64);
   assert.deepEqual(pages.map(({ fences }) => fences), [abandoned.slice(0, 64)]);
   assert.deepEqual((await h.sendState(id)).release, []);
@@ -798,7 +811,8 @@ test('send state: sent and suppressed recipients make a partial send; suppressed
 test('a quota wait ends at the reset of the gate that refused the reservation; the provider\'s daily limit waits for the quota day', () => withSend(async (h, mail, from) => {
   const now = await h.sends.now();
   const monthEnd = now + 10 * 24 * hour;
-  await h.quota('setDay', 'long-day', now + 20 * 24 * hour);
+  // The quota day ends tomorrow, well before the monthly reset.
+  await h.quota('setDay', 'day-1', now + 24 * hour);
   // One monthly slot is left: a two-recipient send is refused by the monthly gate, a one-recipient send still reserves.
   await h.quota('setMonthly', 1, monthEnd);
   const two = await queued(h, mail, from, 'monthly-two', TWO);
@@ -810,10 +824,16 @@ test('a quota wait ends at the reset of the gate that refused the reservation; t
   assert.deepEqual(delayed, { status: 'delayed', until: monthEnd + SKEW });
   const one = await queued(h, mail, from, 'monthly-one');
   await attempt(h, one, { stop: 'claim' });
-  await h.advance(2 * 24 * hour);
+  const enqueued = (await h.sends.queue()).filter(({ sendId }) => sendId === two).length;
+  await h.advance(24 * hour);
+  // The quota day rolls over: the send still waits for the monthly reset.
+  await h.quota('setDay', 'day-2', await h.sends.now() + 24 * hour);
+  await h.advance(24 * hour);
   assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', two), { status: 'not_now', reason: 'delayed' }, 'not woken at a daily reset');
+  assert.equal((await h.sends.queue()).filter(({ sendId }) => sendId === two).length, enqueued, 'and not enqueued again');
   await h.quota('setMonthly', null, null);
   await h.advance(monthEnd + SKEW - await h.sends.now());
+  await h.quota('setDay', 'day-11', await h.sends.now() + 24 * hour);
   const b = await attempt(h, two, { stop: 'authorize' });
   // The provider's own daily limit waits for the quota day's end.
   const providerDaily = await h.sendRpc<DelayAnswer>('delaySend', two, b.claim.fence, 'provider_daily');
@@ -969,7 +989,10 @@ test('authorizeDispatch holds the work lane from its directory statement to the 
   const answer = h.sendRpc<AuthorizeAnswer>('authorizeDispatch', id, a.claim.fence, [0], DAY_END);
   await h.senderCheckPaused();
   let abandoned = false;
+  await h.armArrival('abandonClaim');
   const abandon = h.sendRpc<AbandonAnswer>('abandonClaim', id, a.claim.fence, 0).then(value => { abandoned = true; return value; });
+  // The call has reached the mailbox; it can only be waiting for the lane.
+  await h.arrived('abandonClaim');
   await new Promise(resolve => setTimeout(resolve, 200));
   const during = await h.sendState(id);
   assert.equal(abandoned, false, 'abandonClaim waits for the lane');
@@ -1333,4 +1356,19 @@ test('a poll that stops after taking a recheck leaves the row to the next poll o
   await h.sendRpc<StoredAnswer>('recordStoredResults', id);
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent'], 'the next poll took the row and recorded it');
   assert.deepEqual(await storedRows(h, id), []);
+}));
+
+test('a sendDraft replay reports the send only once its consumer changes are published', () => withSend(async (h, mail, from) => {
+  const draft = await mail.createDraft(draftInput(from), key('draft-replay'));
+  const sent = await mail.sendDraft(draft.id, { ...key('send-replay'), ifMatch: draft.revision });
+  await h.advance(UNDO);
+  const a = await attempt(h, sent.id, { stop: 'authorize' });
+  await h.publishFailure(true);
+  assert.deepEqual(await h.sendRpc<ReportAnswer>('recordResult', sent.id, a.claim.fence, { kind: 'accepted', messageId: 'm' }), { status: 'unpublished' });
+  await assert.rejects(mail.sendDraft(draft.id, { ...key('send-replay'), ifMatch: draft.revision }),
+    (error: { problem?: { code?: string } }) => error.problem?.code === 'idempotency_in_progress');
+  await h.publishFailure(false);
+  const replayed = await mail.sendDraft(draft.id, { ...key('send-replay'), ifMatch: draft.revision });
+  assert.equal(replayed.id, sent.id);
+  assert.deepEqual(replayed.recipients.map(({ state }) => state), ['sent']);
 }));

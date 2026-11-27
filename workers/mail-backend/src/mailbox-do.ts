@@ -22,7 +22,7 @@ import {
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
-import { SEND_DRIVE, UnpublishedSend } from './mailbox-send-store.ts';
+import { SEND_DRIVE, UnpublishedSend, unpublishedProgress } from './mailbox-send-store.ts';
 import {
   CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type StoredAnswer,
@@ -378,12 +378,23 @@ export class Mailbox extends DurableObject<Env> {
     // The action has taken effect; until a publish covers it, the client retries the same key.
     if (!await this.publishThrough(outcome.commit.seq, false)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
     // The answer is queued in the work lane ahead of the covered-work wake-up, so it never waits for it.
-    const answered = this.work.run(async () => {
+    // A send it reports shows consumer changes only once published, as getSend does.
+    const { sendId } = outcome.commit;
+    const answer = () => this.work.run(async (): Promise<MailboxApiResult | { unpublished: number }> => {
+      const unpublished = sendId ? unpublishedProgress(this.ctx.storage.sql, [sendId]) : 0;
+      if (unpublished) return { unpublished };
       const { body, status, replayed } = await outcome.commit.answer();
       return { body, status, ...(replayed && { replayed: true }) };
     });
+    let answered = answer();
     this.scheduleCoveredWake();
-    return answered;
+    for (let round = 0; round < 2; round++) {
+      const result = await answered;
+      if (!('unpublished' in result)) return result;
+      if (round || !await this.publishThrough(result.unpublished)) break;
+      answered = answer();
+    }
+    return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
   }
 
   // Registers a timer kind. Call from the constructor.

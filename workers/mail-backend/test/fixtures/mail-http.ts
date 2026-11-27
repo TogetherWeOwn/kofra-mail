@@ -464,6 +464,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       crashAfterResultDelete: () => controlAction('crash-after-result-delete'),
       // Holds the next pass through a seam ('select', or 'record:<attempt>') until resumed.
       pauseAt: (point: string) => controlAction('pause-at', point),
+      armArrival: (method: string) => controlAction('arm-arrival', method),
+      arrived: (method: string) => controlAction('arrived', method),
       crashAfterRecheckTake: () => controlAction('crash-after-recheck-take'),
       pausedAt: (point: string) => controlAction('paused-at', point),
       resumeAt: (point: string) => controlAction('resume-at', point),

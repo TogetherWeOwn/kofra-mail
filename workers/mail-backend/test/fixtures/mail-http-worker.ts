@@ -156,7 +156,12 @@ export class HttpMailbox extends Mailbox {
       flushed: sql.exec<{ flushed: number; modseq: number }>('SELECT flushed, modseq FROM state WHERE id = 1').one(),
     };
   }
+  // Resolves when the next call of a method reaches this object, before it waits for anything.
+  private arrivals = new Map<string, PromiseWithResolvers<void>>();
+  armArrival(method: string) { this.arrivals.set(method, Promise.withResolvers<void>()); }
+  async arrived(method: string) { await this.arrivals.get(method)!.promise; }
   async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
+    this.arrivals.get(method)?.resolve();
     const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
     if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
     return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
@@ -863,6 +868,8 @@ export default {
           case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
           case '/__fixture/crash-after-result-delete': await box.crashAfterResultDelete(); break;
           case '/__fixture/pause-at': await box.pauseAt(await req.text()); break;
+          case '/__fixture/arm-arrival': await box.armArrival(await req.text()); break;
+          case '/__fixture/arrived': await box.arrived(await req.text()); break;
           case '/__fixture/crash-after-recheck-take': await box.crashAfterRecheckTake(); break;
           case '/__fixture/paused-at': await box.pausedAt(await req.text()); break;
           case '/__fixture/resume-at': await box.resumeAt(await req.text()); break;
