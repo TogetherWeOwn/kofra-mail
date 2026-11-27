@@ -2,31 +2,46 @@ import { failures, isEntryPoint, isRecord, report, targetOrigin, type Verdict } 
 import { EXPECTED_BUCKETS, bucketNames, refusalBand } from './expected-buckets.ts';
 import { PROBE_PATH, PROBE_SECRET_HEADER } from './probe-protocol.ts';
 
-export async function checkProbe(baseUrl: string | undefined, secret: string | undefined, request = fetch): Promise<Verdict[]> {
+type Outcome = 'pass' | 'early' | 'late' | 'fail';
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// The binding's counters are per location and approximate, and a run can cross
+// a counter rollover. A refusal before the band fails at once; a refusal after
+// it, or none, gets one retry with a fresh key after a full period.
+export async function checkProbe(baseUrl: string | undefined, secret: string | undefined, request = fetch,
+  sleep = wait): Promise<Verdict[]> {
   const origin = targetOrigin(baseUrl);
   if (!origin || !secret) return failures();
 
   const verdicts: Verdict[] = [];
   for (const bucket of bucketNames) {
-    let pass = false;
-    try {
-      const { limit, period } = EXPECTED_BUCKETS[bucket];
-      const url = new URL(PROBE_PATH, origin);
-      url.searchParams.set('bucket', bucket);
-      const response = await request(url, {
-        method: 'POST', headers: { [PROBE_SECRET_HEADER]: secret }, redirect: 'manual',
-        signal: AbortSignal.timeout(period * 1000),
-      });
-      if (response.status === 200) {
+    const { limit, period } = EXPECTED_BUCKETS[bucket];
+    const { min, max } = refusalBand(limit);
+    const attempt = async (): Promise<Outcome> => {
+      try {
+        const url = new URL(PROBE_PATH, origin);
+        url.searchParams.set('bucket', bucket);
+        const response = await request(url, {
+          method: 'POST', headers: { [PROBE_SECRET_HEADER]: secret }, redirect: 'manual',
+          signal: AbortSignal.timeout(period * 1000),
+        });
+        if (response.status !== 200) { await response.body?.cancel(); return 'fail'; }
         const result: unknown = await response.json();
-        const { min, max } = refusalBand(limit);
-        pass = isRecord(result) && result.refused === true && Number.isInteger(result.allowed)
-          && (result.allowed as number) >= min && (result.allowed as number) <= max;
-      } else await response.body?.cancel();
-    } catch {
-      // A failed request is a verdict, not a reason to print upstream details.
+        if (!isRecord(result) || !Number.isInteger(result.allowed) || typeof result.refused !== 'boolean') return 'fail';
+        const allowed = result.allowed as number;
+        if (!result.refused || allowed > max) return 'late';
+        return allowed < min ? 'early' : 'pass';
+      } catch {
+        // A failed request is a verdict, not a reason to print upstream details.
+        return 'fail';
+      }
+    };
+    let outcome = await attempt();
+    if (outcome === 'late') {
+      await sleep((period + 1) * 1000);
+      outcome = await attempt();
     }
-    verdicts.push({ bucket, pass });
+    verdicts.push({ bucket, pass: outcome === 'pass' });
   }
   return verdicts;
 }

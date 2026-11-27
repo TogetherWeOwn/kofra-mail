@@ -15,8 +15,11 @@ const baseBuckets: Bucket[] = ['reads', 'writes', 'admin_writes'];
 const batchSize = 8;
 type Session = { cookie?: string; csrf?: string };
 
+type Outcome = 'pass' | 'early' | 'late' | 'fail';
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export async function checkHttp(baseUrl: string | undefined, buckets: readonly Bucket[], session: Session,
-  request = fetch): Promise<Verdict[]> {
+  request = fetch, sleep = wait): Promise<Verdict[]> {
   const origin = targetOrigin(baseUrl);
   if (!origin || !session.cookie || !session.csrf) return failures(buckets);
   // Every undo request also spends the account user's flood budget. Do not let
@@ -35,42 +38,49 @@ export async function checkHttp(baseUrl: string | undefined, buckets: readonly B
         verdicts.push({ bucket, pass });
         continue;
       }
-      const signal = AbortSignal.timeout(period * 1000);
       const notFoundId = crypto.randomUUID();
-      const send = () => {
-        const id = bucket === 'undo_flood' ? crypto.randomUUID() : notFoundId;
-        const path = route.path.replaceAll(/\{[a-zA-Z]+\}/g, id);
-        // Deliberately no body, Idempotency-Key or If-Match.
-        return request(new URL(`${API_PREFIX}${path}`, origin), { method: route.method, headers, redirect: 'manual', signal });
-      };
-      // The counters are approximate: requests below the band must all be
-      // admitted, then the first refusal must come within the band.
       const { min, max } = refusalBand(limit);
-      const isRefusal = async (response: Response) => {
-        if (response.status !== 429 || response.headers.get('retry-after') !== String(period)) {
-          await response.body?.cancel();
-          return false;
+      // One attempt sends at most max + 1 requests, up to eight at a time, so a
+      // 600-request bucket finishes well inside one period. The counters are
+      // approximate: the first refusal must leave between min and max requests
+      // admitted. A refusal before min fails at once; a later one, or none, may
+      // be a counter rollover and gets one retry after a full period.
+      const attempt = async (): Promise<Outcome> => {
+        const signal = AbortSignal.timeout(period * 1000);
+        const send = () => {
+          const id = bucket === 'undo_flood' ? crypto.randomUUID() : notFoundId;
+          const path = route.path.replaceAll(/\{[a-zA-Z]+\}/g, id);
+          // Deliberately no body, Idempotency-Key or If-Match.
+          return request(new URL(`${API_PREFIX}${path}`, origin), { method: route.method, headers, redirect: 'manual', signal });
+        };
+        const classify = async (response: Response): Promise<'admitted' | 'refused' | 'bad'> => {
+          if (response.status === (read ? 404 : 428)) { await response.body?.cancel(); return 'admitted'; }
+          if (response.status !== 429 || response.headers.get('retry-after') !== String(period)) {
+            await response.body?.cancel();
+            return 'bad';
+          }
+          const result: unknown = await response.json();
+          return isRecord(result) && result.code === 'rate_limited' && result.retryAfterSeconds === period ? 'refused' : 'bad';
+        };
+        let admitted = 0;
+        let sent = 0;
+        while (sent <= max) {
+          const batch = await Promise.allSettled(Array.from({ length: Math.min(batchSize, max + 1 - sent) }, async () =>
+            classify(await send())));
+          sent += batch.length;
+          if (batch.some((result) => result.status === 'rejected' || result.value === 'bad')) return 'fail';
+          const values = batch.map((result) => (result as PromiseFulfilledResult<'admitted' | 'refused'>).value);
+          admitted += values.filter((value) => value === 'admitted').length;
+          if (values.includes('refused')) return admitted < min ? 'early' : admitted > max ? 'late' : 'pass';
         }
-        const result: unknown = await response.json();
-        return isRecord(result) && result.code === 'rate_limited' && result.retryAfterSeconds === period;
+        return 'late';
       };
-      let admitted = true;
-      for (let i = 0; admitted && i < min; i += batchSize) {
-        const batch = await Promise.allSettled(Array.from({ length: Math.min(batchSize, min - i) }, async () => {
-          const response = await send();
-          await response.body?.cancel();
-          return response.status === (read ? 404 : 428);
-        }));
-        admitted = batch.every((result) => result.status === 'fulfilled' && result.value);
+      let outcome = await attempt();
+      if (outcome === 'late') {
+        await sleep((period + 1) * 1000);
+        outcome = await attempt();
       }
-      // One at a time inside the band, so the refusal is seen exactly where it starts.
-      for (let count = min; admitted && count <= max; count++) {
-        const response = await send();
-        if (response.status === (read ? 404 : 428)) { await response.body?.cancel(); continue; }
-        if (response.status === 429) pass = await isRefusal(response);
-        else await response.body?.cancel();
-        break;
-      }
+      pass = outcome === 'pass';
     } catch {
       // Never print a session, response, URL or thrown request error.
     }

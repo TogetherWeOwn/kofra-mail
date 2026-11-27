@@ -216,8 +216,10 @@ test('probe client accepts the band edges and fails early refusals, late or no r
     if (bucket === 'admin_writes') return Response.json({ allowed: max, refused: true });
     if (bucket === 'undo_flood') return Response.json({ allowed: limit, refused: false });
     return Response.json({ allowed: limit, refused: true });
-  });
-  assert.deepEqual(seen, bucketNames);
+  }, async () => {});
+  // Late and missing refusals are retried once; the order of buckets is unchanged.
+  assert.deepEqual([...new Set(seen)], bucketNames);
+  assert.deepEqual(seen.filter((bucket) => bucket === 'reads').length, 2);
   assert.deepEqual(result, verdicts('reads', 'writes', 'undo', 'undo_flood', 'uploads'));
 });
 
@@ -226,8 +228,23 @@ test('probe client rejects a fractional admission count', async () => {
     const bucket = new URL(String(url)).searchParams.get('bucket') as Bucket;
     const { min } = refusalBand(EXPECTED_BUCKETS[bucket].limit);
     return Response.json({ allowed: min + 0.5, refused: true });
-  });
+  }, async () => {});
   assert.deepEqual(result, verdicts(...bucketNames));
+});
+
+test('probe client retries a late refusal once after a full period, for a counter rollover', async () => {
+  const waits: number[] = [];
+  const attempts = new Map<string, number>();
+  const result = await checkProbe('https://probe.example.test', probeSecret, async (url) => {
+    const bucket = new URL(String(url)).searchParams.get('bucket') as Bucket;
+    const n = (attempts.get(bucket) ?? 0) + 1;
+    attempts.set(bucket, n);
+    const { limit } = EXPECTED_BUCKETS[bucket];
+    const { max } = refusalBand(limit);
+    return Response.json(n === 1 ? { allowed: max + 1, refused: false } : { allowed: limit, refused: true });
+  }, async (ms) => { waits.push(ms); });
+  assert.deepEqual(result, verdicts());
+  assert.deepEqual(waits, bucketNames.map((bucket) => (EXPECTED_BUCKETS[bucket].period + 1) * 1000));
 });
 
 test('the refusal band is 90% rounded up to 150% rounded down', () => {
@@ -245,7 +262,7 @@ const routes: [Bucket, string, RegExp, number][] = [
   ['admin_writes', 'POST', /^\/api\/v1\/admin\/domains$/, 428],
 ];
 
-type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong retry-after' | 'wrong body period';
+type Mode = 'exact' | 'never' | 'early' | 'late' | 'band low' | 'band high' | 'wrong retry-after' | 'wrong body period' | 'rollover';
 async function fakeServer(mode: Mode, buckets: Bucket[]) {
   const counts = new Map<string, number>();
   const undoPaths = new Set<string>();
@@ -267,14 +284,19 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
     // The number of requests a bucket admits before its first refusal.
     const admits = (limit: number) => {
       const { min, max } = refusalBand(limit);
-      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong retry-after': limit, 'wrong body period': limit }[mode];
+      return { exact: limit, never: limit, early: min - 1, late: max + 1, 'band low': min, 'band high': max, 'wrong retry-after': limit, 'wrong body period': limit, rollover: limit }[mode];
     };
     let limited = false;
     if (bucket === 'undo') {
       undoPaths.add(path);
       limited = hit('undo_flood') > admits(EXPECTED_BUCKETS.undo_flood.limit);
     }
-    limited ||= hit(bucket === 'undo' ? path : bucket) > admits(EXPECTED_BUCKETS[bucket].limit);
+    const count = hit(bucket === 'undo' ? path : bucket);
+    // A rollover mid-run: the first attempt's max + 1 requests are all admitted,
+    // then the counter starts again and refuses past the limit.
+    const firstRun = refusalBand(EXPECTED_BUCKETS[bucket].limit).max + 1;
+    limited ||= mode === 'rollover' ? count > firstRun && count - firstRun > admits(EXPECTED_BUCKETS[bucket].limit)
+      : count > admits(EXPECTED_BUCKETS[bucket].limit);
     if (mode === 'never' || !limited) { response.writeHead(baseline).end('{}'); return; }
     const { period } = EXPECTED_BUCKETS[bucket];
     const header = mode === 'wrong retry-after' ? 10 : period;
@@ -286,8 +308,9 @@ async function fakeServer(mode: Mode, buckets: Bucket[]) {
   try {
     const addr = server.address();
     assert.ok(addr && typeof addr === 'object');
-    const result = await checkHttp(`http://127.0.0.1:${addr.port}`, buckets, session);
-    return { result, counts, undoPaths, calls: requests.length };
+    const waits: number[] = [];
+    const result = await checkHttp(`http://127.0.0.1:${addr.port}`, buckets, session, fetch, async (ms) => { waits.push(ms); });
+    return { result, counts, undoPaths, calls: requests.length, waits };
   } finally {
     await new Promise<void>((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
   }
@@ -298,19 +321,23 @@ test('HTTP check passes exact sequences on all enabled buckets and separates the
   const normal = await fakeServer('exact', buckets);
   assert.deepEqual(normal.result, buckets.map((bucket) => ({ bucket, pass: true })));
   assert.equal(normal.undoPaths.size, 1);
-  assert.equal(normal.counts.get('undo_flood'), EXPECTED_BUCKETS.undo.limit + 1);
+  assert.ok((normal.counts.get('undo_flood') ?? 0) > EXPECTED_BUCKETS.undo.limit);
   const flood = await fakeServer('exact', ['undo_flood']);
   assert.deepEqual(flood.result, [{ bucket: 'undo_flood', pass: true }]);
-  assert.equal(flood.undoPaths.size, EXPECTED_BUCKETS.undo_flood.limit + 1);
+  assert.ok(flood.undoPaths.size > EXPECTED_BUCKETS.undo_flood.limit);
 });
 
 for (const mode of ['never', 'early', 'late', 'wrong retry-after', 'wrong body period'] as const) {
   test(`HTTP check rejects ${mode} rate limiting`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
-    const { result, calls } = await fakeServer(mode, ['writes']);
+    // Requests go out in batches of eight, and one attempt sends at most max + 1.
+    const sent = (n: number) => Math.min(Math.ceil(n / 8) * 8, max + 1);
+    const { result, calls, waits } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: false }]);
-    assert.equal(calls, { never: max + 1, early: min, late: max + 1, 'wrong retry-after': limit + 1, 'wrong body period': limit + 1 }[mode]);
+    assert.equal(calls, { never: 2 * (max + 1), early: sent(min), late: max + 1 + 8, 'wrong retry-after': sent(limit + 1), 'wrong body period': sent(limit + 1) }[mode]);
+    // Only a late or missing refusal is retried, after one full period.
+    assert.deepEqual(waits, mode === 'never' || mode === 'late' ? [61_000] : []);
   });
 }
 
@@ -318,13 +345,21 @@ for (const mode of ['band low', 'band high'] as const) {
   test(`HTTP check accepts a first refusal at the ${mode === 'band low' ? 'low' : 'high'} edge of the band`, async () => {
     const { limit } = EXPECTED_BUCKETS.writes;
     const { min, max } = refusalBand(limit);
-    const { result, calls } = await fakeServer(mode, ['writes']);
+    const sent = (n: number) => Math.min(Math.ceil(n / 8) * 8, max + 1);
+    const { result, calls, waits } = await fakeServer(mode, ['writes']);
     assert.deepEqual(result, [{ bucket: 'writes', pass: true }]);
-    assert.equal(calls, (mode === 'band low' ? min : max) + 1);
+    assert.equal(calls, sent((mode === 'band low' ? min : max) + 1));
+    assert.deepEqual(waits, []);
   });
 }
 
-test('HTTP check batches admissions but sends the refusal check only after they finish', async () => {
+test('HTTP check passes after one retry when a counter rollover hides the refusal', async () => {
+  const { result, waits } = await fakeServer('rollover', ['writes']);
+  assert.deepEqual(result, [{ bucket: 'writes', pass: true }]);
+  assert.deepEqual(waits, [61_000]);
+});
+
+test('HTTP check keeps at most eight requests in flight and stops after the batch with the first refusal', async () => {
   const { limit, period } = EXPECTED_BUCKETS.reads;
   let calls = 0;
   let pending = 0;
@@ -343,8 +378,8 @@ test('HTTP check batches admissions but sends the refusal check only after they 
     return new Response(null, { status: 404 });
   });
   assert.deepEqual(result, [{ bucket: 'reads', pass: true }]);
-  assert.equal(calls, limit + 1);
-  assert.equal(refusalPending, 0);
+  assert.equal(calls, Math.ceil((limit + 1) / 8) * 8);
+  assert.ok(refusalPending !== undefined && refusalPending < 8);
   assert.equal(peak, 8);
 });
 
