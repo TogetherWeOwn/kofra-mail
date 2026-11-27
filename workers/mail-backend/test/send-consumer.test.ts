@@ -1019,3 +1019,19 @@ test('a stored acceptance the mailbox answers stale is kept and flagged on repla
   assert.deepEqual(await h.directoryRows('SELECT 1 FROM send_results WHERE send_id = ?', missing), [], 'deleted');
   assert.equal(logged(h, 'send_result_orphan').length, 1, 'and counted as an orphan');
 }, { forged: 1 }));
+
+test('the provider\'s daily-limit answer to a call ends the crash streak', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'daily-streak');
+  // An unreported marked expiry: the consumer dies after Mark.
+  await crashAt(h, 'after:markSend');
+  const crashed = await consume(h, id);
+  await until(h, await leaseOf(h, id, crashed) + SKEW);
+  await script(h, { result: 'reject', code: 'E_DAILY_LIMIT_EXCEEDED' });
+  await pauseAt(h, 'after:authorizeDispatch');
+  const next = consume(h, id);
+  await pausedAt(h, 'after:authorizeDispatch');
+  assert.equal((await h.sendState(id)).dispatch?.unfinished, 1, 'the claim counted the unreported expiry');
+  await resumeAt(h, 'after:authorizeDispatch');
+  assert.equal(step(await next), 'delayed');
+  assert.equal((await h.sendState(id)).dispatch?.unfinished, 0, 'delaySend(provider_daily) after a call resets the streak');
+}));
