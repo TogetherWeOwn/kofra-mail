@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS quota_released (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS quota_released_by_seen ON quota_released (last_seen_at);
 CREATE TABLE IF NOT EXISTS quota_gate_alerts (day TEXT PRIMARY KEY, created_at INTEGER NOT NULL, sent_at INTEGER) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS quota_alerts_by_age ON quota_gate_alerts (created_at);
+CREATE INDEX IF NOT EXISTS quota_alerts_sent ON quota_gate_alerts (sent_at) WHERE sent_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS quota_alerts_pending ON quota_gate_alerts (created_at) WHERE sent_at IS NULL;
 `;
 
@@ -132,8 +132,9 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
   }
 
   private pruneAlerts(now: number) {
+    // Keep the delivery obligation while the binding is absent or failing.
     this.sql.exec(`DELETE FROM quota_gate_alerts WHERE day IN (SELECT day FROM quota_gate_alerts
-      WHERE created_at < ? ORDER BY created_at LIMIT ?)`, now - ALERT_RETENTION_MS, PRUNE_PAGE);
+      WHERE sent_at IS NOT NULL AND sent_at < ? ORDER BY sent_at LIMIT ?)`, now - ALERT_RETENTION_MS, PRUNE_PAGE);
   }
 
   private prune(now: number, previousMonth?: string) {

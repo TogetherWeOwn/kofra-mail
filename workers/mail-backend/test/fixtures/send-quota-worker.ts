@@ -1,7 +1,7 @@
 import { SendQuota, type SendQuotaConfig } from '../../src/send-quota.ts';
 import type { QuotaPort } from '../../src/mailbox-send-quota.ts';
 
-export type QuotaFixtureEnv = SendQuotaConfig & { INITIAL_TIME: number };
+export type QuotaFixtureEnv = SendQuotaConfig & { INITIAL_TIME: number; AUTO_ALERT_ALARM?: boolean };
 
 export function quotaFixture<Env extends QuotaFixtureEnv>(clock: (env: Env) => number) {
   return class FixtureSendQuota extends SendQuota {
@@ -11,7 +11,12 @@ export function quotaFixture<Env extends QuotaFixtureEnv>(clock: (env: Env) => n
     protected override now() { return this.clockOverride ?? clock(this.fixtureEnv); }
     setTime(now: number) { this.clockOverride = now; }
     private alarmAt: number | null = null;
-    protected override async armAlert(at: number) { this.alarmAt = at; }
+    protected override async armAlert(at: number) {
+      this.alarmAt = at;
+      // Keep the actual storage alarm in the wake-up test, with short wall-clock
+      // intervals so the separate simulated quota clock can stay deterministic.
+      if (this.fixtureEnv.AUTO_ALERT_ALARM) await super.armAlert(Date.now() + 250);
+    }
     alarmDue() { return this.alarmAt; }
     async runAlarm() { this.alarmAt = null; await super.alarm(); }
     retained() {

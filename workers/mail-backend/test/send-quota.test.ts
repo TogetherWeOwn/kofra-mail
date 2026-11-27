@@ -30,26 +30,29 @@ const stub = (mf: Miniflare) => {
 const entry = fileURLToPath(new NodeURL('./fixtures/send-quota-worker.ts', import.meta.url));
 let bundle: ReturnType<typeof build> | undefined;
 
-async function withQuota(run: (quota: ReturnType<typeof stub>, restart: () => Promise<ReturnType<typeof stub>>, logs: string[]) => Promise<void>,
-  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00', alert }: {
-    daily?: string; monthly?: string; now?: number; persist?: boolean; reset?: string; alert?: (body: unknown) => number;
+type AlertHandler = (body: unknown) => number;
+async function withQuota(run: (quota: ReturnType<typeof stub>, restart: (alert?: AlertHandler) => Promise<ReturnType<typeof stub>>, logs: string[]) => Promise<void>,
+  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00', alert, autoAlarm = false }: {
+    daily?: string; monthly?: string; now?: number; persist?: boolean; reset?: string; alert?: AlertHandler; autoAlarm?: boolean;
   } = {}) {
   const { outputFiles } = await (bundle ??= build({ entryPoints: [entry], bundle: true, write: false, format: 'esm', external: ['cloudflare:workers'] }));
   const directory = persist ? await mkdtemp('/var/tmp/velmora-riaklo-m3-6-quota-') : undefined;
   const logs: string[] = [];
-  const start = () => new Miniflare({
+  const start = (handler?: AlertHandler) => new Miniflare({
     handleStructuredLogs: ({ message }: { message: string }) => { logs.push(message); },
     modules: [{ type: 'ESModule', path: 'quota.mjs', contents: outputFiles![0].text }], compatibilityDate: '2026-06-25',
     durableObjects: { SEND_QUOTA: { className: 'FixtureSendQuota', useSQLite: true } },
     durableObjectsPersist: directory && join(directory, 'do'),
-    bindings: { INITIAL_TIME: now, MAIL_SEND_DAILY_QUOTA: daily, MAIL_SEND_MONTHLY_CEILING: monthly, MAIL_SEND_DAILY_RESET_UTC: reset },
-    ...(alert && { serviceBindings: { ALERTS: async (req: LocalRequest) => new LocalResponse(null, { status: alert(await req.json()) }) } }),
+    bindings: { INITIAL_TIME: now, MAIL_SEND_DAILY_QUOTA: daily, MAIL_SEND_MONTHLY_CEILING: monthly, MAIL_SEND_DAILY_RESET_UTC: reset,
+      AUTO_ALERT_ALARM: autoAlarm },
+    ...(handler && { serviceBindings: { ALERTS: async (req: LocalRequest) => new LocalResponse(null, { status: handler(await req.json()) }) } }),
   });
-  let runtime = start();
+  let runtime = start(alert);
   try {
-    await run(await stub(runtime), async () => {
+    await run(stub(runtime), async (restoredAlert = alert) => {
       await runtime.dispose();
-      runtime = start();
+      runtime = start(restoredAlert);
+      await runtime.ready;
       return stub(runtime);
     }, logs);
   } finally {
@@ -211,17 +214,57 @@ test('pruning expires old provisional records but keeps live and recently expire
   assert.equal((await quota.confirm(live, fence(), [0])).status, 'ok');
 }));
 
-test('pruning drops alerts after two days but preserves a more recent refusal', () => withQuota(async quota => {
-  const start = at('2026-11-26T16:00:00Z');
-  const day = 24 * 60 * 60_000;
-  for (const [name, clock] of [['old-alert', start], ['new-alert', start + 2 * day]] as const) {
-    await quota.setTime(clock);
-    assert.equal((await quota.reserve(scope(name), fence(), [0, 1], [], clock + 1000)).status, 'exhausted');
-  }
-  await quota.setTime(start + 2 * day + 1);
-  await quota.release(scope('prune-alerts'), []);
-  assert.deepEqual((await quota.retained()).alerts.map(row => row.day), ['2026-11-28']);
-}, { daily: '2' }));
+test('a confirm 61 minutes after expiry is stale even when the row remains behind the prune page', () => withQuota(async quota => {
+  const earlier = Array.from({ length: 32 }, (_, i) => i);
+  assert.equal((await quota.reserve(scope('earlier-expiry-page'), fence(), earlier, [], NOW + 1000)).status, 'ok');
+  const target = scope('expiry-beyond-first-page');
+  const expiry = NOW + 2000;
+  assert.equal((await quota.reserve(target, fence(), [0], [], expiry)).status, 'ok');
+  await quota.setTime(expiry + 61 * 60_000);
+  assert.deepEqual(await quota.confirm(target, fence(), [0]), { status: 'stale' });
+  assert.deepEqual((await quota.retained()).charges, [{ sendId: target.sendId, day: '2026-11-29', expires_at: expiry }],
+    'the bounded prune did not reach the stale target');
+}, { daily: '100' }));
+
+const dayMs = 24 * 60 * 60_000;
+test('an unsent gate alert survives three days without the binding and sends once it returns', () => withQuota(async (quota, restart) => {
+  assert.equal((await quota.reserve(scope('pending-alert'), fence(), [0, 1], [], NOW + 1000)).status, 'exhausted');
+  const restoredAt = NOW + 3 * dayMs;
+  await quota.setTime(restoredAt);
+  await quota.runAlarm();
+  assert.deepEqual((await quota.retained()).alerts.map(row => row.sent_at), [null], 'the unbound alarm must not lose the unsent row');
+  const deliveries: unknown[] = [];
+  const reopened = await restart(body => { deliveries.push(body); return 204; });
+  await reopened.setTime(restoredAt);
+  await reopened.runAlarm();
+  await reopened.runAlarm();
+  assert.deepEqual(deliveries, [{ source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' }]);
+  assert.deepEqual((await reopened.retained()).alerts.map(row => row.sent_at), [restoredAt]);
+}, { daily: '2', persist: true }));
+
+test('a persisted alarm wakes the reopened quota object without a manual alarm call', () => withQuota(async (quota, restart) => {
+  assert.equal((await quota.reserve(scope('automatic-alarm'), fence(), [0, 1], [], NOW + 1000)).status, 'exhausted');
+  const delivered = Promise.withResolvers<unknown>();
+  await restart(body => { delivered.resolve(body); return 204; });
+  const timeout = setTimeout(() => delivered.reject(new Error('No automatic quota alarm after restart')), 8000);
+  try {
+    assert.deepEqual(await delivered.promise,
+      { source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' });
+  } finally { clearTimeout(timeout); }
+}, { daily: '2', persist: true, autoAlarm: true }));
+
+test('an acknowledged gate alert is pruned two days after delivery rather than creation', () => withQuota(async quota => {
+  assert.equal((await quota.reserve(scope('delivered-alert'), fence(), [0, 1], [], NOW + 1000)).status, 'exhausted');
+  const deliveredAt = NOW + dayMs;
+  await quota.setTime(deliveredAt);
+  await quota.runAlarm();
+  await quota.setTime(deliveredAt + 2 * dayMs);
+  await quota.release(scope('at-retention-cutoff'), []);
+  assert.deepEqual((await quota.retained()).alerts.map(row => row.sent_at), [deliveredAt]);
+  await quota.setTime(deliveredAt + 2 * dayMs + 1);
+  await quota.release(scope('past-retention-cutoff'), []);
+  assert.deepEqual((await quota.retained()).alerts, []);
+}, { daily: '2', alert: () => 204 }));
 
 test('pruning keeps fence rows observed again within 35 days', () => withQuota(async quota => {
   const day = 24 * 60 * 60_000;
