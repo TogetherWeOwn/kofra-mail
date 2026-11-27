@@ -55,16 +55,261 @@ function wireAddresses(input: Address[] | undefined): WireAddress[] {
 // the read, the stored object is corrupt for good.
 export class RawDigestMismatch extends Error { constructor() { super('Raw message digest mismatch'); } }
 
-export async function readMailMime(raw: Uint8Array<ArrayBuffer>, rawKey: string) {
+const MIME_OPTIONS = { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 } as const;
+
+async function verifyRaw(raw: Uint8Array<ArrayBuffer>, rawKey: string): Promise<void> {
   const key = parseObjectKey(rawKey);
   if (key?.kind !== 'raw') throw new Error('Raw message digest mismatch');
   if (await sha256(raw) !== key.digest) throw new RawDigestMismatch();
-  return PostalMime.parse(raw, { attachmentEncoding: 'arraybuffer', maxNestingDepth: 32, maxRfc822NestingDepth: 3 });
+}
+
+export async function readMailMime(raw: Uint8Array<ArrayBuffer>, rawKey: string) {
+  await verifyRaw(raw, rawKey);
+  return PostalMime.parse(raw, MIME_OPTIONS);
+}
+
+// PostalMime 2.7.6 internals that the bounded parse relies on. The package
+// version is pinned; parse-mail-equivalence.test.ts fails if they change.
+type PostalChunk = ArrayBuffer | Uint8Array | string;
+type PostalDecoder = { chunks: PostalChunk[]; decoder?: TextDecoder; update(line: Uint8Array): void; finalize(): Promise<ArrayBuffer> };
+type PostalNode = {
+  state: string; contentDecoder: PostalDecoder | false; contentTransferEncoding?: { encoding?: string };
+  contentType: { multipart?: string | false; parsed?: { value?: string | false } };
+  contentDisposition?: { parsed?: { value?: string | false } };
+};
+type PostalInternals = { currentNode: PostalNode; readPos: number; processLine(line: Uint8Array, isFinal: boolean): Promise<void> };
+type Parsed = Awaited<ReturnType<typeof PostalMime.parse>>;
+
+// A decoded part the parse only measured: its body lines in the raw message
+// and the decoder PostalMime chose for them. Decoding them again yields the
+// bytes PostalMime would have returned.
+export type PartSource = { raw: Uint8Array<ArrayBuffer>; start: number; end: number; size: number; split: boolean; decoder: () => PostalDecoder };
+
+// PostalMime decodes a part line by line, and one line can hold a whole
+// unwrapped base64 body. Its base64 decoder keeps only ASCII base64 characters
+// and an ASCII byte decodes to itself wherever a line is cut, so feeding a long
+// line in pieces yields the same bytes. Quoted-printable and unencoded parts
+// end each fed piece with a line break, so they are fed whole.
+const PIECE_BYTES = 64 * 1024;
+function* pieces(line: Uint8Array, split: boolean): Generator<Uint8Array> {
+  if (!split || line.byteLength <= PIECE_BYTES) { yield line; return; }
+  for (let offset = 0; offset < line.byteLength; offset += PIECE_BYTES) yield line.subarray(offset, offset + PIECE_BYTES);
+}
+
+class BoundedParseFallback extends Error {}
+
+const utf8 = new TextEncoder();
+// The bytes a Blob of PostalMime's decoder chunks would hold.
+const chunkBytes = (chunk: PostalChunk): Uint8Array => typeof chunk === 'string' ? utf8.encode(chunk)
+  : chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : chunk;
+const chunkSize = (chunk: PostalChunk) => typeof chunk === 'string' ? utf8.encode(chunk).byteLength : chunk.byteLength;
+
+// Which parts PostalMime returns only as attachment bytes: not multipart, not
+// an inline message/rfc822 (parsed as a nested message), not inline text, and
+// not a calendar part (re-encoded from its text). Any other leaf with content
+// becomes exactly one attachment holding its decoded bytes.
+function measuredOnly(node: PostalNode): boolean {
+  if (node.contentType.multipart) return false;
+  const type = node.contentType.parsed?.value;
+  const disposition = node.contentDisposition?.parsed?.value;
+  if (type === 'message/rfc822') return (disposition || 'inline') !== 'inline';
+  if ((type === 'text/plain' || type === 'text/html') && disposition !== 'attachment') return false;
+  return type !== 'text/calendar' && type !== 'application/ics';
+}
+
+// Counts a part's decoded bytes and drops them as they are produced. Its
+// finalize() answers a distinct empty buffer that stands for the part, so the
+// attachment PostalMime returns for it can be matched to its source.
+class MeasuringDecoder {
+  private start = -1;
+  private end = -1;
+  private size = 0;
+  private readonly parser: BoundedParser;
+  private readonly inner: PostalDecoder;
+  private readonly split: boolean;
+  constructor(parser: BoundedParser, inner: PostalDecoder, split: boolean) { this.parser = parser; this.inner = inner; this.split = split; }
+
+  update(line: Uint8Array): void {
+    // A leaf's body lines are contiguous; anything else is not the parse this relies on.
+    if (this.start < 0) this.start = line.byteOffset;
+    else if (line.byteOffset !== this.end) throw new BoundedParseFallback('Non-contiguous part');
+    // PostalMime has already read past this line's LF.
+    this.end = (this.parser as unknown as PostalInternals).readPos;
+    for (const piece of pieces(line, this.split)) {
+      this.inner.update(piece);
+      this.drain();
+    }
+  }
+
+  private drain(): void {
+    const { chunks } = this.inner;
+    this.inner.chunks = [];
+    for (const chunk of chunks) this.size += chunkSize(chunk);
+  }
+
+  async finalize(): Promise<ArrayBuffer> {
+    this.drain();
+    this.size += (await this.inner.finalize()).byteLength;
+    const token = new ArrayBuffer(0);
+    const { inner } = this;
+    const Decoder = inner.constructor as new (options: { decoder?: TextDecoder }) => PostalDecoder;
+    const decoder = inner.decoder;
+    this.parser.parts.set(token, { raw: this.parser.raw, start: Math.max(this.start, 0), end: Math.max(this.end, 0), size: this.size,
+      split: this.split, decoder: () => new Decoder({ decoder }) });
+    return token;
+  }
+}
+
+// PostalMime with the body of each attachment-only part measured instead of
+// kept, so a parse never holds the decoded attachments.
+class BoundedParser extends PostalMime {
+  readonly parts = new Map<ArrayBuffer, PartSource>();
+  private last: PostalNode | null = null;
+  readonly raw: Uint8Array<ArrayBuffer>;
+  constructor(raw: Uint8Array<ArrayBuffer>) { super(MIME_OPTIONS); this.raw = raw; }
+
+  async processLine(line: Uint8Array, isFinal: boolean): Promise<void> {
+    await (PostalMime.prototype as unknown as PostalInternals).processLine.call(this, line, isFinal);
+    // A part's decoder is created when its header block ends, before its first body line.
+    const node = (this as unknown as PostalInternals).currentNode;
+    if (node === this.last || node.state !== 'body') return;
+    this.last = node;
+    const decoder = node.contentDecoder;
+    if (decoder && Array.isArray(decoder.chunks) && !decoder.chunks.length && measuredOnly(node)) {
+      // PostalMime's own test for choosing its base64 decoder.
+      const base64 = /base64/i.test(node.contentTransferEncoding?.encoding ?? '');
+      node.contentDecoder = new MeasuringDecoder(this, decoder, base64) as unknown as PostalDecoder;
+    }
+  }
+}
+
+// PostalMime's parse of `raw`, with each attachment's content as its bytes
+// or, for a measured part, as the source to decode it from when it is stored.
+export async function boundedMime(raw: Uint8Array<ArrayBuffer>) {
+  const parser = new BoundedParser(raw);
+  // A whole-buffer view is parsed in place; PostalMime copies any other view.
+  const input = raw.byteOffset === 0 && raw.byteLength === raw.buffer.byteLength ? raw.buffer : raw;
+  let parsed: Parsed;
+  try {
+    parsed = await parser.parse(input);
+  } catch (error) {
+    if (!(error instanceof BoundedParseFallback)) throw error;
+    // Not the parse this relies on: keep every part, as an unbounded parse does.
+    console.error({ code: 'mail_parse_fallback' });
+    parsed = await PostalMime.parse(input, MIME_OPTIONS);
+    return { parsed, contents: parsed.attachments.map(attachment => decodedAttachment(attachment.content)) };
+  }
+  const contents = parsed.attachments.map((attachment): Uint8Array<ArrayBuffer> | PartSource =>
+    attachment.content instanceof ArrayBuffer && parser.parts.get(attachment.content) || decodedAttachment(attachment.content));
+  return { parsed, contents };
+}
+
+// The decoded bytes of a measured part in blocks of up to 64 KiB, exactly as
+// PostalMime's decoder produces them from the same body lines.
+async function* partBlocks(source: PartSource): AsyncGenerator<Uint8Array<ArrayBuffer>> {
+  const { raw, end } = source;
+  const decoder = source.decoder();
+  let block = new Uint8Array(64 * 1024);
+  let used = 0;
+  let total = 0;
+  function* take(chunks: PostalChunk[]): Generator<Uint8Array<ArrayBuffer>> {
+    for (const chunk of chunks) {
+      const bytes = chunkBytes(chunk);
+      total += bytes.byteLength;
+      // No byte past the measured size is ever released.
+      if (total > source.size) throw new Error('Attachment size changed on decode');
+      for (let offset = 0; offset < bytes.byteLength;) {
+        const count = Math.min(block.byteLength - used, bytes.byteLength - offset);
+        block.set(bytes.subarray(offset, offset + count), used);
+        used += count;
+        offset += count;
+        if (used === block.byteLength) { yield block; block = new Uint8Array(block.byteLength); used = 0; }
+      }
+    }
+  }
+  // PostalMime's line reader: a line ends at LF; trailing CR and LF are not part of it.
+  for (let pos = source.start; pos < end;) {
+    const start = pos;
+    let stop = pos;
+    while (pos < end) {
+      const c = raw[pos++];
+      if (c !== 0x0d && c !== 0x0a) stop = pos;
+      if (c === 0x0a) break;
+    }
+    for (const piece of pieces(raw.subarray(start, stop), source.split)) {
+      decoder.update(piece);
+      const { chunks } = decoder;
+      decoder.chunks = [];
+      yield* take(chunks);
+    }
+  }
+  const { chunks } = decoder;
+  decoder.chunks = [];
+  yield* take([...chunks, await decoder.finalize()]);
+  if (total !== source.size) throw new Error('Attachment size changed on decode');
+  if (used) yield block.slice(0, used);
+}
+
+function hex(digest: ArrayBuffer): string {
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export async function partDigest(source: PartSource): Promise<string> {
+  const stream = new crypto.DigestStream('SHA-256');
+  const writer = stream.getWriter();
+  const digest = stream.digest;
+  digest.catch(() => {});
+  try {
+    for await (const block of partBlocks(source)) await writer.write(block);
+  } catch (error) {
+    await writer.abort(error).catch(() => {});
+    throw error;
+  }
+  await writer.close();
+  return hex(await digest);
+}
+
+// The part's bytes for a PUT under `digest`. The last block is released only
+// once the bytes match the digest, so a mismatch errors the stream before it ends.
+export function partStream(source: PartSource, digest: string): ReadableStream<Uint8Array> {
+  const blocks = partBlocks(source);
+  const check = new crypto.DigestStream('SHA-256');
+  const writer = check.getWriter();
+  // Read only after a clean close; an abort rejects it with nobody waiting.
+  const checked = check.digest;
+  checked.catch(() => {});
+  let held: Uint8Array<ArrayBuffer> | null = null;
+  const stop = (reason: unknown) => writer.abort(reason).catch(() => {});
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        for (;;) {
+          const next = await blocks.next();
+          if (next.done) {
+            await writer.close();
+            if (hex(await checked) !== digest) throw new Error('Attachment digest changed on decode');
+            if (held) controller.enqueue(held);
+            controller.close();
+            return;
+          }
+          await writer.write(next.value);
+          const previous = held;
+          held = next.value;
+          if (previous) { controller.enqueue(previous); return; }
+        }
+      } catch (error) {
+        await stop(error);
+        throw error;
+      }
+    },
+    async cancel(reason) { await blocks.return(undefined); await stop(reason); },
+  }, { highWaterMark: 0 });
 }
 
 export async function parseMail(raw: Uint8Array<ArrayBuffer>, rawKey: string, mailApiEnabled = false) {
   const key = parseObjectKey(rawKey)!;
-  const parsed = await readMailMime(raw, rawKey);
+  await verifyRaw(raw, rawKey);
+  const { parsed, contents } = await boundedMime(raw);
   // PostalMime keeps only the first From address; DMARC alignment needs to know
   // whether the message named exactly one author.
   const fromFields = parsed.headers.filter(header => header.key === 'from');
@@ -80,19 +325,21 @@ export async function parseMail(raw: Uint8Array<ArrayBuffer>, rawKey: string, ma
   const body = bodyForIndex(parsed.text, parsed.html);
   const count = parsed.attachments.length;
   const kept = count > MAX_INDEXED_ATTACHMENTS ? MAX_INDEXED_ATTACHMENTS - 1 : count;
+  // A measured part is decoded again only when it is stored.
+  const sizeOf = (content: Uint8Array | PartSource) => content instanceof Uint8Array ? content.byteLength : content.size;
   const attachments = parsed.attachments.slice(0, kept).map((attachment, index) => {
-    const bytes = decodedAttachment(attachment.content);
+    const size = sizeOf(contents[index]);
     return {
       part: index + 1,
       name: mailApiEnabled ? indexedAttachmentName(attachment.filename ?? '') : (attachment.filename ?? '').slice(0, 512),
       mimeType: attachment.mimeType.slice(0, 255),
-      size: bytes.byteLength,
-      external: bytes.byteLength >= EXTERNAL_ATTACHMENT_BYTES ? bytes : null,
+      size,
+      external: size >= EXTERNAL_ATTACHMENT_BYTES ? contents[index] : null,
     };
   });
   if (kept < count) {
     let size = 0;
-    for (let i = kept; i < count; i++) size += decodedAttachment(parsed.attachments[i].content).byteLength;
+    for (let i = kept; i < count; i++) size += sizeOf(contents[i]);
     attachments.push({ part: kept + 1, name: `(${count - kept} more attachments)`, mimeType: 'application/octet-stream',
       size, external: null });
   }
@@ -145,7 +392,7 @@ function hasRemoteImages(html: string): boolean {
   return remote;
 }
 
-function buildDisplay(parsed: Awaited<ReturnType<typeof readMailMime>>, subject: string, body: string, kept: number): MessageDisplay {
+function buildDisplay(parsed: Parsed, subject: string, body: string, kept: number): MessageDisplay {
   const from = wireAddresses(parsed.from ? [parsed.from] : [])[0] ?? { name: '', email: '' };
   const to = wireAddresses(parsed.to);
   const cc = wireAddresses(parsed.cc);

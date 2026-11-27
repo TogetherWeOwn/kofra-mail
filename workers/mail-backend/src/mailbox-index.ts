@@ -14,12 +14,14 @@ import type { ConfirmAnswer, ConfirmEntry, HoldTarget } from './sweep-ledger.ts'
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import { parseObjectKey, type ObjectKind } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
-import { normalizeSearch, parseMail, type ParsedMail } from './parse-mail.ts';
+import { normalizeSearch, parseMail, partDigest, partStream, type ParsedMail } from './parse-mail.ts';
 
 export type MailboxObjects = {
   get(key: string): Promise<Uint8Array<ArrayBuffer>>;
   put(key: string, content: Uint8Array<ArrayBuffer>): Promise<void>;
   putUpload?(key: string, content: ReadableStream<Uint8Array>, size: number, digest: string, timeoutMs: number): Promise<void>;
+  // A streamed PUT of an attachment decoded from a stored message, up to MAX_PARSED_PART_BYTES.
+  putStream?(key: string, content: ReadableStream<Uint8Array>, size: number, digest: string): Promise<void>;
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
   holdProvisional?(target: HoldTarget, holder: string): Promise<string>;
   hold(key: string, holder: string): Promise<void>;
@@ -169,14 +171,18 @@ export class MailboxIndex {
     const holder = this.referenceFor(message.id);
     await this.objects.hold(message.rawKey, holder);
     const attachments: Prepared['attachments'] = [];
+    // One attachment at a time. A measured part is decoded once for its
+    // digest and again as the PUT body, never held whole.
     for (const { external, ...attachment } of parsed.attachments) {
       let key: string | null = null;
       if (external) {
-        const digest = await sha256(external);
+        const digest = external instanceof Uint8Array ? await sha256(external) : await partDigest(external);
         key = await this.objects.register('att', digest, holder);
         const registered = parseObjectKey(key);
         if (registered?.kind !== 'att' || registered.digest !== digest) throw new Error('Invalid registered attachment key');
-        await this.objects.put(key, external);
+        if (external instanceof Uint8Array) await this.objects.put(key, external);
+        else if (!this.objects.putStream) throw new Error('Attachment stream storage unavailable');
+        else await this.objects.putStream(key, partStream(external, digest), external.size, digest);
       }
       attachments.push({ ...attachment, key });
     }
