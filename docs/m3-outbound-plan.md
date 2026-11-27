@@ -502,7 +502,7 @@ Contract section 5 runs rate limits in the first step of every request, before t
   - A partial failure gives `partial` with per-recipient reasons.
   - The quota error gives `delayed` with a timer.
   - A DLQ message never changes the send, and is acknowledged only after the fake alert binding answers 2xx.
-  - A mailbox send event (an outage code, an unknown code, the ambiguous cap, the deadline) reaches the operator alert binding, and a repeat of the same environment and code on the same day is deduplicated.
+  - A mailbox send event (an outage code, an unknown code, the ambiguous cap, the deadline, a stalled send, a quota-object outage) reaches the operator alert binding and the fake operator endpoint records it, and a repeat of the same environment and code on the same day is deduplicated.
   - An alias removed (or the mailbox given to another owner) while a send is `delayed`: the next attempt ends `failed` with `invalid_sender`, with no `EMAIL` call.
   - While the mailbox is `restoring`, the consumer acknowledges without sending and without spending a queue retry; the send goes out after the restore through its timer.
   - A stale fence (after a restore) cannot send, records a confirmed `sent`, and cannot record `failed`, a retry or an ambiguous outcome; no fence changes a terminal recipient except by a late confirmation.
