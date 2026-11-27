@@ -1088,3 +1088,24 @@ test('getThread reports the sent copy\'s send state only once published', () => 
   const thread = await mail.getThread(message.threadId);
   assert.equal(thread.messages.find(({ id: messageId }) => messageId === sent.messageId)?.send?.state, 'sent');
 }));
+
+test('a grace hold does not fail a protected recipient while its stored acceptance waits for its notice time', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'grace-stored');
+  const a = await attempt(h, id, { stop: 'authorize' });
+  await h.restore();
+  await changeOwner(h);
+  await h.advance(LEASE + SKEW);
+  assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', id), { status: 'refused' });
+  const holdUntil = Number((await h.sendState(id)).dispatch?.grace_until);
+  // The consumer stored the acceptance and moved its notify_after past the end of the hold.
+  const noticeAt = holdUntil + 10 * minute;
+  await h.directoryChange(`INSERT INTO send_results (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt, kind, message_id,
+    created_at, notify_after) VALUES (?, ?, ?, ?, ?, 'accepted', 'late', 0, ?)`, WS, MB, id, a.claim.fence.epoch, a.claim.fence.attempt, noticeAt);
+  await h.advance(holdUntil - await h.sends.now());
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['attempting'], 'not failed while the acceptance is stored');
+  assert.deepEqual((await h.sendState(id)).drive, [noticeAt], 'the drive row comes back when the row is due');
+  await h.advance(noticeAt - await h.sends.now());
+  await h.advance(minute);
+  assert.deepEqual(ledgerOf(await finished(h, id)), ['sent']);
+  assert.deepEqual(await storedRows(h, id), []);
+}));
