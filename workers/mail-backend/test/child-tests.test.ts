@@ -48,17 +48,27 @@ test('a runner stopped by SIGTERM or SIGINT kills its child group before it exit
     const runner = spawn(process.execPath, ['--input-type=module', '-e',
       `const { runChild } = await import(${JSON.stringify(helper)}); await runChild(['-e', ${JSON.stringify(child)}], { timeoutMs: 60_000 });`],
     { stdio: 'ignore' });
+    // Observe the runner's exit from the start, so an early exit is never missed.
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
+      runner.once('exit', (code, stopped) => resolve({ code, signal: stopped }));
+      runner.once('error', reject);
+    });
+    exited.catch(() => {});
     let pid = 0;
     const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
     try {
-      for (let i = 0; i < 250 && !pid; i++) {
+      for (let i = 0; i < 250 && !pid && runner.exitCode === null && runner.signalCode === null; i++) {
         pid = Number(await readFile(pidFile, 'utf8').catch(() => '0'));
         if (!pid) await new Promise(resolve => setTimeout(resolve, 20));
       }
-      assert.ok(pid > 0, 'the grandchild started');
-      const exited = new Promise<NodeJS.Signals | null>(resolve => runner.on('exit', (_code, stopped) => resolve(stopped)));
+      assert.ok(pid > 0, `the grandchild started (runner exit ${runner.exitCode ?? runner.signalCode ?? 'none'})`);
       runner.kill(signal);
-      assert.equal(await exited, signal, 'the runner still stops by the signal it received');
+      // Bounded, so an unexpected hang fails the test and the cleanup below still runs.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const stopped = await Promise.race([exited, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`the runner did not exit within 10 s of ${signal}`)), 10_000);
+      })]).finally(() => clearTimeout(timer));
+      assert.deepEqual(stopped, { code: null, signal }, 'the runner still stops by the signal it received');
       for (let i = 0; i < 100 && alive(); i++) await new Promise(resolve => setTimeout(resolve, 20));
       assert.equal(alive(), false, `the grandchild outlived a runner stopped by ${signal}`);
     } finally {
