@@ -455,6 +455,8 @@ Contract section 5 runs rate limits in the first step of every request, before t
 - The built request sets no custom header outside the two above, and never sets `Bcc`, `Sender`, `From`, `Return-Path`, `Reply-To`, `Date` or `Message-ID` in `headers`. A test lists the header names, counts them (at most two), and checks that both outputs use the same frozen Reply-To.
 - 50 recipients, 32 attachments and the measured limit are each accepted, and one more of each is refused.
 
+**Follow-up for MIME v2:** Register adapters and cleanup by version, retain v1, and test replay of each supported version from its frozen inputs.
+
 ### M3-5 Consumer, ledger and DLQ (Opus)
 
 **Change:** section 2, consumer and dead-letter queue: the `send` queue and its DLQ, `claimSend`, `recordResult`, `delaySend` and `abandonClaim` with fencing, `next_attempt_at`, the caps and the deadline, and the ledger states `pending`, `attempting`, `sent`, `failed` and `suppressed`; the attempt history; the `send_results` table (a D1 migration) and result notices; late confirmations.
