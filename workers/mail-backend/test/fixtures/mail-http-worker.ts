@@ -24,6 +24,8 @@ import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
 import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
 import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
+import type { QuotaPort } from '../../src/mailbox-send-quota.ts';
+import { FakeSendQuota } from './send-quota-fake.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -47,6 +49,8 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   MANUAL_ALARMS?: string;
   // A stand-in for the send_email binding; the send path before M3-5 never calls it.
   EMAIL?: { send(message: unknown): Promise<unknown> };
+  // The recording stand-in for the account quota object (M3-6).
+  SEND_QUOTA: DurableObjectNamespace<FakeSendQuota>;
 }
 
 const encoder = new TextEncoder();
@@ -74,6 +78,108 @@ export class HttpMailbox extends Mailbox {
   private stalledPut = Promise.withResolvers<void>();
   private failEpilogue = false;
   private readonly emittedAlerts: string[] = [];
+  // Holds the next queue send of a drive run until resumed.
+  enqueueGate?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pauseNextEnqueue() { this.enqueueGate = { reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }; this.pausedEnqueue = this.enqueueGate; }
+  private pausedEnqueue?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  async enqueuePaused() { await this.pausedEnqueue!.reached.promise; }
+  resumeEnqueue() { this.pausedEnqueue?.resume.resolve(); this.pausedEnqueue = undefined; }
+  // Holds the next authorizeDispatch inside the lane, before or after its directory statement.
+  private senderGate?: { phase: string; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pauseSenderCheck(phase: string) { this.senderGate = { phase, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() }; }
+  async senderCheckPaused() { await this.senderGate!.reached.promise; }
+  resumeSenderCheck() { const gate = this.senderGate; this.senderGate = undefined; gate?.resume.resolve(); }
+  protected override async sendSenderCheckpoint(phase: 'before' | 'after') {
+    const gate = this.senderGate;
+    if (gate?.phase === phase) { gate.reached.resolve(); await gate.resume.promise; }
+  }
+  // Fails the mailbox once between a claim's release-only quota call and the removal of those fences.
+  private crashRelease = false;
+  crashAfterClaimRelease() { this.crashRelease = true; }
+  protected override async sendReleaseCheckpoint() {
+    if (!this.crashRelease) return;
+    this.crashRelease = false;
+    throw new Error('Fixture crash after the release call');
+  }
+  // Fails the mailbox once right after a stored result's row is deleted.
+  private crashDelete = false;
+  crashAfterResultDelete() { this.crashDelete = true; }
+  protected override async sendResultDeleteCheckpoint() {
+    if (!this.crashDelete) return;
+    this.crashDelete = false;
+    throw new Error('Fixture crash after the result delete');
+  }
+  // Fails recordResult `times` times for one fence attempt.
+  private failRecordAttempt?: number;
+  private failRecordTimes = 0;
+  failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
+  // Holds the next record of one fence attempt, or the next poll right after its select, until resumed.
+  // Each pauseAt arms one gate for one pass through the seam, in order; resumeAt releases the oldest waiting pass.
+  private gates = new Map<string, { taken: boolean; resumed: boolean; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> }[]>();
+  pauseAt(point: string) {
+    const list = this.gates.get(point) ?? [];
+    list.push({ taken: false, resumed: false, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() });
+    this.gates.set(point, list);
+  }
+  async pausedAt(point: string) { await this.gates.get(point)!.at(-1)!.reached.promise; }
+  resumeAt(point: string) {
+    const gate = this.gates.get(point)?.find(entry => entry.taken && !entry.resumed);
+    if (gate) { gate.resumed = true; gate.resume.resolve(); }
+  }
+  private async gate(point: string) {
+    const gate = this.gates.get(point)?.find(entry => !entry.taken);
+    if (!gate) return;
+    gate.taken = true;
+    gate.reached.resolve();
+    await gate.resume.promise;
+  }
+  protected override async sendStoredSelectCheckpoint() { await this.gate('select'); }
+  // Fails the mailbox once right after a poll took a flagged row's recheck, before any backoff is written.
+  private crashTake = false;
+  crashAfterRecheckTake() { this.crashTake = true; }
+  protected override async sendRecheckTakeCheckpoint() {
+    if (!this.crashTake) return;
+    this.crashTake = false;
+    throw new Error('Fixture crash after the recheck take');
+  }
+  protected override async sendRecordCheckpoint(fence: { attempt: number }) {
+    await this.gate(`record:${fence.attempt}`);
+    if (fence.attempt !== this.failRecordAttempt || this.failRecordTimes <= 0) return;
+    this.failRecordTimes--;
+    throw new Error('Fixture record failure');
+  }
+  protected override sendQuota() { return (this.env as unknown as FixtureEnv).SEND_QUOTA.getByName('account') as unknown as QuotaPort; }
+  // The consumer's side of one send, as stored (M3-5a).
+  sendState(id: string) {
+    const sql = this.ctx.storage.sql;
+    return {
+      row: sql.exec('SELECT state, terminal_seq, finish_pending FROM mailbox_sends WHERE id = ?', id).toArray()[0] ?? null,
+      ledger: sql.exec('SELECT idx, kind, state, reason FROM mailbox_send_recipients WHERE send_id = ? ORDER BY idx', id).toArray(),
+      dispatch: sql.exec('SELECT * FROM mailbox_send_dispatch WHERE send_id = ?', id).toArray()[0] ?? null,
+      fences: sql.exec('SELECT epoch, attempt, lease_until, marked, authorized, outcome FROM mailbox_send_fences WHERE send_id = ? ORDER BY epoch, attempt', id).toArray(),
+      marks: sql.exec('SELECT epoch, attempt, idx, outcome, provider_id FROM mailbox_send_marks WHERE send_id = ? ORDER BY epoch, attempt, idx', id).toArray(),
+      release: sql.exec('SELECT epoch, attempt FROM mailbox_send_release_list WHERE send_id = ? ORDER BY epoch, attempt', id).toArray(),
+      drive: sql.exec("SELECT due_at FROM timers WHERE kind = 'send_drive' AND ref = ?", id).toArray().map(row => row.due_at),
+      flushed: sql.exec<{ flushed: number; modseq: number }>('SELECT flushed, modseq FROM state WHERE id = 1').one(),
+    };
+  }
+  // Resolves when the next call of a method reaches this object, before it waits for anything.
+  private arrivals = new Map<string, PromiseWithResolvers<void>>();
+  armArrival(method: string) { this.arrivals.set(method, Promise.withResolvers<void>()); }
+  async arrived(method: string) { await this.arrivals.get(method)!.promise; }
+  async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
+    this.arrivals.get(method)?.resolve();
+    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
+    if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
+    return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
+  }
+  // A restore that takes `ms`: the mailbox becomes ready that much later on the fixture clock.
+  async restoreAfter(ws: string, mb: string, at: number) {
+    await this.ctx.storage.deleteAll();
+    await this.restoreFromBackup(ws, mb);
+    time = at;
+    await this.testAlarm();
+  }
 
   constructor(ctx: DurableObjectState, env: FixtureEnv) {
     let mailbox: HttpMailbox;
@@ -104,7 +210,11 @@ export class HttpMailbox extends Mailbox {
     };
     super(ctx, { ...env, MAIL_STATE: state, MAIL_DRAFT_UPLOADS_ENABLED: flag ?? env.MAIL_DRAFT_UPLOADS_ENABLED,
       MAIL_SEND_ENABLED: sendFlag ?? env.MAIL_SEND_ENABLED,
-      SEND: { send: async (body: SendDispatch) => { record('fixture_send_queue', body); } },
+      SEND: { send: async (body: SendDispatch) => {
+        const gate = mailbox.enqueueGate;
+        if (gate) { mailbox.enqueueGate = undefined; gate.reached.resolve(); await gate.resume.promise; }
+        record('fixture_send_queue', body);
+      } },
       ...{ EMAIL: { send: async (message: unknown) => { record('fixture_email', { kind: typeof message }); return {}; } } },
       ALERTS: { fetch: async (input, init) => {
         const { source } = await new Request(input, init).json<{ source: string }>();
@@ -543,6 +653,7 @@ export class Sweeper extends MailSweeper {
   }
 }
 export { ContentLookup } from '../../src/entry.ts';
+export { FakeSendQuota };
 
 // Request rate limits with per-key counters that a test can cap, per binding.
 const rateCaps = new Map<string, number>();
@@ -755,6 +866,40 @@ export default {
           case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;
           case '/__fixture/purge-trash': return Response.json(await box.purgeTrash(ws));
           case '/__fixture/restore': await box.restoreFixture(ws, mailboxId!); break;
+          case '/__fixture/restore-after': {
+            time = now(env) + Number(await req.text());
+            await box.restoreAfter(ws, mailboxId!, time);
+            break;
+          }
+          case '/__fixture/send-rpc': {
+            const { method, args, mb } = await req.json<{ method: string; args: unknown[]; mb?: string }>();
+            return Response.json(await box.sendRpc(ws, mb ?? mailboxId!, method, args) ?? null);
+          }
+          case '/__fixture/pause-sender-check': await box.pauseSenderCheck(await req.text() || 'before'); break;
+          case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
+          case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
+          case '/__fixture/fail-record-once': {
+            const [attempt, times] = (await req.text()).split(',').map(Number);
+            await box.failRecordOnce(attempt, times || 1);
+            break;
+          }
+          case '/__fixture/crash-after-claim-release': await box.crashAfterClaimRelease(); break;
+          case '/__fixture/crash-after-result-delete': await box.crashAfterResultDelete(); break;
+          case '/__fixture/pause-at': await box.pauseAt(await req.text()); break;
+          case '/__fixture/arm-arrival': await box.armArrival(await req.text()); break;
+          case '/__fixture/arrived': await box.arrived(await req.text()); break;
+          case '/__fixture/crash-after-recheck-take': await box.crashAfterRecheckTake(); break;
+          case '/__fixture/paused-at': await box.pausedAt(await req.text()); break;
+          case '/__fixture/resume-at': await box.resumeAt(await req.text()); break;
+          case '/__fixture/quota': {
+            const { method, args } = await req.json<{ method: string; args: unknown[] }>();
+            const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+            return Response.json(await quota[method](...args) ?? null);
+          }
+          case '/__fixture/send-state': return Response.json(await box.sendState(await req.text()));
+          case '/__fixture/pause-enqueue': await box.pauseNextEnqueue(); break;
+          case '/__fixture/enqueue-paused': await box.enqueuePaused(); break;
+          case '/__fixture/resume-enqueue': await box.resumeEnqueue(); break;
           case '/__fixture/send-queue': return Response.json(await box.sendQueue());
           case '/__fixture/email-calls': return Response.json(await box.emailCalls());
           case '/__fixture/crash-after': await box.crashAfter(await req.text() as SendStep); break;

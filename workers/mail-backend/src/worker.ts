@@ -38,6 +38,8 @@ export type Env = KofraConfig & {
   MAIL_SWEEP_ENABLED?: string;
   // The send path (docs/m3-outbound-plan.md, section 1): off unless 'on'.
   MAIL_SEND_ENABLED?: string;
+  // The bound on clock differences of the send path, in seconds (default 30).
+  MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
   SEND?: { send(message: SendDispatch): Promise<unknown> };
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;

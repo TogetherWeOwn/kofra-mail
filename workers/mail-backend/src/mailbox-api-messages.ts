@@ -6,7 +6,7 @@ import type { JournalEvent } from './mail-journal.ts';
 import { fail, invalid, iso, isId, need, object, requireId, text } from './mailbox-api-input.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY } from './mailbox-schema.ts';
 import { normalizeSearch, type MessageDisplay } from './parse-mail.ts';
-import { sendByMessage, summaryState } from './mailbox-send-store.ts';
+import { sendByMessage, summaryState, unpublishedProgress, UnpublishedSend } from './mailbox-send-store.ts';
 
 const FOLDERS = ['inbox', 'archive', 'spam', 'trash'] as const;
 // M1 uses zero for new inbound mail. Reserve a separate bit range so its
@@ -133,6 +133,9 @@ export function getThread(sql: SqlStorage, id: string, now: number, state: strin
   const flushed = sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
   const messages = rows.map((row): Message => {
     const send = row.flags & SENT ? sendByMessage(sql, row.id) : undefined;
+    // A sent copy reports its send's state only once published, as getSend does.
+    const unpublished = send ? unpublishedProgress(sql, [send.id]) : 0;
+    if (unpublished) throw new UnpublishedSend(unpublished);
     const display = displayOf(row);
     const body = sql.exec<{ body: string }>(`SELECT coalesce(d.body_override, f.body, '') AS body FROM messages m
       LEFT JOIN fts f ON m.rowid = f.rowid LEFT JOIN mailbox_api_display d ON m.id = d.id WHERE m.id = ?`, row.id).one().body;

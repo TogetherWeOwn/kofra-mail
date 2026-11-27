@@ -42,6 +42,41 @@ CREATE TABLE IF NOT EXISTS mailbox_send_drivers (
   send_id TEXT PRIMARY KEY, token TEXT NOT NULL, backoff INTEGER NOT NULL DEFAULT 0, held INTEGER NOT NULL DEFAULT 0 CHECK (held IN (0, 1))
 );
 CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
+-- The consumer's side of the state machine (section 2.4, M3-5), non-derived
+-- like the ledger. mailbox_send_dispatch holds a send's attempt counter, its
+-- live lease (fence = recovery epoch and attempt), the next attempt time, the
+-- quota wait, the caps' counters and a grace hold. mailbox_send_fences is the
+-- attempt history: one row per fence with its lease, whether Mark and an
+-- authorization happened and its reported outcome; mailbox_send_marks is each
+-- fence's Mark set with each recipient's confirmed outcome under it. A
+-- recipient that is attempting is attempting under the newest marked fence
+-- whose Mark set holds it. mailbox_send_release_list holds the fences whose
+-- quota reservations must be released.
+CREATE TABLE IF NOT EXISTS mailbox_send_dispatch (
+  send_id TEXT PRIMARY KEY REFERENCES mailbox_sends(id) ON DELETE CASCADE, attempt INTEGER NOT NULL,
+  lease_epoch INTEGER, lease_attempt INTEGER, lease_until INTEGER, next_attempt_at INTEGER NOT NULL, delayed_until INTEGER,
+  ambiguous INTEGER NOT NULL, provider_wait INTEGER NOT NULL, refusals INTEGER NOT NULL, outages INTEGER NOT NULL, unfinished INTEGER NOT NULL,
+  held_at INTEGER, grace_until INTEGER, grace_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS mailbox_send_held ON mailbox_send_dispatch(held_at) WHERE held_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS mailbox_send_fences (
+  send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+  lease_until INTEGER NOT NULL, marked INTEGER NOT NULL, authorized INTEGER NOT NULL, outcome TEXT,
+  PRIMARY KEY (send_id, epoch, attempt)
+);
+CREATE TABLE IF NOT EXISTS mailbox_send_marks (
+  send_id TEXT NOT NULL, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL, idx INTEGER NOT NULL, outcome TEXT, provider_id TEXT,
+  PRIMARY KEY (send_id, epoch, attempt, idx),
+  FOREIGN KEY (send_id, epoch, attempt) REFERENCES mailbox_send_fences(send_id, epoch, attempt) ON DELETE CASCADE
+);
+-- Local, like the breaches: send_results rows that raise a mailbox alert, by code
+-- ('unapplied': an acceptance that cannot be recorded; 'stuck': an applicable row that keeps failing).
+CREATE TABLE IF NOT EXISTS mailbox_send_result_alerts (send_id TEXT NOT NULL, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+  code TEXT NOT NULL CHECK (code IN ('unapplied', 'stuck')), since INTEGER NOT NULL, PRIMARY KEY (send_id, epoch, attempt, code));
+CREATE TABLE IF NOT EXISTS mailbox_send_release_list (
+  send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
+  PRIMARY KEY (send_id, epoch, attempt)
+);
 `;
 
 export const MAILBOX_SCHEMA = `

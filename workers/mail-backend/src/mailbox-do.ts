@@ -22,7 +22,12 @@ import {
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
-import { SEND_DRIVE } from './mailbox-send-store.ts';
+import { SEND_DRIVE, UnpublishedSend, unpublishedProgress } from './mailbox-send-store.ts';
+import {
+  CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
+  type ReportAnswer, type StoredAnswer,
+} from './mailbox-send-dispatch.ts';
+import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -145,7 +150,7 @@ export class Mailbox extends DurableObject<Env> {
         const life = storedLifecycle<Lifecycle>(this.ctx.storage);
         if (life?.state !== 'ready') return;
         return { incarnation: life.incarnation, index: this.index(life.scope.workspaceId),
-          scope: { ...life.scope, holderScope: this.ctx.id.toString() } };
+          scope: { ...life.scope, holderScope: this.ctx.id.toString() }, epoch: life.epoch ?? 0, restoredAt: life.restoredAt ?? 0 };
       },
       local: this.local,
       publishThrough: seq => this.publishThrough(seq),
@@ -155,8 +160,121 @@ export class Mailbox extends DurableObject<Env> {
       get queue() { return self.env.SEND; },
       get mime() { return self.sendMime; },
       put: (workspaceId, key, bytes) => kofra(this.env, workspaceId).put(key, bytes),
+      get dispatcher() { return self.sendDispatcher(); },
+      quota: () => this.sendQuota(),
       checkpoint: step => this.sendCheckpoint(step),
     };
+  }
+
+  // The account quota gate (M3-6 supplies the quota object). Without it, a
+  // step that must release or read the quota fails and is retried.
+  protected sendQuota(): QuotaPort | undefined { return undefined; }
+
+  // clockSkew (section 2.4, step 5) is configuration, used only on the mailbox side.
+  private clockSkewMs(): number {
+    const configured = this.env.MAIL_SEND_CLOCK_SKEW_SECONDS;
+    if (configured === undefined || configured === '') return CLOCK_SKEW_MS;
+    const seconds = Number(configured);
+    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) throw new Error('Invalid send clock skew');
+    return seconds * 1000;
+  }
+
+  private sendDispatcher(): SendDispatcher {
+    return new SendDispatcher({
+      sql: this.ctx.storage.sql,
+      ready: scope => this.work.run(async () => {
+        if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+        this.verifyScope(scope);
+        return this.ready(this.index(scope.workspaceId), scope);
+      }),
+      current: () => {
+        const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+        if (life?.state !== 'ready') return;
+        return { index: this.index(life.scope.workspaceId), epoch: life.epoch ?? 0, restoredAt: life.restoredAt ?? 0 };
+      },
+      local: this.local,
+      exclusive: (io, step) => this.exclusiveStep(io, step),
+      senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
+      beforeRecord: fence => this.sendRecordCheckpoint(fence),
+      afterClaimRelease: () => this.sendReleaseCheckpoint(),
+      afterResultDelete: () => this.sendResultDeleteCheckpoint(),
+      afterStoredSelect: () => this.sendStoredSelectCheckpoint(),
+      afterRecheckTake: () => this.sendRecheckTakeCheckpoint(),
+      publishThrough: seq => this.publishThrough(seq),
+      journalDue: timers => this.journalDue(timers),
+      directory: this.env.DIRECTORY,
+      quota: () => this.sendQuota(),
+      clockSkewMs: this.clockSkewMs(),
+      now: () => this.mailApiNow(),
+      sending: this.env.MAIL_SEND_ENABLED === 'on',
+    });
+  }
+
+  // A test seam inside the work lane, before and after authorizeDispatch's directory statement.
+  protected async sendSenderCheckpoint(_phase: 'before' | 'after'): Promise<void> {}
+  // A test seam before recordResult acts.
+  protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
+  // A test seam between a claim's release-only quota call and the removal of those fences.
+  protected async sendReleaseCheckpoint(): Promise<void> {}
+  // A test seam right after a stored result's row is deleted.
+  protected async sendResultDeleteCheckpoint(): Promise<void> {}
+  // A test seam right after a poll selected its stored rows.
+  protected async sendStoredSelectCheckpoint(): Promise<void> {}
+  // A test seam right after a poll took a flagged row's recheck.
+  protected async sendRecheckTakeCheckpoint(): Promise<void> {}
+
+  // Holds the work lane across `io`, then runs `step` in a transaction and
+  // re-arms without reading the alarm first, so `io` is the last await before
+  // the step's commit.
+  private exclusiveStep<A, T>(io: () => Promise<A>, step: (timers: TimerTable, value: A) => T): Promise<T> {
+    return this.work.run(async () => {
+      const value = await io();
+      let result!: T;
+      const timers = this.timerTable();
+      await this.rearm(() => {
+        result = this.ctx.storage.transactionSync(() => {
+          try { return step(timers, value); } finally { timers.revoke(); }
+        });
+      }, true);
+      return result;
+    });
+  }
+
+  // The send consumer's RPCs (docs/m3-outbound-plan.md, section 2.4; M3-5a).
+  async claimSend(workspaceId: string, mailboxId: string, sendId: string): Promise<ClaimAnswer> {
+    return this.sendDispatcher().claim({ workspaceId, mailboxId }, sendId);
+  }
+
+  async markSend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
+    released: SendFence[]): Promise<MarkAnswer> {
+    return this.sendDispatcher().mark({ workspaceId, mailboxId }, sendId, fence, recipients, released);
+  }
+
+  async authorizeDispatch(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
+    quotaDayEnd: number): Promise<AuthorizeAnswer> {
+    return this.sendDispatcher().authorize({ workspaceId, mailboxId }, sendId, fence, recipients, quotaDayEnd);
+  }
+
+  async recordResult(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, result: ProviderResult): Promise<ReportAnswer> {
+    return this.sendDispatcher().record({ workspaceId, mailboxId }, sendId, fence, result);
+  }
+
+  // `gate`: our own gate refused the reservation, with the refusing gate's `resetAt`;
+  // `provider_daily`: the provider's daily-limit error.
+  async delaySend(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, cause: 'gate' | 'provider_daily',
+    resetAt?: number): Promise<DelayAnswer> {
+    return this.sendDispatcher().delay({ workspaceId, mailboxId }, sendId, fence, cause, resetAt);
+  }
+
+
+  async abandonClaim(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, retryAt: number): Promise<AbandonAnswer> {
+    return this.sendDispatcher().abandon({ workspaceId, mailboxId }, sendId, fence, retryAt);
+  }
+
+  // Shared by the drive handler and result notices; a notice passes its fence,
+  // and that row is recorded whatever its notify_after.
+  async recordStoredResults(workspaceId: string, mailboxId: string, sendId: string, fence?: SendFence): Promise<StoredAnswer> {
+    return this.sendDispatcher().recordStored({ workspaceId, mailboxId }, sendId, fence);
   }
 
   // A test seam after each release step; does nothing here.
@@ -220,10 +338,11 @@ export class Mailbox extends DurableObject<Env> {
     }
   }
 
+  // `published`: a read already waited once for the publish of its sends' consumer changes.
   private async sendApi(scope: Scope, operation: 'sendDraft' | 'undoSend' | 'getSend' | 'listSends', params: Record<string, string>,
-    options: MailboxApiOptions): Promise<MailboxApiResult> {
+    options: MailboxApiOptions, published = false): Promise<MailboxApiResult> {
     const index = this.index(scope.workspaceId);
-    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit }> => {
+    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { commit: SendCommit } | { reread: number }> => {
       if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
       const life = index.lifecycle<Lifecycle>();
       // Undo and send reads use only send rows, never the message index, so they
@@ -238,8 +357,13 @@ export class Mailbox extends DurableObject<Env> {
       try {
         const api = new SendApi(index, this.ctx.storage.sql, { ...scope, holderScope: this.ctx.id.toString() }, life.incarnation, timers,
           this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table));
-        if (operation === 'getSend') return { result: { body: api.getSend(params) } };
-        if (operation === 'listSends') return { result: { body: await api.listSends(params, options.cursorScope) } };
+        if (operation === 'getSend' || operation === 'listSends') {
+          const body = operation === 'getSend' ? api.getSend(params) : await api.listSends(params, options.cursorScope);
+          // A send's consumer state is reported only once published (section 2.1), like its terminal state.
+          const unpublished = api.unpublishedProgress('items' in body ? body.items.map(({ id }) => id) : [body.id]);
+          if (!unpublished) return { result: { body } };
+          return published ? fail('mailbox_restoring', { retryAfterSeconds: 1 }) : { reread: unpublished };
+        }
         return { commit: operation === 'sendDraft' ? await api.sendDraft(params, options) : await api.undoSend(params, options) };
       } finally {
         timers.revoke();
@@ -247,15 +371,30 @@ export class Mailbox extends DurableObject<Env> {
       }
     });
     if ('result' in outcome) return outcome.result;
+    if ('reread' in outcome) {
+      if (!await this.publishThrough(outcome.reread)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+      return this.sendApi(scope, operation, params, options, true);
+    }
     // The action has taken effect; until a publish covers it, the client retries the same key.
     if (!await this.publishThrough(outcome.commit.seq, false)) return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
     // The answer is queued in the work lane ahead of the covered-work wake-up, so it never waits for it.
-    const answered = this.work.run(async () => {
+    // A send it reports shows consumer changes only once published, as getSend does.
+    const { sendId } = outcome.commit;
+    const answer = () => this.work.run(async (): Promise<MailboxApiResult | { unpublished: number }> => {
+      const unpublished = sendId ? unpublishedProgress(this.ctx.storage.sql, [sendId]) : 0;
+      if (unpublished) return { unpublished };
       const { body, status, replayed } = await outcome.commit.answer();
       return { body, status, ...(replayed && { replayed: true }) };
     });
+    let answered = answer();
     this.scheduleCoveredWake();
-    return answered;
+    for (let round = 0; round < 2; round++) {
+      const result = await answered;
+      if (!('unpublished' in result)) return result;
+      if (round || !await this.publishThrough(result.unpublished)) break;
+      answered = answer();
+    }
+    return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
   }
 
   // Registers a timer kind. Call from the constructor.
@@ -381,7 +520,17 @@ export class Mailbox extends DurableObject<Env> {
       if (http && (operation === 'createDraft' || operation === 'createLabel')) {
         return await this.createJsonWrite(scope, operation, http, options, now);
       }
-      return await this.executeMailApi(scope, operation, params, input, options);
+      try { return await this.executeMailApi(scope, operation, params, input, options); }
+      catch (error) {
+        // A thread whose sent copy reports an unpublished send state: publish, then read once more.
+        if (!(error instanceof UnpublishedSend)) throw error;
+        if (!await this.publishThrough(error.seq)) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+        try { return await this.executeMailApi(scope, operation, params, input, options); }
+        catch (retry) {
+          if (retry instanceof UnpublishedSend) return { error: { code: 'mailbox_restoring', retryAfterSeconds: 1 } };
+          throw retry;
+        }
+      }
     } catch (error) {
       if (error instanceof ApiFault) return { error: error.problem };
       return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
@@ -1008,9 +1157,19 @@ export class Mailbox extends DurableObject<Env> {
     const holderLost = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_unusable_sources)
       OR EXISTS (SELECT 1 FROM mailbox_alerts WHERE code = 'holder_source_lost' AND sent_at IS NULL) AS active`).one().active !== 0;
     const breach = life?.state === 'ready' && sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_breaches) AS active').one().active !== 0;
+    // A send held after repeated crashes of our own waits for an operator.
+    const held = life?.state === 'ready' && sql.exec(`SELECT EXISTS (SELECT 1 FROM mailbox_send_dispatch d JOIN mailbox_sends s ON s.id = d.send_id
+      WHERE d.held_at IS NOT NULL AND s.state NOT IN ('sent', 'partial', 'failed', 'cancelled')) AS active`).one().active !== 0;
+    // A stored acceptance that cannot be recorded: an invariant breach.
+    const resultAlert = (code: string) => life?.state === 'ready' &&
+      sql.exec('SELECT EXISTS (SELECT 1 FROM mailbox_send_result_alerts WHERE code = ?) AS active', code).one().active !== 0;
+    const unapplied = resultAlert('unapplied');
+    // A stored result that can apply but keeps failing to record.
+    const stuck = resultAlert('stuck');
     const conditions: Array<[MailboxAlertCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
-      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach]];
+      ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held],
+      ['send_result_unapplied', unapplied], ['send_result_stuck', stuck]];
     let next = confirmStaleAt > now ? confirmStaleAt : Infinity;
     for (const [code, active] of conditions) {
       if (!active) {

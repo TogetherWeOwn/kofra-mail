@@ -2,7 +2,7 @@ import type { AlertEvent } from './deliver.ts';
 
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
-  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant';
+  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant' | 'send_held' | 'send_result_unapplied' | 'send_result_stuck';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
 
 const TITLE: Record<Event['code'], string> = {
@@ -16,6 +16,9 @@ const TITLE: Record<Event['code'], string> = {
   holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
   holder_source_lost: 'A mailbox source object is missing',
   send_invariant: 'A send is held after a release invariant failed',
+  send_held: 'A send is held after repeated unfinished attempts',
+  send_result_unapplied: 'A stored provider acceptance cannot be recorded',
+  send_result_stuck: 'A stored provider result keeps failing to record',
 };
 
 export function mailAlert(binding?: AlertBinding) {

@@ -3,7 +3,10 @@ import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
 import { MailJournal, type JournalEvent, type JournalRow, type SendRecipientKind, type SentCopy } from './mail-journal.ts';
-import { checkKinds, checkSendRecord, epochMs, SEND_FAILURES, sendRow, sentCopyId, TERMINAL, validSendId } from './mailbox-send-store.ts';
+import {
+  checkDispatch, checkFence, checkKinds, checkMark, checkReleaseEntry, checkSendRecord, epochMs, LEDGER_STATES, SEND_FAILURES, sendRow, sentCopyId,
+  TERMINAL, validReason, validSendId,
+} from './mailbox-send-store.ts';
 import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
 import { JOURNAL_FLUSH } from './mailbox-timers.ts';
 import { IDEM_EXPIRY } from './mailbox-upload.ts';
@@ -725,12 +728,64 @@ export class MailboxIndex {
         }
         this.sql.exec('DELETE FROM mailbox_send_uploads WHERE send_id = ?', row.id);
         this.sql.exec("DELETE FROM mailbox_unusable_sources WHERE kind = 'send' AND id = ?", row.id);
+        // Finish step 4: its step 3 released every listed fence.
+        this.sql.exec('DELETE FROM mailbox_send_release_list WHERE send_id = ?', row.id);
         break;
       }
       case 'send_window': {
         const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
         if (!row || row.state !== 'pending' || !epochMs(event.undoUntil) || event.undoUntil < row.undoUntil) throw new Error('Invalid send window');
         this.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', event.undoUntil, row.id);
+        break;
+      }
+      case 'send_progress': {
+        const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
+        const final = event.state === 'sent' || event.state === 'partial' || event.state === 'failed';
+        if (!row || row.queuedSeq === null || row.state === 'cancelled' || row.state === 'pending' || row.state === 'releasing' ||
+            !['queued', 'sending', 'delayed', 'sent', 'partial', 'failed'].includes(event.state) ||
+            (event.terminal !== undefined && event.terminal !== true)) throw new Error('Invalid send progress');
+        // `terminal` starts the finish rule; a terminal send changes only its reported state (a late confirmation).
+        const terminal = TERMINAL.includes(row.state);
+        if (event.terminal ? terminal || !final : terminal !== final) throw new Error('Invalid send progress');
+        checkDispatch(event.dispatch);
+        const size = row.record.recipients.length;
+        const list = <T>(value: T[] | undefined, limit: number): T[] => {
+          if (value === undefined) return [];
+          if (!Array.isArray(value) || value.length > limit) throw new Error('Invalid send progress');
+          return value;
+        };
+        const recipients = list(event.recipients, size), fences = list(event.fences, 64), marks = list(event.marks, 64 * size);
+        const added = list(event.releaseAdd, 64), removed = list(event.releaseRemove, 64);
+        for (const change of recipients) {
+          if (!change || !count(change.idx) || change.idx >= size || !LEDGER_STATES.includes(change.state) ||
+              (change.reason !== null && !validReason(change.reason))) throw new Error('Invalid send ledger change');
+        }
+        fences.forEach(checkFence);
+        for (const mark of marks) checkMark(mark, size);
+        [...added, ...removed].forEach(checkReleaseEntry);
+        if (event.terminal) {
+          this.sql.exec('UPDATE mailbox_sends SET state = ?, finish_pending = 1, terminal_seq = ? WHERE id = ?', event.state, this.journal.revision() + 1, row.id);
+        } else this.sql.exec('UPDATE mailbox_sends SET state = ? WHERE id = ?', event.state, row.id);
+        const d = event.dispatch;
+        this.sql.exec(`INSERT OR REPLACE INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, row.id, d.attempt,
+          d.leaseEpoch, d.leaseAttempt, d.leaseUntil, d.nextAttemptAt, d.delayedUntil, d.ambiguous, d.providerWait, d.refusals, d.outages,
+          d.unfinished, d.heldAt, d.graceUntil, d.graceReason);
+        for (const { idx, state, reason } of recipients) {
+          const updated = this.sql.exec('UPDATE mailbox_send_recipients SET state = ?, reason = ? WHERE send_id = ? AND idx = ? RETURNING idx',
+            state, reason, row.id, idx).toArray();
+          if (updated.length !== 1) throw new Error('Missing send ledger row');
+        }
+        for (const f of fences) {
+          // An upsert: a replace would delete the fence's Mark set through its foreign key.
+          this.sql.exec(`INSERT INTO mailbox_send_fences VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(send_id, epoch, attempt) DO UPDATE SET
+            lease_until = excluded.lease_until, marked = excluded.marked, authorized = excluded.authorized, outcome = excluded.outcome`,
+          row.id, f.epoch, f.attempt, f.leaseUntil, f.marked ? 1 : 0, f.authorized ? 1 : 0, f.outcome);
+        }
+        for (const m of marks) {
+          this.sql.exec('INSERT OR REPLACE INTO mailbox_send_marks VALUES (?, ?, ?, ?, ?, ?)', row.id, m.epoch, m.attempt, m.idx, m.outcome, m.providerId);
+        }
+        for (const f of added) this.sql.exec('INSERT OR IGNORE INTO mailbox_send_release_list VALUES (?, ?, ?)', row.id, f.epoch, f.attempt);
+        for (const f of removed) this.sql.exec('DELETE FROM mailbox_send_release_list WHERE send_id = ? AND epoch = ? AND attempt = ?', row.id, f.epoch, f.attempt);
         break;
       }
       default: throw new Error('Unexpected journal event');
@@ -821,6 +876,20 @@ export class MailboxIndex {
         SELECT 'send_recipient', json_object('sendId', send_id, 'idx', idx, 'kind', kind, 'state', state, 'reason', reason)
         FROM mailbox_send_recipients;
         INSERT INTO backup_capture(kind, value)
+        SELECT 'send_dispatch', json_object('sendId', send_id, 'attempt', attempt, 'leaseEpoch', lease_epoch, 'leaseAttempt', lease_attempt,
+          'leaseUntil', lease_until, 'nextAttemptAt', next_attempt_at, 'delayedUntil', delayed_until, 'ambiguous', ambiguous,
+          'providerWait', provider_wait, 'refusals', refusals, 'outages', outages, 'unfinished', unfinished, 'heldAt', held_at, 'graceUntil', grace_until,
+          'graceReason', grace_reason) FROM mailbox_send_dispatch;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'send_fence', json_object('sendId', send_id, 'epoch', epoch, 'attempt', attempt, 'leaseUntil', lease_until,
+          'marked', json(CASE marked WHEN 1 THEN 'true' ELSE 'false' END), 'authorized', json(CASE authorized WHEN 1 THEN 'true' ELSE 'false' END),
+          'outcome', outcome) FROM mailbox_send_fences;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'send_mark', json_object('sendId', send_id, 'epoch', epoch, 'attempt', attempt, 'idx', idx, 'outcome', outcome, 'providerId', provider_id)
+        FROM mailbox_send_marks;
+        INSERT INTO backup_capture(kind, value)
+        SELECT 'send_release', json_object('sendId', send_id, 'epoch', epoch, 'attempt', attempt) FROM mailbox_send_release_list;
+        INSERT INTO backup_capture(kind, value)
         SELECT 'pending_release', json_object('seq', seq, 'key', object_key, 'holder', holder) FROM mailbox_pending_releases;
         INSERT INTO backup_capture(kind, value)
         SELECT 'pending_confirmation', json_object('seq', seq, 'key', object_key, 'holder', holder, 'publishedAt', published_at)
@@ -859,6 +928,7 @@ export class MailboxIndex {
       DELETE FROM receipts; DELETE FROM fingerprints; DELETE FROM labels; DELETE FROM drafts; DELETE FROM bayes;
       DELETE FROM mailbox_api_uploads; DELETE FROM mailbox_pending_releases; DELETE FROM mailbox_pending_confirmations;
       DELETE FROM mailbox_unusable_sources;
+      DELETE FROM mailbox_send_marks; DELETE FROM mailbox_send_fences; DELETE FROM mailbox_send_release_list; DELETE FROM mailbox_send_dispatch;
       DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
       DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
@@ -918,6 +988,8 @@ export class MailboxIndex {
           !['pending', 'attempting', 'sent', 'failed', 'suppressed'].includes(entry.state) ||
           (entry.reason !== null && !bounded(entry.reason, 64))) throw new Error('Invalid snapshot send recipient');
       this.sql.exec('INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, ?, ?)', entry.sendId, entry.idx, entry.kind, entry.state, entry.reason);
+    } else if (row.kind === 'send_dispatch' || row.kind === 'send_fence' || row.kind === 'send_mark' || row.kind === 'send_release') {
+      this.restoreSendDispatch(row.kind, value);
     } else if (row.kind === 'pending_release') {
       const entry = value as { seq: number; key: string; holder: string };
       this.enqueueRelease(entry.seq, entry.key, entry.holder);
@@ -928,6 +1000,29 @@ export class MailboxIndex {
       row.kind === 'api_result' || row.kind === 'api_settings' || row.kind === 'api_upload' || row.kind === 'api_source_lost') {
       this.apply({ ...(value as object), type: row.kind } as Exclude<JournalEvent, MessageEvent>, true);
     } else throw new Error('Invalid snapshot state row');
+  }
+
+  // The consumer's state of a restored send (M3-5); its send row was restored before it.
+  private restoreSendDispatch(kind: 'send_dispatch' | 'send_fence' | 'send_mark' | 'send_release', value: unknown): void {
+    const { sendId, ...entry } = (value ?? {}) as { sendId?: unknown };
+    const send = validSendId(sendId) ? sendRow(this.sql, sendId) : undefined;
+    if (!send || send.queuedSeq === null) throw new Error('Invalid snapshot send dispatch');
+    if (kind === 'send_dispatch') {
+      checkDispatch(entry);
+      this.sql.exec('INSERT INTO mailbox_send_dispatch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, entry.attempt, entry.leaseEpoch,
+        entry.leaseAttempt, entry.leaseUntil, entry.nextAttemptAt, entry.delayedUntil, entry.ambiguous, entry.providerWait, entry.refusals,
+        entry.outages, entry.unfinished, entry.heldAt, entry.graceUntil, entry.graceReason);
+    } else if (kind === 'send_fence') {
+      checkFence(entry);
+      this.sql.exec('INSERT INTO mailbox_send_fences VALUES (?, ?, ?, ?, ?, ?, ?)', send.id, entry.epoch, entry.attempt, entry.leaseUntil,
+        entry.marked ? 1 : 0, entry.authorized ? 1 : 0, entry.outcome);
+    } else if (kind === 'send_mark') {
+      checkMark(entry, send.record.recipients.length);
+      this.sql.exec('INSERT INTO mailbox_send_marks VALUES (?, ?, ?, ?, ?, ?)', send.id, entry.epoch, entry.attempt, entry.idx, entry.outcome, entry.providerId);
+    } else {
+      checkReleaseEntry(entry);
+      this.sql.exec('INSERT INTO mailbox_send_release_list VALUES (?, ?, ?)', send.id, entry.epoch, entry.attempt);
+    }
   }
 
   // Applies one journal row, idempotently. Returns the object references a purge

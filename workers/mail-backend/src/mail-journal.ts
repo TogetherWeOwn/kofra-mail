@@ -19,6 +19,23 @@ export type SendRecord = {
   parts: SendPart[];
 };
 export type SendPart = { messageId: string; part: number; digest: string; size: number };
+// The consumer's side of a send (docs/m3-outbound-plan.md, section 2.4; M3-5).
+// A null lease means no lease is live; `graceReason` is the failure a grace
+// hold ends in.
+export type SendDispatchRow = {
+  attempt: number; leaseEpoch: number | null; leaseAttempt: number | null; leaseUntil: number | null;
+  // `refusals` and `outages` count try-later and our-outage results in a row, for their backoffs.
+  nextAttemptAt: number; delayedUntil: number | null; ambiguous: number; providerWait: number; refusals: number; outages: number;
+  unfinished: number; heldAt: number | null; graceUntil: number | null; graceReason: SendFailure | null;
+};
+// A reported outcome under a fence; null until one is recorded.
+export type SendFenceOutcome = 'accepted' | 'rejected' | 'try_later' | 'outage' | 'ambiguous' | 'delayed' | 'abandoned';
+export type SendFenceRow = { epoch: number; attempt: number; leaseUntil: number; marked: boolean; authorized: boolean; outcome: SendFenceOutcome | null };
+// One recipient of a fence's Mark set and its confirmed outcome under that fence.
+export type SendMarkRow = { epoch: number; attempt: number; idx: number; outcome: 'sent' | 'suppressed' | 'failed' | null; providerId: string | null };
+export type SendLedgerState = 'pending' | 'attempting' | 'sent' | 'failed' | 'suppressed';
+export type SendLedgerChange = { idx: number; state: SendLedgerState; reason: string | null };
+type SendProgressState = 'queued' | 'sending' | 'delayed' | 'sent' | 'partial' | 'failed';
 // The sent copy's non-derived index state, as a message event carries it.
 export type SentCopy = { id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
   subjectKey: string; auth: string; attKeys: string[]; flags: number };
@@ -58,7 +75,13 @@ export type JournalEvent =
   // Finish rule step 4: cleanup is done.
   | { type: 'send_finish'; id: string }
   // The restore epilogue's fresh undo window for a restored pending send.
-  | { type: 'send_window'; id: string; undoUntil: number };
+  | { type: 'send_window'; id: string; undoUntil: number }
+  // A consumer step or a drive decision after release (M3-5): the send's state
+  // (`terminal` starts the finish rule), its dispatch row, and the ledger rows,
+  // fences, Mark sets and release-list entries it changed, all as absolute values.
+  | { type: 'send_progress'; id: string; state: SendProgressState; terminal?: true; dispatch: SendDispatchRow;
+      recipients?: SendLedgerChange[]; fences?: SendFenceRow[]; marks?: SendMarkRow[];
+      releaseAdd?: { epoch: number; attempt: number }[]; releaseRemove?: { epoch: number; attempt: number }[] };
 
 export type JournalRow = { seq: number; event: string };
 
