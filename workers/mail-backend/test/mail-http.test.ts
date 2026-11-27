@@ -85,6 +85,24 @@ test('directory writers reject plus-tagged mailboxes and aliases that would rout
   } finally { await fixture.close(); }
 });
 
+test('a legacy allowed primary works for compose but not sending', async () => {
+  const fixture = await startMailHttpFixture({ send: true });
+  try {
+    const mail = fixture.as('member');
+    const { mailbox } = await mail.getSession();
+    assert.ok(mailbox);
+    const from = mailbox.primaryAddress;
+    await fixture.directoryChange('UPDATE addresses SET send_as_policy = ? WHERE address_norm = ?', 'allowed', from);
+    assert.equal((await mail.listIdentities()).items.find((identity) => identity.primary)?.sendAs, 'pending');
+    assert.equal((await mail.getSettings()).defaultFrom, from);
+    const draft = await mail.createDraft({ from, to: [{ email: 'recipient@example.net' }], cc: [], bcc: [], subject: '', body: '', attachments: [] },
+      { idempotencyKey: 'legacy-primary-draft' });
+    assert.equal(draft.from, from);
+    await assert.rejects(mail.sendDraft(draft.id, { idempotencyKey: 'legacy-primary-send', ifMatch: draft.revision }),
+      (error) => isMailApiError(error, 'invalid_sender'));
+  } finally { await fixture.close(); }
+});
+
 test('drafts can use a pending send-as alias but settings still require an active identity', async () => {
   const fixture = await startMailHttpFixture();
   try {

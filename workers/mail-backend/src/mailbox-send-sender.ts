@@ -10,13 +10,13 @@ type DirectoryDatabase = { withSession(constraint: 'first-primary'): Pick<D1Data
 
 export type SenderCheck = { workspaceId: string; mailboxId: string; ownerUserId: string; from: string };
 
-// `from` is compared exactly with the stored identity: the primary address,
-// or an alias of this mailbox with send-as `active`. Both conditions come
-// from the same read, so a caller can tell a lost mailbox from a lost
-// identity without a second statement.
+// Both primary and alias senders must match an active addresses row exactly.
+// Read ownership in the same statement to distinguish a lost mailbox from
+// an inactive identity without a second read.
 export const SENDER_CHECK = `SELECT m.user_id = ?3 AS owner,
-    (m.primary_address = ?4 OR EXISTS (SELECT 1 FROM addresses a WHERE a.address_norm = ?4 AND a.workspace_id = m.workspace_id
-      AND a.target_kind = 'mailbox' AND a.target_id = m.id AND a.kind = 'alias' AND a.send_as_policy = 'active')) AS active
+    EXISTS (SELECT 1 FROM addresses a WHERE a.address_norm = ?4 AND a.workspace_id = m.workspace_id
+      AND a.target_kind = 'mailbox' AND a.target_id = m.id AND a.send_as_policy = 'active'
+      AND (a.kind = 'alias' OR (a.kind = 'primary' AND a.address_norm = m.primary_address))) AS active
   FROM mailboxes m WHERE m.workspace_id = ?1 AND m.id = ?2`;
 
 // `not_owner`: the mailbox is gone or belongs to someone else now.

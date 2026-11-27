@@ -427,6 +427,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
     return { origin, contentOrigin, directoryChange, directoryRows, as, deliver, advance, objects, failingReads, writes, holders, timers, pendingReleases, releaseRetryAt, restore,
+      activatePrimary: (address: string) => controlAction('activate-primary', address),
       forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,

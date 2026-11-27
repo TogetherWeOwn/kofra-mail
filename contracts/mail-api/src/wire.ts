@@ -188,14 +188,14 @@ export interface Identity {
   name: string;
   kind: IdentityKind;
   primary: boolean;
-  /** `pending` until the sending configuration that allows the address is deployed. */
+  /** A primary or alias is `active` only when it is in the deployed sender allow-list; it starts `pending`. */
   sendAs: 'active' | 'pending';
 }
 
 export interface Settings {
   signature: string;
   undoSeconds: 5 | 10 | 20 | 30;
-  /** One of the identities with `sendAs: 'active'`. */
+  /** An active identity, or the pending primary when there is no active identity. Setting it explicitly requires an active identity. */
   defaultFrom: string;
   /** Reply from the address the message was sent to, when it is one of ours. */
   replyFromReceivedAddress: boolean;

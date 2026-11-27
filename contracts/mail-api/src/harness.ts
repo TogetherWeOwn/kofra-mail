@@ -67,6 +67,8 @@ export interface ConformanceHarness {
   /** True by default. Set false to run the M2-W gate instead of outbound cases. */
   m3?: boolean;
   as(principal: Principal): MailService;
+  /** Fixture-only promotion of a primary to simulate the deployed allow-list. */
+  activatePrimary(address: string): Promise<void>;
   /** Deliver to a principal's mailbox (default `member`). */
   deliver(message: TestMessage, to?: Principal): Promise<{ threadId: Id; messageId: Id }>;
   /** Move the service clock forward and run every timer that is due. */

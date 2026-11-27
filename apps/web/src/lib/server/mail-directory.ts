@@ -98,9 +98,17 @@ export class Directory {
     const mailbox = await this.byId(mailboxId);
     if (!mailbox) return fail('not_found');
     const name = mailbox.display_name ?? '';
-    const primary: Identity = { email: mailbox.primary_address, name, kind: 'primary', primary: true, sendAs: 'active' };
+    const primary = await this.prep(`SELECT send_as_policy FROM addresses
+      WHERE address_norm = ? AND workspace_id = ? AND target_kind = 'mailbox' AND target_id = ? AND kind = 'primary'`,
+    mailbox.primary_address, this.ws, mailboxId).first<{ send_as_policy: string }>();
+    const identities: Identity[] = [];
+    // As for aliases, a legacy policy is draftable but does not authorize sending.
+    if (primary && primary.send_as_policy !== 'off') {
+      identities.push({ email: mailbox.primary_address, name, kind: 'primary', primary: true,
+        sendAs: primary.send_as_policy === 'active' ? 'active' : 'pending' });
+    }
     const aliases = (await this.aliases(mailboxId)).filter((alias) => alias.sendAs !== 'off');
-    return [primary, ...aliases.map(({ address: email, sendAs }): Identity => ({ email, name, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending' }))];
+    return [...identities, ...aliases.map(({ address: email, sendAs }): Identity => ({ email, name, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending' }))];
   }
   private async asMailbox(row: MailboxRow): Promise<AdminMailbox> {
     return { id: row.id, primaryAddress: row.primary_address, displayName: row.display_name ?? '', ownerUserId: row.user_id, aliases: await this.aliases(row.id) };
@@ -146,7 +154,7 @@ export class Directory {
         this.prep('INSERT INTO mailboxes (id,workspace_id,user_id,primary_address) VALUES (?,?,?,?)', mailboxId, this.ws, ownerUserId, primaryAddress),
         this.prep('INSERT INTO mailbox_profiles (workspace_id,mailbox_id,display_name) VALUES (?,?,?)', this.ws, mailboxId, displayName),
         this.prep(`INSERT INTO addresses (address_norm,workspace_id,target_kind,target_id,kind,send_as_policy)
-          VALUES (?,?,'mailbox',?,'primary','active')`, primaryAddress, this.ws, mailboxId),
+          VALUES (?,?,'mailbox',?,'primary','pending')`, primaryAddress, this.ws, mailboxId),
       ] };
     }
     const mailboxId = text(input.mailboxId, '/mailboxId', 64);

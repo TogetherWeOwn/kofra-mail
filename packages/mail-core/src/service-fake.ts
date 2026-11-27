@@ -297,6 +297,12 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   local.domains.set('example.net', { name: 'example.net', kind: 'alias', aliasOf: 'example.com', routing: 'active', sending: 'active' });
   const foreign = workspaceFixture('demo-foreign-workspace', 'example.org');
   const workspaces = [local, foreign];
+  const activePrimaries = new Set<string>();
+  function activatePrimary(address: string): void {
+    const exists = workspaces.some((workspace) => [...workspace.boxes.values()].some((box) => box.directory.primaryAddress === address));
+    if (!exists) fail('not_found');
+    activePrimaries.add(address);
+  }
   const workspaceFor = (principal: Principal) => principal === 'foreignAdmin' ? foreign : local;
   const userIdFor = (principal: Principal) => principal === 'staleAdmin' ? 'admin' : principal;
   const cursors = new Map<string, Cursor>();
@@ -319,11 +325,15 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     const email = `${user.toLowerCase()}@example.com`;
     const invited = user === 'invited';
     local.members.set(user, { id: user, name, email, status: invited ? 'invited' : 'active' });
-    if (!invited && user !== 'newAdmin') newMailbox(local, email, name, user);
+    if (!invited && user !== 'newAdmin') {
+      newMailbox(local, email, name, user);
+      activatePrimary(email);
+    }
   }
   const foreignAdmin = { id: 'foreignAdmin', name: 'Foreign Administrator', email: 'admin@example.org', status: 'active' } as const;
   foreign.members.set(foreignAdmin.id, foreignAdmin);
   newMailbox(foreign, foreignAdmin.email, foreignAdmin.name, foreignAdmin.id);
+  activatePrimary(foreignAdmin.email);
   const ownerBox = (workspace: Workspace, userId: Id) => [...workspace.boxes.values()].find(({ directory }) => directory.ownerUserId === userId);
   const state = (box: Mailbox) => `${box.directory.id}-${box.version}`;
   const bump = (box: Mailbox) => { box.version++; };
@@ -385,16 +395,23 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
 
   function identities(box: Mailbox): Identity[] {
     const { primaryAddress, aliases, displayName: name } = box.directory;
-    const primary: Identity = { email: primaryAddress, name, primary: true, kind: 'primary', sendAs: 'active' };
+    const primary: Identity = { email: primaryAddress, name, primary: true, kind: 'primary', sendAs: activePrimaries.has(primaryAddress) ? 'active' : 'pending' };
     const explicit = aliases.filter((alias) => alias.sendAs !== 'off').map(({ address: email, sendAs }): Identity => ({
       name, email, kind: 'alias', primary: false, sendAs: sendAs === 'active' ? 'active' : 'pending',
     }));
     const implicit = [...box.workspace.domains.values()].filter((d) => d.kind === 'alias' && d.routing === 'active')
       .flatMap((d) => [primary, ...explicit].filter((source) => source.email.endsWith(`@${d.aliasOf}`)).map((source): Identity => ({
-        name, email: `${source.email.split('@')[0]}@${d.name}`, kind: 'alias_domain', primary: false,
-        sendAs: source.sendAs === 'active' && d.sending === 'active' ? 'active' : 'pending',
+        // Alias-domain addresses are not entries in the sending allow-list.
+        name, email: `${source.email.split('@')[0]}@${d.name}`, kind: 'alias_domain', primary: false, sendAs: 'pending',
       })));
     return [primary, ...explicit, ...implicit];
+  }
+  function effectiveSettings(box: Mailbox): Settings {
+    const all = identities(box);
+    const active = all.filter((identity) => identity.sendAs === 'active');
+    const fallback = active[0] ?? all.find((identity) => identity.primary);
+    const stored = active.find((identity) => identity.email === box.settings.defaultFrom);
+    return { ...box.settings, defaultFrom: (stored ?? fallback)?.email ?? '' };
   }
   function receivingAddresses(box: Mailbox): Set<string> {
     const { primaryAddress, aliases } = box.directory;
@@ -845,7 +862,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         }
       },
       async listIdentities() { return { items: identities(mailbox()) }; },
-      async getSettings() { return mailbox().settings; },
+      async getSettings() { return effectiveSettings(mailbox()); },
       async updateSettings(patch) {
         const box = mailbox();
         fields(patch, ['signature', 'undoSeconds', 'defaultFrom', 'replyFromReceivedAddress']);
@@ -853,12 +870,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         if (signature !== undefined) boundedText(signature, limits.signatureBytes, '/signature');
         if (undoSeconds !== undefined && !limits.undoSecondsOptions.includes(undoSeconds)) invalid('/undoSeconds');
         if (replyFromReceivedAddress !== undefined && typeof replyFromReceivedAddress !== 'boolean') invalid('/replyFromReceivedAddress');
+        const previous = effectiveSettings(box);
         const settings = {
-          signature: signature ?? box.settings.signature, undoSeconds: undoSeconds ?? box.settings.undoSeconds,
-          defaultFrom: defaultFrom === undefined ? box.settings.defaultFrom : sender(box, defaultFrom, true).email,
-          replyFromReceivedAddress: replyFromReceivedAddress ?? box.settings.replyFromReceivedAddress,
+          signature: signature ?? previous.signature, undoSeconds: undoSeconds ?? previous.undoSeconds,
+          defaultFrom: defaultFrom === undefined ? previous.defaultFrom : sender(box, defaultFrom, true).email,
+          replyFromReceivedAddress: replyFromReceivedAddress ?? previous.replyFromReceivedAddress,
         };
-        if (canonical(settings) !== canonical(box.settings)) { box.settings = settings; bump(box); }
+        if (canonical(settings) !== canonical(previous)) { box.settings = settings; bump(box); }
         return settings;
       },
       async listDrafts(query) {
@@ -1091,6 +1109,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
   };
   return {
     as: (principal) => sessions[principal],
+    async activatePrimary(address) { activatePrimary(address); },
     contentOrigin,
     async deliver(input: TestMessage, principal = 'member') {
       const box = need(ownerBox(workspaceFor(principal), userIdFor(principal)));

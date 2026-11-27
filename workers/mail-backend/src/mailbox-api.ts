@@ -15,8 +15,8 @@ import { parseObjectKey } from './object-key.ts';
 import { decodedAttachment, normalizeSearch, readMailMime } from './parse-mail.ts';
 
 // userId is the verified account user making the request; a send records it as its submitter.
-export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; cursorScope?: string; userId?: string;
-  httpWrite?: HttpMailboxWrite };
+export type MailboxApiOptions = { idempotencyKey?: string; ifMatch?: string; canSendAs: string[]; pendingPrimary?: string;
+  cursorScope?: string; userId?: string; httpWrite?: HttpMailboxWrite };
 export type PreparedApiKey = { token: string; fingerprint: string };
 export type MailboxApiResult = { body?: unknown; status?: number; replayed?: boolean; error?: MailboxApiError };
 export type MailContentBody = { html?: string; text?: string; auth: string };
@@ -52,9 +52,9 @@ export class MailboxApi {
     return { id: id ?? crypto.randomUUID(), name: cleaned };
   }
 
-  private settings(canSendAs: string[]): Settings {
+  private settings(canSendAs: string[], pendingPrimary?: string): Settings {
     const row = this.sql.exec<{ definition: string }>('SELECT definition FROM mailbox_api_settings WHERE id = 1').toArray()[0];
-    const defaults: Settings = { signature: '', undoSeconds: 10, defaultFrom: canSendAs[0] ?? '', replyFromReceivedAddress: true };
+    const defaults: Settings = { signature: '', undoSeconds: 10, defaultFrom: canSendAs[0] ?? pendingPrimary ?? '', replyFromReceivedAddress: true };
     if (!row) return defaults;
     const stored = JSON.parse(row.definition) as Settings;
     return { ...stored, defaultFrom: canSendAs.includes(stored.defaultFrom) ? stored.defaultFrom : defaults.defaultFrom };
@@ -163,10 +163,10 @@ export class MailboxApi {
         if (this.sql.exec('SELECT 1 FROM labels WHERE id = ?', id).toArray().length) this.index.changeMany([{ type: 'label_delete', id }]);
         return {};
       }
-      case 'getSettings': return { body: this.settings(canSendAs) };
+      case 'getSettings': return { body: this.settings(canSendAs, options.pendingPrimary) };
       case 'updateSettings': {
         const patch = object(input, ['signature', 'undoSeconds', 'defaultFrom', 'replyFromReceivedAddress']);
-        const previous = this.settings(canSendAs);
+        const previous = this.settings(canSendAs, options.pendingPrimary);
         const settings = { ...previous };
         if (patch.signature !== undefined) settings.signature = text(patch.signature, LIMITS.signatureBytes, '/signature');
         if (patch.undoSeconds !== undefined) {
