@@ -443,18 +443,33 @@ test('an unread large CID has no MIME charge and does not delay another mailbox'
   assert.ok(store.get(objectPath('alpha', rawKey))!.byteLength + store.get(objectPath('beta', otherKey))!.byteLength > 25 * 1024 * 1024);
   const start = reads.length;
   const image = await get(await cidUrl(1));
+  // Miniflare wraps Undici's response around the same stream. Lock it without
+  // reading so Undici cannot cancel it when the original response is collected.
+  const reader = image.body?.getReader();
+  let drained = 0;
   try {
     assert.equal(image.status, 200);
     assert.equal(image.headers.get('content-type'), 'image/png');
+    assert.ok(reader);
     const budget = await (await get('/__mime-budget')).json() as { inFlight: number };
     assert.equal(budget.inFlight, 0, 'returning response headers ends the raw MIME reservation');
     assert.deepEqual(reads.slice(start), [objectPath('alpha', rawKey), objectPath('alpha', key)]);
     await status(await sign('body', { ...beta, ri: false }), 200);
+    assert.equal(image.bodyUsed, false, 'the CID must stay unread through the other mailbox request');
   } finally {
-    // Drain the first stream rather than testing cancel propagation by accident.
-    await image.arrayBuffer();
-    for (const path of [objectPath('alpha', rawKey), objectPath('alpha', key), objectPath('beta', otherKey)]) store.delete(path);
+    try {
+      // Drain the first stream rather than testing cancel propagation by accident.
+      if (reader) {
+        for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+          drained += chunk.value.byteLength;
+        }
+      }
+    } finally {
+      reader?.releaseLock();
+      for (const path of [objectPath('alpha', rawKey), objectPath('alpha', key), objectPath('beta', otherKey)]) store.delete(path);
+    }
   }
+  assert.equal(drained, large.byteLength);
 });
 
 test('saturated raw MIME admission returns 503 with Retry-After and the complete security headers', async () => {
