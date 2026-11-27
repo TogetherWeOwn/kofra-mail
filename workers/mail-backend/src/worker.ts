@@ -65,7 +65,6 @@ function queueNames(env: Partial<Env>): void {
   if (!env.DELIVERY_QUEUE_NAME || !env.DEAD_LETTER_QUEUE_NAME || env.DELIVERY_QUEUE_NAME === env.DEAD_LETTER_QUEUE_NAME) {
     throw new Error('Mail queue names missing or not distinct');
   }
-  if (env.MAIL_SEND_ENABLED === 'on') sendAlertEnvironment(env.MAIL_ENVIRONMENT);
 }
 
 export async function handleEmail(message: InboundMail, env: Partial<Env>): Promise<void> {
@@ -116,9 +115,12 @@ export async function handleScheduled(_event: ScheduledController, env: Env, now
   if (!enabled(env)) return;
   queueNames(env);
   // Delayed cron invocations reserve work from the time they actually run.
-  const outbound = env.MAIL_SEND_ENABLED === 'on' && env.SEND?.sendBatch
-    ? reconcileSendResults(env.DIRECTORY, { sendBatch: env.SEND.sendBatch.bind(env.SEND) }, now())
-      .catch(() => console.error({ code: 'send_result_reconcile_failed' }))
+  const sendBatch = env.SEND?.sendBatch?.bind(env.SEND);
+  const outbound = env.MAIL_SEND_ENABLED === 'on' && sendBatch
+    ? (async () => {
+      sendAlertEnvironment(env.MAIL_ENVIRONMENT);
+      await reconcileSendResults(env.DIRECTORY, { sendBatch }, now());
+    })().catch(() => console.error({ code: 'send_result_reconcile_failed' }))
     : undefined;
   const alert = mailAlert(env.ALERTS);
   const [result] = await Promise.all([reconcile({

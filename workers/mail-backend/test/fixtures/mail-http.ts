@@ -412,8 +412,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       clients.set(principal, client);
       return client;
     };
-    const advance = async (ms: number, parallel = false) => {
-      const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel) });
+    const advance = async (ms: number, parallel = false, alarms = true) => {
+      const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel), 'x-fixture-alarms': String(alarms) });
       if (!res.ok) throw new Error(`Fixture advance HTTP ${res.status}: ${await res.text()}`);
       now += ms;
     };
@@ -480,6 +480,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       senderCheckPaused: () => controlAction('sender-check-paused'),
       resumeSenderCheck: () => controlAction('resume-sender-check'),
       failRecordOnce: (attempt: number, times = 1) => controlAction('fail-record-once', `${attempt},${times}`),
+      crashAfterRecordCommit: () => controlAction('crash-after-record-commit'),
       crashAfterClaimRelease: () => controlAction('crash-after-claim-release'),
       crashAfterResultDelete: () => controlAction('crash-after-result-delete'),
       // Holds the next pass through a seam ('select', or 'record:<attempt>') until resumed.

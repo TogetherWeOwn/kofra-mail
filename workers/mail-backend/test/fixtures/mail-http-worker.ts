@@ -116,6 +116,13 @@ export class HttpMailbox extends Mailbox {
   // Fails recordResult `times` times for one fence attempt.
   private failRecordAttempt?: number;
   private failRecordTimes = 0;
+  private crashCommittedRecord = false;
+  crashAfterRecordCommit() { this.crashCommittedRecord = true; }
+  protected override async sendRecordCommittedCheckpoint() {
+    if (!this.crashCommittedRecord) return;
+    this.crashCommittedRecord = false;
+    throw new Error('Fixture crash after record commit');
+  }
   private claimFailures = 0;
   private claimsFailed = 0;
   failClaims(count: number) { this.claimFailures = count; }
@@ -925,6 +932,7 @@ export default {
           case '/__fixture/pause-sender-check': await box.pauseSenderCheck(await req.text() || 'before'); break;
           case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
           case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
+          case '/__fixture/crash-after-record-commit': await box.crashAfterRecordCommit(); break;
           case '/__fixture/fail-record-once': {
             const [attempt, times] = (await req.text()).split(',').map(Number);
             await box.failRecordOnce(attempt, times || 1);
@@ -1044,7 +1052,7 @@ export default {
         if (!Number.isSafeInteger(delta) || delta < 0) return new Response(null, { status: 400 });
         time = now(env) + delta;
         const { results } = await env.DIRECTORY.prepare('SELECT id, workspace_id FROM mailboxes').all<{ id: string; workspace_id: string }>();
-        const alarms = req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
+        const alarms = req.headers.get('x-fixture-alarms') === 'false' ? 0 : req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
         await Promise.all(results.map(({ workspace_id, id }) => env.MAILBOX.getByName(mailboxName(workspace_id, id)).advanceClock(time!,
           env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && workspace_id === env.ACCOUNTS.member.ws && id === env.ACCOUNTS.member.mailboxId ? alarms : 0)));
         return new Response(null, { status: 204 });

@@ -173,10 +173,21 @@ test('a cron holding an older re-drive generation cannot stamp a later failure a
   assert.equal((await db.prepare('SELECT alerted_at AS alertedAt FROM deliveries WHERE id = ?').bind(id(9)).first())?.alertedAt, 500);
 });
 
-test('an enabled send path rejects an unconfigured alert environment', async () => {
-  const env = { MAIL_BACKEND_ENABLED: 'on', MAIL_SEND_ENABLED: 'on', DIRECTORY: db,
-    DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq' } as Env;
-  await assert.rejects(handleScheduled({} as ScheduledController, env), /Invalid mail alert environment/);
+test('an invalid send-alert environment does not stop inbound delivery reconciliation', async t => {
+  await insert(8);
+  await db.prepare(`INSERT INTO send_results (workspace_id, mailbox_id, send_id, fence_epoch, fence_attempt, kind, created_at, notify_after)
+    VALUES ('workspace', 'mailbox', ?, 0, 1, 'accepted', 0, 0)`).bind(id(8)).run();
+  t.after(() => db.prepare('DELETE FROM send_results WHERE send_id = ?').bind(id(8)).run());
+  const queued: string[] = [];
+  let sendBatches = 0;
+  const env = { MAIL_BACKEND_ENABLED: 'on', MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: 'invalid environment', DIRECTORY: db,
+    DELIVERY_QUEUE_NAME: 'deliver', DEAD_LETTER_QUEUE_NAME: 'dlq', DELIVER: { async send(id: string) { queued.push(id); } },
+    SEND: { async sendBatch() { sendBatches++; } },
+  } as unknown as Env;
+  await handleScheduled({} as ScheduledController, env);
+  assert.deepEqual(queued, [id(8)]);
+  assert.equal(sendBatches, 0);
+  assert.deepEqual(await db.prepare('SELECT notify_after FROM send_results WHERE send_id = ?').bind(id(8)).first(), { notify_after: 0 });
 });
 
 test('a second cron cannot take a daily send alert during the first reservation', async () => {

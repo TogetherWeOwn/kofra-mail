@@ -39,9 +39,9 @@ export class SendStalls {
     // A deliberate quota wait is not stall time. Do not defer a condition that
     // was already active when the quota wait began.
     this.sql.exec(`UPDATE mailbox_send_stalls SET lease_expires_at = NULL,
-      expiries = CASE WHEN ? THEN 0 ELSE expiries END,
+      expiries = CASE WHEN ? AND expiries < ? THEN 0 ELSE expiries END,
       stall_since = CASE WHEN stall_since + ? > ? THEN stall_since + ? ELSE stall_since END WHERE send_id = ?`,
-    beforeMark ? 1 : 0, STALL_AGE_MS, now, quotaUntil === undefined ? 0 : Math.max(0, quotaUntil - now), id);
+    beforeMark ? 1 : 0, PRE_MARK_EXPIRIES, STALL_AGE_MS, now, quotaUntil === undefined ? 0 : Math.max(0, quotaUntil - now), id);
   }
 
   clear(id: string): void { this.sql.exec('DELETE FROM mailbox_send_stalls WHERE send_id = ?', id); }

@@ -9,7 +9,7 @@ import type { MailboxIndex } from './mailbox-index.ts';
 import { fenceBefore, fenceKey, sameFence, validFence, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
 import { senderActive } from './mailbox-send-sender.ts';
 import { SendStalls } from './mailbox-send-stalls.ts';
-import type { SendEventCode } from './send-alert-events.ts';
+import { stageSendEvent, type SendEventCode } from './send-alert-events.ts';
 import { NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS, RESTORING_NOTICE_MS } from './send-result-backoff.ts';
 export { NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS, RESTORING_NOTICE_MS } from './send-result-backoff.ts';
 import {
@@ -103,6 +103,8 @@ export type DispatchPorts = {
   senderCheckpoint?(phase: 'before' | 'after'): Promise<void>;
   // A test seam before recordResult acts, for fault injection.
   beforeRecord?(fence: SendFence): Promise<void>;
+  // A test seam after the outcome commits but before the fast-path alert flush.
+  afterRecordCommit?(): Promise<void>;
   // A test seam between a claim's release-only quota call and the removal of those fences.
   afterClaimRelease?(): Promise<void>;
   // A test seam right after a stored result's row is deleted.
@@ -116,7 +118,7 @@ export type DispatchPorts = {
   journalDue(timers: TimerTable): void;
   directory: DirectoryDatabase;
   quota(): QuotaPort | undefined;
-  alert?(code: SendEventCode): Promise<void>;
+  alert?(code: SendEventCode, occurredAt?: number): Promise<void>;
   // The structured send() request for these recipients from the send's frozen
   // inputs; null when they can no longer build it.
   buildRequest(record: SendRecord, recipients: number[]): Promise<SendRequest | null>;
@@ -336,9 +338,9 @@ export class SendDispatcher {
   private readonly stalls: SendStalls;
   constructor(private readonly ports: DispatchPorts) { this.stalls = new SendStalls(ports.sql); }
 
-  private async alert(code: SendEventCode): Promise<void> {
+  private async alert(code: SendEventCode, occurredAt?: number): Promise<void> {
     console.error({ code });
-    await this.ports.alert?.(code);
+    await this.ports.alert?.(code, occurredAt);
   }
 
   private expirePreMark(id: string, now: number, timers: TimerTable): void {
@@ -443,6 +445,7 @@ export class SendDispatcher {
         }
         endLease(m, ctx);
         m.d.heldAt = ctx.now;
+        stageSendEvent(ports.sql, 'send_held', ctx.now);
         console.error({ code: 'send_held' });
         this.commit(m, ready, timers, ctx.now + HOLD_RECHECK_MS);
         return { status: 'not_now', reason: 'held' };
@@ -656,6 +659,7 @@ export class SendDispatcher {
     if (!await this.readyFor(scope)) return { status: 'restoring' };
     await ports.beforeRecord?.(fence);
     const alerts: SendEventCode[] = [];
+    let alertAt: number | undefined;
     const outcome = await ports.local((timers): ReportAnswer | { seq: number; refused?: true } => {
       const ready = ports.current();
       if (!ready) return { status: 'restoring' };
@@ -730,10 +734,13 @@ export class SendDispatcher {
         alerts.push(m.d.ambiguous >= AMBIGUOUS_CAP ? 'send_ambiguous_cap' : 'send_deadline');
         driveAt = grace(m, 'delivery_error', ctx) ?? ctx.now;
       } else if (m.allTerminal()) driveAt = finish(m, ctx);
+      alertAt = ctx.now;
+      for (const code of alerts) stageSendEvent(ports.sql, code, alertAt);
       return { seq: this.commit(m, ready, timers, driveAt, true) || ready.index.journal.revision(), ...(refused && { refused: true as const }) };
     });
     if ('status' in outcome) return outcome;
-    for (const code of alerts) await this.alert(code);
+    await ports.afterRecordCommit?.();
+    for (const code of alerts) await this.alert(code, alertAt);
     if (outcome.refused) await this.releaseNow(scope, id, fence);
     return await ports.publishThrough(outcome.seq) ? { status: 'recorded' } : { status: 'unpublished' };
   }
@@ -1035,8 +1042,11 @@ export class SendDispatcher {
           id, row.epoch, row.attempt, code).toArray().length > 0 || changed;
       }
       for (const code of set) {
-        changed = this.ports.sql.exec('INSERT OR IGNORE INTO mailbox_send_result_alerts VALUES (?, ?, ?, ?, ?) RETURNING 1', id, row.epoch, row.attempt,
-          code, this.ports.now()).toArray().length > 0 || changed;
+        const now = this.ports.now();
+        const inserted = this.ports.sql.exec('INSERT OR IGNORE INTO mailbox_send_result_alerts VALUES (?, ?, ?, ?, ?) RETURNING 1', id, row.epoch,
+          row.attempt, code, now).toArray().length > 0;
+        if (inserted) stageSendEvent(this.ports.sql, code === 'unapplied' ? 'send_result_unapplied' : 'send_result_stuck', now);
+        changed = inserted || changed;
       }
       // The backup lane evaluates the alerts: bring it forward when one changed.
       if (changed) this.ports.journalDue(timers);

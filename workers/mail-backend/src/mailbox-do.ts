@@ -10,7 +10,7 @@ import { contentRecord, type MailboxContentRecord } from './mailbox-api-messages
 import { ObjectMissingError } from './object-errors.ts';
 import { mailAlert, type MailboxAlertCode } from './alerts.ts';
 import { MailAlerts } from './mail-alerts.ts';
-import { isSendEventCode, sendAlertEnvironment, type SendEventCode } from './send-alert-events.ts';
+import { isSendEventCode, sendAlertEnvironment, stageSendEvent, type SendEventCode } from './send-alert-events.ts';
 import { kofra } from './kofra.ts';
 import { MailboxIndex, PermanentMailError, storedLifecycle } from './mailbox-index.ts';
 import {
@@ -200,6 +200,7 @@ export class Mailbox extends DurableObject<Env> {
       exclusive: (io, step) => this.exclusiveStep(io, step),
       senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
       beforeRecord: fence => this.sendRecordCheckpoint(fence),
+      afterRecordCommit: () => this.sendRecordCommittedCheckpoint(),
       afterClaimRelease: () => this.sendReleaseCheckpoint(),
       afterResultDelete: () => this.sendResultDeleteCheckpoint(),
       afterStoredSelect: () => this.sendStoredSelectCheckpoint(),
@@ -208,7 +209,7 @@ export class Mailbox extends DurableObject<Env> {
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
       quota: () => this.sendQuota(),
-      alert: code => this.sendOperatorEvent(code),
+      alert: (code, occurredAt) => this.sendOperatorEvent(code, occurredAt),
       buildRequest: (record, recipients) => {
         const life = storedLifecycle<Lifecycle>(this.ctx.storage);
         // Reads stop once the mailbox is no longer the ready incarnation the request started on.
@@ -229,6 +230,7 @@ export class Mailbox extends DurableObject<Env> {
   protected async sendSenderCheckpoint(_phase: 'before' | 'after'): Promise<void> {}
   // A test seam before recordResult acts.
   protected async sendRecordCheckpoint(_fence: SendFence): Promise<void> {}
+  protected async sendRecordCommittedCheckpoint(): Promise<void> {}
   // A test seam between a claim's release-only quota call and the removal of those fences.
   protected async sendReleaseCheckpoint(): Promise<void> {}
   // A test seam right after a stored result's row is deleted.
@@ -300,15 +302,14 @@ export class Mailbox extends DurableObject<Env> {
     this.ctx.storage.sql.exec('DELETE FROM mailbox_send_event_outbox WHERE day = ? AND code = ?', day, code);
   }
 
-  private async sendOperatorEvent(code: SendEventCode): Promise<void> {
-    const now = this.mailApiNow();
-    const day = Math.floor(now / 86_400_000);
+  private async sendOperatorEvent(code: SendEventCode, occurredAt = this.mailApiNow()): Promise<void> {
     try {
-      await this.local(timers => {
-        this.ctx.storage.sql.exec('INSERT OR IGNORE INTO mailbox_send_event_outbox (day, code, occurred_at) VALUES (?, ?, ?)', day, code, now);
+      const day = await this.local(timers => {
+        const day = stageSendEvent(this.ctx.storage.sql, code, occurredAt);
         this.journalDue(timers);
+        return day;
       });
-      await this.flushSendEvent(day, code, now);
+      await this.flushSendEvent(day, code, occurredAt);
     } catch { console.error({ code: 'send_alert_store_failed' }); }
   }
 
@@ -316,7 +317,10 @@ export class Mailbox extends DurableObject<Env> {
   async recordSendEvent(workspaceId: string, mailboxId: string, code: unknown): Promise<void> {
     this.verifyScope({ workspaceId, mailboxId });
     if (!isSendEventCode(code)) throw new Error('Invalid send alert code');
-    if (enabled(this.env) && this.env.MAIL_SEND_ENABLED === 'on') await this.sendOperatorEvent(code);
+    if (enabled(this.env) && this.env.MAIL_SEND_ENABLED === 'on') {
+      sendAlertEnvironment(this.env.MAIL_ENVIRONMENT);
+      await this.sendOperatorEvent(code);
+    }
   }
 
   // Shared by the drive handler and result notices; a notice passes its fence,

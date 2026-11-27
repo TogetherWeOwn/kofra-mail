@@ -11,13 +11,21 @@ const TITLES = {
   send_quota_failed: 'The send quota object could not reserve or confirm a charge',
   send_stale_release_failed: 'A stale send charge could not be released',
   send_request_invalid: 'An outbound request could not be built',
-  send_stalled: 'An outbound send has stalled before Mark',
+  send_stalled: 'An outbound send has stalled',
 } as const;
 export type SendEventCode = keyof typeof TITLES;
 export const isSendEventCode = (value: unknown): value is SendEventCode => typeof value === 'string' && Object.hasOwn(TITLES, value);
 export const sendEventTitle = (code: SendEventCode): string => TITLES[code];
 
 const DAY = 86_400_000;
+
+// Safe to call inside the transaction that commits the event's source fact.
+export function stageSendEvent(sql: SqlStorage, code: SendEventCode, now: number): number {
+  const day = Math.floor(now / DAY);
+  sql.exec('INSERT OR IGNORE INTO mailbox_send_event_outbox (day, code, occurred_at) VALUES (?, ?, ?)', day, code, now);
+  return day;
+}
+
 const ENVIRONMENT = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 export function sendAlertEnvironment(value: string | undefined): string {
   if (!value || !ENVIRONMENT.test(value)) throw new Error('Invalid mail alert environment');

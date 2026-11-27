@@ -293,6 +293,24 @@ test('every mailbox send-event code reaches the operator, once per UTC day acros
   assertRedacted(h);
 }));
 
+test('a send-event enqueue rejects an invalid alert environment', () => run(async h => {
+  await assert.rejects(h.sendEvent('send_outage'));
+  assert.deepEqual(await h.directoryRows('SELECT key FROM mail_alerts'), []);
+}, { environment: 'invalid environment' }));
+
+test('a committed outbound alert survives a crash before the fast-path flush', () => run(async h => {
+  const id = await queued(h, 'alert-record-crash');
+  await h.crashAfterRecordCommit();
+  h.providerErrors.push('E_EMAIL_SENDING_NOT_READY');
+  assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+  assert.equal((await h.sendState(id)).fences[0].outcome, 'outage');
+  assert.deepEqual(await h.directoryRows('SELECT key FROM mail_alerts'), []);
+  await h.advance(MINUTE);
+  await h.backendCron();
+  assert.deepEqual(sources(h), ['mail:send_outage']);
+  assert.equal(h.providerCalls(), 1);
+}));
+
 test('a one-shot outbound event survives an unavailable D1 alert insert', () => run(async h => {
   const id = await queued(h, 'alert-write-fails');
   await h.directoryChange(`CREATE TRIGGER fixture_no_send_alert BEFORE INSERT ON mail_alerts
@@ -433,6 +451,7 @@ test('repeated Mark and abandon without authorization still alerts after 24 hour
   }
   assert.equal(h.providerCalls(), 0);
   assert.equal((await h.sendState(id)).dispatch?.unfinished, 0);
+  assert.equal(JSON.parse(h.alerts[0].body).title, 'An outbound send has stalled');
 }));
 
 test('a worker with no EMAIL binding still raises the stall alert', () => run(async h => {
@@ -461,6 +480,20 @@ test('deliberate quota waits do not count toward the stall age', () => run(async
   await advanceTo(h, release + 24 * HOUR + wait);
   await h.backendCron();
   assert.ok(sources(h).includes(stalledSource));
+}));
+
+test('an immediate abandon cannot erase an already reached fifth pre-Mark expiry', () => run(async h => {
+  const id = await queued(h, 'stall-reached-streak');
+  let claimed = await claim(h, id);
+  for (let round = 0; round < 5; round++) {
+    // No alarm observes the fifth expiry before the new claim does.
+    await h.advance(claimed.leaseUntil + 30_000 - await h.sends.now(), false, false);
+    claimed = await claim(h, id);
+  }
+  await h.sendRpc('abandonClaim', id, claimed.fence, await h.sends.now() + MINUTE);
+  await h.advance(MINUTE);
+  await h.backendCron();
+  assert.deepEqual(sources(h), [stalledSource]);
 }));
 
 test('a reported abandon breaks the consecutive pre-Mark expiry streak', () => run(async h => {
