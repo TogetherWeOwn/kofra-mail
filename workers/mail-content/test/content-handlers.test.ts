@@ -370,7 +370,9 @@ test('workerd still serves a live CID follower after the stalled read leader can
   const leader = mf.dispatchFetch(new URL(path, origin), { headers: { 'x-fixture-cancel-leader': '1' } });
   try {
     assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
-    const follower = get(path);
+    const follower = get(path).then(async live => ({ live, body: new Uint8Array(await live.arrayBuffer()) }));
+    // The body read can reject before we await it below.
+    void follower.catch(() => {});
     // The origin remains blocked while the second HTTP request joins the flight.
     await new Promise(resolve => setTimeout(resolve, 200));
     await set('cancel-flight-leader', null);
@@ -378,9 +380,9 @@ test('workerd still serves a live CID follower after the stalled read leader can
     const stopped = await leader;
     assert.equal(stopped.status, 404);
     void stopped.body?.cancel().catch(() => {});
-    const live = await follower;
+    const { live, body } = await follower;
     assert.equal(live.status, 200);
-    assert.deepEqual(new Uint8Array(await live.arrayBuffer()), png);
+    assert.deepEqual(body, png);
     assert.deepEqual(reads.slice(start).filter(read => read === rawPath), [rawPath]);
     assert.equal((await (await get('/__mime-budget')).json() as { inFlight: number }).inFlight, 0);
   } finally {
@@ -409,15 +411,16 @@ for (const recovered of [true, false]) test(`a CID follower ${recovered ? 'recov
   const leader = get(path);
   try {
     assert.equal(await Promise.race([arrived.promise.then(() => 'origin entered'), leader.then(r => `leader returned ${r.status}`)]), 'origin entered');
-    const follower = get(path);
+    const follower = get(path).then(async replacement => ({ replacement, body: new Uint8Array(await replacement.arrayBuffer()) }));
+    // The body read can reject before we await it below.
+    void follower.catch(() => {});
     // Keep the source blocked while the real Workerd follower opts into the flight.
     await new Promise(resolve => setTimeout(resolve, 200));
     assert.equal(attempts, 1);
     failLeader.resolve();
-    const [failed, replacement] = await Promise.all([leader, follower]);
+    const [failed, { replacement, body }] = await Promise.all([leader, follower]);
     assert.equal(failed.status, 404);
     assert.equal((await failed.arrayBuffer()).byteLength, 0);
-    const body = new Uint8Array(await replacement.arrayBuffer());
     assert.equal(replacement.status, recovered ? 200 : 503);
     if (recovered) assert.deepEqual(body, png);
     else {
