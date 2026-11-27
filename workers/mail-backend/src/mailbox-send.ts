@@ -9,7 +9,7 @@ import type { Draft, Send } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { normalizeAddress } from './directory.ts';
 import {
-  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject, sendableDraftObject, sendFileName, sendFileType,
+  draftObjectKeys, draftRef, draftUploadIds, eachForwardedPart, encodeDraftObject, fingerprintParts, inlinePart, readDraft, readDraftObject, sendableDraftObject, sendFileName, sendFileType, sendThreading,
   type DraftObject, type DraftObjectRef,
 } from './mailbox-api-drafts.ts';
 import { apiKey, committedKey, fingerprintOf, RESULT_TTL_MS, scheduleResult } from './mailbox-api-idempotency.ts';
@@ -80,13 +80,14 @@ export function mimeMessage(record: SendRecord, draft: DraftObject): SendMimeMes
   const field = (name: SendRecipient['field']) => record.recipients.filter(r => r.field === name).map(({ email, name: display }) =>
     ({ email, ...(display ? { name: display } : {}) }));
   const links = (draft.attachments ?? []).flatMap(({ wire }) => wire.kind === 'link' ? [`${wire.name}: ${wire.url}`] : []);
+  const { inReplyTo, references } = sendThreading(draft.replyHeaders);
   return {
     messageId: sentMessageIdHeader(record), boundary: sentBoundary(record), date: record.dateAt,
     from: { email: record.from.email, ...(record.from.name ? { name: record.from.name } : {}) }, replyTo: record.replyTo,
-    to: field('to'), cc: field('cc'), subject: draft.fields.subject, text: [draft.fields.body, ...links].join('\r\n'),
+    to: field('to'), cc: field('cc'), subject: draft.fields.subject.toWellFormed(), text: [draft.fields.body, ...links].join('\r\n'),
     attachments: files(draft).map(({ wire }) => ({ name: sendFileName(wire.name), type: sendFileType(wire.type), size: wire.size })),
-    ...(draft.replyHeaders?.inReplyTo ? { inReplyTo: draft.replyHeaders.inReplyTo } : {}),
-    ...(draft.replyHeaders?.references ? { references: draft.replyHeaders.references } : {}),
+    ...(inReplyTo ? { inReplyTo } : {}),
+    ...(references ? { references } : {}),
   };
 }
 

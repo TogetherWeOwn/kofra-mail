@@ -1297,18 +1297,23 @@ test('getDraft, replaceDraft and sendDraft of a stored draft that does not decod
     '2 503 unavailable', '2 503 unavailable', '2 503 unavailable']);
 }));
 
-// Rewrites a send's frozen draft revision as a digest-valid object with one change to its upload attachment.
-async function sendChangedUpload(h: Fixture, mail: MailService, from: string, change: (wire: Record<string, unknown>) => void) {
-  const uploaded = await mail.createUpload({ name: 'note.txt', type: 'text/plain', bytes: new Blob(['attachment']) }, key('upload'));
-  const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
-  const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
-  const draft = JSON.parse(new TextDecoder().decode(h.objects.get(objectPath(rawKey)))) as { attachments: { wire: Record<string, unknown> }[] };
-  change(draft.attachments[0].wire);
+// Rewrites a send's frozen draft revision as a digest-valid object with one change.
+async function rewriteFrozenDraft(h: Fixture, sendId: string, change: (draft: Record<string, unknown>) => void) {
+  const { draft: { rawKey } } = JSON.parse((await h.sends.row(sendId))!.record) as { draft: { rawKey: string } };
+  const draft = JSON.parse(new TextDecoder().decode(h.objects.get(objectPath(rawKey)))) as Record<string, unknown>;
+  change(draft);
   const bytes = new TextEncoder().encode(JSON.stringify(draft));
   const [kind, , gen] = rawKey.split('/');
   const changedKey = `${kind}/${sha256(bytes.buffer as ArrayBuffer)}/${gen}`;
   h.objects.set(objectPath(changedKey), bytes.slice().buffer);
-  await h.sends.setDraftKey(pending.id, changedKey);
+  await h.sends.setDraftKey(sendId, changedKey);
+}
+
+// The same, with one change to the send's upload attachment.
+async function sendChangedUpload(h: Fixture, mail: MailService, from: string, change: (wire: Record<string, unknown>) => void) {
+  const uploaded = await mail.createUpload({ name: 'note.txt', type: 'text/plain', bytes: new Blob(['attachment']) }, key('upload'));
+  const { send: pending } = await send(mail, from, 'one', { attachments: [{ kind: 'upload', uploadId: uploaded.id }] });
+  await rewriteFrozenDraft(h, pending.id, draft => change((draft.attachments as { wire: Record<string, unknown> }[])[0].wire));
   return pending;
 }
 
@@ -1331,6 +1336,7 @@ test('a digest-valid draft revision whose upload size differs from its att/ obje
 for (const [label, name, type, sentName, sentType] of [
   ['an empty name and a type holding CR LF', '', 'text/plain\r\nX-Injected: 1', 'attachment', 'application/octet-stream'],
   ['a name indexed before names were cleaned', `a\tb/c\\${'x'.repeat(300)}`, 'text/plain', indexedAttachmentName(`a\tb/c\\${'x'.repeat(300)}`), 'text/plain'],
+  ['a lone UTF-16 surrogate in its name and type', 'a\ud800b.txt', 'text/plain\udc00', 'a\ufffdb.txt', 'text/plain\ufffd'],
 ] as const) {
   test(`a stored file with ${label} is sent with a cleaned name and type, never failed`, () => withSend(async (h, mail, from) => {
     const pending = await sendChangedUpload(h, mail, from, wire => { wire.name = name; wire.type = type; });
@@ -1364,3 +1370,34 @@ test('a forwarded part indexed with an uncleaned name and a control character in
     const [copy] = await sentCopies(mail);
     assert.deepEqual(copy.attachments.map(({ name, size }) => ({ name, size })), [{ name: indexedAttachmentName(legacyName), size: bytes.byteLength }]);
   }));
+
+test('an unsafe or over-long stored In-Reply-To is left out and References keeps only safe ids, with every header line within 998 octets',
+  () => withSend(async (h, mail, from) => {
+    const { send: pending } = await send(mail, from, 'one');
+    await rewriteFrozenDraft(h, pending.id, draft => {
+      draft.replyHeaders = { inReplyTo: `<${'a'.repeat(1500)}@example.net>`, references: `<ok@example.net> <${'b'.repeat(1200)}@example.net> <bad id@example.net>` };
+    });
+    await h.advance(UNDO);
+    assert.equal((await mail.getSend(pending.id)).state, 'sending');
+    const text = new TextDecoder().decode(h.objects.get(objectPath((await h.sends.registration(pending.id))!.key!)));
+    const head = text.slice(0, text.indexOf('\r\n\r\n'));
+    assert.doesNotMatch(head, /^In-Reply-To:/m);
+    assert.match(head, /^References: <ok@example\.net>\r?$/m);
+    for (const line of text.split('\r\n')) assert.ok(new TextEncoder().encode(line).byteLength <= 998, `line of ${line.length}`);
+  }));
+
+test('a stored draft with more attachments than pageSizeMax fails the send with delivery_error, an alert and no MIME', () => withSend(async (h, mail, from) => {
+  const { send: pending } = await send(mail, from, 'one');
+  await rewriteFrozenDraft(h, pending.id, draft => {
+    draft.attachments = Array.from({ length: 101 }, (_, i) => ({ wire: { kind: 'link', url: `https://example.net/${i}`, name: `link ${i}` } }));
+  });
+  const builds = (await h.sends.builds()).length;
+  await h.advance(UNDO);
+  const failed = await mail.getSend(pending.id);
+  assert.equal(failed.state, 'failed');
+  assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+  assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+  assert.deepEqual(await h.sends.queue(), []);
+  await h.advance(minute);
+  assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+}));

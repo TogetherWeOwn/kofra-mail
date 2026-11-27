@@ -1,4 +1,4 @@
-import { hasHeaderControl, indexedAttachmentName, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
+import { hasHeaderControl, indexedAttachmentName, isSafeMessageId, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput, Draft, DraftAttachment, DraftInput } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
@@ -82,11 +82,34 @@ const isAddress = (value: unknown) => isRecord(value) && isBounded(value.email, 
 // The file name and type the MIME builder gets. Uploads (`uploadName`,
 // `uploadMediaType`) and parts indexed with the mail API on already fit: a name
 // of 1 to 255 bytes with no control character, a type with no header control.
-// A part indexed before names were cleaned, or a forwarded type holding a
-// control character, is cleaned here instead of failing the send.
+// A part indexed before names were cleaned, a forwarded type holding a control
+// character, or a lone UTF-16 surrogate (which encodeURIComponent refuses) is
+// cleaned here instead of failing the send: a failed send does not restore its draft.
 const isFileName = (value: string) => value !== '' && isBounded(value, 255, true) && !value.includes('\t');
-export const sendFileName = (name: string) => isFileName(name) ? name : indexedAttachmentName(name);
-export const sendFileType = (type: string) => type.length <= 255 && !hasHeaderControl(type) ? type : 'application/octet-stream';
+export function sendFileName(name: string): string {
+  const whole = name.toWellFormed();
+  return isFileName(whole) ? whole : indexedAttachmentName(whole);
+}
+export function sendFileType(type: string): string {
+  const whole = type.toWellFormed();
+  return whole.length <= 255 && !hasHeaderControl(whole) ? whole : 'application/octet-stream';
+}
+// Threading is optional: an unsafe or over-long In-Reply-To is left out, and
+// References keeps its safe ids, in order, while the unfolded value fits
+// headerValueBytes, as threadingHeaders stores them.
+export function sendThreading(headers: ThreadingHeaders | undefined): ThreadingHeaders {
+  const max = LIMITS.headerValueBytes;
+  const fits = (id: string) => isSafeMessageId(id) && utf8(id).byteLength <= max;
+  const kept: string[] = [];
+  let total = -1;
+  for (const id of headers?.references?.split(' ') ?? []) {
+    if (!fits(id) || total + 1 + id.length > max) continue;
+    kept.push(id);
+    total += 1 + id.length;
+  }
+  const inReplyTo = headers?.inReplyTo;
+  return { ...(inReplyTo && fits(inReplyTo) && { inReplyTo }), ...(kept.length && { references: kept.join(' ') }) };
+}
 function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
@@ -107,9 +130,10 @@ export function sendableDraftObject(draft: DraftObject): boolean {
     lists.reduce<number>((sum, list) => sum + (list as unknown[]).length, 0) <= LIMITS.recipientsPerMessage &&
     isBounded(fields.subject, LIMITS.subjectBytes, true) && isBounded(fields.body, LIMITS.bodyBytes) &&
     optional(fields.inReplyTo, isId) && optional(fields.forwardOf, isId) &&
-    optional(attachments, list => Array.isArray(list) && list.every(isStoredAttachment)) &&
-    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, value => isBounded(value, LIMITS.headerValueBytes, true)) &&
-      optional(headers.references, value => isBounded(value, LIMITS.headerValueBytes, true)));
+    // The save path keeps at most pageSizeMax attachments, links included.
+    optional(attachments, list => Array.isArray(list) && list.length <= LIMITS.pageSizeMax && list.every(isStoredAttachment)) &&
+    // Unsafe threading values are left out when the MIME is built (sendThreading).
+    optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
 }
 export async function readDraftObject(index: MailboxIndex, ref: DraftObjectRef): Promise<DraftObject> {
   return (await loadDraft(index, ref)).draft;
