@@ -5,7 +5,22 @@
   import { pushState, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { TopBar } from 'suite-shell';
-  import { Archive, File, Inbox, Mail, OctagonAlert, Paperclip, Pencil, Plus, RefreshCw, Shield, Search, Send, Star, Tag, Trash2 } from '@lucide/svelte';
+  // Import per icon so cold Vite SSR does not load the entire Lucide catalog.
+  import Archive from '@lucide/svelte/icons/archive';
+  import File from '@lucide/svelte/icons/file';
+  import Inbox from '@lucide/svelte/icons/inbox';
+  import Mail from '@lucide/svelte/icons/mail';
+  import OctagonAlert from '@lucide/svelte/icons/octagon-exclamation-point';
+  import Paperclip from '@lucide/svelte/icons/paperclip';
+  import Pencil from '@lucide/svelte/icons/pencil';
+  import Plus from '@lucide/svelte/icons/plus';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import Search from '@lucide/svelte/icons/search';
+  import Send from '@lucide/svelte/icons/send';
+  import Shield from '@lucide/svelte/icons/shield';
+  import Star from '@lucide/svelte/icons/star';
+  import Tag from '@lucide/svelte/icons/tag';
+  import Trash2 from '@lucide/svelte/icons/trash';
   import { onMount, tick } from 'svelte';
   import { ROUTES, createHttpMailService, isMailApiError, type Conversation, type Draft, type Identity, type Label, type MailApiError, type MailboxPage, type Message, type MessageAttachment, type Operation, type Session, type Settings, type ThreadChange, type ThreadQuery, type ThreadSummary, type View, type ViewList } from '@kofra/mail-contract';
   import Compose, { type ComposeDraft, type DraftEdits } from '$lib/Compose.svelte';

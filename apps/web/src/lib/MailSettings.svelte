@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { ArrowLeft, CircleCheck } from '@lucide/svelte';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+  import CircleCheck from '@lucide/svelte/icons/circle-check';
   import type { Identity, Limits, Settings } from '@kofra/mail-contract';
 
   let { value, identities, limits, onBack, onSave }: {

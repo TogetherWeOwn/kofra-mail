@@ -1,5 +1,9 @@
 <script lang="ts">
-  import { ArrowLeft, CircleCheck, Clock3, Globe, Plus } from '@lucide/svelte';
+  import ArrowLeft from '@lucide/svelte/icons/arrow-left';
+  import CircleCheck from '@lucide/svelte/icons/circle-check';
+  import Clock3 from '@lucide/svelte/icons/clock-3';
+  import Globe from '@lucide/svelte/icons/globe';
+  import Plus from '@lucide/svelte/icons/plus';
   import { onMount, tick } from 'svelte';
   import type { AdminMailbox, Domain, DomainInput, MailService, Member } from '@kofra/mail-contract';
   import { mailAction } from './mail-action';
