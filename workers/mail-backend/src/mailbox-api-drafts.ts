@@ -7,6 +7,7 @@ import { fail, invalid, isId, iso, need, object, requireId, text, utf8 } from '.
 import type { ApiDraftRef, MailboxIndex } from './mailbox-index.ts';
 import { decodedAttachment, MAX_INDEXED_ATTACHMENTS, parseMail, readMailMime } from './parse-mail.ts';
 import { unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
+import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
 
 export type DraftObjectRef = Omit<ApiDraftRef, 'holder'>;
@@ -56,8 +57,9 @@ async function loadDraft(index: MailboxIndex, ref: DraftObjectRef): Promise<{ dr
   const digest = parsed?.kind === 'raw' ? parsed.digest : /^drafts\/([0-9a-f]{64})$/.exec(ref.rawKey)?.[1];
   if (!digest) throw new Error('Invalid API draft reference');
   const bytes = await index.readObject(ref.rawKey);
+  // The read enforced the declared length, so wrong bytes are corrupt for good.
   if (bytes.byteLength > MAX_DRAFT_OBJECT_BYTES || await sha256(bytes) !== digest) {
-    throw new Error('Invalid API draft object');
+    throw new ObjectInvalidError('Invalid API draft object');
   }
   const draft = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)) as DraftObject;
   if (draft.version !== 1 || !draft.fields || typeof draft.fields !== 'object') throw new Error('Unsupported draft object');

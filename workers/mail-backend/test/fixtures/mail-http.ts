@@ -63,6 +63,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
   const objects = new Map<string, ArrayBuffer>();
+  // Object paths whose GET answers 503, a transient object store failure.
+  const failingReads = new Set<string>();
   const writes: { key: string; holders: string[] }[] = [];
   let inspectPut: ((pathname: string) => Promise<void>) | undefined;
   let nextPut: { start: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> } | undefined;
@@ -105,6 +107,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
           return new LocalResponse(null, { status: 201 });
         }
         case 'GET': {
+          if (failingReads.has(pathname)) return new LocalResponse('<Error><Code>ServiceUnavailable</Code></Error>', { status: 503 });
           const object = objects.get(pathname);
           return object ? new LocalResponse(object, { headers: { 'content-length': String(object.byteLength) } })
             : new LocalResponse('<Error><Code>NoSuchKey</Code></Error>', { status: 404 });
@@ -358,7 +361,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       }
       assert.ok((await mail.getThread(threadId)).messages.length);
     }
-    return { origin, contentOrigin, directoryDb: db, as, deliver, advance, objects, writes, holders, timers, pendingReleases, releaseRetryAt, restore,
+    return { origin, contentOrigin, directoryDb: db, as, deliver, advance, objects, failingReads, writes, holders, timers, pendingReleases, releaseRetryAt, restore,
       forceSnapshot, uploadSwitch, sends,
       publishFailure, releaseFailure, acknowledgedReleases, purgeTrash, pauseExpiry, expiryStarts, finishExpiry, eventCount,
       startedAt: startTime, hasIdempotency, confirmations, holderDetails, confirmFailure, confirmBatches, releaseHolder, sweepAt, alerts, alertFailure, stageAndCrash, persistMaximumHolder,

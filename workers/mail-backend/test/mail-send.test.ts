@@ -1121,3 +1121,90 @@ test('a small forwarded part whose source raw object is stored as zero bytes fai
     await h.advance(minute);
     assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
   }));
+
+test('sendDraft answers 422 invalid_recipients for a local part holding "=?", and accepts a standalone "=" or "?"', () => withSend(async (h, mail, from) => {
+  for (const [i, email] of ['=?utf-8?b?QQ==?=@example.com', 'a.=?x@example.com'].entries()) {
+    const draft = await mail.createDraft(draftInput(from, { cc: [{ email }] }), key(`draft-encoded-${i}`));
+    const response = await post(h, mail, `/drafts/${draft.id}/send`, `send-encoded-${i}`, draft.revision);
+    assert.equal(response.status, 422);
+    assert.equal(((await response.json()) as { code: string }).code, 'invalid_recipients');
+  }
+  assert.deepEqual(await h.sends.ids(), [], 'no send was accepted');
+  const { send: pending } = await send(mail, from, 'plain', { to: [{ email: 'a=b@example.com' }, { email: 'c?d@example.com' }, { email: 'e?=f@example.com' }] });
+  assert.equal(pending.state, 'pending');
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+}));
+
+test('a settings Reply-To whose local part holds "=?" is left out of the frozen send record', () => withSend(async (h, mail, from) => {
+  await h.sends.setReplyTo([{ email: '=?utf-8?b?QQ==?=@example.com' }, { email: 'replies@example.com', name: 'Replies' }]);
+  const { send: pending } = await send(mail, from, 'one');
+  const record = JSON.parse((await h.sends.row(pending.id))!.record) as { replyTo: unknown };
+  assert.deepEqual(record.replyTo, [{ email: 'replies@example.com', name: 'Replies' }]);
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(pending.id)).state, 'sending');
+}));
+
+test('a small forwarded part whose source raw object is changed in place fails the send with delivery_error, an alert and no MIME',
+  () => withSend(async (h, mail, from) => {
+    const { pending } = await forwardDraft(h, mail, from);
+    const [sourceKey] = (JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[] }).attachmentKeys;
+    assert.match(sourceKey, /^raw\//, 'the part stays inside its source message');
+    // Same length, different bytes: the read succeeds, the digest does not match the key.
+    const stored = h.objects.get(objectPath(sourceKey))!;
+    h.objects.set(objectPath(sourceKey), new Uint8Array(stored.byteLength).fill(66).buffer);
+    const builds = (await h.sends.builds()).length;
+    await h.advance(UNDO);
+    const failed = await mail.getSend(pending.id);
+    assert.equal(failed.state, 'failed');
+    assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), [{ state: 'failed', reason: 'delivery_error' }]);
+    assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+    assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+    assert.deepEqual(await h.sends.queue(), []);
+    assert.deepEqual(await sentCopies(mail), []);
+    await h.advance(minute);
+    assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+    assert.equal(await h.sends.emailCalls(), 0);
+  }));
+
+for (const corruption of ['changed', 'empty'] as const) {
+  test(`a draft revision object ${corruption === 'changed' ? 'changed in place' : 'stored as zero bytes'} fails the send with delivery_error, an alert and no MIME`,
+    () => withSend(async (h, mail, from) => {
+      const { send: pending } = await send(mail, from, 'one', { to: [{ email: 'friend@example.net' }, { email: 'other@example.com' }] });
+      const { draft: { rawKey } } = JSON.parse((await h.sends.row(pending.id))!.record) as { draft: { rawKey: string } };
+      const stored = h.objects.get(objectPath(rawKey))!;
+      h.objects.set(objectPath(rawKey), corruption === 'changed' ? new Uint8Array(stored.byteLength).fill(66).buffer : new ArrayBuffer(0));
+      const builds = (await h.sends.builds()).length;
+      await h.advance(UNDO);
+      const failed = await mail.getSend(pending.id);
+      assert.equal(failed.state, 'failed');
+      assert.deepEqual(failed.recipients.map(({ state, reason }) => ({ state, reason })), Array(2).fill({ state: 'failed', reason: 'delivery_error' }));
+      assert.equal((await h.sends.builds()).length, builds, 'no MIME was built');
+      assert.equal((await h.sends.registration(pending.id))?.key ?? null, null, 'nothing was registered or stored');
+      assert.deepEqual(await h.sends.queue(), []);
+      assert.deepEqual(await sentCopies(mail), []);
+      await h.advance(minute);
+      assert.ok((await h.alerts()).includes('mail:holder_source_lost'));
+      assert.equal(await h.sends.emailCalls(), 0);
+    }));
+}
+
+for (const target of ['source', 'draft'] as const) {
+  test(`a 503 reading ${target === 'source' ? 'a small forwarded part\'s source raw object' : 'the draft revision object'} still retries instead of failing the send`,
+    () => withSend(async (h, mail, from) => {
+      const { pending } = await forwardDraft(h, mail, from);
+      const record = JSON.parse((await h.sends.row(pending.id))!.record) as { attachmentKeys: string[]; draft: { rawKey: string } };
+      const path = objectPath(target === 'source' ? record.attachmentKeys[0] : record.draft.rawKey);
+      h.failingReads.add(path);
+      await h.advance(UNDO);
+      await h.advance(DRIVE_BACKOFF);
+      assert.equal((await h.sends.row(pending.id))?.state, 'releasing', 'a failed read retries');
+      assert.equal((await mail.getSend(pending.id)).state, 'sending');
+      assert.deepEqual(await h.sends.queue(), []);
+      assert.ok(!(await h.alerts()).includes('mail:holder_source_lost'));
+      h.failingReads.delete(path);
+      await h.advance(2 * DRIVE_BACKOFF);
+      assert.equal((await h.sends.row(pending.id))?.state, 'queued');
+      assert.equal((await h.sends.queue()).length, 1);
+    }));
+}

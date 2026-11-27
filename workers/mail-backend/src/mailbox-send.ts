@@ -67,7 +67,8 @@ function validDomain(name: string): boolean {
 }
 export function validEmail(email: string): boolean {
   const [local, domain, extra] = email.split('@');
-  return extra === undefined && local.length <= 64 && email.length <= LIMITS.addressBytes && !!domain && validDomain(domain)
+  // An RFC 2047 encoded word is not allowed inside an addr-spec (contract section 8.3).
+  return extra === undefined && !local.includes('=?') && local.length <= 64 && email.length <= LIMITS.addressBytes && !!domain && validDomain(domain)
     && /^[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/i.test(local);
 }
 
@@ -396,17 +397,20 @@ export class SendDriver {
     const { record } = row;
     const kinds = await this.classify(start.scope, record);
     let failure: SendFailure | null = null;
-    let draft: DraftObject | undefined;
+    // Null once read and found invalid for good; undefined if never read.
+    let draft: DraftObject | null | undefined;
     let forwarded: Map<number, Uint8Array<ArrayBuffer>> | null = new Map();
     // A deploy that dropped the frozen builder version is our invariant breach, never the sender's failure.
     if (!ports.mime.get(record.builderVersion)) return this.breach(start);
     if (!await this.senderValid(start.scope, record)) failure = 'invalid_sender';
     // A lost source is never read: its object may be gone.
     else if (await this.sourceLost(record)) failure = 'delivery_error';
-    else if (!this.withinLimits(record, draft = await this.draftOf(start, record))) failure = 'message_too_large';
+    // A draft revision that no longer matches its digest is unusable, like a lost source.
+    else if (!(draft = await this.draftOf(start, record))) failure = 'delivery_error';
+    else if (!this.withinLimits(record, draft)) failure = 'message_too_large';
     // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
     else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
-    if (failure || !draft || !forwarded) return this.fail(start, kinds, failure ?? 'delivery_error', !forwarded);
+    if (failure || !draft || !forwarded) return this.fail(start, kinds, failure ?? 'delivery_error', draft === null || !forwarded);
     // Step 3: build, register (holders before PUT), then PUT.
     const builder = ports.mime.get(record.builderVersion);
     if (!builder) return this.breach(start);
@@ -505,10 +509,17 @@ export class SendDriver {
     console.error({ code: 'send_invariant' });
   }
 
-  private async draftOf(start: Start, record: SendRecord): Promise<DraftObject> {
+  // Null when the stored revision is invalid for good: declared empty, over the
+  // cap or not matching its digest. A missing object or a failed read still retries.
+  private async draftOf(start: Start, record: SendRecord): Promise<DraftObject | null> {
     const ready = this.ports.ready();
     if (!ready || ready.incarnation !== start.incarnation) throw new Error('Mailbox changed during release');
-    return readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
+    try {
+      return await readDraftObject(ready.index, { id: record.draftId, rawKey: record.draft.rawKey, revision: record.draft.revision, updatedAt: record.draft.updatedAt });
+    } catch (error) {
+      if (error instanceof ObjectInvalidError) return null;
+      throw error;
+    }
   }
 
   // Reads the small forwarded parts, one source at a time, and checks each against
@@ -541,13 +552,18 @@ export class SendDriver {
   }
 
   // A stored object declared empty or over the cap is invalid for good, like a
-  // digest mismatch; a missing object or a failed read still retries.
+  // digest mismatch; a missing object or a failed read still retries. The read
+  // enforces the declared length, so a raw/ source with wrong bytes is corrupt.
   private async readSource(index: MailboxIndex, key: string): Promise<Uint8Array<ArrayBuffer>> {
-    try { return await index.readObject(key); }
+    let bytes: Uint8Array<ArrayBuffer>;
+    try { bytes = await index.readObject(key); }
     catch (error) {
       if (error instanceof ObjectInvalidError) throw new SourceMismatch();
       throw error;
     }
+    const parsed = parseObjectKey(key);
+    if (parsed?.kind === 'raw' && await sha256(bytes) !== parsed.digest) throw new SourceMismatch();
+    return bytes;
   }
 
   private parts(start: Start, draft: DraftObject, forwarded: Map<number, Uint8Array<ArrayBuffer>>): SendMimeParts {
