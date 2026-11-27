@@ -1,0 +1,5 @@
+{
+  "missing bucket": [{ "op": "remove", "index": 3, "bucket": "uploads" }],
+  "wrong limit": [{ "op": "replace", "index": 4, "field": "limit", "value": 21, "bucket": "sends" }],
+  "wrong period": [{ "op": "replace", "index": 7, "field": "period", "value": 10, "bucket": "admin_writes" }]
+}
