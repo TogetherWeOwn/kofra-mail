@@ -107,13 +107,33 @@ export function kofra(config: KofraConfig, workspaceId: string) {
       throw new Error('Invalid attachment PUT');
     }
     const stream = new FixedLengthStream(size);
-    const pipe = new AbortController();
-    const copied = bytes.pipeTo(stream.writable, { signal: pipe.signal });
+    const reader = bytes.getReader();
+    const writer = stream.writable.getWriter();
+    // Both ends are observed, so a failure on either side is never an unhandled rejection.
+    reader.closed.catch(() => {});
+    writer.closed.catch(() => {});
+    const copied = (async () => {
+      try {
+        for (let next = await reader.read(); !next.done; next = await reader.read()) await writer.write(next.value);
+        await writer.close();
+      } catch (error) {
+        await writer.abort(error).catch(() => {});
+        await reader.cancel(error).catch(() => {});
+        throw error;
+      }
+    })();
+    copied.catch(() => {});
+    let done = false;
     try {
       const [response] = await Promise.all([request('PUT', key, stream.readable, digest, Math.min(60_000, timeoutMs)), copied]);
+      done = true;
       await response.body?.cancel();
     } finally {
-      pipe.abort();
+      // A failed request stops the copy, including a write waiting for the body to be read.
+      if (!done) {
+        await writer.abort().catch(() => {});
+        await reader.cancel().catch(() => {});
+      }
     }
   }
   return {

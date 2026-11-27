@@ -1,10 +1,11 @@
 export const MAX_RAW_BYTES = 25 * 1024 * 1024;
 // The most bytes PostalMime can decode from one part of a message within
-// MAX_RAW_BYTES. Quoted-printable and unencoded parts are decoded through
-// their charset and re-encoded as UTF-8: every raw byte yields at most one
-// character of at most 3 UTF-8 bytes (an invalid byte becomes U+FFFD), a line
-// break replaces at least one raw byte, and a last line without one gains a
-// single line break: the + 1. Base64 decodes to fewer bytes than its input.
+// MAX_RAW_BYTES. A quoted-printable part is decoded through its charset and
+// re-encoded as UTF-8: every raw byte yields at most one character of at most
+// 3 UTF-8 bytes (an invalid byte becomes U+FFFD). A 7bit, 8bit or binary part
+// keeps its bytes. In both, a line break replaces at least one raw byte, and a
+// last line without one gains a single line break: the + 1. Base64 decodes to
+// fewer bytes than its input.
 export const MAX_PARSED_PART_BYTES = 3 * MAX_RAW_BYTES + 1;
 
 export async function readExact(stream: ReadableStream<Uint8Array>, size: number, limit: number): Promise<Uint8Array<ArrayBuffer>> {

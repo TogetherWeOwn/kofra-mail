@@ -10,7 +10,7 @@ import type { IndexPlumbing } from './fixtures/index-plumbing.ts';
 
 const id = '01KBN8ZJ7G0000000000000000';
 let runtime: Miniflare;
-let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'parts' | 'storeCalls'> };
+let boxes: { getByName(name: string): Pick<IndexPlumbing, 'indexRaw' | 'indexThroughKofra' | 'overlongThroughKofra' | 'parts' | 'storeCalls'> };
 let raw: Awaited<ReturnType<Miniflare['getR2Bucket']>>;
 // The object store behind the Kofra adapter; a PUT is kept only if its body matches its signed digest.
 const stored = new Map<string, Uint8Array>();
@@ -173,4 +173,16 @@ test('an attachment PUT that fails midway is retried from a fresh decode and sto
   const [row] = JSON.parse(await box.parts()) as Array<{ size: number; object_key: string }>;
   assert.equal(row.object_key, `att/${await sha256(binary)}/${id}`);
   assert.deepEqual(stored.get(`/mail-workspace/${row.object_key}`), binary);
+});
+
+test('a replay that overruns its measured size fails the Kofra PUT with no unhandled rejection', async () => {
+  const binary = new Uint8Array(300 * 1024).map((_, i) => (i * 2654435761) >>> 24);
+  const key = await upload(multipart('overlong', [
+    `Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=over.bin\r\nContent-Transfer-Encoding: base64\r\n\r\n${Buffer.from(binary).toString('base64').match(/.{1,76}/g)!.join('\r\n')}`,
+  ]));
+  const before = stored.size;
+  const result = JSON.parse(await boxes.getByName('kofra-overlong').overlongThroughKofra(key)) as { error: string; unhandled: string[] };
+  assert.notEqual(result.error, 'stored');
+  assert.deepEqual(result.unhandled, []);
+  assert.equal(stored.size, before);
 });

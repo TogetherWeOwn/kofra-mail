@@ -18,6 +18,8 @@ const known = {
   'plain-text-body': 'a 25 MiB plain-text body',
   'inline-forward': 'a 25 MiB inline message/rfc822 holding a large attachment',
   calendar: 'a 25 MiB ASCII calendar attachment',
+  'qp-escape-dense-lines': 'a 25 MiB quoted-printable attachment in escape-dense 1 MB lines',
+  'qp-single-line': 'a quoted-printable attachment on one 23 MB line',
 };
 
 async function run(kind: string, reportOnly: boolean) {

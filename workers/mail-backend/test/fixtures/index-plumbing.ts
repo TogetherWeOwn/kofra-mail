@@ -1,6 +1,14 @@
 import { kofra, type KofraConfig } from '../../src/kofra.ts';
 import { MailboxIndex, PermanentMailError } from '../../src/mailbox-index.ts';
+import { boundedMime, partStream } from '../../src/parse-mail.ts';
 import { FixtureMailbox, fixturePutStream } from './mailbox-worker.ts';
+
+// Unhandled rejections seen by this isolate, for the streamed-PUT failure test.
+const unhandled: string[] = [];
+globalThis.addEventListener('unhandledrejection', event => {
+  unhandled.push(String(event.reason));
+  event.preventDefault();
+});
 export { FixtureSweeper } from './mailbox-worker.ts';
 
 export class IndexPlumbing extends FixtureMailbox {
@@ -57,6 +65,25 @@ export class IndexPlumbing extends FixtureMailbox {
     try { await index.ingest(id, key, 100); }
     catch (error) { return error instanceof Error ? error.message : String(error); }
     return 'indexed';
+  }
+
+  // Streams a stored message's first measured part through the Kofra adapter
+  // with a measured size the replay overruns, and reports what the caller saw
+  // and any unhandled rejection that followed.
+  async overlongThroughKofra(rawKey: string) {
+    const object = await this.env.RAW.get(rawKey);
+    if (!object) throw new Error('Missing fixture raw object');
+    const { contents } = await boundedMime(new Uint8Array(await object.arrayBuffer()));
+    const source = contents.find(content => !(content instanceof Uint8Array));
+    if (!source || source instanceof Uint8Array) throw new Error('No measured part');
+    const digest = 'a'.repeat(64);
+    const short = { ...source, size: 64 * 1024 };
+    unhandled.length = 0;
+    let error = 'stored';
+    try { await kofra(this.env as unknown as KofraConfig, 'workspace').putStream(`att/${digest}/01KBN8ZJ7G0000000000000000`, partStream(short, digest), short.size, digest); }
+    catch (caught) { error = caught instanceof Error ? caught.message : String(caught); }
+    await new Promise(resolve => setTimeout(resolve, 200));
+    return JSON.stringify({ error, unhandled });
   }
 
   async journalEvents() {

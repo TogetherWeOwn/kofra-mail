@@ -71,10 +71,11 @@ const calendar = () => `${head}Content-Type: multipart/mixed; boundary=cal\r\n\r
 const inlineForward = () => `${head}Content-Type: multipart/mixed; boundary=fwd\r\n\r\n--fwd\r\nContent-Type: message/rfc822\r\n\r\n` +
   `${attachmentsMessage(1, 76, 4096)}\r\n--fwd--\r\n`;
 
-// An 8-bit or quoted-printable attachment in 1 MB lines, which are fed whole.
-function longLines(cte: string): string {
-  const line = 'x'.repeat(1_000_000);
-  const body = Array.from({ length: Math.floor((MAX_RAW_BYTES - 1024 * 1024) / 1_000_002) }, () => line).join('\r\n');
+// An 8-bit or quoted-printable attachment in lines of `width` bytes made of
+// `unit`, which are fed whole.
+function longLines(cte: string, unit = 'x', width = 1_000_000): string {
+  const line = unit.repeat(Math.floor(width / unit.length));
+  const body = Array.from({ length: Math.floor((MAX_RAW_BYTES - 1024 * 1024) / (line.length + 2)) }, () => line).join('\r\n');
   return `${head}Content-Type: multipart/mixed; boundary=o\r\n\r\n--o\r\nContent-Type: application/octet-stream\r\n` +
     `Content-Disposition: attachment; filename=o.bin\r\nContent-Transfer-Encoding: ${cte}\r\n\r\n${body}\r\n--o--\r\n`;
 }
@@ -89,6 +90,9 @@ const CASES: Record<string, () => string> = {
   'qp-body': qpMessage,
   '8bit-long-lines': () => longLines('8bit'),
   'qp-long-lines': () => longLines('quoted-printable'),
+  // Malformed under RFC 2045 (lines over 76 characters); M3-14b.
+  'qp-escape-dense-lines': () => longLines('quoted-printable', '=41x'),
+  'qp-single-line': () => longLines('quoted-printable', 'x', 23_000_000),
   'plain-text-body': textBody,
   calendar,
   'inline-forward': inlineForward,
@@ -144,6 +148,12 @@ wrap(TextDecoder.prototype, 'decode', decode => function (this: TextDecoder, inp
   const value = decode.call(this, input, options);
   if (large(input) || ++decodes % 16_384 === 0) sample();
   return value;
+});
+// The decoders collect a line's decoded chunks in an array that is then
+// drained; the drain iterates it while every chunk is still alive.
+wrap(Array.prototype, Symbol.iterator, values => function (this: unknown[]) {
+  if (this.length >= 1024) sample();
+  return values.call(this);
 });
 wrap(TextEncoder.prototype, 'encode', encode => function (this: TextEncoder, input) {
   const value = encode.call(this, input);
