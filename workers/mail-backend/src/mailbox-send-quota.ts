@@ -1,8 +1,7 @@
 // The account quota gate as the send path sees it (docs/m3-outbound-plan.md,
 // section 2.4, consumer steps 2 and 3a, and M3-6). The consumer reserves and
 // confirms; the mailbox releases refused or never-authorized charges and asks
-// for the reset time. M3-6's quota object implements this port; until then
-// tests use a recording fake.
+// for the reset time.
 
 // A send attempt's fence: the mailbox's recovery epoch and the send's attempt.
 export type SendFence = { epoch: number; attempt: number };
@@ -42,6 +41,10 @@ export interface QuotaPort {
   // reset of the gate that refused it in its `exhausted` answer.)
   resetAt(): Promise<number>;
 }
+
+// Both Workers must address the same object in the mail-backend namespace.
+export type SendQuotaBinding = { getByName(name: string): QuotaPort };
+export const accountSendQuota = (binding: SendQuotaBinding): QuotaPort => binding.getByName('account');
 
 export const fenceKey = ({ epoch, attempt }: SendFence) => `${epoch}:${attempt}`;
 export const sameFence = (a: SendFence | null | undefined, b: SendFence | null | undefined) =>

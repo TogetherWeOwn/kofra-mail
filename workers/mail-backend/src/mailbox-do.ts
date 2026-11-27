@@ -30,7 +30,7 @@ import {
   CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
-import { validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
+import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -170,9 +170,11 @@ export class Mailbox extends DurableObject<Env> {
     };
   }
 
-  // The account quota gate (M3-6 supplies the quota object). Without it, a
-  // step that must release or read the quota fails and is retried.
-  protected sendQuota(): QuotaPort | undefined { return undefined; }
+  // Without the account quota binding, a release or reset lookup is retried.
+  protected sendQuota(): QuotaPort | undefined {
+    const { SEND_QUOTA } = this.env;
+    return SEND_QUOTA && accountSendQuota(SEND_QUOTA);
+  }
 
   // clockSkew (section 2.4, step 5) is configuration, used only on the mailbox side.
   private clockSkewMs(): number {

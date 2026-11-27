@@ -33,16 +33,18 @@ async function checkFencing(h: Fixture, forged: number) {
   for (const call of calls) {
     assert.ok(call.fence && call.deadline !== null, `EMAIL call ${call.n} started without an authorization`);
     assert.ok(call.consumerNow < call.deadline, `EMAIL call ${call.n} started at ${call.consumerNow}, not before its deadline ${call.deadline}`);
-    const state = states.get(call.sendId) ?? await h.sendState(call.sendId);
-    states.set(call.sendId, state);
+    const scopeKey = JSON.stringify([call.mb, call.sendId]);
+    const state = states.get(scopeKey) ?? await h.sendState(call.sendId, call.mb);
+    states.set(scopeKey, state);
     const fence = state.fences.find(row => row.epoch === call.fence!.epoch && row.attempt === call.fence!.attempt);
     assert.ok(fence, `EMAIL call ${call.n} has no fence row`);
     assert.ok(call.authClock < fence.lease_until, `EMAIL call ${call.n} started at ${call.authClock}, not before lease_until ${fence.lease_until}`);
   }
 }
 
-async function withConsumer(run: (h: Fixture, mail: MailService, from: string) => Promise<void>, { forged = 0 } = {}) {
-  const fixture = await startMailHttpFixture({ send: true });
+async function withConsumer(run: (h: Fixture, mail: MailService, from: string) => Promise<void>,
+  { forged = 0, ...options }: Parameters<typeof startMailHttpFixture>[0] & { forged?: number } = {}) {
+  const fixture = await startMailHttpFixture({ send: true, ...options });
   try {
     const mail = fixture.as('member');
     const { mailbox } = await mail.getSession();
@@ -1035,3 +1037,176 @@ test('the provider\'s daily-limit answer to a call ends the crash streak', () =>
   assert.equal(step(await next), 'delayed');
   assert.equal((await h.sendState(id)).dispatch?.unfinished, 0, 'delaySend(provider_daily) after a call resets the streak');
 }));
+
+const realQuota = { realQuota: {}, startedAt: Date.parse('2026-11-17T12:00:00Z') };
+const quotaBalances = (h: Fixture) => h.quota<{ mb: string; sendId: string; attempt: number; day: string; charges: number }[]>('balances');
+const chargeFor = async (h: Fixture, id: string, attempt: number) =>
+  (await quotaBalances(h)).filter(row => row.sendId === id && row.attempt === attempt).reduce((sum, row) => sum + row.charges, 0);
+const afterLease = async (h: Fixture, id: string, o: Outcome) => until(h, await leaseOf(h, id, o) + SKEW);
+
+test('real quota: dispatch at the reset releases the old charge and dispatches in the new day', () => withConsumer(async (h, mail, from) => {
+  const reset = Date.parse('2026-11-17T15:00:00Z');
+  const id = await queued(h, mail, from, 'quota-reset');
+  await h.pauseSenderCheck('after');
+  const old = consume(h, id);
+  // If the attempt does not reach the directory, show its outcome rather than hanging.
+  await Promise.race([h.senderCheckPaused(), old.then(outcome => assert.fail(`Authorization never reached the directory: ${step(outcome)}`))]);
+  assert.equal((await quotaBalances(h))[0]?.day, '2026-11-16');
+  await h.advance(reset + second - await h.sends.now(), 'clock-only');
+  await h.resumeSenderCheck();
+  const delayed = await old;
+  assert.equal(step(delayed), 'abandoned');
+  assert.equal('cause' in delayed && delayed.cause, 'quota_window');
+  assert.equal(await chargeFor(h, id, fenceOf(delayed).attempt), 0);
+  assert.deepEqual(await calls(h), []);
+  // abandonClaim clamps retryAfter to at least one minute from now.
+  const retryAt = reset + second + minute;
+  assert.equal((await h.sendState(id)).dispatch?.next_attempt_at, retryAt);
+  await until(h, retryAt);
+  const next = await consume(h, id);
+  assert.equal(step(next), 'recorded');
+  assert.deepEqual(await h.consumer('authorizationCalls'), [fenceOf(delayed), fenceOf(next)], 'only one authorizeDispatch per fence');
+  const [call] = await calls(h);
+  assert.ok(call.authClock >= reset, 'the EMAIL call started in the charged quota day');
+  assert.deepEqual((await quotaBalances(h)).map(({ day, charges }) => ({ day, charges })), [{ day: '2026-11-17', charges: 1 }]);
+}, { ...realQuota, startedAt: Date.parse('2026-11-17T14:58:00Z') }));
+
+test('real quota: a kept charge does not stall the retry', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'quota-kept');
+  await script(h, { result: 'reject' });
+  const first = await consume(h, id);
+  assert.equal(step(first), 'recorded');
+  await until(h, Number((await h.sendState(id)).dispatch?.next_attempt_at));
+  const retry = await consume(h, id);
+  assert.equal(step(retry), 'recorded');
+  assert.equal(await chargeFor(h, id, fenceOf(first).attempt), 1);
+  assert.equal(await chargeFor(h, id, fenceOf(retry).attempt), 1);
+  assert.equal((await calls(h)).length, 2);
+}, realQuota));
+
+test('real quota: finish drains a crashed consumer release list and preserves a kept charge', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'quota-finish');
+  await script(h, { result: 'reject' });
+  const a = await consume(h, id);
+  assert.equal(step(a), 'recorded');
+  await until(h, Number((await h.sendState(id)).dispatch?.next_attempt_at));
+  await crashAt(h, 'after:confirm');
+  const b = await consume(h, id);
+  assert.equal(await chargeFor(h, id, fenceOf(b).attempt), 1);
+  await afterLease(h, id, b);
+  await crashAt(h, 'before:reserve');
+  const c = await consume(h, id);
+  assert.deepEqual((await h.sendState(id)).release, [fenceOf(b)]);
+  await afterLease(h, id, c);
+  await changeOwner(h);
+  assert.equal(step(await consume(h, id)), 'refused');
+  await h.advance(minute);
+  assert.deepEqual((await finished(h, id)).release, []);
+  assert.equal(await chargeFor(h, id, fenceOf(a).attempt), 1);
+  assert.equal(await chargeFor(h, id, fenceOf(b).attempt), 0);
+}, realQuota));
+
+for (const fault of ['reserve', 'markSend'] as const) {
+  test(`real quota: ${fault} failing for 30 minutes leaves pending recipients, no cap or leak`, () => withConsumer(async (h, mail, from) => {
+    const id = await queued(h, mail, from, `quota-failed-${fault}`);
+    for (let elapsed = 0; elapsed < 30; elapsed++) {
+      if (fault === 'reserve') await h.quota('failNext', fault);
+      else await h.consumer('failNext', fault);
+      assert.equal(step(await consume(h, id)), 'abandoned');
+      const state = await h.sendState(id);
+      assert.deepEqual(ledgerOf(state), ['pending']);
+      assert.equal(state.dispatch?.unfinished, 0);
+      assert.equal(state.dispatch?.provider_wait, 0);
+      assert.deepEqual(await quotaBalances(h), []);
+      await h.advance(minute);
+    }
+    assert.equal((await calls(h)).length, 0);
+    assert.equal(step(await consume(h, id)), 'recorded');
+    assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent']);
+  }, realQuota));
+}
+
+for (const crashMiddle of [false, true]) {
+  test(`real quota: a confirmation stalled past its lease${crashMiddle ? ' with the next consumer crashing before reserve' : ''} leaves one charge`, () => withConsumer(async (h, mail, from) => {
+    const id = await queued(h, mail, from, `quota-stalled-${crashMiddle}`, THREE);
+    await pauseAt(h, 'after:confirm');
+    const old = consume(h, id);
+    await Promise.race([pausedAt(h, 'after:confirm'), old.then(outcome => assert.fail(`Confirmation did not finish: ${step(outcome)}`))]);
+    const first = (await h.sendState(id)).fences[0];
+    await until(h, first.lease_until + SKEW);
+    // Commit another claim while A is still paused. If A resumed first, its
+    // own abandon would release the charge and the successor would not test the release list.
+    if (crashMiddle) await crashAt(h, 'before:reserve');
+    else await pauseAt(h, 'before:reserve');
+    const successor = consume(h, id);
+    const crashed = crashMiddle ? await successor : undefined;
+    if (crashed) assert.ok('crashed' in crashed);
+    else await Promise.race([pausedAt(h, 'before:reserve'), successor.then(outcome => assert.fail(`Successor did not claim: ${step(outcome)}`))]);
+    await resumeAt(h, 'after:confirm');
+    const abandoned = await old;
+    assert.equal('cause' in abandoned && abandoned.cause, 'request_stale', 'the request check stops the old consumer before authorization');
+    assert.deepEqual(await h.sendRpc('authorizeDispatch', id, fenceOf(abandoned), [0, 1, 2], await h.quota('resetAt')),
+      { status: 'stale' }, 'the mailbox separately refuses authorization under the expired lease');
+    assert.deepEqual(await calls(h), []);
+    assert.equal(await chargeFor(h, id, first.attempt), 3);
+    if (crashed) await afterLease(h, id, crashed);
+    else await resumeAt(h, 'before:reserve');
+    const next = await (crashed ? consume(h, id) : successor);
+    assert.equal(step(next), 'recorded');
+    assert.deepEqual((await quotaBalances(h)).map(({ attempt, charges }) => ({ attempt, charges })),
+      [{ attempt: fenceOf(next).attempt, charges: 3 }]);
+    assert.deepEqual(Object.values(perRecipient(await calls(h))), [1, 1, 1]);
+    await h.advance(24 * hour);
+    assert.deepEqual(await h.quota('reserve', scope(id), { attempt: first.attempt, epoch: first.epoch }, [0, 1, 2], [], await h.sends.now() + minute),
+      { status: 'stale' }, 'released older fence cannot reappear tomorrow');
+  }, realQuota));
+}
+
+test('real quota: refusals release immediately or through the durable release list', () => withConsumer(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'quota-provider-refusal');
+  await script(h, { result: 'reject', code: 'E_RATE_LIMIT_EXCEEDED' }, { result: 'reject', code: 'E_EMAIL_SENDING_NOT_READY' });
+  const a = await consume(h, id);
+  assert.equal(step(a), 'recorded');
+  assert.equal(await chargeFor(h, id, fenceOf(a).attempt), 0);
+  await h.advance(minute);
+  await h.quota('failNext', 'release');
+  const b = await consume(h, id);
+  assert.equal(step(b), 'recorded');
+  assert.equal(await chargeFor(h, id, fenceOf(b).attempt), 1);
+  assert.deepEqual((await h.sendState(id)).release, [fenceOf(b)]);
+  await h.advance(2 * minute);
+  assert.equal(step(await consume(h, id)), 'recorded');
+  assert.equal(await chargeFor(h, id, fenceOf(b).attempt), 0);
+  assert.deepEqual((await h.sendState(id)).release, []);
+}, realQuota));
+
+test('real quota: two mailboxes with the same sendId and recipient have independent charges and fences', () => withConsumer(async (h, mail, from) => {
+  const other = h.as('other');
+  const { mailbox } = await other.getSession();
+  assert.ok(mailbox);
+  const make = async (client: MailService, address: string) => {
+    const draft = await client.createDraft(draftInput(address), key('collision-draft'));
+    return (await client.sendDraft(draft.id, { ...key('collision-send'), ifMatch: draft.revision })).id;
+  };
+  const id = await make(mail, from);
+  assert.equal(await make(other, mailbox.primaryAddress), id);
+  await h.advance(UNDO, 'all-mailboxes');
+  const otherMessage = { ...dispatch(id), mb: 'mailbox-b' };
+  assert.equal((await h.sendState(id, otherMessage.mb)).row?.state, 'queued');
+  await script(h, { result: 'reject', code: 'E_EMAIL_SENDING_NOT_READY' }, { result: 'accept' });
+  await pauseAt(h, 'after:confirm');
+  const otherRun = h.consumer<Outcome>('consume', otherMessage);
+  await Promise.race([pausedAt(h, 'after:confirm'), otherRun.then(outcome => assert.fail(`Other mailbox did not confirm: ${step(outcome)}`))]);
+  const a = await consume(h, id);
+  assert.equal(step(a), 'recorded');
+  assert.deepEqual((await quotaBalances(h)).map(({ mb, sendId, charges }) => ({ mb, sendId, charges })),
+    [{ mb: otherMessage.mb, sendId: id, charges: 1 }], 'the first complete refusal did not release the other mailbox');
+  await resumeAt(h, 'after:confirm');
+  const b = await otherRun;
+  assert.equal(step(b), 'recorded');
+  assert.deepEqual(fenceOf(a), fenceOf(b), 'both mailboxes started with the same fence');
+  assert.deepEqual(await h.quota('reserve', scope(id), fenceOf(a), [0], [], await h.sends.now() + minute), { status: 'stale' });
+  assert.equal((await h.sendState(id, otherMessage.mb)).row?.state, 'sent');
+  assert.deepEqual((await calls(h)).map(({ mb, to }) => ({ mb, to })),
+    [MB, otherMessage.mb].map(mb => ({ mb, to: ['friend@example.net'] })));
+}, { ...realQuota, fixedSendId: '01ARZ3NDEKTSV4RRFFQ69G5FAV' }));

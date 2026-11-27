@@ -26,8 +26,11 @@ const draftInput = (from: string, patch: Partial<DraftInput> = {}): DraftInput =
 });
 const TWO = { to: [{ email: 'friend@example.net' }, { email: 'second@example.net' }] };
 
-async function withSend(run: (h: Fixture, mail: MailService, from: string) => Promise<void>) {
-  const fixture = await startMailHttpFixture({ send: true });
+const quotaTestStart = Date.parse('2026-11-17T12:00:00Z');
+
+async function withSend(run: (h: Fixture, mail: MailService, from: string) => Promise<void>,
+  options: Parameters<typeof startMailHttpFixture>[0] = {}) {
+  const fixture = await startMailHttpFixture({ send: true, ...options });
   try {
     const mail = fixture.as('member');
     const { mailbox } = await mail.getSession();
@@ -484,7 +487,7 @@ test('invalid_sender at the claim ends the send, and an alias removed while dela
   assert.equal((await mail.getSend(other)).state, 'failed');
 }));
 
-test('a try-later or outage result leaves no charge under its fence, also when the immediate release fails once (fake quota, early coverage)', () => withSend(async (h, mail, from) => {
+test('a try-later or outage result leaves no charge in real quota, also when the immediate release fails once', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'refused');
   const a = await attempt(h, id, { result: { kind: 'try_later' } });
   assert.equal(await balanceOf(h, a.claim.fence), 0);
@@ -512,7 +515,7 @@ test('a try-later or outage result leaves no charge under its fence, also when t
   await h.advance(minute);
   await finished(h, other);
   assert.equal(await balanceOf(h, d.claim.fence), 0, 'finish released the listed fence');
-}));
+}, { realQuota: {}, startedAt: quotaTestStart }));
 
 test('recordStoredResults: point lookup, record per fence, delete after the publish, back off otherwise', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'stored');
@@ -809,16 +812,14 @@ test('send state: sent and suppressed recipients make a partial send; suppressed
 }));
 
 test('a quota wait ends at the reset of the gate that refused the reservation; the provider\'s daily limit waits for the quota day', () => withSend(async (h, mail, from) => {
-  const now = await h.sends.now();
-  const monthEnd = now + 10 * 24 * hour;
-  // The quota day ends tomorrow, well before the monthly reset.
-  await h.quota('setDay', 'day-1', now + 24 * hour);
-  // One monthly slot is left: a two-recipient send is refused by the monthly gate, a one-recipient send still reserves.
-  await h.quota('setMonthly', 1, monthEnd);
+  const monthEnd = Date.parse('2026-12-01T15:00:00Z');
+  // One monthly slot is left: a two-recipient send is refused, but a one-recipient send still reserves.
+  const used = await queued(h, mail, from, 'monthly-used');
+  await attempt(h, used, { result: { kind: 'accepted', messageId: 'monthly-used' } });
   const two = await queued(h, mail, from, 'monthly-two', TWO);
   const claim = await h.sendRpc<ClaimAnswer>('claimSend', two);
   if (claim.status !== 'claimed') return assert.fail('claim');
-  const refused = await h.quota<QuotaAnswer>('reserve', scope(two), claim.fence, [0, 1], claim.release, 0);
+  const refused = await h.quota<QuotaAnswer>('reserve', scope(two), claim.fence, [0, 1], claim.release, claim.leaseUntil + 2 * minute);
   assert.deepEqual(refused, { status: 'exhausted', resetAt: monthEnd });
   const delayed = await h.sendRpc<DelayAnswer>('delaySend', two, claim.fence, 'gate', monthEnd);
   assert.deepEqual(delayed, { status: 'delayed', until: monthEnd + SKEW });
@@ -827,13 +828,9 @@ test('a quota wait ends at the reset of the gate that refused the reservation; t
   const enqueued = (await h.sends.queue()).filter(({ sendId }) => sendId === two).length;
   await h.advance(24 * hour);
   // The quota day rolls over: the send still waits for the monthly reset.
-  await h.quota('setDay', 'day-2', await h.sends.now() + 24 * hour);
-  await h.advance(24 * hour);
   assert.deepEqual(await h.sendRpc<ClaimAnswer>('claimSend', two), { status: 'not_now', reason: 'delayed' }, 'not woken at a daily reset');
   assert.equal((await h.sends.queue()).filter(({ sendId }) => sendId === two).length, enqueued, 'and not enqueued again');
-  await h.quota('setMonthly', null, null);
   await h.advance(monthEnd + SKEW - await h.sends.now());
-  await h.quota('setDay', 'day-11', await h.sends.now() + 24 * hour);
   const b = await attempt(h, two, { stop: 'authorize' });
   // The provider's own daily limit waits for the quota day's end.
   const providerDaily = await h.sendRpc<DelayAnswer>('delaySend', two, b.claim.fence, 'provider_daily');
@@ -842,7 +839,7 @@ test('a quota wait ends at the reset of the gate that refused the reservation; t
   const at = await h.sends.now();
   await assert.rejects(h.sendRpc('delaySend', two, b.claim.fence, 'gate', at - 1));
   await assert.rejects(h.sendRpc('delaySend', two, b.claim.fence, 'gate', at + 33 * 24 * hour));
-}));
+}, { realQuota: { monthly: '2' }, startedAt: quotaTestStart }));
 
 test('the stored-result page: a row that fails backs off alone and the others are recorded; a restoring mailbox defers every row', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'page', TWO);
@@ -1399,26 +1396,29 @@ test('a flagged acceptance a restore made eligible raises send_result_stuck when
   assert.ok((await h.sends.activeAlerts()).includes('send_result_stuck'));
 }));
 
-test('a refused reservation still releases the listed fences it carries; they stay listed until a Mark (fake quota, early coverage)', () => withSend(async (h, mail, from) => {
-  const id = await queued(h, mail, from, 'refused-release');
+test('a real quota refusal still releases the listed fences; they stay listed until a Mark', () => withSend(async (h, mail, from) => {
+  const id = await queued(h, mail, from, 'refused-release', TWO);
   const a = await h.sendRpc<ClaimAnswer>('claimSend', id);
   if (a.status !== 'claimed') return assert.fail('claim');
-  assert.equal((await h.quota<QuotaAnswer>('reserve', scope(id), a.fence, [0], a.release, 0)).status, 'ok');
+  assert.equal((await h.quota<QuotaAnswer>('reserve', scope(id), a.fence, [0, 1], a.release, a.leaseUntil + 2 * minute)).status, 'ok');
   await h.quota('failNext', 'release');
   await h.sendRpc<AbandonAnswer>('abandonClaim', id, a.fence, 0);
-  assert.equal(await balanceOf(h, a.fence), 1, 'a live, listed charge');
-  await h.advance(minute);
+  assert.equal(await balanceOf(h, a.fence), 2, 'a live, listed charge');
+  await h.advance(2 * minute);
+  // The old charges are still live but belong to yesterday; one of today's two slots is taken.
+  const filler = { ...scope('filler'), mailboxId: 'mailbox-b' };
+  const fillerFence = { epoch: 1, attempt: 1 };
+  assert.equal((await h.quota<QuotaAnswer>('reserve', filler, fillerFence, [0], [], await h.sends.now() + minute)).status, 'ok');
   const b = await h.sendRpc<ClaimAnswer>('claimSend', id);
   if (b.status !== 'claimed') return assert.fail('claim');
   assert.deepEqual(b.release, [a.fence]);
-  await h.quota('setExhausted', true);
-  const refused = await h.quota<QuotaAnswer>('reserve', scope(id), b.fence, [0], b.release, 0);
+  const refused = await h.quota<QuotaAnswer>('reserve', scope(id), b.fence, [0, 1], b.release, b.leaseUntil + 2 * minute);
   assert.equal(refused.status, 'exhausted');
   assert.equal(await balanceOf(h, a.fence), 0, 'released although the reservation was refused');
   const delayed = await h.sendRpc<DelayAnswer>('delaySend', id, b.fence, 'gate', refused.status === 'exhausted' ? refused.resetAt : 0);
   assert.equal(delayed.status, 'delayed');
   assert.ok((await h.sendState(id)).release.some(({ attempt: n }) => n === a.fence.attempt), 'still listed until a Mark acknowledges it');
-}));
+}, { realQuota: { daily: '3' }, startedAt: Date.parse('2026-11-17T14:58:00Z') }));
 
 test('a keyed notice records a restored acceptance although the reconciler moved its notify_after ahead', () => withSend(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'reconciler-ahead');

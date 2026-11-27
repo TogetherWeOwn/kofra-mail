@@ -24,8 +24,8 @@ import { legacyFixtureObjects } from './legacy-draft.ts';
 import { sha256 } from '../../src/bytes.ts';
 import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
 import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
-import type { QuotaPort } from '../../src/mailbox-send-quota.ts';
 import { FakeSendQuota } from './send-quota-fake.ts';
+import { quotaFixture } from './send-quota-worker.ts';
 import { sendConsumerFixture } from './send-consumer.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
@@ -175,7 +175,6 @@ export class HttpMailbox extends Mailbox {
     this.failRecordTimes--;
     throw new Error('Fixture record failure');
   }
-  protected override sendQuota() { return (this.env as unknown as FixtureEnv).SEND_QUOTA.getByName('account') as unknown as QuotaPort; }
   // The consumer's side of one send, as stored (M3-5a).
   sendState(id: string) {
     const sql = this.ctx.storage.sql;
@@ -682,6 +681,7 @@ export class Sweeper extends MailSweeper {
 }
 export { ContentLookup } from '../../src/entry.ts';
 export { FakeSendQuota };
+export const RealSendQuota = quotaFixture((env: FixtureEnv) => now(env));
 // The consumer reads the mailbox's clock through the same fixture time.
 export const SendConsumer = sendConsumerFixture((env: FixtureEnv) => now(env));
 
@@ -951,7 +951,10 @@ export default {
             const quota = env.SEND_QUOTA.getByName('account') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
             return Response.json(await quota[method](...args) ?? null);
           }
-          case '/__fixture/send-state': return Response.json(await box.sendState(await req.text()));
+          case '/__fixture/send-state': {
+            const mb = req.headers.get('x-fixture-send-mailbox') ?? mailboxId!;
+            return Response.json(await env.MAILBOX.getByName(mailboxName(ws, mb)).sendState(await req.text()));
+          }
           case '/__fixture/consumer': {
             const { method, args } = await req.json<{ method: string; args: unknown[] }>();
             const consumer = env.SEND_CONSUMER.getByName('consumer') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
@@ -1052,9 +1055,11 @@ export default {
         if (!Number.isSafeInteger(delta) || delta < 0) return new Response(null, { status: 400 });
         time = now(env) + delta;
         const { results } = await env.DIRECTORY.prepare('SELECT id, workspace_id FROM mailboxes').all<{ id: string; workspace_id: string }>();
-        const alarms = req.headers.get('x-fixture-alarms') === 'false' ? 0 : req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
+        const mode = req.headers.get('x-fixture-parallel');
+        const alarms = req.headers.get('x-fixture-alarms') === 'false' || mode === 'clock-only' ? 0 : mode === 'true' ? 2 : 1;
         await Promise.all(results.map(({ workspace_id, id }) => env.MAILBOX.getByName(mailboxName(workspace_id, id)).advanceClock(time!,
-          env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && workspace_id === env.ACCOUNTS.member.ws && id === env.ACCOUNTS.member.mailboxId ? alarms : 0)));
+          env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && (mode === 'all-mailboxes' ||
+            (workspace_id === env.ACCOUNTS.member.ws && id === env.ACCOUNTS.member.mailboxId)) ? alarms : 0)));
         return new Response(null, { status: 204 });
       }
       return missing();

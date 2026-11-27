@@ -123,13 +123,21 @@ interface FixtureOptions {
   // The send path (M3-3) with fake SEND and EMAIL bindings and manual alarms.
   send?: boolean;
   configureWorkers?: (backend: WorkerOptions, workers: WorkerOptions[]) => void;
+  realQuota?: { daily?: string; monthly?: string; reset?: string };
+  fixedSendId?: string;
 }
 
 export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
-  send = false, configureWorkers }: FixtureOptions = {}) {
+  send = false, configureWorkers, realQuota, fixedSendId }: FixtureOptions = {}) {
   const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
-  const contents = outputFiles[0].text;
+  let contents = outputFiles[0].text;
+  if (fixedSendId) {
+    // Force two independently created sends to collide, without adding a production injection point.
+    const generator = /const (\w+) = ulid\(at\);(?=\s*const mimeId = \1\.toLowerCase\(\);)/g;
+    assert.equal([...contents.matchAll(generator)].length, 1, 'expected exactly one send ID generator');
+    contents = contents.replace(generator, (_, name: string) => `const ${name} = ${JSON.stringify(fixedSendId)};`);
+  }
   const objects = new Map<string, ArrayBuffer>();
   // Object paths whose GET answers 503, a transient object store failure.
   const failingReads = new Set<string>();
@@ -152,12 +160,15 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
     compatibilityDate: '2026-06-25',
     durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true },
-      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true }, SEND_CONSUMER: { className: 'SendConsumer', useSQLite: true } },
+      SEND_QUOTA: { className: realQuota ? 'RealSendQuota' : 'FakeSendQuota', useSQLite: true },
+      SEND_CONSUMER: { className: 'SendConsumer', useSQLite: true } },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
       ...(send && { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: 'test', MANUAL_ALARMS: 'on' }),
+      ...(realQuota && { MAIL_SEND_DAILY_QUOTA: realQuota.daily ?? '1000', MAIL_SEND_MONTHLY_CEILING: realQuota.monthly ?? '3000',
+        MAIL_SEND_DAILY_RESET_UTC: realQuota.reset ?? '15:00' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
       ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },
@@ -271,8 +282,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       assert.equal(res.status, 200);
       return res.json() as Promise<string[]>;
     };
-    const readControl = async <T>(path: string, body = ''): Promise<T> => {
-      const res = await call(path, body);
+    const readControl = async <T>(path: string, body = '', extra?: Record<string, string>): Promise<T> => {
+      const res = await call(path, body, extra);
       assert.equal(res.status, 200);
       return res.json() as Promise<T>;
     };
@@ -412,7 +423,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       clients.set(principal, client);
       return client;
     };
-    const advance = async (ms: number, parallel = false, alarms = true) => {
+    const advance = async (ms: number, parallel: boolean | 'clock-only' | 'all-mailboxes' = false, alarms = true) => {
       const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel), 'x-fixture-alarms': String(alarms) });
       if (!res.ok) throw new Error(`Fixture advance HTTP ${res.status}: ${await res.text()}`);
       now += ms;
@@ -495,7 +506,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       consumer: <T>(method: string, ...args: unknown[]) => readControl<T>('consumer', JSON.stringify({ method, args })),
       // Structured log lines of the send fixture, in order.
       logs: () => [...logs],
-      sendState: (id: string) => readControl<SendStateView>('send-state', id),
+      sendState: (id: string, mb?: string) => readControl<SendStateView>('send-state', id, mb && { 'x-fixture-send-mailbox': mb } || undefined),
       pauseNextEnqueue: () => controlAction('pause-enqueue'),
       enqueuePaused: () => controlAction('enqueue-paused'),
       resumeEnqueue: () => controlAction('resume-enqueue'),
