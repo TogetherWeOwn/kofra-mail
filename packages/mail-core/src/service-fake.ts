@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
   DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
@@ -282,8 +282,7 @@ async function sha256(blob: Blob): Promise<string> {
 }
 
 /** Test/demo fixture. Never binds a real session, delivers mail, or serves content bytes. */
-export function createFakeMailHarness(options: { contentOrigin?: string; start?: number; drive?: boolean; outboundMessageBytes?: number } = {}): ConformanceHarness {
-  const limits = { ...LIMITS, outboundMessageBytes: options.outboundMessageBytes ?? LIMITS.outboundMessageBytes };
+export function createFakeMailHarness(options: { contentOrigin?: string; start?: number; drive?: boolean } = {}): ConformanceHarness {
   const drive = options.drive ?? true;
   const contentOrigin = new URL(options.contentOrigin ?? 'https://content.usercontent.example').origin;
   const start = options.start ?? Date.parse('2026-11-22T12:00:00Z');

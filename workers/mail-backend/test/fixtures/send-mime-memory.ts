@@ -1,7 +1,7 @@
-// Run from workers/mail-backend: node --expose-gc test/send-mime-memory.bench.ts
+// Run from workers/mail-backend: node --expose-gc test/fixtures/send-mime-memory.ts
 import assert from 'node:assert/strict';
-import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
-import { defaultMimeBuilders, type SendMimeMessage } from '../src/mailbox-send-mime.ts';
+import { LIMITS } from '../../../../contracts/mail-api/src/limits.ts';
+import { defaultMimeBuilders, type SendMimeMessage } from '../../src/mailbox-send-mime.ts';
 
 assert.ok(globalThis.gc, 'run with --expose-gc');
 const MiB = 1024 ** 2;

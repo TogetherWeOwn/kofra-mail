@@ -72,12 +72,12 @@ export interface Limits {
  */
 export const LIMITS = {
   inboundMessageBytes: 25 * MiB,
-  // Measured: Cloudflare refuses its own assembled message above 26,214,400 bytes
-  // (E_CONTENT_TOO_LARGE). Its structured send assembled about 1.3% more bytes
-  // than our serialized MIME. It accepted 24 MiB serialized, about 4% below
-  // the provider cap before that expansion. The server checks the real
-  // serialized length (encodedSize); attachmentBudget is only a client hint.
-  outboundMessageBytes: 24 * MiB,
+  // M3-0: 24 MiB is the measured provider-safe ceiling for the tested shape
+  // (Cloudflare caps its assembly at 26,214,400 bytes; about 1.3% expansion).
+  // Keep 5 MiB until both the serializer and mail parser measure at or below
+  // a 64 MiB peak at the larger size. The server checks encodedSize, not the
+  // client hint from attachmentBudget.
+  outboundMessageBytes: 5 * MiB,
   recipientsPerMessage: 50,
   attachmentsPerMessage: 32,
   uploadBytes: 25 * MiB,
