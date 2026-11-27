@@ -8,6 +8,7 @@ function recording(builder: SendMimeBuilder): SendMimeBuilder {
   return {
     version: builder.version,
     encodedSize: message => builder.encodedSize(message),
+    request: (message, parts) => builder.request(message, parts),
     async build(message, parts) {
       const read: number[] = [];
       const bytes = await builder.build(message, async index => {
@@ -28,6 +29,7 @@ const header = new TextEncoder().encode('X-Fixture-Builder: 2\r\n');
 const second: SendMimeBuilder = {
   version: current.version + 1,
   encodedSize: message => current.encodedSize(message) + header.byteLength,
+  request: (message, parts) => current.request(message, parts),
   async build(message, parts) {
     const bytes = await current.build(message, parts);
     const joined = new Uint8Array(header.length + bytes.length);

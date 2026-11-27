@@ -14,6 +14,7 @@ import {
   type LedgerRow, type SendRow,
 } from './mailbox-send-store.ts';
 import type { TimerRun, TimerTable } from './mailbox-timers.ts';
+import type { SendRequest } from './send-mime.ts';
 import type {
   JournalEvent, SendDispatchRow, SendFailure, SendFenceOutcome, SendFenceRow, SendLedgerChange, SendMarkRow, SendRecipient, SendRecord,
 } from './mail-journal.ts';
@@ -74,6 +75,8 @@ export type ClaimAnswer =
   // A ready mailbox has no such send.
   | { status: 'gone' };
 export type MarkAnswer = { status: 'ok' | 'stale' };
+// `invalid`: the frozen inputs can no longer build the request (an invariant breach).
+export type RequestAnswer = { status: 'ok'; request: SendRequest } | { status: 'stale' | 'invalid' };
 export type AuthorizeAnswer = { status: 'ok'; remainingMs: number } | { status: 'stale' } | { status: 'quota_window'; retryAfter: number };
 // `unpublished`: recorded, but no publish covers it yet; the caller keeps the result and retries.
 export type ReportAnswer = { status: 'recorded' | 'stale' | 'restoring' | 'unpublished' | 'gone' };
@@ -113,6 +116,9 @@ export type DispatchPorts = {
   journalDue(timers: TimerTable): void;
   directory: DirectoryDatabase;
   quota(): QuotaPort | undefined;
+  // The structured send() request for these recipients from the send's frozen
+  // inputs; null when they can no longer build it.
+  buildRequest(record: SendRecord, recipients: number[]): Promise<SendRequest | null>;
   clockSkewMs: number;
   now(): number;
   sending: boolean;
@@ -539,6 +545,33 @@ export class SendDispatcher {
       }
       return { status: 'stale' };
     });
+  }
+
+  // Consumer step 3a's request: the structured send() request for the fence's
+  // Mark set, built from the send's frozen inputs (never from the sent copy).
+  // The fence rules are Mark's: only the current, live, marked lease of a send
+  // that is not finished gets a request. It records nothing; authorizeDispatch
+  // checks everything again.
+  async request(scope: DispatchScope, id: string, fence: SendFence): Promise<RequestAnswer> {
+    const { ports } = this;
+    if (!validFence(fence)) throw new Error('Invalid send request');
+    if (!ports.sending || !await this.readyFor(scope)) return { status: 'stale' };
+    const claimed = await ports.local(() => {
+      const ready = ports.current();
+      const m = ready && this.load(id);
+      if (!ready || !m) return null;
+      const ctx = this.ctx(ready);
+      const row = m.fence(fence);
+      if (m.finished || fence.epoch !== ctx.epoch || !sameFence(m.lease(), fence) || ctx.now >= m.d.leaseUntil! || !row?.marked) return null;
+      const recipients = m.markSet(fence).map(mark => mark.idx)
+        .filter(idx => m.recipient(idx)?.state === 'attempting' && sameFence(m.attemptingFence(idx), fence));
+      return recipients.length ? { record: m.row.record, recipients } : null;
+    });
+    if (!claimed) return { status: 'stale' };
+    const request = await ports.buildRequest(claimed.record, claimed.recipients);
+    if (request) return { status: 'ok', request };
+    console.error({ code: 'send_request_invalid' });
+    return { status: 'invalid' };
   }
 
   // Consumer step 4: at most one authorization per fence. `quotaDayEnd` is the

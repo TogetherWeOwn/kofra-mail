@@ -26,6 +26,7 @@ import { encodeDraftObject } from '../../src/mailbox-api-drafts.ts';
 import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
 import type { QuotaPort } from '../../src/mailbox-send-quota.ts';
 import { FakeSendQuota } from './send-quota-fake.ts';
+import { sendConsumerFixture } from './send-consumer.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -51,6 +52,8 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   EMAIL?: { send(message: unknown): Promise<unknown> };
   // The recording stand-in for the account quota object (M3-6).
   SEND_QUOTA: DurableObjectNamespace<FakeSendQuota>;
+  // The send consumer's dispatch core (M3-5b), run against this mailbox and quota fake.
+  SEND_CONSUMER: DurableObjectNamespace;
 }
 
 const encoder = new TextEncoder();
@@ -169,7 +172,7 @@ export class HttpMailbox extends Mailbox {
   async arrived(method: string) { await this.arrivals.get(method)!.promise; }
   async sendRpc(ws: string, mb: string, method: string, args: unknown[]) {
     this.arrivals.get(method)?.resolve();
-    const allowed = ['claimSend', 'markSend', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
+    const allowed = ['claimSend', 'markSend', 'sendRequest', 'authorizeDispatch', 'recordResult', 'delaySend', 'abandonClaim', 'recordStoredResults'];
     if (!allowed.includes(method)) throw new Error('Unknown fixture send RPC');
     return (this as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>)[method](ws, mb, ...args);
   }
@@ -654,6 +657,8 @@ export class Sweeper extends MailSweeper {
 }
 export { ContentLookup } from '../../src/entry.ts';
 export { FakeSendQuota };
+// The consumer reads the mailbox's clock through the same fixture time.
+export const SendConsumer = sendConsumerFixture((env: FixtureEnv) => now(env));
 
 // Request rate limits with per-key counters that a test can cap, per binding.
 const rateCaps = new Map<string, number>();
@@ -897,6 +902,11 @@ export default {
             return Response.json(await quota[method](...args) ?? null);
           }
           case '/__fixture/send-state': return Response.json(await box.sendState(await req.text()));
+          case '/__fixture/consumer': {
+            const { method, args } = await req.json<{ method: string; args: unknown[] }>();
+            const consumer = env.SEND_CONSUMER.getByName('consumer') as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+            return Response.json(await consumer[method](...args) ?? null);
+          }
           case '/__fixture/pause-enqueue': await box.pauseNextEnqueue(); break;
           case '/__fixture/enqueue-paused': await box.enqueuePaused(); break;
           case '/__fixture/resume-enqueue': await box.resumeEnqueue(); break;

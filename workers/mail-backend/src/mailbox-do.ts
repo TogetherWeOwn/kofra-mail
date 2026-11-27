@@ -21,11 +21,11 @@ import {
 } from './mailbox-timers.ts';
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
-import { markSendHeld, SendApi, sendDrive, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
+import { markSendHeld, SendApi, sendDrive, sendRequestFor, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
 import { SEND_DRIVE, UnpublishedSend, unpublishedProgress } from './mailbox-send-store.ts';
 import {
   CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
-  type ReportAnswer, type StoredAnswer,
+  type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
 import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
@@ -204,6 +204,16 @@ export class Mailbox extends DurableObject<Env> {
       journalDue: timers => this.journalDue(timers),
       directory: this.env.DIRECTORY,
       quota: () => this.sendQuota(),
+      buildRequest: (record, recipients) => {
+        const life = storedLifecycle<Lifecycle>(this.ctx.storage);
+        // Reads stop once the mailbox is no longer the ready incarnation the request started on.
+        const sources = () => {
+          const now = storedLifecycle<Lifecycle>(this.ctx.storage);
+          if (life?.state !== 'ready' || now?.state !== 'ready' || now.incarnation !== life.incarnation) throw new Error('Mailbox changed during the send request');
+          return this.index(now.scope.workspaceId);
+        };
+        return sendRequestFor(sources, this.sendMime, record, recipients);
+      },
       clockSkewMs: this.clockSkewMs(),
       now: () => this.mailApiNow(),
       sending: this.env.MAIL_SEND_ENABLED === 'on',
@@ -253,6 +263,11 @@ export class Mailbox extends DurableObject<Env> {
   async authorizeDispatch(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, recipients: number[],
     quotaDayEnd: number): Promise<AuthorizeAnswer> {
     return this.sendDispatcher().authorize({ workspaceId, mailboxId }, sendId, fence, recipients, quotaDayEnd);
+  }
+
+  // Consumer step 3a: the send() request for the fence's Mark set, from the send's frozen inputs.
+  async sendRequest(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence): Promise<RequestAnswer> {
+    return this.sendDispatcher().request({ workspaceId, mailboxId }, sendId, fence);
   }
 
   async recordResult(workspaceId: string, mailboxId: string, sendId: string, fence: SendFence, result: ProviderResult): Promise<ReportAnswer> {

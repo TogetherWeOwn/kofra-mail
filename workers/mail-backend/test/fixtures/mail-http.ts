@@ -149,7 +149,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     modules: [{ type: 'ESModule', path: 'mail-http-worker.mjs', contents }],
     compatibilityDate: '2026-06-25',
     durableObjects: { SWEEPER: { className: 'Sweeper', useSQLite: true }, MAILBOX: { className: 'HttpMailbox', useSQLite: true },
-      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true } },
+      SEND_QUOTA: { className: 'FakeSendQuota', useSQLite: true }, SEND_CONSUMER: { className: 'SendConsumer', useSQLite: true } },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
@@ -240,8 +240,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       },
     });
   }
-  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...(inlineCids && {
+  // The send path's structured log events (alert codes and metrics), recorded for assertions.
+  const logs: string[] = [];
+  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send) && {
     handleStructuredLogs: ({ message }: { message: string }) => {
+      if (send) logs.push(message);
       if (message === cidAdmissionMarker && ++cidAdmissions === 6) cidBurst.resolve();
     },
   }) });
@@ -471,6 +474,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       pausedAt: (point: string) => controlAction('paused-at', point),
       resumeAt: (point: string) => controlAction('resume-at', point),
       quota: <T>(method: string, ...args: unknown[]) => readControl<T>('quota', JSON.stringify({ method, args })),
+      // The send consumer's dispatch core (M3-5b) in the fixture worker, and its fakes.
+      consumer: <T>(method: string, ...args: unknown[]) => readControl<T>('consumer', JSON.stringify({ method, args })),
+      // Structured log lines of the send fixture, in order.
+      logs: () => [...logs],
       sendState: (id: string) => readControl<SendStateView>('send-state', id),
       pauseNextEnqueue: () => controlAction('pause-enqueue'),
       enqueuePaused: () => controlAction('enqueue-paused'),
