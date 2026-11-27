@@ -21,7 +21,7 @@ Run from the repository root with Node.js 24. The clients print only `bucket PAS
 
 ## Step 2: relevant flag on, before user traffic
 
-The target must already expose the mail HTTP API to the operator; turning on a feature flag alone does not expose it. Use a dedicated operator account with a provisioned mailbox and a clean limiter window. The admin check needs a workspace admin session reauthenticated within the contract's 10-minute window and a clean workspace counter. Load the full Cookie header value into `R2_MAIL_COOKIE` and the session's CSRF value into `R2_MAIL_CSRF`. The base URL must be an HTTPS origin (plain HTTP is accepted only on loopback for local fixtures). Run only buckets whose routes are enabled:
+The current gateway accepts only loopback requests with a development session provider. Use a local fixture until a deployed gateway exposes the API to the operator; turning on a feature flag alone does not expose it. This tooling does not add that gateway. Use a dedicated operator account with a provisioned mailbox and a clean limiter window. The admin check needs a workspace admin session reauthenticated within the contract's 10-minute window and a clean workspace counter. Load the full Cookie header value into `R2_MAIL_COOKIE` and the session's CSRF value into `R2_MAIL_CSRF`. The base URL must be an HTTPS origin (plain HTTP is accepted only on loopback for local fixtures). Run only buckets whose routes are enabled:
 
 ```sh
 # Base API buckets (also the default if no buckets are listed)
