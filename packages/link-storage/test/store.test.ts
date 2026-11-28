@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import {
-  CredentialSealError, credentialSecret, DELETE_CLAIM_MS, USAGE_TIMEOUT_MS, deploymentLocations, linkKek, linkSecretViolations, LinkStorageStore, LocationRepointedError,
+  CredentialSealError, credentialSecret, DELETE_CLAIM_MS, LocationPendingDeleteError, USAGE_TIMEOUT_MS, deploymentLocations, linkKek, linkSecretViolations, LinkStorageStore, LocationRepointedError,
   newLocationId, openCredential, S3Credentials, sealCredential, type LinkKek, type LinkLocationFields, type LinkLocationUsage,
 } from '../src/index.ts';
 import { testDatabase } from './d1.ts';
@@ -123,8 +123,9 @@ test('a location still in use cannot be deleted', async () => {
     seen.push(String(db.raw.prepare('SELECT state FROM link_storage_locations WHERE location_id = ?').get(locationId)?.state));
     // A second delete meanwhile learns that the first is still deciding, not that the location is gone.
     assert.equal(await store.delete(workspaceId, locationId, { inUse: async () => false }), 'pending');
-    assert.equal(await store.get(workspaceId, locationId), null);
-    assert.equal(await store.rotate(k, workspaceId, locationId, rotated, 5), false);
+    // Links made with it still resolve, and it is listed as `deleting`.
+    assert.equal((await store.get(workspaceId, locationId))?.state, 'deleting');
+    assert.deepEqual((await store.credential(k, workspaceId, locationId, 'read', { rewrap: false }))!.reveal(), READ);
     if (answer instanceof Error) throw answer;
     return answer;
   } });
@@ -231,13 +232,55 @@ test('a content-lookup read does not rewrap, and a failed final delete keeps the
     return fails ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
   } };
   await assert.rejects(new LinkStorageStore(broken).delete('ws-a', id, { inUse: async () => false }, 10_000), /d1 down/);
-  assert.equal(await store.get('ws-a', id), null);
+  assert.equal((await store.get('ws-a', id))?.state, 'deleting');
   assert.equal(await store.delete('ws-a', id, { inUse: async () => false }, 10_000 + DELETE_CLAIM_MS - 1), 'pending');
   let asked = false;
   assert.equal(await store.delete('ws-a', id, { inUse: async () => { asked = true; return true; } }, 10_000 + DELETE_CLAIM_MS), 'in_use');
   assert.ok(asked);
   assert.ok(await store.get('ws-a', id));
   assert.equal(await store.delete('ws-a', id, { inUse: async () => false }), 'deleted');
+});
+
+test('while a delete checks usage, downloads resolve and new links wait instead of using the deployment', async () => {
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const k = await kek(1, [1]);
+  const id = await created(store, db, k);
+  const deployment = deploymentLocations(JSON.stringify({ current: 'main', locations: { main: fields } }));
+  let answer!: (value: boolean) => void;
+  let checking!: () => void;
+  const started = new Promise<void>(resolve => { checking = resolve; });
+  const pending = store.delete('ws-a', id, { inUse: () => { checking(); return new Promise<boolean>(resolve => { answer = resolve; }); } }, 1_000);
+  await started;
+  // A download of an existing link still gets the read key.
+  assert.deepEqual((await store.credential(k, 'ws-a', id, 'read', { rewrap: false }))!.reveal(), READ);
+  // A new link neither uses the deployment bucket nor the location: retry later.
+  await assert.rejects(store.currentLocation('ws-a', deployment, 1_001), LocationPendingDeleteError);
+  assert.deepEqual((await store.list('ws-a', 1_001)).map(l => [l.locationId, l.state]), [[id, 'deleting']]);
+  answer(true);
+  assert.equal(await pending, 'in_use');
+  assert.equal((await store.currentLocation('ws-a', deployment, 1_002))?.kind, 'workspace');
+});
+
+test('a location whose restore failed after an in-use answer heals itself', async () => {
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const k = await kek(1, [1]);
+  const id = await created(store, db, k);
+  const deployment = deploymentLocations(JSON.stringify({ current: 'main', locations: { main: fields } }));
+  const broken = { ...db, prepare(sql: string) {
+    const statement = db.prepare(sql);
+    return sql.includes("SET state = 'active'") ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
+  } };
+  await assert.rejects(new LinkStorageStore(broken).delete('ws-a', id, { inUse: async () => true }, 5_000), /d1 down/);
+  // Until the claim is stale the row is `deleting`; downloads still work.
+  assert.equal((await store.get('ws-a', id))?.state, 'deleting');
+  assert.ok(await store.credential(k, 'ws-a', id, 'read', { rewrap: false }));
+  await assert.rejects(store.currentLocation('ws-a', deployment, 5_000 + DELETE_CLAIM_MS - 1), LocationPendingDeleteError);
+  // Then it heals without anyone retrying the delete.
+  const current = await store.currentLocation('ws-a', deployment, 5_000 + DELETE_CLAIM_MS);
+  assert.deepEqual([current?.kind, current?.kind === 'workspace' && current.location.state], ['workspace', 'active']);
+  assert.deepEqual((await store.list('ws-a', 5_000 + DELETE_CLAIM_MS)).map(l => l.state), ['active']);
 });
 
 test('a delete whose claim was taken over can neither delete nor restore the location', async () => {

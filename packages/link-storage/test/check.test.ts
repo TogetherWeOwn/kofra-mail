@@ -28,7 +28,7 @@ test('a private bucket with both keys passes, signed, and leaves nothing behind'
   assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: true });
   assert.deepEqual(s3.calls.map(({ op, signedBy, status }) => [op, signedBy, status]), [
     ['HeadBucket', WRITE.accessKeyId, 200], ['PutObject', WRITE.accessKeyId, 200], ['GetObject', READ.accessKeyId, 200],
-    ['PutObject', READ.accessKeyId, 403], ['DeleteObject', READ.accessKeyId, 403], ['GetObject', null, 403], ['ListObjects', null, 403],
+    ['GetObject', WRITE.accessKeyId, 200], ['PutObject', READ.accessKeyId, 403], ['DeleteObject', READ.accessKeyId, 403], ['GetObject', null, 403], ['ListObjects', null, 403],
     ['CreateMultipart', WRITE.accessKeyId, 200], ['UploadPart', WRITE.accessKeyId, 200], ['ListParts', WRITE.accessKeyId, 200],
     ['CompleteMultipart', WRITE.accessKeyId, 200], ['DeleteObject', WRITE.accessKeyId, 204],
     ['CreateMultipart', WRITE.accessKeyId, 200], ['AbortMultipart', WRITE.accessKeyId, 204], ['DeleteObject', WRITE.accessKeyId, 204],
@@ -91,6 +91,28 @@ test('a public bucket fails the save check', async (t) => {
       assert.equal(s3.objects.size, 0);
     });
   }
+});
+
+test('an endpoint that refuses unsigned requests with 400 (as R2 does) is private, and only a 2xx is public', async () => {
+  const r2 = provider({ anonymousRefusal: 400 });
+  assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: r2.fetch }), { ok: true });
+  assert.deepEqual(r2.calls.filter(({ signedBy }) => signedBy === null).map(({ op, status }) => [op, status]),
+    [['GetObject', 400], ['ListObjects', 400]]);
+  for (const status of [404, 401, 403, 451]) {
+    assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: provider({ anonymousRefusal: status }).fetch }), { ok: true }, String(status));
+  }
+  // A 5xx to an unsigned request is unexpected, never a pass.
+  const broken = provider({ anonymousRefusal: 503 });
+  assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: broken.fetch }), { ok: false, reason: 'bucket' });
+  assert.equal(broken.objects.size, 0);
+});
+
+test('a write key that cannot read objects fails with auth', async () => {
+  const keys = { [READ.accessKeyId]: { secret: READ.secretAccessKey, ops: new Set<S3Op>(READ_OPS) },
+    [WRITE.accessKeyId]: { secret: WRITE.secretAccessKey, ops: new Set<S3Op>(ALL_OPS.filter(op => op !== 'GetObject')) } };
+  const s3 = provider({ keys });
+  assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: false, reason: 'auth' });
+  assert.equal(s3.objects.size, 0);
 });
 
 test('refused hosts are refused before any request', async (t) => {

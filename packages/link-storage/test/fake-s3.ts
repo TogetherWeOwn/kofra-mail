@@ -23,6 +23,8 @@ export interface FakeS3Options {
   redirect?: number;
   /** Answer a 200 error document to CompleteMultipartUpload. */
   completeError?: boolean;
+  /** The status of a refused unsigned request (403 by default; R2's S3 endpoint answers 400). */
+  anonymousRefusal?: number;
   /** Keep every written version; a DELETE without `versionId` only adds a delete marker. */
   versioning?: boolean;
 }
@@ -106,7 +108,8 @@ export function fakeS3(options: FakeS3Options) {
     if (op === 'unknown') return record(error('NotImplemented', 501));
     if (signedBy === false) return record(error('SignatureDoesNotMatch', 403));
     const allowed = signedBy === null ? (options.anonymous ?? []).includes(op) : options.keys[signedBy].ops.has(op);
-    if (!allowed) return record(error('AccessDenied', 403));
+    if (!allowed) return record(signedBy === null && options.anonymousRefusal
+      ? error('InvalidArgument', options.anonymousRefusal) : error('AccessDenied', 403));
     const uploadId = url.searchParams.get('uploadId') ?? '';
     switch (op) {
       case 'HeadBucket': return record(new Response(null, { status: 200 }));

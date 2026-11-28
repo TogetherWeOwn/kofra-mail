@@ -6,6 +6,7 @@ import { linkKek, LinkStorageStore, type LinkLocationUsage } from '@kofra/link-s
 import { testDatabase } from '../../../../packages/link-storage/test/d1.ts';
 import { ALL_OPS, fakeS3, READ_OPS, type FakeS3Options, type S3Op } from '../../../../packages/link-storage/test/fake-s3.ts';
 import { handleMailApi, type LocalPrincipal, type MailApiEnvironment } from './server/mail-api.ts';
+import { runLinkStorage } from './server/link-storage.ts';
 
 // Synthetic values only: a local fake S3 endpoint, never a real provider.
 const origin = 'http://127.0.0.1:4178';
@@ -107,7 +108,7 @@ test('an admin adds a private bucket; only the key ids\' last 4 characters come 
   const body = created.body as LinkLocation;
   assert.match(body.id, /^[a-z2-7]{26}$/);
   assert.deepEqual({ ...body, id: 'id', createdAt: 'created' }, { id: 'id', endpoint: `https://${host}`, region: 'auto', bucket: 'links',
-    prefix: 'riaklo/', pathStyle: true, current: true, readKeyIdLast4: '0001', writeKeyIdLast4: 'Y002', createdAt: 'created', rotatedAt: null });
+    prefix: 'riaklo/', pathStyle: true, current: true, state: 'active', readKeyIdLast4: '0001', writeKeyIdLast4: 'Y002', createdAt: 'created', rotatedAt: null });
   // A retry replays; the same key with other fields is refused.
   const retry = await f.call('createLinkLocation', { json: location, key: 'create-1' });
   assert.deepEqual([retry.status, retry.body], [201, body]);
@@ -251,4 +252,56 @@ test('a network failure that mentions a secret never surfaces it', async (t) => 
   const response = await f.call('createLinkLocation', { json: location, key: 'create-1' });
   assert.deepEqual([response.status, response.body.reason], [422, 'network']);
   noSecrets(f);
+});
+
+test('a create whose only change is a secret is a different request', async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.call('createLinkLocation', { json: location, key: 'create-1' })).status, 201);
+  const changed = await f.call('createLinkLocation', { json: { ...location, write: { ...WRITE, secretAccessKey: 'fake-write-secret-value-0009' } }, key: 'create-1' });
+  assert.deepEqual([changed.status, changed.body.code], [422, 'idempotency_key_reused']);
+  // The stored fingerprint is keyed: a plain digest of the body (secrets included) does not match it.
+  const [row] = f.db.dump('directory_api_keys') as { fingerprint: string }[];
+  assert.match(row.fingerprint, /^1\.[0-9a-f]{64}$/);
+  const canonical = JSON.stringify(['createLinkLocation', Object.fromEntries(Object.keys(location).sort().map((k) => [k, (location as Record<string, unknown>)[k]]))]);
+  const plain = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))).toString('hex');
+  assert.ok(!row.fingerprint.includes(plain));
+  noSecrets(f);
+});
+
+test('an attempt whose claim expired cannot commit over the attempt that replaced it', async (t) => {
+  const f = fixture(t);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reached!: () => void;
+  const started = new Promise<void>((resolve) => { reached = resolve; });
+  let first = true;
+  t.mock.method(globalThis, 'fetch', async (request: Request) => {
+    if (first) { first = false; reached(); await gate; }
+    return f.s3.fetch(request);
+  });
+  const t0 = Date.now();
+  const ctx = (now: number) => ({ db: f.db, workspaceId: admin.workspaceId, principal: { role: 'admin' as const, authTime: now },
+    env: f.env, params: {}, input: structuredClone(location) as Record<string, unknown>, idempotencyKey: 'create-1', now });
+  // Attempt A holds its claim, then stalls inside its check past the 5-minute claim lifetime.
+  const a = runLinkStorage('createLinkLocation', ctx(t0));
+  await started;
+  // Attempt B, 6 minutes later, takes over the expired claim and commits.
+  const b = await runLinkStorage('createLinkLocation', ctx(t0 + 6 * 60_000));
+  assert.ok(b.body && !b.replayed);
+  // A resumes: it commits nothing and answers B's result.
+  release();
+  const late = await a;
+  assert.deepEqual([late.body, late.replayed], [b.body, true]);
+  assert.equal(f.db.dump('link_storage_locations').length, 1);
+  const [record] = f.db.dump('directory_api_keys') as { result: string }[];
+  assert.deepEqual(JSON.parse(record.result), b.body);
+});
+
+test('deleting a location that does not exist answers 204 even before the usage port exists', async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.call('deleteLinkLocation', { params: { locationId: 'cccccccccccccccccccccccccc' } })).status, 204);
+  const { body: created } = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  const existing = await f.call('deleteLinkLocation', { params: { locationId: created.id } });
+  assert.deepEqual([existing.status, existing.body.code], [501, 'feature_unavailable']);
+  assert.equal(f.db.dump('link_storage_locations').length, 1);
 });

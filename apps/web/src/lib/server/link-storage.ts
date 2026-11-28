@@ -5,7 +5,8 @@
 import { MailApiError, problem, LIMITS } from '@kofra/mail-contract';
 import type { LinkLocation, MailErrorCode, Operation, Problem } from '@kofra/mail-contract';
 import {
-  checkLinkLocation, deploymentLocations, HAS_ROOM, linkKek, LinkStorageStore, locationFields, MAX_WORKSPACE_LOCATIONS, newLocationId,
+  checkLinkLocation, deploymentLocations, keyedFingerprint, linkKek, LinkStorageStore, locationFields, matchesFingerprint, MAX_WORKSPACE_LOCATIONS,
+  newLocationId,
   refusedZones, S3Credentials, type Fetcher, type LinkDatabase, type LinkLocationFields, type LinkLocationUsage, type StoredLocation,
 } from '@kofra/link-storage';
 import type { DirectoryDatabase } from './mail-directory.ts';
@@ -45,14 +46,14 @@ const invalid = (field: string): never => fail('invalid_request', { errors: [{ f
 const iso = (ms: number) => new Date(ms).toISOString();
 const locationIdPattern = /^[a-z2-7]{26}$/;
 const createFields = ['endpoint', 'region', 'bucket', 'prefix', 'pathStyle', 'read', 'write'];
-// An idempotency record whose operation is still running (contract section 5).
-const IN_PROGRESS = '';
+// The prefix of an idempotency record whose operation is still running (contract section 5).
+const IN_PROGRESS = 'in-progress:';
 const IN_PROGRESS_MS = 5 * 60_000;
 
 function asLinkLocation(row: StoredLocation): LinkLocation {
   return {
     id: row.locationId, endpoint: row.endpoint, region: row.region, bucket: row.bucket, prefix: row.prefix, pathStyle: row.pathStyle,
-    current: row.current, readKeyIdLast4: row.readKeyLast4, writeKeyIdLast4: row.writeKeyLast4,
+    current: row.current, state: row.state, readKeyIdLast4: row.readKeyLast4, writeKeyIdLast4: row.writeKeyLast4,
     createdAt: iso(row.createdAt), rotatedAt: row.rotatedAt === null ? null : iso(row.rotatedAt),
   };
 }
@@ -75,9 +76,13 @@ async function writeConfig(env: LinkStorageEnvironment) {
   return { kek, zones };
 }
 
-async function sha256(text: string): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)));
-  return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+/** A JSON value with every object's keys sorted, so equal bodies have one encoding. */
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map(name => [name, canonicalJson((value as Record<string, unknown>)[name])]));
+  }
+  return value;
 }
 
 export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Promise<OperationResult> {
@@ -95,25 +100,25 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
 
   switch (op) {
     case 'listLinkLocations':
-      return { body: { deployment: deploymentLocations(ctx.env.LINK_LOCATIONS) !== undefined, items: (await store.list(ws)).map(asLinkLocation) } };
+      return { body: { deployment: deploymentLocations(ctx.env.LINK_LOCATIONS) !== undefined, items: (await store.list(ws, now)).map(asLinkLocation) } };
 
     case 'createLinkLocation': {
       const key = ctx.idempotencyKey;
       if (!key) return fail('precondition_required');
       const { kek, zones } = await writeConfig(ctx.env);
       const input = ctx.input;
-      // The key's fingerprint covers the whole body except the secret values (each
-      // credential counts by its key id and field names), so nothing derived from a secret is stored.
-      const shape = (value: unknown) => value && typeof value === 'object' && !Array.isArray(value)
-        ? { accessKeyId: (value as Record<string, unknown>).accessKeyId, fields: Object.keys(value).sort() } : value;
-      const fingerprint = await sha256(JSON.stringify([op, Object.keys(input).sort().map(name =>
-        [name, name === 'read' || name === 'write' ? shape(input[name]) : input[name]])]));
+      // The key's fingerprint covers the whole canonical body, secrets included, as an HMAC under
+      // a key derived from the KEK: a change to any field, the secret alone too, is a different body.
+      const canonical = JSON.stringify([op, canonicalJson(input)]);
+      const fingerprint = (await keyedFingerprint(kek, canonical))!;
+      // Each attempt has its own in-progress claim; only that claim can commit or be cleaned up.
+      const claim = `${IN_PROGRESS}${crypto.randomUUID()}`;
       const replay = async () => {
         const row = await db.prepare('SELECT fingerprint, result FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND expires_at > ?')
           .bind(ws, key, now).first<{ fingerprint: string; result: string }>();
         if (!row) return undefined;
-        if (row.fingerprint !== fingerprint) return fail('idempotency_key_reused');
-        if (row.result === IN_PROGRESS) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+        if (!await matchesFingerprint(kek, canonical, row.fingerprint)) return fail('idempotency_key_reused');
+        if (row.result.startsWith(IN_PROGRESS)) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
         return { body: JSON.parse(row.result) as LinkLocation, replayed: true };
       };
       const earlier = await replay();
@@ -122,45 +127,52 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       const parsed = locationFields(input, zones);
       if (!parsed.ok) return parsed.reason === 'endpoint' ? fail('storage_check_failed', { reason: 'endpoint' }) : invalid(parsed.field || '/');
       const credentials = credentialPair(input);
-      if ((await store.list(ws)).length >= MAX_WORKSPACE_LOCATIONS) return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
-      // Mark the key in progress before the check's first request (contract section 5); a marker
+      if ((await store.list(ws, now)).length >= MAX_WORKSPACE_LOCATIONS) return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
+      // Mark the key in progress before the check's first request (contract section 5); a claim
       // left by a crash expires after 5 minutes, longer than the check's own request deadlines.
       try {
         await db.batch([
           db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND expires_at <= ?').bind(ws, key, now),
           db.prepare('INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) VALUES (?, ?, ?, ?, ?)')
-            .bind(ws, key, fingerprint, IN_PROGRESS, now + IN_PROGRESS_MS),
+            .bind(ws, key, fingerprint, claim, now + IN_PROGRESS_MS),
         ]);
       } catch {
         return (await replay()) ?? fail('unavailable');
       }
-      let committed = false;
       try {
         const verdict = await check(parsed.fields, credentials, zones);
         if (!verdict.ok) return fail('storage_check_failed', { reason: verdict.reason });
         const locationId = newLocationId();
-        const body = asLinkLocation({ ...parsed.fields, workspaceId: ws, locationId, current: true, readKeyLast4: credentials.read.keyIdLast4,
-          writeKeyLast4: credentials.write.keyIdLast4, createdAt: now, rotatedAt: null });
+        const body = asLinkLocation({ ...parsed.fields, workspaceId: ws, locationId, current: true, state: 'active',
+          readKeyLast4: credentials.read.keyIdLast4, writeKeyLast4: credentials.write.keyIdLast4, createdAt: now, rotatedAt: null });
+        // Every statement requires this attempt's claim to be still in place, so an attempt whose
+        // claim expired and was replaced commits nothing.
+        const ownClaim = { sql: 'EXISTS (SELECT 1 FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?)', binds: [ws, key, claim] };
         try {
           await db.batch([
-            db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, IN_PROGRESS),
-            db.prepare(`INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) SELECT ?, ?, ?, ?, ? WHERE ${HAS_ROOM}`)
-              .bind(ws, key, fingerprint, JSON.stringify(body), now + LIMITS.idempotencyRetentionSeconds * 1000, ws),
-            ...await store.createStatements(kek, ws, locationId, parsed.fields, credentials, now),
+            ...await store.createStatements(kek, ws, locationId, parsed.fields, credentials, now, ownClaim),
+            db.prepare(`UPDATE directory_api_keys SET result = ?, expires_at = ? WHERE workspace_id = ? AND key = ? AND result = ?
+              AND EXISTS (SELECT 1 FROM link_storage_locations WHERE workspace_id = ? AND location_id = ?)`)
+              .bind(JSON.stringify(body), now + LIMITS.idempotencyRetentionSeconds * 1000, ws, key, claim, ws, locationId),
           ]);
         } catch {
           // Never expose the database error.
           return fail('unavailable');
         }
-        committed = true;
         if (await store.get(ws, locationId)) return { body };
-        return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
+        const replaced = await replay().catch((error: unknown) => {
+          // Our claim is still there: the workspace was full.
+          if (error instanceof MailApiError && error.code === 'idempotency_in_progress') return undefined;
+          throw error;
+        });
+        if (replaced) return replaced;
+        const ours = await db.prepare('SELECT 1 AS held FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?')
+          .bind(ws, key, claim).first();
+        return ours ? fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS }) : fail('unavailable', { retryAfterSeconds: 1 });
       } finally {
-        // A failed operation releases its key, so a retry runs again.
-        if (!committed) {
-          await db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, IN_PROGRESS).run()
-            .catch(() => {});
-        }
+        // Release only this attempt's claim (a no-op once it has committed), so a retry runs again.
+        await db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, claim).run()
+          .catch(() => {});
       }
     }
 
@@ -179,14 +191,15 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
     }
 
     case 'deleteLinkLocation': {
+      const locationId = ctx.params.locationId;
+      // DELETE answers 204 when the location does not exist (contract section 5), before anything else.
+      if (!locationIdPattern.test(locationId) || !await store.get(ws, locationId)) return {};
+      // An existing location stays until the usage port (M3-13, M3-15b) can say nothing uses it.
       const usage = ctx.env.LINK_USAGE;
       if (!usage || typeof usage.inUse !== 'function') return fail('feature_unavailable');
-      const locationId = ctx.params.locationId;
-      // DELETE answers 204 whether or not the location exists (contract section 5).
-      if (!locationIdPattern.test(locationId)) return {};
       let outcome: Awaited<ReturnType<LinkStorageStore['delete']>>;
       try {
-        outcome = await store.delete(ws, locationId, usage);
+        outcome = await store.delete(ws, locationId, usage, now);
       } catch {
         return fail('unavailable');
       }

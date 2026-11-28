@@ -38,6 +38,8 @@ export interface StoredLocation extends LinkLocationFields {
   workspaceId: string;
   locationId: string;
   current: boolean;
+  /** `deleting` while a delete checks whether anything still uses the location. */
+  state: 'active' | 'deleting';
   readKeyLast4: string;
   writeKeyLast4: string;
   createdAt: number;
@@ -46,19 +48,24 @@ export interface StoredLocation extends LinkLocationFields {
 
 interface LocationRow {
   workspace_id: string; location_id: string; endpoint: string; region: string; bucket: string; prefix: string;
-  path_style: number; current: number; read_key_last4: string; write_key_last4: string; created_at: number; rotated_at: number | null;
+  path_style: number; current: number; state: 'active' | 'deleting'; read_key_last4: string; write_key_last4: string; created_at: number; rotated_at: number | null;
 }
 interface SealedRow { key_version: number; sealed: string }
+
+/** The workspace's current location is being deleted: retry; never fall back to another location. */
+export class LocationPendingDeleteError extends Error {
+  constructor() { super('Link location delete pending'); this.name = 'LocationPendingDeleteError'; }
+}
 
 export class LocationRepointedError extends Error {
   constructor() { super('Link location id is already recorded with other fields'); this.name = 'LocationRepointedError'; }
 }
 
-const columns = `workspace_id, location_id, endpoint, region, bucket, prefix, path_style, current,
+const columns = `workspace_id, location_id, endpoint, region, bucket, prefix, path_style, current, state,
   read_key_last4, write_key_last4, created_at, rotated_at`;
 const asLocation = (row: LocationRow): StoredLocation => ({
   workspaceId: row.workspace_id, locationId: row.location_id, endpoint: row.endpoint, region: row.region, bucket: row.bucket,
-  prefix: row.prefix, pathStyle: row.path_style === 1, current: row.current === 1, readKeyLast4: row.read_key_last4,
+  prefix: row.prefix, pathStyle: row.path_style === 1, current: row.current === 1, state: row.state, readKeyLast4: row.read_key_last4,
   writeKeyLast4: row.write_key_last4, createdAt: row.created_at, rotatedAt: row.rotated_at,
 });
 // Fixed column names per role: never interpolated from input.
@@ -106,15 +113,27 @@ export class LinkStorageStore {
   readonly #db: LinkDatabase;
   constructor(db: LinkDatabase) { this.#db = db; }
 
-  async list(workspaceId: string): Promise<StoredLocation[]> {
+  /**
+   * Returns a workspace's `deleting` rows whose claim is older than `DELETE_CLAIM_MS`
+   * to `active`: their delete failed or was abandoned (at most `MAX_WORKSPACE_LOCATIONS` rows).
+   */
+  async healStaleDeletes(workspaceId: string, now = Date.now()): Promise<void> {
+    await this.#db.prepare(`UPDATE link_storage_locations SET state = 'active', delete_claim = NULL, delete_claimed_at = NULL
+      WHERE workspace_id = ? AND state = 'deleting' AND delete_claimed_at <= ?`).bind(workspaceId, now - DELETE_CLAIM_MS).run();
+  }
+
+  /** Every location of a workspace, `deleting` ones included (stale claims healed first). */
+  async list(workspaceId: string, now = Date.now()): Promise<StoredLocation[]> {
+    await this.healStaleDeletes(workspaceId, now);
     const { results } = await this.#db.prepare(`SELECT ${columns} FROM link_storage_locations
-      WHERE workspace_id = ? AND state = 'active' ORDER BY created_at, location_id LIMIT ?`).bind(workspaceId, MAX_WORKSPACE_LOCATIONS).all<LocationRow>();
+      WHERE workspace_id = ? ORDER BY created_at, location_id LIMIT ?`).bind(workspaceId, MAX_WORKSPACE_LOCATIONS).all<LocationRow>();
     return results.map(asLocation);
   }
 
+  /** One location, `deleting` included: links already made with it keep resolving. Read-only. */
   async get(workspaceId: string, locationId: string): Promise<StoredLocation | null> {
     const row = await this.#db.prepare(`SELECT ${columns} FROM link_storage_locations
-      WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(workspaceId, locationId).first<LocationRow>();
+      WHERE workspace_id = ? AND location_id = ?`).bind(workspaceId, locationId).first<LocationRow>();
     return row && asLocation(row);
   }
 
@@ -125,31 +144,34 @@ export class LinkStorageStore {
    * workspace is at its limit.
    */
   async createStatements(kek: LinkKek, workspaceId: string, locationId: string, fields: LinkLocationFields,
-    credentials: { read: S3Credentials; write: S3Credentials }, now: number): Promise<LinkStatement[]> {
+    credentials: { read: S3Credentials; write: S3Credentials }, now: number,
+    guard: { sql: string; binds: (string | number)[] } = { sql: '1', binds: [] }): Promise<LinkStatement[]> {
     const read = await sealCredential(kek, workspaceId, locationId, 'read', credentials.read);
     const write = await sealCredential(kek, workspaceId, locationId, 'write', credentials.write);
     const fingerprint = await locationFingerprint(fields);
-    const room = HAS_ROOM;
+    // `guard` is an extra condition (with its binds) every statement requires, such as the caller's idempotency claim.
+    const room = `${HAS_ROOM} AND (${guard.sql})`;
     return [
       this.#db.prepare(`UPDATE link_storage_locations SET current = 0 WHERE workspace_id = ? AND current = 1 AND ${room}`)
-        .bind(workspaceId, workspaceId),
+        .bind(workspaceId, workspaceId, ...guard.binds),
       this.#db.prepare(`INSERT INTO link_storage_locations (workspace_id, location_id, endpoint, region, bucket, prefix, path_style,
           fingerprint, state, current, read_key_last4, read_key_version, read_sealed, write_key_last4, write_key_version, write_sealed,
           created_at, rotated_at)
         SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?, ?, ?, NULL WHERE ${room}`).bind(
         workspaceId, locationId, fields.endpoint, fields.region, fields.bucket, fields.prefix, fields.pathStyle ? 1 : 0, fingerprint,
-        credentials.read.keyIdLast4, read.version, read.sealed, credentials.write.keyIdLast4, write.version, write.sealed, now, workspaceId),
+        credentials.read.keyIdLast4, read.version, read.sealed, credentials.write.keyIdLast4, write.version, write.sealed, now, workspaceId,
+        ...guard.binds),
     ];
   }
 
-  /** Replaces both credentials of an active location in place. False if there is no such location. */
+  /** Replaces both credentials of a location in place (a pending delete does not block it). False if there is no such location. */
   async rotate(kek: LinkKek, workspaceId: string, locationId: string, credentials: { read: S3Credentials; write: S3Credentials },
     now: number): Promise<boolean> {
     const read = await sealCredential(kek, workspaceId, locationId, 'read', credentials.read);
     const write = await sealCredential(kek, workspaceId, locationId, 'write', credentials.write);
     const { meta } = await this.#db.prepare(`UPDATE link_storage_locations SET read_key_last4 = ?, read_key_version = ?, read_sealed = ?,
         write_key_last4 = ?, write_key_version = ?, write_sealed = ?, rotated_at = ?
-      WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(
+      WHERE workspace_id = ? AND location_id = ?`).bind(
       credentials.read.keyIdLast4, read.version, read.sealed, credentials.write.keyIdLast4, write.version, write.sealed, now,
       workspaceId, locationId).run();
     return (meta.changes ?? 0) > 0;
@@ -206,7 +228,7 @@ export class LinkStorageStore {
   }
 
   /**
-   * Opens one credential of an active location. Unless `rewrap` is false (read-only
+   * Opens one credential of a location (`active` or `deleting`). Unless `rewrap` is false (read-only
    * callers such as the content lookup), a value sealed under an older KEK version is
    * rewrapped under the current one (a conditional update, so a concurrent rotation
    * always wins). Null if there is no such location.
@@ -214,8 +236,9 @@ export class LinkStorageStore {
   async credential(kek: LinkKek, workspaceId: string, locationId: string, role: CredentialRole,
     { rewrap = true }: { rewrap?: boolean } = {}): Promise<S3Credentials | null> {
     const column = sealedColumns[role];
+    // No state filter: links made with a location keep their key while a delete checks its usage.
     const row = await this.#db.prepare(`SELECT ${column.version} AS key_version, ${column.sealed} AS sealed FROM link_storage_locations
-      WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(workspaceId, locationId).first<SealedRow>();
+      WHERE workspace_id = ? AND location_id = ?`).bind(workspaceId, locationId).first<SealedRow>();
     if (!row) return null;
     const credentials = await openCredential(kek, workspaceId, locationId, role, row.key_version, row.sealed);
     if (rewrap && row.key_version !== kek.current) await this.#rewrap(kek, workspaceId, locationId, role, row, credentials);
@@ -320,11 +343,15 @@ export class LinkStorageStore {
   /**
    * The location new links of a workspace use: its current override, else the
    * deployment's current location (fingerprint-checked). Null if neither exists.
+   * While the current override is being deleted it throws `LocationPendingDeleteError`
+   * (retryable): new links never fall back to the deployment's storage then.
    */
   async currentLocation(workspaceId: string, deployment: DeploymentLocations | undefined, now: number):
     Promise<{ kind: 'workspace'; location: StoredLocation } | { kind: 'deployment'; locationId: string; fields: LinkLocationFields } | null> {
+    await this.healStaleDeletes(workspaceId, now);
     const row = await this.#db.prepare(`SELECT ${columns} FROM link_storage_locations
-      WHERE workspace_id = ? AND current = 1 AND state = 'active'`).bind(workspaceId).first<LocationRow>();
+      WHERE workspace_id = ? AND current = 1`).bind(workspaceId).first<LocationRow>();
+    if (row?.state === 'deleting') throw new LocationPendingDeleteError();
     if (row) return { kind: 'workspace', location: asLocation(row) };
     if (!deployment) return null;
     const fields = deployment.locations.get(deployment.current)!;

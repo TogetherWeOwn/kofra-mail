@@ -100,6 +100,8 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     cleanup.push(() => call(credentials.write, 'DELETE', removal(probeKey, probeVersion)).then(discard));
     const got = expect(await call(credentials.read, 'GET', objectAt(probeKey)), [200], 'auth', 'bucket');
     if (await boundedText(got, 1024) !== PROBE_BYTES) throw new CheckFailure('bucket');
+    // The write key reads objects too (an upload's Complete is confirmed by HEAD): a denied HEAD is `auth`.
+    discard(expect(await call(credentials.write, 'HEAD', objectAt(probeKey)), [200], 'auth', 'bucket'));
 
     // The read key is read-only: it may neither write nor delete.
     const readKey = `${probeKey}-r`;
@@ -127,14 +129,17 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
 
     // The bucket must be private: an anonymous read and an anonymous list of the probe are both refused.
     // This sees only the probe key; a policy that opens other keys or prefixes cannot be detected here.
-    const anonymous = await call(undefined, 'GET', objectAt(probeKey));
-    discard(anonymous);
-    if (anonymous.status !== 401 && anonymous.status !== 403) throw new CheckFailure('public_bucket');
+    // Only a 2xx can return bytes or a listing; any 4xx is a refusal (R2's S3 endpoint answers
+    // 400 to unsigned requests); anything else is unexpected. A 3xx is already `redirect`.
+    const refusedAnonymously = (response: Response) => {
+      discard(response);
+      if (response.ok) throw new CheckFailure('public_bucket');
+      if (response.status < 400 || response.status >= 500) throw new CheckFailure('bucket');
+    };
+    refusedAnonymously(await call(undefined, 'GET', objectAt(probeKey)));
     const list = new URL(bucket);
     list.search = new URLSearchParams({ 'list-type': '2', prefix: probeKey }).toString();
-    const listed = await call(undefined, 'GET', list);
-    discard(listed);
-    if (listed.status !== 401 && listed.status !== 403) throw new CheckFailure('public_bucket');
+    refusedAnonymously(await call(undefined, 'GET', list));
 
     // A probe multipart upload, completed and deleted.
     const created = expect(await call(credentials.write, 'POST', objectAt(multipartKey, 'uploads')), [200], 'multipart', 'multipart');

@@ -332,6 +332,12 @@ export interface LinkLocation {
   pathStyle: boolean;
   /** New links use the current location; older locations keep serving the links made with them. */
   current: boolean;
+  /**
+   * `deleting` while a delete checks whether anything still uses the location: its links keep
+   * working, but new links wait (503) rather than use another location. It is `active` again if
+   * the delete is refused or does not finish.
+   */
+  state: 'active' | 'deleting';
   readKeyIdLast4: string;
   writeKeyIdLast4: string;
   createdAt: UTCDate;

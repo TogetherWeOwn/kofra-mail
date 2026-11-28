@@ -14,6 +14,8 @@ import { S3Credentials, type CredentialRole } from './credentials.ts';
 export interface LinkKek {
   current: number;
   keys: ReadonlyMap<number, CryptoKey>;
+  /** Per version: an HMAC key derived from that KEK version (HKDF), for keyed fingerprints. Never exported. */
+  fingerprintKeys: ReadonlyMap<number, CryptoKey>;
 }
 
 /** A sealed value that cannot be opened. Carries no detail: never the value, key or reason. */
@@ -40,13 +42,19 @@ export async function linkKek(raw: unknown): Promise<LinkKek | undefined> {
   if (Object.keys(value).length !== 2 || typeof current !== 'string' || !/^[1-9]\d{0,2}$/.test(current)) return undefined;
   if (keys === null || typeof keys !== 'object' || Array.isArray(keys)) return undefined;
   const parsed = new Map<number, CryptoKey>();
+  const fingerprintKeys = new Map<number, CryptoKey>();
   for (const [version, encoded] of Object.entries(keys)) {
     const bytes = typeof encoded === 'string' ? base64Bytes(encoded) : undefined;
     if (!/^[1-9]\d{0,2}$/.test(version) || !isVersion(Number(version)) || !bytes) return undefined;
     parsed.set(Number(version), await crypto.subtle.importKey('raw', bytes, 'AES-GCM', false, ['encrypt', 'decrypt']));
+    const base = await crypto.subtle.importKey('raw', bytes, 'HKDF', false, ['deriveKey']);
+    fingerprintKeys.set(Number(version), await crypto.subtle.deriveKey(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new Uint8Array(utf8.encode('kofra-mail/link-fingerprint/v1')) },
+      base, { name: 'HMAC', hash: 'SHA-256', length: 256 }, false, ['sign']));
+    bytes.fill(0);
   }
   if (!parsed.has(Number(current))) return undefined;
-  return { current: Number(current), keys: parsed };
+  return { current: Number(current), keys: parsed, fingerprintKeys };
 }
 
 /** The additional data: an unambiguous encoding of the row and column the value belongs to. */
@@ -110,4 +118,24 @@ export async function openCredential(kek: LinkKek, workspaceId: string, location
   const credentials = S3Credentials.from(value);
   if (!credentials) throw new CredentialSealError();
   return credentials;
+}
+
+/**
+ * A keyed fingerprint of `text` (for example a request body with its secrets):
+ * `<version>.<hex HMAC-SHA-256>` under a key derived from KEK `version` (the
+ * current one by default). It reveals nothing about `text` without the KEK.
+ * Undefined if that version is not loaded.
+ */
+export async function keyedFingerprint(kek: LinkKek, text: string, version = kek.current): Promise<string | undefined> {
+  const key = kek.fingerprintKeys.get(version);
+  if (!key) return undefined;
+  const mac = new Uint8Array(await crypto.subtle.sign('HMAC', key, new Uint8Array(utf8.encode(text))));
+  return `${version}.${Array.from(mac, byte => byte.toString(16).padStart(2, '0')).join('')}`;
+}
+
+/** Whether `stored` is the keyed fingerprint of `text` under the version it names. */
+export async function matchesFingerprint(kek: LinkKek, text: string, stored: string): Promise<boolean> {
+  const match = /^([1-9]\d{0,2})\.[0-9a-f]{64}$/.exec(stored);
+  if (!match) return false;
+  return await keyedFingerprint(kek, text, Number(match[1])) === stored;
 }
