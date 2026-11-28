@@ -138,14 +138,7 @@ export class HttpMailbox extends Mailbox {
   }
   async beginFixtureRestore(ws: string, mb: string) {
     await this.ctx.storage.deleteAll();
-    // On the fixture clock, as every alarm runs: a fixture that starts at a fixed
-    // date must not record the restore's start at the wall-clock time.
-    await this.onFixtureClock(() => this.restoreFromBackup(ws, mb));
-  }
-  private async onFixtureClock<T>(run: () => Promise<T>): Promise<T> {
-    const actual = Date.now, simulated = this.mailApiNow();
-    Date.now = () => simulated;
-    try { return await run(); } finally { Date.now = actual; }
+    await this.restoreFromBackup(ws, mb);
   }
   failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
   // Holds the next record of one fence attempt, or the next poll right after its select, until resumed.
@@ -237,7 +230,7 @@ export class HttpMailbox extends Mailbox {
   // A restore that takes `ms`: the mailbox becomes ready that much later on the fixture clock.
   async restoreAfter(ws: string, mb: string, at: number) {
     await this.ctx.storage.deleteAll();
-    await this.onFixtureClock(() => this.restoreFromBackup(ws, mb));
+    await this.restoreFromBackup(ws, mb);
     time = at;
     await this.testAlarm();
   }
@@ -646,7 +639,7 @@ export class HttpMailbox extends Mailbox {
   }
   async restoreFixture(ws: string, mb: string) {
     await this.ctx.storage.deleteAll();
-    await this.onFixtureClock(() => this.restoreFromBackup(ws, mb));
+    await this.restoreFromBackup(ws, mb);
     await this.testAlarm();
   }
   delivered(id: string) {
