@@ -1,5 +1,6 @@
 const KiB = 1024;
 const MiB = 1024 * KiB;
+const GiB = 1024 * MiB;
 
 /**
  * Limits every implementation enforces and reports in `Session.limits`.
@@ -63,6 +64,17 @@ export interface Limits {
   /** Days a message stays in Spam or Trash before it expires. */
   spamTrashRetentionDays: number;
   undoSecondsOptions: readonly number[];
+  /** `file_link` attachments of one outbound message; they do not count toward `attachmentsPerMessage`. */
+  fileLinksPerMessage: number;
+  /** The link expiry choices offered, in days; `linkExpiryDefaultDays` is preselected. */
+  linkExpiryDayOptions: readonly number[];
+  linkExpiryDefaultDays: number;
+  /** The longest custom link expiry, in days (`'never'` is also accepted). */
+  linkExpiryMaxDays: number;
+  /** One file sent as a link. */
+  linkFileBytes: number;
+  /** The part size of a link upload; the last part is the remainder. */
+  linkPartBytes: number;
 }
 
 /**
@@ -109,7 +121,21 @@ export const LIMITS = {
   remoteImageRedirects: 3,
   spamTrashRetentionDays: 30,
   undoSecondsOptions: [5, 10, 20, 30],
+  fileLinksPerMessage: 32,
+  linkExpiryDayOptions: [7, 30, 90],
+  linkExpiryDefaultDays: 30,
+  linkExpiryMaxDays: 3650,
+  linkFileBytes: 2 * GiB,
+  linkPartBytes: 16 * MiB,
 } as const satisfies Limits;
+
+/**
+ * True for a valid `file_link` expiry: `'never'`, or a whole number of days
+ * from 1 to `linkExpiryMaxDays`.
+ */
+export function isLinkExpiry(value: unknown, limits: Pick<Limits, 'linkExpiryMaxDays'> = LIMITS): boolean {
+  return value === 'never' || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= limits.linkExpiryMaxDays);
+}
 
 /** RFC 2045 text line endings, before applying a MIME transfer encoding. */
 export function canonicalMailText(text: string): string {

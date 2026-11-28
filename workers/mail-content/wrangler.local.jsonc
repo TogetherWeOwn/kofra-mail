@@ -11,6 +11,10 @@
     { "binding": "MAIL_LOOKUP", "service": "mail-backend-local", "entrypoint": "ContentLookup" },
     { "binding": "ACCOUNT_EPOCH", "service": "account-local", "entrypoint": "CredentialEpoch" }
   ],
+  // File links (M3-13): the IP-keyed flood bucket that runs before any lookup on /f/.
+  "ratelimits": [
+    { "name": "LINK_FLOOD", "namespace_id": "2001", "simple": { "limit": 120, "period": 60 } }
+  ],
   "vars": {
     "MAIL_CONTENT_ENABLED": "off",
     "CONTENT_ORIGIN": "https://content.example",
@@ -19,6 +23,7 @@
     "CONTENT_SUITE_DOMAIN": "mail.example",
     "CONTENT_STORAGE_DOMAIN": "objects.example",
     "CONTENT_ACCOUNT_DOMAIN": "account.example",
-    "CONTENT_WORKERS_DEV_DOMAIN": "account-example.workers.dev"
+    "CONTENT_WORKERS_DEV_DOMAIN": "account-example.workers.dev",
+    "LINK_HOSTS": "files.example"
   }
 }

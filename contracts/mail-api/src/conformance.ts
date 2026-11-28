@@ -1105,6 +1105,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         { kind: 'upload', uploadId: missing },
         { kind: 'message', messageId: source.messageId, part },
         { kind: 'link', url: 'https://example.net/doc', name: 'Link' },
+        { kind: 'file_link', linkUploadId: missing },
       ];
       for (const attachment of attachments) {
         const attached = { ...input, attachments: [attachment] };
@@ -1150,6 +1151,35 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
       assert.equal((await mail.listSends({})).state, sent);
     }, { requires: 'm3' });
 
+    run('25. file links: link uploads are unavailable while features.fileLinks is off; links are listed, revoked and deleted', async (_h, mail) => {
+      const session = await mail.getSession();
+      // Link uploads (M3-15b) add their own cases once an implementation serves them.
+      if (session.features.fileLinks) return;
+      await rejects(mail.createLinkUpload({ name: 'large.bin', size: 1 }, key('link-upload')), 'feature_unavailable');
+      await rejects(mail.getLinkUpload(missing), 'feature_unavailable');
+      await rejects(mail.putLinkPart(missing, 1, { bytes: new Blob(['x']) }), 'feature_unavailable');
+      await rejects(mail.completeLinkUpload(missing), 'feature_unavailable');
+      await rejects(mail.deleteLinkUpload(missing), 'feature_unavailable');
+      assert.deepEqual(await mail.listLinks({}), { items: [], nextCursor: null });
+      await rejects(mail.listLinks({ limit: 0 }), 'invalid_request');
+      await rejects(mail.listLinks({ cursor: 'garbage' }), 'invalid_cursor');
+      await rejects(mail.revokeLink(missing), 'not_found');
+      await mail.deleteLink(missing);
+    });
+
+    run('25a. a draft takes a file link only from a completed link upload, with a valid expiry and at most fileLinksPerMessage links', async (_h, mail) => {
+      const session = await mail.getSession();
+      const input = draftInput(requiredMailbox(session).primaryAddress);
+      const fileLink = (expiry?: unknown) => ({ kind: 'file_link' as const, linkUploadId: missing, ...(expiry !== undefined && { expiry: expiry as 7 }) });
+      await rejects(mail.createDraft({ ...input, attachments: [fileLink()] }, key('file-link')), 'not_found');
+      await rejects(mail.createDraft({ ...input, attachments: [fileLink('never')] }, key('file-link-never')), 'not_found');
+      for (const [i, expiry] of [0, session.limits.linkExpiryMaxDays + 1, 2.5, 'forever', null].entries()) {
+        await rejects(mail.createDraft({ ...input, attachments: [fileLink(expiry)] }, key(`file-link-expiry-${i}`)), 'invalid_request');
+      }
+      const many = Array.from({ length: session.limits.fileLinksPerMessage + 1 }, () => fileLink());
+      await rejects(mail.createDraft({ ...input, attachments: many }, key('file-links-many')), 'invalid_request');
+    }, { requires: 'm3' });
+
     test('only the named outbound cases require M3', () => {
       assert.deepEqual(m3Cases, [
         '1a. a new mailbox cannot send from its pending primary until fixture activation',
@@ -1161,6 +1191,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         '21a. sent headers are safe and threading headers fit the byte limit',
         '22. a pending send never goes out after the mailbox changes owner',
         '23a. sends move the mailbox state and listSends reports it',
+        '25a. a draft takes a file link only from a completed link upload, with a valid expiry and at most fileLinksPerMessage links',
       ]);
     });
   });

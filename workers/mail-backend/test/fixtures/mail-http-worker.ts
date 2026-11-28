@@ -28,6 +28,10 @@ import { decodedAttachment, readMailMime } from '../../src/parse-mail.ts';
 import { FakeSendQuota } from './send-quota-fake.ts';
 import { quotaFixture } from './send-quota-worker.ts';
 import { sendConsumerFixture } from './send-consumer.ts';
+import { ContentLookup as RealContentLookup } from '../../src/content-lookup.ts';
+import { revokeFileLink } from '../../src/admin.ts';
+import { fileLinkUsage, type StoredFileLink } from '../../src/file-links.ts';
+import type { LinkExpiry } from '../../../../contracts/mail-api/src/wire.ts';
 
 // Only this test bundle exposes fixture provisioning or accepts a chosen principal.
 export interface FixturePrincipal {
@@ -492,6 +496,31 @@ export class HttpMailbox extends Mailbox {
     });
     return { id, revision, rawKey, holder };
   }
+  // A draft with file links (M3-13), in the form the link upload path (M3-15b) attaches them.
+  async seedFileLinkDraft(ws: string, mb: string, input: { from: string; to: string[]; subject?: string; body?: string;
+    links: { linkUploadId: string; name: string; size: number; expiry: LinkExpiry; link: StoredFileLink }[] }) {
+    return this.mutate(ws, mb, SETTINGS_FLUSH_MS, async index => {
+      const draft = { version: 1 as const, fields: { from: input.from, to: input.to.map(email => ({ email })), cc: [], bcc: [],
+        subject: input.subject ?? 'Files for you', body: input.body ?? 'Here are the files.' },
+        attachments: input.links.map(({ link, ...wire }) => ({ wire: { kind: 'file_link' as const, ...wire }, link })) };
+      const ref = await index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.mailApiNow(), []);
+      index.changeMany([{ type: 'draft', ...ref, attachmentKeys: [], uploadIds: [] }]);
+      return { id: ref.id, revision: ref.revision };
+    });
+  }
+  // Calls to the mailbox's link capability, for the flood bucket ordering test.
+  linkTargetCalls = 0;
+  override async fileLinkTarget(...args: Parameters<Mailbox['fileLinkTarget']>) {
+    this.linkTargetCalls++;
+    return super.fileLinkTarget(...args);
+  }
+  linkCalls() { return this.linkTargetCalls; }
+  // An outage of the routing table at release step 4b.
+  private linkRoutesDown = false;
+  setLinkRoutesDown(down: boolean) { this.linkRoutesDown = down; }
+  protected override linkRouteDatabase(): D1Database {
+    return this.linkRoutesDown ? downable(this.env.DIRECTORY, () => true) : this.env.DIRECTORY;
+  }
   async changeSendSwitch(enabled: boolean) {
     this.ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS fixture_send_switch (id INTEGER PRIMARY KEY, flag TEXT NOT NULL)');
     this.ctx.storage.sql.exec('INSERT OR REPLACE INTO fixture_send_switch VALUES (1, ?)', enabled ? 'on' : 'off');
@@ -755,7 +784,13 @@ export class Sweeper extends MailSweeper {
       .toArray().map(row => row.holder);
   }
 }
-export { ContentLookup } from '../../src/entry.ts';
+// The content Worker's lookup, counting the link lookups it serves (M3-13: the flood bucket runs before any).
+let linkLookups = 0;
+export class ContentLookup extends RealContentLookup {
+  override async fileLink(tokenHash: unknown) { linkLookups++; return super.fileLink(tokenHash); }
+  override async reportFileLink(tokenHash: unknown) { linkLookups++; return super.reportFileLink(tokenHash); }
+}
+export { LinkUsage } from '../../src/entry.ts';
 export { FakeSendQuota };
 export const RealSendQuota = quotaFixture((env: FixtureEnv) => now(env));
 // The consumer reads the mailbox's clock through the same fixture time.
@@ -1013,6 +1048,20 @@ export default {
         return Response.json(await reconcileHandoffs(ports, now(env), callMs));
       }
       if (url.pathname === '/__fixture/expand') return Response.json(await expandHandoff(pipelinePorts(env), await req.text(), now(env)));
+      // File links (M3-13): seeding a draft, the operator's revoke, the usage port and the lookup count.
+      if (url.pathname === '/__fixture/links') {
+        const { method, args, principal = 'member' } = await req.json<{ method: string; args: unknown[]; principal?: string }>();
+        const { ws, mailboxId } = env.ACCOUNTS[principal];
+        const box = env.MAILBOX.getByName(mailboxName(ws, mailboxId!));
+        switch (method) {
+          case 'seedDraft': return Response.json(await box.seedFileLinkDraft(ws, mailboxId!, args[0] as Parameters<HttpMailbox['seedFileLinkDraft']>[2]));
+          case 'operatorRevoke': return Response.json(await revokeFileLink(env, args[0] as { linkId: string }));
+          case 'inUse': return Response.json(await fileLinkUsage(env.DIRECTORY).inUse(args[0] as { workspaceId: string; locationId: string }));
+          case 'lookups': return Response.json({ lookups: linkLookups, targets: await box.linkCalls() });
+          case 'routesDown': await box.setLinkRoutesDown(args[0] === true); return Response.json(null);
+          default: throw new Error('Unknown fixture link method');
+        }
+      }
       if (url.pathname === '/__fixture/box') {
         const { principal, method, args } = await req.json<{ principal: string; method: string; args: unknown[] }>();
         const allowed = ['pauseAt', 'pausedAt', 'resumeAt', 'crashAtHandoff', 'setOutboxDown', 'shortenHandoffBound', 'pauseStatement',
@@ -1252,6 +1301,7 @@ export default {
       MAILBOX: mailboxPort(env), DIRECTORY: env.DIRECTORY,
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
+      LINK_USAGE: fileLinkUsage(env.DIRECTORY),
       MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: env.REAL_CONTENT_ORIGIN ?? contentOrigin(url, env),
       MAIL_CONTENT: env.MAIL_CONTENT ?? { mintForWeb: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
     };

@@ -121,7 +121,10 @@ test('local Wrangler config has exactly the two named service bindings and no st
     { binding: 'ACCOUNT_EPOCH', service: 'account-local', entrypoint: 'CredentialEpoch' },
   ]);
   assert.equal(config.observability?.logs?.invocation_logs, false, 'signed request URLs must not enter invocation logs');
-  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'observability', 'preview_urls', 'services', 'vars', 'workers_dev']);
+  assert.deepEqual(Object.keys(config).sort(), ['compatibility_date', 'compatibility_flags', 'main', 'name', 'observability', 'preview_urls', 'ratelimits',
+    'services', 'vars', 'workers_dev']);
+  // File links (M3-13): the link host's flood bucket is the only rate limit; link URLs carry tokens, so invocation logs stay off.
+  assert.deepEqual(config.ratelimits, [{ name: 'LINK_FLOOD', namespace_id: '2001', simple: { limit: 120, period: 60 } }]);
   assert.deepEqual(config.compatibility_flags, ['enable_request_signal']);
   assert.equal(config.vars.MAIL_CONTENT_ENABLED, 'off');
   assert.equal(config.workers_dev, false);

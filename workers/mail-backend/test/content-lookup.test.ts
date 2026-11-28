@@ -48,8 +48,10 @@ async function call(...args: unknown[]) {
   return response.json();
 }
 
-test('ContentLookup has exactly three own RPC methods and directly extends WorkerEntrypoint', async () => {
-  assert.deepEqual(await call('surface'), { names: ['constructor', 'linkReadCredential', 'mailboxOwner', 'messageRecord'], direct: true });
+test('ContentLookup has exactly its named RPC methods and directly extends WorkerEntrypoint', async () => {
+  assert.deepEqual(await call('surface'), {
+    names: ['chargeFileLink', 'constructor', 'fileLink', 'linkReadCredential', 'mailboxOwner', 'messageRecord', 'reportFileLink'], direct: true,
+  });
 });
 test('mail-content can receive only the read-only key of a workspace link location', async () => {
   const answer = await call('linkReadCredential', 'w', LINK_LOCATION);

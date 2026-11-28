@@ -12,6 +12,11 @@ import { isSafeMessageId } from '../../../../contracts/mail-api/src/headers.ts';
 import { LIMITS } from '../../../../contracts/mail-api/src/limits.ts';
 import type { Address } from '../../../../contracts/mail-api/src/wire.ts';
 import { directoryMigrationBatches } from './directory-db.ts';
+import { fakeS3 } from '../../../../packages/link-storage/test/fake-s3.ts';
+import { linkKek } from '../../../../packages/link-storage/src/kek.ts';
+import { S3Credentials } from '../../../../packages/link-storage/src/credentials.ts';
+import { LinkStorageStore, type LinkDatabase } from '../../../../packages/link-storage/src/store.ts';
+import type { LinkLocationFields } from '../../../../packages/link-storage/src/location.ts';
 import type { FixturePrincipal } from './mail-http-worker.ts';
 
 const entry = fileURLToPath(new NodeURL('./mail-http-worker.ts', import.meta.url));
@@ -134,10 +139,58 @@ interface FixtureOptions {
   fixedSendId?: string;
   // Adds the longSender and longRecipient accounts.
   longIds?: boolean;
+  // File links (M3-13): the link host on the real content Worker, a deployment and a
+  // workspace link location on local fake S3 endpoints, and a controllable flood bucket.
+  fileLinks?: FileLinkOptions;
 }
 
-export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
-  send = false, configureWorkers, realQuota, fixedSendId, longIds = false }: FixtureOptions = {}) {
+export type FileLinkOptions = {
+  // Extra hosts the content Worker serves links on (the Playwright bridge's host).
+  hosts?: string[];
+  hourlyFactor?: number;
+  totalFactor?: number;
+  // Extra headers the fake providers add to every object GET.
+  objectHeaders?: Record<string, string>;
+};
+export const LINK_HOST = 'files.example.test';
+const LINK_READ = { accessKeyId: 'link-reader-0001', secretAccessKey: 'link-reader-secret-0001' };
+const LINK_WS_READ = { accessKeyId: 'ws-reader-0001', secretAccessKey: 'ws-reader-secret-0001' };
+const LINK_WS_WRITE = { accessKeyId: 'ws-writer-0001', secretAccessKey: 'ws-writer-secret-0001' };
+const LINK_KEK = JSON.stringify({ current: '1', keys: { 1: Buffer.alloc(32, 7).toString('base64') } });
+export const DEPLOYMENT_LOCATION: LinkLocationFields = { endpoint: 'https://links.example.test', region: 'auto', bucket: 'riaklo-links', prefix: 'files/', pathStyle: true };
+export const WORKSPACE_LOCATION: LinkLocationFields = { endpoint: 'https://ws-links.example.test', region: 'auto', bucket: 'workspace-files', prefix: '', pathStyle: true };
+export const WORKSPACE_LOCATION_ID = 'abcdefghijklmnopqrstuvwxyz';
+// The flood bucket: a cap per key that a test sets, and every key it was asked about.
+const FLOOD_WORKER = `import { WorkerEntrypoint } from 'cloudflare:workers';
+let cap = Infinity; const counts = new Map(); const calls = [];
+export class Flood extends WorkerEntrypoint {
+  async limit({ key }) { calls.push(key); const n = (counts.get(key) ?? 0) + 1; counts.set(key, n); return { success: n <= cap }; }
+}
+export default { async fetch(req) {
+  const { pathname } = new URL(req.url);
+  if (pathname === '/cap') { cap = Number(await req.text()); counts.clear(); return new Response(null); }
+  if (pathname === '/calls') return Response.json(calls);
+  return new Response(null, { status: 404 });
+} };`;
+// The operator alert Worker: records what each alert POST carries.
+const ALERT_WORKER = `const received = [];
+export default { async fetch(req) {
+  const { pathname } = new URL(req.url);
+  if (pathname === '/v1/alert' && req.method === 'POST') { received.push(await req.json()); return new Response(null, { status: 204 }); }
+  if (pathname === '/received') return Response.json(received);
+  return new Response(null, { status: 404 });
+} };`;
+
+export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent: content, inlineCids = false,
+  send = false, configureWorkers, realQuota, fixedSendId, longIds = false, fileLinks }: FixtureOptions = {}) {
+  // File links are served by the real content Worker.
+  const realContent = content ?? (fileLinks ? { appOrigin: 'https://mail.example', contentOrigin: 'https://content.example' } : undefined);
+  const linkStores = fileLinks && {
+    deployment: fakeS3({ host: 'links.example.test', bucket: DEPLOYMENT_LOCATION.bucket, objectHeaders: fileLinks.objectHeaders,
+      keys: { [LINK_READ.accessKeyId]: { secret: LINK_READ.secretAccessKey, ops: new Set(['GetObject']) } } }),
+    workspace: fakeS3({ host: 'ws-links.example.test', bucket: WORKSPACE_LOCATION.bucket, objectHeaders: fileLinks.objectHeaders,
+      keys: { [LINK_WS_READ.accessKeyId]: { secret: LINK_WS_READ.secretAccessKey, ops: new Set(['GetObject']) } } }),
+  };
   const principals = { ...accounts, ...(longIds ? longAccounts : {}) } as typeof accounts & Partial<typeof longAccounts>;
   const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
@@ -181,8 +234,12 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
         MAIL_SEND_DAILY_RESET_UTC: realQuota.reset ?? '15:00' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
-      ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },
-    ...(realContent && { serviceBindings: { MAIL_CONTENT: { name: 'mail-content', entrypoint: 'ContentMint' } } }),
+      ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }),
+      ...(fileLinks && { LINK_HOST, LINK_CRED_KEK: LINK_KEK,
+        ...(fileLinks.hourlyFactor && { LINK_HOURLY_FACTOR: String(fileLinks.hourlyFactor) }),
+        ...(fileLinks.totalFactor && { LINK_TOTAL_FACTOR: String(fileLinks.totalFactor) }) }) },
+    ...(realContent && { serviceBindings: { MAIL_CONTENT: { name: 'mail-content', entrypoint: 'ContentMint' },
+      ...(fileLinks && { ALERTS: { name: 'link-alerts' } }) } }),
     outboundService: async (req: LocalRequest) => {
       const { host, pathname } = new NodeURL(req.url);
       assert.equal(host, 'object-store.example.test');
@@ -244,13 +301,23 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
         CONTENT_S3_ENDPOINT: 'https://object-store.example.test', CONTENT_S3_ACCESS_KEY_ID: crypto.randomUUID(), CONTENT_S3_SECRET_ACCESS_KEY: crypto.randomUUID(),
         CONTENT_ZONE: 'content.example', CONTENT_SUITE_DOMAIN: 'mail.example', CONTENT_ACCOUNT_DOMAIN: 'account.example',
         CONTENT_STORAGE_DOMAIN: 'object-store.example.test', CONTENT_WORKERS_DEV_DOMAIN: 'account-example.workers.dev',
+        ...(fileLinks && { LINK_HOSTS: [LINK_HOST, ...fileLinks.hosts ?? []].join(' '),
+          LINK_LOCATIONS: JSON.stringify({ current: 'links', locations: { links: DEPLOYMENT_LOCATION } }),
+          LINK_READ_CREDENTIALS: JSON.stringify({ links: LINK_READ }) }),
       },
       serviceBindings: {
         MAIL_LOOKUP: { name: 'mail-backend', entrypoint: 'ContentLookup' },
         ACCOUNT_EPOCH: { name: 'account', entrypoint: 'CredentialEpoch' },
+        ...(fileLinks && { LINK_FLOOD: { name: 'link-flood', entrypoint: 'Flood' } }),
       },
       outboundService: async (req: LocalRequest) => {
         const { host, pathname } = new NodeURL(req.url);
+        const store = host === 'links.example.test' ? linkStores?.deployment : host === 'ws-links.example.test' ? linkStores?.workspace : undefined;
+        if (store) {
+          const answer = await store.fetch(new Request(req.url, { method: req.method, headers: Object.fromEntries(req.headers),
+            ...(req.method === 'GET' || req.method === 'HEAD' ? {} : { body: await req.arrayBuffer() }) }));
+          return new LocalResponse(answer.body, { status: answer.status, headers: Object.fromEntries(answer.headers) });
+        }
         if (req.method !== 'GET' || host !== 'object-store.example.test' || !req.headers.has('authorization')) {
           return new LocalResponse(null, { status: 404 });
         }
@@ -270,12 +337,16 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       },
     });
   }
+  if (fileLinks) {
+    workers.push({ name: 'link-flood', compatibilityDate: '2026-07-30', modules: [{ type: 'ESModule', path: 'flood.mjs', contents: FLOOD_WORKER }] },
+      { name: 'link-alerts', compatibilityDate: '2026-07-30', modules: [{ type: 'ESModule', path: 'alerts.mjs', contents: ALERT_WORKER }] });
+  }
   configureWorkers?.(backend, workers);
   // The send path's structured log events (alert codes and metrics), recorded for assertions.
   const logs: string[] = [];
-  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send) && {
+  const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send || fileLinks) && {
     handleStructuredLogs: ({ message }: { message: string }) => {
-      if (send) logs.push(message);
+      if (send || fileLinks) logs.push(message);
       if (message === cidAdmissionMarker && ++cidAdmissions === 6) cidBurst.resolve();
     },
   }) });
@@ -307,6 +378,13 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     // Wait for native D1 setup in the fixture worker rather than going through
     // Miniflare's synchronous Node binding proxy for each prepared statement.
     await controlAction('seed-directory', JSON.stringify(await directoryMigrationBatches({ localApi: true })));
+    // A workspace link location of w1 (M3-15a's row, sealed under the fixture KEK).
+    if (fileLinks) {
+      const kek = await linkKek(LINK_KEK);
+      const db = await mf.getD1Database('DIRECTORY', 'mail-backend');
+      await db.batch(await new LinkStorageStore(db as unknown as LinkDatabase).createStatements(kek!, accounts.member.ws, WORKSPACE_LOCATION_ID,
+        WORKSPACE_LOCATION, { read: S3Credentials.from(LINK_WS_READ)!, write: S3Credentials.from(LINK_WS_WRITE)! }, startTime) as unknown as D1PreparedStatement[]);
+    }
     const directoryChange = (statement: string, ...binds: unknown[]) => controlAction('directory-change', JSON.stringify({ statement, binds }));
     const directoryRows = (statement: string, ...binds: unknown[]) => readControl<Record<string, unknown>[]>('directory-rows', JSON.stringify({ statement, binds }));
     const hasIdempotency = (key: string) => readControl<boolean>('has-idempotency', key);
@@ -530,6 +608,22 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       backendCron: () => controlAction('backend-cron'),
       sendEvent: (code: string, principal: 'member' | 'other' = 'member') => controlAction('send-event', JSON.stringify({ code, principal })),
       contentRawReads: () => contentRawReads,
+      links: linkStores && {
+        stores: linkStores,
+        // Puts a link object at `key` (the full key, prefix included) in a location's fake bucket.
+        put: (kind: 'deployment' | 'workspace', key: string, bytes: Uint8Array<ArrayBuffer>) => { linkStores[kind].objects.set(key, bytes); },
+        // A request to the link host, as a recipient's browser makes it.
+        fetch: (path: string, init: RequestInit & { ip?: string } = {}) => {
+          const headers = new Headers(init.headers);
+          headers.set('cf-connecting-ip', init.ip ?? '192.0.2.1');
+          return contentWorker!.fetch(`https://${LINK_HOST}${path}`, { ...init, headers } as never);
+        },
+        floodCap: async (cap: number) => { await (await mf.getWorker('link-flood')).fetch('http://flood/cap', { method: 'POST', body: String(cap) }); },
+        floodCalls: async () => (await (await mf.getWorker('link-flood')).fetch('http://flood/calls')).json() as Promise<string[]>,
+        // Every operator alert the backend posted.
+        alerts: async () => (await (await mf.getWorker('link-alerts')).fetch('http://alerts/received')).json() as Promise<Record<string, unknown>[]>,
+        control: <T>(method: string, args: unknown[] = [], principal?: string) => readControl<T>('links', JSON.stringify({ method, args, principal })),
+      },
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
       sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId),
       // Internal delivery (M3-8): the pipeline's queue consumer for every pending delivery, the reconciler's

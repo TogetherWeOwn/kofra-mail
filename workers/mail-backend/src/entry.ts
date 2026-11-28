@@ -4,3 +4,4 @@ export { Sweeper } from './sweeper-do.ts';
 export { SendQuota } from './send-quota.ts';
 export { MailAdmin } from './admin.ts';
 export { ContentLookup } from './content-lookup.ts';
+export { LinkUsage } from './link-usage.ts';

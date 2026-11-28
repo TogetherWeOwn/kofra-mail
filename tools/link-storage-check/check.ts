@@ -11,7 +11,36 @@ import {
 export type CheckLine =
   | { location: string; result: 'ok' | 'missing_credentials' | string }
   | { worker: string; result: 'ok' | 'forbidden_secrets' | 'unavailable'; names?: string[] }
+  | { linkHost: string; result: 'ok' | 'invalid' | 'not_first' | 'shared_domain' | 'shared_domain_allowed' }
   | { config: 'invalid' };
+
+const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const dnsName = (value: string) => value.length <= 253 && value.split('.').length >= 2 && value.split('.').every(part => label.test(part));
+// The registrable domain, approximated by the last two labels. With a multi-label
+// public suffix (such as co.uk) this over-matches, which refuses more, never less.
+const registrable = (host: string) => host.split('.').slice(-2).join('.');
+
+/**
+ * The link host (docs/m3-outbound-plan.md, M3-13): LINK_HOST must be a registrable
+ * domain separate from the mail app's and the content origin's, so a Safe Browsing
+ * flag on one link cannot block reading mail. A shared domain is refused unless
+ * LINK_HOST_ALLOW_SHARED_DOMAIN=1, which passes with `shared_domain_allowed` so the
+ * risk is printed at every deploy. If LINK_HOSTS (mail-content) is given, LINK_HOST is its first entry.
+ */
+export function linkHostCheck(env: Record<string, string | undefined>): CheckLine | undefined {
+  const host = env.LINK_HOST;
+  if (host === undefined) return undefined;
+  if (!dnsName(host)) return { linkHost: 'LINK_HOST', result: 'invalid' };
+  if (env.LINK_HOSTS !== undefined && env.LINK_HOSTS.toLowerCase().split(/[\s,]+/).filter(Boolean)[0] !== host) {
+    return { linkHost: host, result: 'not_first' };
+  }
+  const others = [env.MAIL_APP_ORIGIN, env.CONTENT_ORIGIN].flatMap(origin => {
+    const url = origin ? URL.parse(origin) : null;
+    return url ? [url.hostname] : [];
+  });
+  if (!others.some(other => registrable(other) === registrable(host))) return { linkHost: host, result: 'ok' };
+  return { linkHost: host, result: env.LINK_HOST_ALLOW_SHARED_DOMAIN === '1' ? 'shared_domain_allowed' : 'shared_domain' };
+}
 
 const API = 'https://api.cloudflare.com/client/v4';
 const ID = /^[a-z0-9_-]{1,64}$/i;
@@ -38,7 +67,8 @@ export async function deployCheck(env: Record<string, string | undefined>, reque
   const locations = deploymentLocations(env.LINK_LOCATIONS);
   const read = credentialSecret(env.LINK_READ_CREDENTIALS);
   const write = credentialSecret(env.LINK_WRITE_CREDENTIALS);
-  if (!locations || !read || !write) return { ok: false, lines: [{ config: 'invalid' }] };
+  const host = linkHostCheck(env);
+  if (!locations || !read || !write) return { ok: false, lines: [{ config: 'invalid' }, ...host ? [host] : []] };
   const lines: CheckLine[] = [];
   const zones = refusedZones([]);
   for (const [id, fields] of locations.locations) {
@@ -58,6 +88,7 @@ export async function deployCheck(env: Record<string, string | undefined>, reque
       lines.push(extra.length ? { worker: workers[role], result: 'forbidden_secrets', names: extra } : { worker: workers[role], result: 'ok' });
     }
   }
-  return { ok: lines.every(line => 'result' in line && line.result === 'ok'), lines };
+  if (host) lines.push(host);
+  return { ok: lines.every(line => 'result' in line && (line.result === 'ok' || line.result === 'shared_domain_allowed')), lines };
 }
 

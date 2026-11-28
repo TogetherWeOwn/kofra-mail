@@ -4,7 +4,7 @@ import { fileURLToPath, URL } from 'node:url';
 import { failedTests, passedCases, runChild } from './fixtures/child-tests.ts';
 
 // Run the send cases the backend supports over HTTP in local workerd.
-const owned = ['1a', '13', '14', '15', '21', '21a', '22', '23', '23a'];
+const owned = ['1a', '13', '14', '15', '21', '21a', '22', '23', '23a', '25', '25a'];
 
 // Inside the backend CI job's five minutes, so a hang still reports the captured output.
 test(`conformance cases ${owned.join(', ')} pass against the backend with the send path on`, { timeout: 170_000 }, async () => {

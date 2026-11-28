@@ -3,6 +3,7 @@ import { after, before, beforeEach, test } from 'node:test';
 import { Miniflare } from 'miniflare';
 import { deliver, type AlertEvent, type MailboxOutcome } from '../src/deliver.ts';
 import type { HandoffStuckAlert } from '../src/internal-handoff.ts';
+import type { LinkReportedAlert } from '../src/mail-alerts.ts';
 import { MailAlerts } from '../src/mail-alerts.ts';
 import { dailySendAlertKey } from '../src/send-alert-events.ts';
 import { LEASE_MS, Outbox, RECONCILE_PAGE } from '../src/outbox.ts';
@@ -29,11 +30,11 @@ async function insert(n: number, createdAt = 100) {
 }
 
 function ports(now: number) {
-  const alerts: (AlertEvent | HandoffStuckAlert)[] = [];
+  const alerts: (AlertEvent | HandoffStuckAlert | LinkReportedAlert)[] = [];
   const queued: string[] = [];
   return { alerts, queued, outbox, now: () => now,
     send: async (deliveryId: string) => { queued.push(deliveryId); },
-    alert: async (event: AlertEvent | HandoffStuckAlert) => { alerts.push(event); },
+    alert: async (event: AlertEvent | HandoffStuckAlert | LinkReportedAlert) => { alerts.push(event); },
     index: async (): Promise<MailboxOutcome> => 'indexed', release: async () => {},
   };
 }

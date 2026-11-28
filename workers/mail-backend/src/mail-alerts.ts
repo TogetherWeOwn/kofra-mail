@@ -1,12 +1,16 @@
 import type { AlertEvent } from './deliver.ts';
 import type { HandoffStuckAlert } from './internal-handoff.ts';
 import { isDeliveryId } from './outbox.ts';
+import { isLinkId } from './file-links.ts';
+
+export type LinkReportedAlert = { code: 'link_reported'; key: string };
 import { dailySendAlert, dailySendAlertKey, type DailySendAlert, type SendEventCode } from './send-alert-events.ts';
 
 const DLQ_PREFIX = 'delivery_dlq:';
 const FAILED_PREFIX = 'delivery_failed:';
 const STUCK_PREFIX = 'delivery_stuck:';
 const HANDOFF_STUCK_PREFIX = 'handoff_stuck:';
+const LINK_REPORTED_PREFIX = 'link_reported:';
 const ALERT_PAGE = 12;
 const PRUNE_PAGE = 100;
 
@@ -44,7 +48,7 @@ export class MailAlerts {
       .bind(dailySendAlertKey(environment, code, now), `mail:${code}`, now).run();
   }
 
-  async pending(now: number): Promise<Array<{ key: string; event?: AlertEvent | DailySendAlert | HandoffStuckAlert }>> {
+  async pending(now: number): Promise<Array<{ key: string; event?: AlertEvent | DailySendAlert | HandoffStuckAlert | LinkReportedAlert }>> {
     // One indexed range scan of the unsent outbox, also when the range is empty.
     const { results } = await this.db.withSession('first-primary').prepare(`SELECT key FROM mail_alerts
       WHERE sent_at IS NULL AND created_at BETWEEN 0 AND ? ORDER BY created_at, key LIMIT ?`).bind(now, ALERT_PAGE).all<{ key: string }>();
@@ -52,6 +56,11 @@ export class MailAlerts {
       if (key.startsWith('send-event:')) return { key, event: dailySendAlert(key) };
       // A stuck internal handoff, reported by its send id only.
       if (key.startsWith(HANDOFF_STUCK_PREFIX)) return { key, event: { code: 'handoff_stuck' as const, key: key.slice(key.lastIndexOf(':') + 1) } };
+      // An abuse report (M3-13), carrying the reported link's id only.
+      if (key.startsWith(LINK_REPORTED_PREFIX)) {
+        const linkId = key.slice(LINK_REPORTED_PREFIX.length);
+        return { key, event: isLinkId(linkId) ? { code: 'link_reported' as const, key: linkId } : undefined };
+      }
       const prefix = [FAILED_PREFIX, STUCK_PREFIX, DLQ_PREFIX].find(p => key.startsWith(p)) ?? DLQ_PREFIX;
       const code = prefix === FAILED_PREFIX ? 'delivery_failed' : prefix === STUCK_PREFIX ? 'delivery_stuck' : 'delivery_dlq';
       const [id, generation] = key.slice(prefix.length).split(':');

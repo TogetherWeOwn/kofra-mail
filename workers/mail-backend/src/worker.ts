@@ -50,6 +50,11 @@ export type Env = KofraConfig & {
   MAIL_ENVIRONMENT?: string;
   // Secret: the link storage credential KEK (packages/link-storage, kek.ts).
   LINK_CRED_KEK?: string;
+  // File links (M3-13): the host new links are made on (a DNS name; each link freezes it),
+  // and the per-link download budgets as multiples of the file size (100 per hour, 1,000 in total by default).
+  LINK_HOST?: string;
+  LINK_HOURLY_FACTOR?: string;
+  LINK_TOTAL_FACTOR?: string;
   SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
   SEND_QUOTA?: SendQuotaBinding;
   DIRECTORY: D1Database;

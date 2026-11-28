@@ -4,7 +4,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { ALL_OPS, fakeS3, READ_OPS, type S3Op } from '../../packages/link-storage/test/fake-s3.ts';
-import { deployCheck } from './check.ts';
+import { deployCheck, linkHostCheck } from './check.ts';
 
 // Synthetic values only: a local fake S3 endpoint and a fake Cloudflare API.
 const READ = { accessKeyId: 'FAKEREADKEY0001', secretAccessKey: 'fake-read-secret-value-0001' };
@@ -92,4 +92,29 @@ test('mail-content never names a write credential or the KEK, and mail-web never
     const paths = statSync(`${root}${dir}`).isDirectory() ? files(`${root}${dir}`) : [`${root}${dir}`];
     for (const path of paths) assert.doesNotMatch(readFileSync(path, 'utf8'), forbidden, path);
   }
+});
+
+test('the link host must be a domain of its own unless the shared-domain override is set, and the CLI then warns', async () => {
+  const origins = { MAIL_APP_ORIGIN: 'https://mail.mail-suite.example', CONTENT_ORIGIN: 'https://content.mail-content.example' };
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-links.example' }), { linkHost: 'files.mail-links.example', result: 'ok' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example' }), { linkHost: 'files.mail-suite.example', result: 'shared_domain' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-content.example' }), { linkHost: 'files.mail-content.example', result: 'shared_domain' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }),
+    { linkHost: 'files.mail-suite.example', result: 'shared_domain_allowed' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: 'yes' }),
+    { linkHost: 'files.mail-suite.example', result: 'shared_domain' }, 'only the exact override');
+  assert.deepEqual(linkHostCheck({ LINK_HOST: 'https://files.example.com' }), { linkHost: 'LINK_HOST', result: 'invalid' });
+  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'old.example.net files.example.com' }),
+    { linkHost: 'files.example.com', result: 'not_first' });
+  assert.equal(linkHostCheck({}), undefined);
+  const { fetcher, env } = setup();
+  assert.equal((await deployCheck({ ...env, ...origins, LINK_HOST: 'files.mail-suite.example' }, fetcher)).ok, false);
+  assert.equal((await deployCheck({ ...env, ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }, fetcher)).ok, true);
+  const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
+  let stderr = '';
+  try {
+    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) { stderr = (error as { stderr: string }).stderr; }
+  assert.match(stderr, /LINK_HOST shares a registrable domain/);
 });

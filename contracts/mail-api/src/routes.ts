@@ -68,6 +68,15 @@ export const ROUTES = {
   deleteUpload: route({ method: 'DELETE', path: '/uploads/{uploadId}', success: 204 }),
   importFromDrive: route({ method: 'POST', path: '/drive/imports', success: 201, idempotency: 'required' }),
 
+  createLinkUpload: route({ method: 'POST', path: '/link-uploads', success: 201, idempotency: 'required' }),
+  getLinkUpload: route({ method: 'GET', path: '/link-uploads/{uploadId}', success: 200 }),
+  putLinkPart: route({ method: 'PUT', path: '/link-uploads/{uploadId}/parts/{partNumber}', success: 204, body: 'bytes' }),
+  completeLinkUpload: route({ method: 'POST', path: '/link-uploads/{uploadId}/complete', success: 200, body: 'none' }),
+  deleteLinkUpload: route({ method: 'DELETE', path: '/link-uploads/{uploadId}', success: 204 }),
+  listLinks: route({ method: 'GET', path: '/links', success: 200, query: paged }),
+  revokeLink: route({ method: 'POST', path: '/links/{linkId}/revoke', success: 200, body: 'none' }),
+  deleteLink: route({ method: 'DELETE', path: '/links/{linkId}', success: 204 }),
+
   listDomains: route({ method: 'GET', path: '/admin/domains', success: 200, access: 'admin' }),
   addDomain: route({ method: 'POST', path: '/admin/domains', success: 201, idempotency: 'required', access: 'admin', reauth: true }),
   listMailboxes: route({ method: 'GET', path: '/admin/mailboxes', success: 200, access: 'admin', query: paged }),

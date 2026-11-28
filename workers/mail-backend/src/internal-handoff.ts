@@ -9,6 +9,7 @@
 // rows and the handoff's release flag in one batch. From then on every child
 // follows the inbound rules unchanged.
 import { sha256 } from './bytes.ts';
+import { linkFloorBelow } from './file-links.ts';
 import { senderHolds } from './mailbox-send-sender.ts';
 import { parseObjectKey } from './object-key.ts';
 import type { SendRecord } from './mail-journal.ts';
@@ -64,13 +65,13 @@ export const handoffHolder = (key: string) => `handoff:${key}`;
 export const HANDOFF_KEY_MAX = 256 - handoffHolder('').length;
 export const deliveryHolder = (id: string) => `delivery:${id}`;
 
-// M3-13 dependency. Release step 6.2 rejects a handoff with `link_expired` when
-// a file link of the send is below its expiry floor. Revocable file links
-// (M3-13) are not on main yet, so no send carries a link with an expiry and
-// this floor always passes. M3-13 replaces it with the check of the frozen
-// `expiresAt` values, made just before the decision statement.
-export function handoffLinkFloorBelow(_record: SendRecord, _now: number): boolean {
-  return false;
+// Release step 6.2's link floor (M3-13): the decision statement writes
+// `rejected` with `link_expired`, without evaluating the directory, when a file
+// link of the send has less than an hour left, from the frozen `expiresAt`
+// values, checked just before that statement. Expansion never re-checks expiry:
+// an accepted handoff is delivered with its links as they are.
+export function handoffLinkFloorBelow(record: SendRecord, now: number): boolean {
+  return linkFloorBelow(record.links, now);
 }
 
 const COLUMNS = `key, workspace_id AS workspaceId, mailbox_id AS mailboxId, send_id AS sendId, raw_key AS rawKey, sender,

@@ -1,3 +1,5 @@
+import type { SendLink } from './file-links.ts';
+
 export const JOURNAL_PAGE_SIZE = 64;
 
 // The stored idempotency result committed in the same event as a send's effect.
@@ -5,7 +7,9 @@ export type JournalResult = { key: string; fingerprint: string; expiresAt: numbe
 export type SendAddress = { email: string; name?: string };
 export type SendRecipient = SendAddress & { field: 'to' | 'cc' | 'bcc' };
 export type SendRecipientKind = 'external' | 'internal';
-export type SendFailure = 'invalid_sender' | 'message_too_large' | 'delivery_error';
+// `link_expired`: a file link of the send had less than an hour left at a claim, an
+// authorization or the internal handoff decision (M3-13).
+export type SendFailure = 'invalid_sender' | 'message_too_large' | 'delivery_error' | 'link_expired';
 // Everything the sent copy's bytes depend on, frozen at sendDraft
 // (docs/m3-outbound-plan.md, section 2.3, step 2). The draft revision is
 // immutable; boundary and Message-ID are derived once at submission.
@@ -17,6 +21,9 @@ export type SendRecord = {
   attachmentKeys: string[]; uploadIds: string[]; recipients: SendRecipient[];
   // Each small forwarded part's decoded digest and size, fixed when it was attached.
   parts: SendPart[];
+  // Its file links (M3-13), each with its token, host, name, size, expiry and object;
+  // absent on sends without links and on every send made before M3-13.
+  links?: SendLink[];
 };
 export type SendPart = { messageId: string; part: number; digest: string; size: number };
 // The consumer's side of a send (docs/m3-outbound-plan.md, section 2.4; M3-5).
@@ -83,6 +90,8 @@ export type JournalEvent =
   // A consumer step or a drive decision after release (M3-5): the send's state
   // (`terminal` starts the finish rule), its dispatch row, and the ledger rows,
   // fences, Mark sets and release-list entries it changed, all as absolute values.
+  // A file link revoked (and, with `deletedAt`, deleted) by its sender or an operator (M3-13).
+  | { type: 'link_state'; sendId: string; linkId: string; revokedAt: number; deletedAt?: number }
   | { type: 'send_progress'; id: string; state: SendProgressState; terminal?: true; dispatch: SendDispatchRow;
       recipients?: SendLedgerChange[]; fences?: SendFenceRow[]; marks?: SendMarkRow[];
       releaseAdd?: { epoch: number; attempt: number }[]; releaseRemove?: { epoch: number; attempt: number }[] };

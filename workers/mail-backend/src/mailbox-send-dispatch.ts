@@ -8,6 +8,7 @@
 import type { MailboxIndex } from './mailbox-index.ts';
 import { fenceBefore, fenceKey, sameFence, validFence, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
 import { senderActive } from './mailbox-send-sender.ts';
+import { linkFloorBelow } from './file-links.ts';
 import { SendStalls } from './mailbox-send-stalls.ts';
 import { stageSendEvent, type SendEventCode } from './send-alert-events.ts';
 import { NOTICE_BACKOFF_MAX_MS, NOTICE_BACKOFF_MS, RESTORING_NOTICE_MS } from './send-result-backoff.ts';
@@ -435,6 +436,11 @@ export class SendDispatcher {
         this.commit(m, ready, timers, grace(m, 'delivery_error', ctx), true);
         return { status: 'refused' };
       }
+      // The link floor (M3-13): every file link needs an hour of life left at the claim.
+      if (linkFloorBelow(m.row.record.links, ctx.now)) {
+        this.commit(m, ready, timers, grace(m, 'link_expired', ctx), true);
+        return { status: 'refused' };
+      }
       if (!sender) {
         this.commit(m, ready, timers, grace(m, 'invalid_sender', ctx), true);
         return { status: 'refused' };
@@ -645,6 +651,11 @@ export class SendDispatcher {
       if (!current || !row.marked || row.authorized || ctx.now >= m.d.leaseUntil!) return stale();
       const marked = new Set(m.markSet(fence).map(mark => mark.idx));
       if (recipients.length !== marked.size || !recipients.every(idx => marked.has(idx) && m.recipient(idx)?.state === 'attempting')) return stale();
+      // The link floor (M3-13), again immediately before the EMAIL call.
+      if (linkFloorBelow(m.row.record.links, ctx.now)) {
+        this.commit(m, ready, timers, grace(m, 'link_expired', ctx), true);
+        return { status: 'stale' };
+      }
       if (!sender) {
         this.commit(m, ready, timers, grace(m, 'invalid_sender', ctx), true);
         return { status: 'stale' };
