@@ -1,6 +1,6 @@
 import { mailAlert, type AlertBinding } from '../../mail-backend/src/alerts.ts';
 import type { StoredAnswer } from '../../mail-backend/src/mailbox-send-dispatch.ts';
-import { validFence, type QuotaPort, type QuotaScope, type SendFence } from '../../mail-backend/src/mailbox-send-quota.ts';
+import { accountSendQuota, validFence, type QuotaPort, type QuotaScope, type SendFence, type SendQuotaBinding } from '../../mail-backend/src/mailbox-send-quota.ts';
 import { validSendId } from '../../mail-backend/src/mailbox-send-store.ts';
 import { sendAlertEnvironment } from '../../mail-backend/src/send-alert-events.ts';
 import { dispatchSend, storeSendResult, type ConsumerMailbox, type EmailBinding, type ResultNotice } from '../../mail-backend/src/send-consumer.ts';
@@ -21,9 +21,8 @@ export type Env = {
   DIRECTORY: Pick<D1Database, 'prepare'>;
   MAILBOX: Namespace<SendMailbox>;
   ALERTS: AlertBinding;
-  // M3-6 supplies the account quota binding. Until then it is only present in
-  // tests. A missing binding refuses dispatch even if both flags are on.
-  SEND_QUOTA?: Namespace<QuotaPort>;
+  // A missing binding refuses dispatch even if both flags are on.
+  SEND_QUOTA?: SendQuotaBinding;
   EMAIL?: EmailBinding;
 };
 
@@ -37,7 +36,7 @@ function isNotice(value: unknown): value is ResultNotice {
 function quotaPort(env: Env, mailbox: (ws: string, mb: string) => SendMailbox): QuotaPort {
   const account = () => {
     if (!env.SEND_QUOTA) throw new Error('Send quota binding missing');
-    return env.SEND_QUOTA.getByName('account');
+    return accountSendQuota(env.SEND_QUOTA);
   };
   const call = async <T>(scope: QuotaScope, code: QuotaEvent, run: (port: QuotaPort) => Promise<T>): Promise<T> => {
     try { return await run(account()); }

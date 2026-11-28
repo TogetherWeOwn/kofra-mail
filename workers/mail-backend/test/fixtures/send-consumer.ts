@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { QuotaPort, SendFence } from '../../src/mailbox-send-quota.ts';
+import { accountSendQuota, type QuotaPort, type SendFence, type SendQuotaBinding } from '../../src/mailbox-send-quota.ts';
 import type { SendRequest } from '../../src/send-mime.ts';
 import {
   dispatchSend, storeSendResult, type ConsumerMailbox, type ConsumerPorts, type DispatchOutcome, type ResultNotice,
@@ -15,7 +15,7 @@ import { mailboxName, type SendDispatch } from '../../src/worker.ts';
 
 type Env = {
   MAILBOX: { getByName(name: string): ConsumerMailbox & { sendQueue(): Promise<unknown[]> } };
-  SEND_QUOTA: { getByName(name: string): unknown };
+  SEND_QUOTA: SendQuotaBinding;
   DIRECTORY: D1Database;
 };
 
@@ -31,7 +31,7 @@ export type EmailBehaviour =
 // and the authorizing mailbox's clock at that real time.
 export type EmailCall = {
   // `granted`: the mailbox itself answered ok; false for a forged grant.
-  n: number; sendId: string; fence: SendFence | null; deadline: number | null; granted: boolean; consumerNow: number; real: number; authClock: number;
+  n: number; mb: string; sendId: string; fence: SendFence | null; deadline: number | null; granted: boolean; consumerNow: number; real: number; authClock: number;
   to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; replyTo: string | null; headers: Record<string, string>;
   attachments: { filename: string; type: string; size: number }[];
 };
@@ -51,6 +51,7 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
     private consumerLead = 0;
     private readonly script: EmailBehaviour[] = [];
     private readonly calls: EmailCall[] = [];
+    private readonly authorizations: SendFence[] = [];
     private readonly requests: SendRequest[] = [];
     private readonly notices: ResultNotice[] = [];
     private readonly gates = new Map<string, Gate>();
@@ -70,6 +71,7 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
     leads() { return { mailbox: this.mailboxLead, consumer: this.consumerLead, real: this.real(), consumerNow: this.consumerNow() }; }
     scriptEmail(behaviours: EmailBehaviour[]) { this.script.push(...behaviours); }
     emailCalls() { return this.calls; }
+    authorizationCalls() { return this.authorizations; }
     // The n-th call's whole request, with attachment bytes in base64.
     emailRequest(n: number) {
       const request = this.requests[n - 1];
@@ -155,6 +157,7 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
           // The mailbox clock's lead as of the grant, read when the answer returns (before the after: seam).
           let lead = this.mailboxLead;
           const answer = await this.step(run, 'authorizeDispatch', async () => {
+            this.authorizations.push(args[3]);
             const granted = forged ? { status: 'ok' as const, remainingMs: 10_000 } : await box.authorizeDispatch(...args);
             lead = this.mailboxLead;
             return granted;
@@ -170,7 +173,7 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
         delaySend: (...args) => this.step(run, 'delaySend', () => box.delaySend(...args)),
         abandonClaim: (...args) => this.step(run, 'abandonClaim', () => box.abandonClaim(...args)),
       };
-      const stub = this.env.SEND_QUOTA.getByName('account') as QuotaPort;
+      const stub = accountSendQuota(this.env.SEND_QUOTA);
       const quota: QuotaPort = {
         reserve: (...args) => this.step(run, 'reserve', () => stub.reserve(...args)),
         confirm: (...args) => this.step(run, 'confirm', () => stub.confirm(...args)),
@@ -203,7 +206,7 @@ export function sendConsumerFixture(mailboxNow: (env: never) => number) {
       const auth = run.auth;
       const { attachments = [], headers = {}, replyTo, subject, text } = request as SendRequest & { text?: string; subject?: string };
       this.calls.push({
-        n: this.calls.length + 1, sendId: message.sendId, fence: auth?.fence ?? null, deadline: auth?.deadline ?? null, granted: !!auth && !auth.forged,
+        n: this.calls.length + 1, mb: message.mb, sendId: message.sendId, fence: auth?.fence ?? null, deadline: auth?.deadline ?? null, granted: !!auth && !auth.forged,
         consumerNow: this.consumerNow(),
         real, authClock: real + (auth?.lead ?? this.mailboxLead), to: addresses(request.to), cc: addresses(request.cc), bcc: addresses(request.bcc),
         subject: subject ?? '', text: text ?? '', replyTo: replyTo === undefined ? null : address(replyTo), headers: { ...headers },

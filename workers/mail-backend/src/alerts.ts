@@ -6,6 +6,7 @@ export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
   'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
+type GateAlert = { code: 'send_quota_gate_hit'; key: string; environment: string; time: number };
 type SendAlert = DailySendAlert | { code: 'send_dlq'; environment: string; time: number; occurrence: string };
 
 const TITLE: Record<Event['code'], string> = {
@@ -22,12 +23,15 @@ const TITLE: Record<Event['code'], string> = {
 };
 
 export function mailAlert(binding?: AlertBinding) {
-  return async (event: Event | SendAlert): Promise<void> => {
+  return async (event: Event | SendAlert | GateAlert, signal?: AbortSignal): Promise<void> => {
     if (!binding) throw new Error('Mail alert binding missing');
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     const source = `mail:${event.code}`;
     let body: Record<string, string | number>;
-    if ('environment' in event) {
+    if (event.code === 'send_quota_gate_hit' && 'key' in event) {
+      headers['idempotency-key'] = event.key;
+      body = { source, key: event.key, title: sendEventTitle(event.code), environment: event.environment, time: event.time };
+    } else if ('environment' in event) {
       const key = await sha256(new Uint8Array(new TextEncoder().encode(event.occurrence)));
       headers['idempotency-key'] = key;
       body = { source, key, title: event.code === 'send_dlq' ? 'Outbound mail queue message dead-lettered' : sendEventTitle(event.code),
@@ -38,10 +42,11 @@ export function mailAlert(binding?: AlertBinding) {
       body = { source, key, title: TITLE[event.code] };
     }
     const response = await binding.fetch('https://alerts.internal/v1/alert', {
-      method: 'POST', redirect: 'manual', headers, body: JSON.stringify(body),
+      method: 'POST', redirect: 'manual', headers, body: JSON.stringify(body), signal,
     });
     // Do not read or log a response from the alert service.
     void response.body?.cancel().catch(() => {});
+    signal?.throwIfAborted();
     if (response.status < 200 || response.status >= 300) throw new Error(`Mail alert not accepted (${response.status})`);
   };
 }

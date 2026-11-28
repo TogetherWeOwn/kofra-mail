@@ -8,6 +8,7 @@ import { receive, type InboundMail } from './inbound.ts';
 import { kofra, type KofraConfig } from './kofra.ts';
 import { MailAlerts } from './mail-alerts.ts';
 import { mailboxName } from './mailbox-name.ts';
+import type { SendQuotaBinding } from './mailbox-send-quota.ts';
 import { Outbox } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
 import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
@@ -45,6 +46,7 @@ export type Env = KofraConfig & {
   MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
   MAIL_ENVIRONMENT?: string;
   SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
+  SEND_QUOTA?: SendQuotaBinding;
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;

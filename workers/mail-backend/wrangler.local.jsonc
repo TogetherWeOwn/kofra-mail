@@ -12,6 +12,10 @@
     "MAIL_SWEEP_ENABLED": "off",
     "MAIL_SEND_ENABLED": "off",
     "MAIL_ENVIRONMENT": "local",
+    // Emulation only. Set the measured reset and approved ceiling for each deployment.
+    "MAIL_SEND_DAILY_QUOTA": "1000",
+    "MAIL_SEND_DAILY_RESET_UTC": "15:00",
+    "MAIL_SEND_MONTHLY_CEILING": "3000",
     "DELIVERY_QUEUE_NAME": "mail-local-deliver",
     "DEAD_LETTER_QUEUE_NAME": "mail-local-dlq"
   },
@@ -24,9 +28,13 @@
   "services": [{ "binding": "ALERTS", "service": "mail-alerts-local" }],
   "durable_objects": { "bindings": [
     { "name": "MAILBOX", "class_name": "Mailbox" },
-    { "name": "SWEEPER", "class_name": "Sweeper" }
+    { "name": "SWEEPER", "class_name": "Sweeper" },
+    { "name": "SEND_QUOTA", "class_name": "SendQuota" }
   ] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Mailbox", "Sweeper"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Mailbox", "Sweeper"] },
+    { "tag": "send-quota-v1", "new_sqlite_classes": ["SendQuota"] }
+  ],
   "queues": {
     "producers": [
       { "binding": "DELIVER", "queue": "mail-local-deliver" },

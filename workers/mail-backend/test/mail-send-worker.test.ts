@@ -4,13 +4,25 @@ import { setTimeout } from 'node:timers/promises';
 import type { ClaimAnswer } from '../src/mailbox-send-dispatch.ts';
 import type { SendFence } from '../src/mailbox-send-quota.ts';
 import { TAKE_SEND_NOTICES } from '../src/reconcile-send-results.ts';
+import { isSendEventCode } from '../src/send-alert-events.ts';
 import type { DispatchOutcome, ResultNotice } from '../src/send-consumer.ts';
 import { DLQ, HOUR, MB, MINUTE, SEND, WS, startMailSendFixture } from './fixtures/mail-send.ts';
 
 type Fixture = Awaited<ReturnType<typeof startMailSendFixture>>;
 const run = async (body: (h: Fixture) => Promise<void>, options?: Parameters<typeof startMailSendFixture>[0]) => {
   const h = await startMailSendFixture(options);
-  try { await body(h); } finally { await h.close(); }
+  try {
+    await body(h);
+    if (options?.realQuota) {
+      assert.equal(h.providerStarts.length, h.providerCalls(), 'every provider call has a captured start');
+      for (const { grant, now } of h.providerStarts) {
+        assert.ok(grant && now < grant.deadline, 'every provider call starts within a real authorization window');
+        const state = await h.sendState(grant.sendId);
+        const fence = state.fences.find(row => row.epoch === grant.fence.epoch && row.attempt === grant.fence.attempt);
+        assert.ok(fence?.authorized && now < fence.lease_until, 'every provider call starts under an authorized live lease');
+      }
+    }
+  } finally { await h.close(); }
 };
 const TO = 'person@example.net', SUBJECT = 'Secret project title', BODY = 'Private body sentinel';
 async function queued(h: Fixture, name: string, principal: 'member' | 'other' = 'member', to = [TO]) {
@@ -542,3 +554,82 @@ test('outage payloads and logs omit provider data and mail content', () => run(a
   assert.equal(h.alerts.length, 1);
   assertRedacted(h);
 }));
+
+const gateCode = 'send_quota_gate_hit';
+const quotaCharges = (h: Fixture) => h.quota<{ sendId: string; day: string; charges: number }[]>('balances');
+
+test('cross-worker real quota shares a gate and delivers one redacted operator alert per quota day', () => run(async h => {
+  const first = await queued(h, 'real-quota-first');
+  assert.deepEqual(await h.batch(SEND, dispatch(first)), ['ack']);
+  await assertSent(h, first);
+  assert.deepEqual((await quotaCharges(h)).map(({ sendId, day, charges }) => ({ sendId, day, charges })),
+    [{ sendId: first, day: '2026-11-26', charges: 1 }], 'mail-send wrote to the same account object as mail-backend');
+  const reset = await h.quota<number>('resetAt');
+  const delayed = await queued(h, 'real-quota-delayed');
+  const blockedToday = [delayed, await queued(h, 'real-quota-also-delayed')];
+  const firstRefusedAt = await h.sends.now();
+  for (const id of blockedToday) {
+    assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+    const state = await h.sendState(id);
+    assert.equal(state.row?.state, 'delayed');
+    assert.equal(state.dispatch?.delayed_until, reset + 30_000);
+    assert.deepEqual(state.ledger.map(row => row.state), ['pending']);
+    await h.quota('runAlarm');
+  }
+  const alerts = () => h.alerts.filter(({ body }) => (JSON.parse(body) as { source: string }).source === `mail:${gateCode}`);
+  const expectedAlert = (day: string, time: number) => ({ source: `mail:${gateCode}`, key: `send_quota_gate:test:${day}`,
+    title: 'A mail account quota gate was reached', environment: 'test', time });
+  const today = expectedAlert('2026-11-26', firstRefusedAt);
+  assert.deepEqual(alerts().map(({ body }) => JSON.parse(body)), [today]);
+  assert.ok(isSendEventCode(gateCode), 'the quota code is on the operator allow-list');
+  assert.equal(h.providerCalls(), 1);
+  await advanceTo(h, reset + 30_000);
+  assert.deepEqual(await h.batch(SEND, dispatch(delayed)), ['ack']);
+  await assertSent(h, delayed);
+  const blockedNextDay = await queued(h, 'real-quota-new-day');
+  const tomorrow = expectedAlert('2026-11-27', await h.sends.now());
+  assert.deepEqual(await h.batch(SEND, dispatch(blockedNextDay)), ['ack']);
+  assert.equal((await h.sendState(blockedNextDay)).row?.state, 'delayed');
+  await h.quota('runAlarm');
+  await h.quota('runAlarm');
+  assert.deepEqual(alerts().map(({ body }) => JSON.parse(body)), [today, tomorrow]);
+  assert.deepEqual(alerts().map(({ key }) => key), [today.key, tomorrow.key]);
+  assert.equal(h.providerCalls(), 2);
+  assertRedacted(h);
+}, { realQuota: { daily: '2' } }));
+
+test('cross-worker three-day real quota outage keeps recipients pending, alerts at 24 hours and recovers', () => run(async h => {
+  const id = await queued(h, 'quota-unavailable-three-days');
+  const released = await h.sends.now();
+  await h.quota('setUnavailableUntil', released + 72 * HOUR);
+  const stallCount = () => sources(h).filter(source => source === stalledSource).length;
+  for (let hour = 0; hour < 72; hour++) {
+    await advanceTo(h, released + hour * HOUR);
+    assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
+    const state = await h.sendState(id);
+    assert.ok(state.row?.state === 'queued' || state.row?.state === 'sending', `send state at outage hour ${hour}: ${state.row?.state}`);
+    assert.deepEqual(state.ledger.map(row => row.state), ['pending']);
+    assert.equal(state.dispatch?.provider_wait, 0);
+    assert.equal(state.dispatch?.unfinished, 0);
+    await h.backendCron();
+    if (hour === 23) {
+      await advanceTo(h, released + 24 * HOUR - 1);
+      await h.backendCron();
+      assert.equal(stallCount(), 0, 'no stall alert before 24 hours since published release');
+    }
+    if (hour === 24) assert.equal(stallCount(), 1, 'the operator received send_stalled at 24 hours');
+  }
+  assert.equal(h.providerCalls(), 0);
+  assert.deepEqual(await quotaCharges(h), []);
+  await h.sends.driveIdle();
+  const beforeRecovery = (await h.sends.queue()).length;
+  await advanceTo(h, released + 72 * HOUR);
+  await h.sends.driveIdle();
+  const redrive = (await h.sends.queue()).slice(beforeRecovery).find(message => message.sendId === id);
+  assert.deepEqual(redrive, dispatch(id), 'the mailbox published a fresh dispatch after recovery');
+  assert.deepEqual(await h.batch(SEND, redrive), ['ack']);
+  await assertSent(h, id);
+  assert.equal(h.providerCalls(), 1);
+  assert.deepEqual((await quotaCharges(h)).map(({ sendId, charges }) => ({ sendId, charges })), [{ sendId: id, charges: 1 }]);
+  assertRedacted(h);
+}, { realQuota: {} }));

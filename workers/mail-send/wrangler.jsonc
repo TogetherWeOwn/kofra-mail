@@ -12,7 +12,8 @@
     "SEND_DLQ_NAME": "send-dlq"
   },
   "durable_objects": { "bindings": [
-    { "name": "MAILBOX", "class_name": "Mailbox", "script_name": "mail-backend" }
+    { "name": "MAILBOX", "class_name": "Mailbox", "script_name": "mail-backend" },
+    { "name": "SEND_QUOTA", "class_name": "SendQuota", "script_name": "mail-backend" }
   ] },
   "d1_databases": [{
     "binding": "DIRECTORY",

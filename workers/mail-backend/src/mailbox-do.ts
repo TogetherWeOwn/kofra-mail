@@ -27,10 +27,10 @@ import { markSendHeld, SendApi, sendDrive, sendRequestFor, type SendCommit, type
 import { SEND_DRIVE, UnpublishedSend, unpublishedProgress, validSendId } from './mailbox-send-store.ts';
 import { SendStalls } from './mailbox-send-stalls.ts';
 import {
-  CLOCK_SKEW_MS, SendDispatcher, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
+  SendDispatcher, sendClockSkewMs, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
   type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
-import { validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
+import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -170,17 +170,10 @@ export class Mailbox extends DurableObject<Env> {
     };
   }
 
-  // The account quota gate (M3-6 supplies the quota object). Without it, a
-  // step that must release or read the quota fails and is retried.
-  protected sendQuota(): QuotaPort | undefined { return undefined; }
-
-  // clockSkew (section 2.4, step 5) is configuration, used only on the mailbox side.
-  private clockSkewMs(): number {
-    const configured = this.env.MAIL_SEND_CLOCK_SKEW_SECONDS;
-    if (configured === undefined || configured === '') return CLOCK_SKEW_MS;
-    const seconds = Number(configured);
-    if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 600) throw new Error('Invalid send clock skew');
-    return seconds * 1000;
+  // Without the account quota binding, a release or reset lookup is retried.
+  protected sendQuota(): QuotaPort | undefined {
+    const { SEND_QUOTA } = this.env;
+    return SEND_QUOTA && accountSendQuota(SEND_QUOTA);
   }
 
   private sendDispatcher(): SendDispatcher {
@@ -220,7 +213,7 @@ export class Mailbox extends DurableObject<Env> {
         };
         return sendRequestFor(sources, this.sendMime, record, recipients);
       },
-      clockSkewMs: this.clockSkewMs(),
+      clockSkewMs: sendClockSkewMs(this.env.MAIL_SEND_CLOCK_SKEW_SECONDS),
       now: () => this.mailApiNow(),
       sending: this.env.MAIL_SEND_ENABLED === 'on',
     });

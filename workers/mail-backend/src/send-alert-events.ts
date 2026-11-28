@@ -1,4 +1,5 @@
-// Operator send events share one allow-list and one daily outbox key format.
+// Operator send events share one allow-list. Mailbox events use a UTC-day
+// outbox key; the account quota object keys gate events by its quota day.
 const TITLES = {
   send_outage: 'The outbound mail provider is unavailable',
   send_unknown_error: 'The outbound mail provider returned an unknown error',
@@ -9,6 +10,7 @@ const TITLES = {
   send_result_stuck: 'A stored provider result keeps failing to record',
   send_quota_release: 'The send quota object could not release a charge',
   send_quota_failed: 'The send quota object could not reserve or confirm a charge',
+  send_quota_gate_hit: 'A mail account quota gate was reached',
   send_stale_release_failed: 'A stale send charge could not be released',
   send_request_invalid: 'An outbound request could not be built',
   send_stalled: 'An outbound send has stalled',
