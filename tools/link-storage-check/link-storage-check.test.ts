@@ -96,28 +96,43 @@ test('mail-content never names a write credential or the KEK, and mail-web never
 
 test('the link host must be a domain of its own unless the shared-domain override is set, and the CLI then warns', async () => {
   const origins = { MAIL_APP_ORIGIN: 'https://mail.mail-suite.example', CONTENT_ORIGIN: 'https://content.mail-content.example' };
-  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-links.example' }), { linkHost: 'files.mail-links.example', result: 'ok' });
-  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example' }), { linkHost: 'files.mail-suite.example', result: 'shared_domain' });
-  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-content.example' }), { linkHost: 'files.mail-content.example', result: 'shared_domain' });
-  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }),
+  const check = (host: string, extra: Record<string, string> = {}) => linkHostCheck({ ...origins, LINK_HOST: host, LINK_HOSTS: host, ...extra });
+  assert.deepEqual(check('files.mail-links.example'), { linkHost: 'files.mail-links.example', result: 'ok' });
+  assert.deepEqual(check('files.mail-suite.example'), { linkHost: 'files.mail-suite.example', result: 'shared_domain' });
+  assert.deepEqual(check('files.mail-content.example'), { linkHost: 'files.mail-content.example', result: 'shared_domain' });
+  assert.deepEqual(check('files.mail-suite.example', { LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }),
     { linkHost: 'files.mail-suite.example', result: 'shared_domain_allowed' });
-  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: 'yes' }),
+  assert.deepEqual(check('files.mail-suite.example', { LINK_HOST_ALLOW_SHARED_DOMAIN: 'yes' }),
     { linkHost: 'files.mail-suite.example', result: 'shared_domain' }, 'only the exact override');
-  assert.deepEqual(linkHostCheck({ LINK_HOST: 'https://files.example.com' }), { linkHost: 'LINK_HOST', result: 'invalid' });
-  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'old.example.net files.example.com' }),
-    { linkHost: 'files.example.com', result: 'not_first' });
-  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com https://old.example.net' }),
+  assert.deepEqual(check('https://files.example.com'), { linkHost: 'LINK_HOSTS', result: 'invalid' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'https://files.example.com', LINK_HOSTS: 'files.example.com' }),
+    { linkHost: 'LINK_HOST', result: 'invalid' });
+  // Only the current host must be separate: an old shared host may stay listed for its links.
+  assert.deepEqual(check('files.mail-links.example', { LINK_HOSTS: 'files.mail-links.example old.mail-suite.example' }),
+    { linkHost: 'files.mail-links.example', result: 'ok' });
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'old.example.net files.example.com' }), { linkHost: 'files.example.com', result: 'not_first' });
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'files.example.com https://old.example.net' }),
     { linkHost: 'LINK_HOSTS', result: 'invalid' }, 'mail-content would serve no host at all');
-  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com, old.example.net' }),
-    { linkHost: 'files.example.com', result: 'ok' });
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'files.example.com, old.example.net' }), { linkHost: 'files.example.com', result: 'ok' });
+  // A link-enabled deploy fails closed without its served hosts or either origin.
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.example.com' }), { linkHost: 'LINK_HOSTS', result: 'invalid' });
+  for (const [name, value] of [['MAIL_APP_ORIGIN', undefined], ['MAIL_APP_ORIGIN', 'mail.example.com'], ['CONTENT_ORIGIN', undefined],
+    ['CONTENT_ORIGIN', 'http://content.example.org'], ['CONTENT_ORIGIN', 'https://content.example.org/path']] as const) {
+    const env: Record<string, string | undefined> = { ...origins, LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com', [name]: value };
+    assert.deepEqual(linkHostCheck(env), { linkHost: name, result: 'invalid' }, `${name}=${value}`);
+  }
+  // Without LINK_HOST the deploy is not link-enabled: nothing is required, and a listed old host must still be valid.
   assert.equal(linkHostCheck({}), undefined);
+  assert.deepEqual(linkHostCheck({ LINK_HOSTS: 'old.example.net' }), { linkHost: 'LINK_HOSTS', result: 'ok' });
+  assert.deepEqual(linkHostCheck({ LINK_HOSTS: 'old.example.net/x' }), { linkHost: 'LINK_HOSTS', result: 'invalid' });
   const { fetcher, env } = setup();
-  assert.equal((await deployCheck({ ...env, ...origins, LINK_HOST: 'files.mail-suite.example' }, fetcher)).ok, false);
-  assert.equal((await deployCheck({ ...env, ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }, fetcher)).ok, true);
+  const shared = { ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOSTS: 'files.mail-suite.example' };
+  assert.equal((await deployCheck({ ...env, ...shared }, fetcher)).ok, false);
+  assert.equal((await deployCheck({ ...env, ...shared, LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }, fetcher)).ok, true);
   const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
   let stderr = '';
   try {
-    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOST_ALLOW_SHARED_DOMAIN: '1' },
+    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, ...shared, LINK_HOST_ALLOW_SHARED_DOMAIN: '1' },
       encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (error) { stderr = (error as { stderr: string }).stderr; }
   assert.match(stderr, /LINK_HOST shares a registrable domain/);

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parse, type DefaultTreeAdapterMap } from 'parse5';
-import { linkHosts, parseRange, serveFileLink, type FileLinkEnv } from '../src/file-link.ts';
-import { escapeHtml, LINK_PAGE_CSP, linkDisposition, linkPage, visibleText } from '../src/link-page.ts';
+import { floodKey, keyWithin, linkHosts, parseRange, serveFileLink, type FileLinkEnv } from '../src/file-link.ts';
+import { escapeHtml, limitPage, LINK_PAGE_CSP, linkDisposition, linkPage, visibleText } from '../src/link-page.ts';
 
 // The link host's page and routing (docs/m3-outbound-plan.md, M3-13), without
 // workerd: escaping, bidi removal, headers, ranges, and that the flood bucket
@@ -114,7 +114,7 @@ test('the flood bucket runs before any lookup, keyed by the client IP, and fails
     const refused = stubEnv(false);
     const response = await serveFileLink(request(path, method), refused.env);
     assert.equal(response.status, 429, path);
-    assert.deepEqual(refused.calls, ['flood:203.0.113.9'], `${path}: nothing is looked up`);
+    assert.deepEqual(refused.calls, ['flood:v4:203.0.113.9'], `${path}: nothing is looked up`);
     for (const failure of ['missing', 'throws'] as const) {
       const closed = stubEnv(failure);
       assert.equal((await serveFileLink(request(path, method), closed.env)).status, 503);
@@ -123,7 +123,7 @@ test('the flood bucket runs before any lookup, keyed by the client IP, and fails
   }
   const admitted = stubEnv(true);
   assert.equal((await serveFileLink(request(`/f/${TOKEN}`), admitted.env)).status, 404);
-  assert.deepEqual(admitted.calls, ['flood:203.0.113.9', 'lookup']);
+  assert.deepEqual(admitted.calls, ['flood:v4:203.0.113.9', 'lookup']);
 });
 
 test('every link answer carries the page policy, nosniff, no-referrer and no-store', async () => {
@@ -136,4 +136,35 @@ test('every link answer carries the page policy, nosniff, no-referrer and no-sto
     assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
     assert.equal(response.headers.get('cache-control'), 'private, no-store');
   }
+});
+
+test('the flood key is an IPv4 address, or an IPv6 /64', () => {
+  assert.equal(floodKey('203.0.113.9'), 'v4:203.0.113.9');
+  assert.equal(floodKey('2001:DB8:1:2::1'), 'v6:2001:db8:1:2');
+  assert.equal(floodKey('2001:db8:1:2:ffff:ffff:ffff:fffe'), 'v6:2001:db8:1:2', 'two addresses in one /64 share a key');
+  assert.notEqual(floodKey('2001:db8:1:3::1'), floodKey('2001:db8:1:2::1'));
+  assert.equal(floodKey('::'), 'v6:0:0:0:0');
+  assert.equal(floodKey('fe80::1%eth0'), 'v6:fe80:0:0:0');
+  assert.equal(floodKey('::ffff:198.51.100.7'), 'v4:198.51.100.7');
+  assert.equal(floodKey('::ffff:c633:6407'), 'v4:198.51.100.7');
+  for (const bad of ['1:2:3', '2001:db8::1::2', 'zz::1', '1:2:3:4:5:6:7:8:9', '::ffff:300.1.1.1']) assert.equal(floodKey(bad), 'invalid', bad);
+  assert.equal(floodKey(null), 'unknown');
+});
+
+test('the range unit is case-insensitive', () => {
+  assert.deepEqual(parseRange('Bytes=1-', 10), { start: 1, end: 9 });
+  assert.deepEqual(parseRange('BYTES=-2', 10), { start: 8, end: 9 });
+});
+
+test('a key is read only inside its location prefix and without dot segments', () => {
+  assert.equal(keyWithin('files/a/b.bin', 'files/'), true);
+  assert.equal(keyWithin('a/b.bin', ''), true);
+  for (const [key, prefix] of [['elsewhere/x', 'files/'], ['files/', 'files/'], ['files/../x', 'files/'], ['files/./x', 'files/'], ['files//x', 'files/'],
+    ['../x', ''], ['a/..', '']] as const) assert.equal(keyWithin(key, prefix), false, `${prefix}${key}`);
+});
+
+test('the download limit page still offers Report abuse', () => {
+  const html = limitPage(TOKEN);
+  assert.ok(html.includes(`<form method="post" action="/f/${TOKEN}/report"><button class="report" type="submit">Report abuse</button></form>`));
+  assert.throws(() => limitPage('"><x'));
 });

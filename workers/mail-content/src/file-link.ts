@@ -36,6 +36,9 @@ export type FileLinkEnv = {
   // The deployment's link locations and their read-only keys (packages/link-storage).
   LINK_LOCATIONS?: string;
   LINK_READ_CREDENTIALS?: string;
+  // The deployment's own zones (a JSON array), refused for workspace locations as at save time.
+  // Without it, links in a workspace's own location are not served.
+  LINK_REFUSED_ZONES?: string;
   MAIL_LOOKUP: Partial<FileLinkLookup>;
 };
 
@@ -43,6 +46,43 @@ const TOKEN = /^[A-Za-z0-9_-]{21}[AQgw]$/;
 const encoder = new TextEncoder();
 // The provider has this long to answer with headers; the body is a native pipe with no per-chunk JavaScript.
 const HEADERS_TIMEOUT_MS = 60_000;
+
+/**
+ * The flood bucket's key: an IPv4 address whole, an IPv6 address by its /64
+ * (one host controls at least a /64), an IPv4-mapped IPv6 address as its IPv4.
+ * Anything unparsable shares one bucket.
+ */
+export function floodKey(ip: string | null): string {
+  if (!ip) return 'unknown';
+  const value = ip.trim().toLowerCase();
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(value)) return `v4:${value}`;
+  const groups = ipv6Groups(value);
+  if (!groups) return 'invalid';
+  if (groups.slice(0, 5).every(group => group === 0) && groups[5] === 0xffff) {
+    return `v4:${groups[6] >> 8}.${groups[6] & 0xff}.${groups[7] >> 8}.${groups[7] & 0xff}`;
+  }
+  return `v6:${groups.slice(0, 4).map(group => group.toString(16)).join(':')}`;
+}
+
+/** The eight 16-bit groups of an IPv6 address (`::` and a trailing IPv4 part allowed), or undefined. */
+function ipv6Groups(value: string): number[] | undefined {
+  let text = value.split('%')[0];
+  const tail = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+  if (tail) {
+    const bytes = tail.slice(1).map(Number);
+    if (bytes.some(byte => byte > 255)) return undefined;
+    text = `${text.slice(0, tail.index)}${((bytes[0] << 8) | bytes[1]).toString(16)}:${((bytes[2] << 8) | bytes[3]).toString(16)}`;
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return undefined;
+  const parse = (part: string) => part === '' ? [] : part.split(':');
+  const head = parse(halves[0]), rest = halves.length === 2 ? parse(halves[1]) : [];
+  const missing = 8 - head.length - rest.length;
+  if (halves.length === 1 ? missing !== 0 : missing < 1) return undefined;
+  const all = [...head, ...Array<string>(halves.length === 2 ? missing : 0).fill('0'), ...rest];
+  if (!all.every(group => /^[0-9a-f]{1,4}$/.test(group))) return undefined;
+  return all.map(group => parseInt(group, 16));
+}
 
 /** The configured link hosts (`host` or `host:port`), lowercased; empty if unset or invalid. */
 export function linkHosts(raw: string | undefined): string[] {
@@ -65,7 +105,8 @@ function html(status: number, body: string, extra: Record<string, string> = {}):
 }
 const gone = () => html(404, unavailablePage());
 const busy = (status = 503) => html(status, busyPage(), status === 503 ? { 'retry-after': '60' } : {});
-const limited = () => html(429, limitPage(), { 'retry-after': '3600' });
+// The limit page still lets a recipient report the link.
+const limited = (token: string) => html(429, limitPage(token), { 'retry-after': '3600' });
 
 export type ByteRange = { start: number; end: number };
 /**
@@ -74,7 +115,8 @@ export type ByteRange = { start: number; end: number };
  */
 export function parseRange(header: string | null, size: number): ByteRange | 'none' | 'unsatisfiable' {
   if (header === null) return 'none';
-  const match = /^bytes=(\d{0,16})-(\d{0,16})$/.exec(header.trim());
+  // The range unit is case-insensitive (RFC 9110, section 14.1).
+  const match = /^bytes=(\d{0,16})-(\d{0,16})$/i.exec(header.trim());
   if (!match || (match[1] === '' && match[2] === '')) return 'none';
   if (match[1] === '') {
     const suffix = Number(match[2]);
@@ -102,23 +144,40 @@ function downloadHeaders(view: FileLinkView): Headers {
   });
 }
 
+/** The deployment's refused zones from `LINK_REFUSED_ZONES`, as the save check reads them; undefined if absent or invalid. */
+function configuredZones(raw: string | undefined): string[] | undefined {
+  let configured: unknown;
+  try { configured = JSON.parse(raw ?? ''); } catch { return undefined; }
+  return Array.isArray(configured) && configured.length > 0 ? refusedZones(configured) : undefined;
+}
+
+/** A key inside the location's prefix with no empty, `.` or `..` segment, so the URL can never leave the bucket or prefix. */
+export function keyWithin(key: string, prefix: string): boolean {
+  return key.startsWith(prefix) && key.length > prefix.length && key.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..');
+}
+
 /** The location's fields and read-only key, after checking they are the ones the link was made with. */
 async function source(view: FileLinkView, env: FileLinkEnv): Promise<{ fields: LinkLocationFields; key: { accessKeyId: string; secretAccessKey: string } } | null> {
   let fields: LinkLocationFields | undefined | null;
   let key: { accessKeyId: string; secretAccessKey: string } | null | undefined;
+  let zones: string[] | undefined;
   if (view.location.kind === 'deployment') {
     fields = deploymentLocations(env.LINK_LOCATIONS)?.locations.get(view.location.id);
     key = credentialSecret(env.LINK_READ_CREDENTIALS)?.get(view.location.id)?.reveal();
+    zones = refusedZones([]);
   } else {
-    fields = view.fields;
+    // A workspace's own endpoint passes the same refused zones as at save time, or is not read at all.
+    zones = configuredZones(env.LINK_REFUSED_ZONES);
+    fields = zones && view.fields;
     key = fields && await env.MAIL_LOOKUP.linkReadCredential?.(view.handle.ws, view.location.id);
   }
   // A location is immutable: a repointed one would serve other bytes, so it is never read.
-  if (!fields || !key || !linkEndpoint(fields.endpoint, refusedZones([])) || await locationFingerprint(fields) !== view.fingerprint) return null;
+  if (!fields || !key || !zones || !linkEndpoint(fields.endpoint, zones) || !keyWithin(view.key, fields.prefix) ||
+      await locationFingerprint(fields) !== view.fingerprint) return null;
   return { fields, key };
 }
 
-async function download(request: Request, view: FileLinkView, env: FileLinkEnv): Promise<Answer> {
+async function download(request: Request, view: FileLinkView, env: FileLinkEnv, token: string): Promise<Answer> {
   const lookup = env.MAIL_LOOKUP;
   if (!lookup.chargeFileLink) return busy();
   const headers = downloadHeaders(view);
@@ -161,7 +220,7 @@ async function download(request: Request, view: FileLinkView, env: FileLinkEnv):
   catch { charge = 'unavailable'; }
   if (charge !== 'ok') {
     void upstream.body?.cancel().catch(() => {});
-    return charge === 'gone' ? gone() : charge === 'limit' ? limited() : busy();
+    return charge === 'gone' ? gone() : charge === 'limit' ? limited(token) : busy();
   }
   headers.set('content-length', String(length));
   if (range !== 'none') headers.set('content-range', `bytes ${range.start}-${range.end}/${view.size}`);
@@ -182,11 +241,11 @@ async function answer(request: Request, env: FileLinkEnv, action: Action, token:
     return outcome === 'gone' ? gone() : outcome === 'limit' ? html(429, reportedPage(), { 'retry-after': '3600' }) : busy();
   }
   const view = await lookup.fileLink(hash);
-  if (view.status !== 'live') return view.status === 'limit' ? limited() : view.status === 'unavailable' ? busy() : gone();
+  if (view.status !== 'live') return view.status === 'limit' ? limited(token) : view.status === 'unavailable' ? busy() : gone();
   if (action === 'page') {
     return html(200, linkPage({ token, name: view.name, size: view.size, sender: view.sender, expiresAt: view.expiresAt }));
   }
-  return download(request, view, env);
+  return download(request, view, env, token);
 }
 
 /** Every request to a link host. */
@@ -210,7 +269,7 @@ async function route(request: Request, env: FileLinkEnv, url: URL, seen: (action
   const flood = env.LINK_FLOOD;
   if (!flood || typeof flood.limit !== 'function') return busy();
   let admitted: unknown;
-  try { admitted = (await flood.limit({ key: request.headers.get('cf-connecting-ip') ?? 'unknown' }))?.success; }
+  try { admitted = (await flood.limit({ key: floodKey(request.headers.get('cf-connecting-ip')) }))?.success; }
   catch { return busy(); }
   if (admitted !== true) return html(429, busyPage(), { 'retry-after': '60' });
   const match = /^\/f\/([^/]{1,64})(?:\/(download|report))?$/.exec(url.pathname);

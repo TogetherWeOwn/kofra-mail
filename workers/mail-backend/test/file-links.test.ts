@@ -210,7 +210,11 @@ test('ranged requests count their bytes, counters answer 429, and the total budg
   const refused = await links.fetch(path(link, '/download'), { headers: { range: 'bytes=0-0' } });
   assert.equal(refused.status, 429, 'one more byte is over the hourly budget');
   assert.equal(refused.headers.get('retry-after'), '3600');
-  assert.equal((await links.fetch(path(link))).status, 429, 'the page says so too');
+  const limitedPage = await links.fetch(path(link));
+  assert.equal(limitedPage.status, 429, 'the page says so too');
+  assert.ok((await limitedPage.text()).includes(`<form method="post" action="/f/${link.token}/report"><button class="report" type="submit">Report abuse</button>`),
+    'and still offers Report abuse');
+  assert.equal((await links.fetch(path(link, '/report'), { method: 'POST' })).status, 200, 'a spent link can be reported');
   await h.advance(hour);
   assert.equal((await links.fetch(path(link, '/download'))).status, 200, 'a new hour: 3000 in total');
   assert.equal((await links.fetch(path(link, '/download'), { headers: { range: 'bytes=0-0' } })).status, 429, 'the total budget is spent');
@@ -245,6 +249,9 @@ test('Range resumes work, an If-Range mismatch serves the whole file, and a rang
   assert.equal(rest.headers.get('content-length'), '60000');
   const tail = new Uint8Array(await rest.arrayBuffer());
   assert.equal(sha(Buffer.concat([head, tail])), sha(bytes), 'the resumed parts make the file');
+  const capital = await links.fetch(path(link, '/download'), { headers: { range: 'Bytes=99990-' } });
+  assert.equal(capital.status, 206, 'the range unit is case-insensitive');
+  assert.deepEqual(new Uint8Array(await capital.arrayBuffer()), bytes.slice(-10));
   const suffix = await links.fetch(path(link, '/download'), { headers: { range: 'bytes=-10' } });
   assert.equal(suffix.status, 206);
   assert.deepEqual(new Uint8Array(await suffix.arrayBuffer()), bytes.slice(-10));
@@ -347,7 +354,7 @@ test('the flood bucket runs before any lookup', () => withLinks(async (h, mail, 
     assert.equal(response.headers.get('retry-after'), '60');
   }
   assert.deepEqual(await links.control('lookups'), { lookups: 0, targets: 0 }, 'no routing lookup and no mailbox call');
-  assert.deepEqual(new Set(await links.floodCalls()), new Set(['198.51.100.7']), 'keyed by the client IP only');
+  assert.deepEqual(new Set(await links.floodCalls()), new Set(['v4:198.51.100.7']), 'keyed by the client IP only');
   await links.floodCap(Infinity);
   assert.equal((await links.fetch(path(link))).status, 200);
   assert.deepEqual(await links.control('lookups'), { lookups: 1, targets: 1 });
@@ -409,6 +416,18 @@ test('a send claimed after its links passed the floor ends link_expired with no 
   const send = await mail.getSend(id);
   assert.equal(send.state, 'failed');
   assert.deepEqual(send.recipients, [{ email: OUTSIDE, state: 'failed', reason: 'link_expired' }]);
+}));
+
+test('a send claimed at or after its links expired ends link_expired with no EMAIL call', () => withLinks(async (h, mail, from, links) => {
+  const id = await submit(h, mail, from, [await linkFile(links, bytesOf(100), { expiry: 1 })]);
+  const [link] = await frozen(h, id);
+  await h.advance(UNDO);
+  await h.advance(link.expiresAt! - await h.sends.now());
+  assert.equal(await h.sends.now(), link.expiresAt, 'claimed exactly at expiresAt');
+  await h.consumer('drain', WS, MB);
+  assert.equal(await emailCalls(h), 0);
+  assert.deepEqual((await h.sendState(id)).fences, [], 'the claim refused it');
+  assert.deepEqual((await mail.getSend(id)).recipients, [{ email: OUTSIDE, state: 'failed', reason: 'link_expired' }]);
 }));
 
 test('the floor is checked again in authorizeDispatch, immediately before the EMAIL call', () => withLinks(async (h, mail, from, links) => {
@@ -537,9 +556,16 @@ test('drafts take a file link only with a valid expiry; a carried link keeps its
   assert.deepEqual((await mail.listLinks({})).items, []);
 }));
 
-test('without a link host a draft with file links cannot be sent', () => withLinks(async (h, mail, from, links) => {
+test('without a link host only a draft with file links cannot be sent; every other draft sends', () => withLinks(async (h, mail, from, links) => {
   const seeded = await links.control<{ id: string; revision: string }>('seedDraft', [{ from, to: [OUTSIDE], links: [await linkFile(links, bytesOf(10))] }]);
   await assert.rejects(mail.sendDraft(seeded.id, { idempotencyKey: 'k', ifMatch: seeded.revision }), { code: 'feature_unavailable' });
+  const plain = await mail.createDraft({ from, to: [{ email: OUTSIDE }], cc: [], bcc: [], subject: 'No links', body: 'Text only', attachments: [] },
+    { idempotencyKey: 'plain' });
+  const sent = await mail.sendDraft(plain.id, { idempotencyKey: 'plain-send', ifMatch: plain.revision });
+  assert.equal(sent.state, 'pending');
+  await h.advance(UNDO);
+  await h.consumer('drain', WS, MB);
+  assert.equal((await mail.getSend(sent.id)).state, 'sent', 'a deployment without links sends as before');
 }, { configureWorkers: backend => { delete (backend.bindings as Record<string, unknown>).LINK_HOST; } }));
 
 test('link uploads are not served yet and session features say so', () => withLinks(async (_h, mail) => {
@@ -548,4 +574,64 @@ test('link uploads are not served yet and session features say so', () => withLi
   await assert.rejects(mail.getLinkUpload('u1'), { code: 'feature_unavailable' });
   await assert.rejects(mail.completeLinkUpload('u1'), { code: 'feature_unavailable' });
   await assert.rejects(mail.deleteLinkUpload('u1'), { code: 'feature_unavailable' });
+}));
+
+test('the flood bucket keys IPv6 clients by their /64 and IPv4 clients by address', () => withLinks(async (h, mail, from, links) => {
+  const id = await submit(h, mail, from, [await linkFile(links, bytesOf(10))]);
+  const [link] = await frozen(h, id);
+  await h.advance(UNDO);
+  await links.floodCap(1);
+  assert.equal((await links.fetch(path(link), { ip: '2001:db8:1:2::1' })).status, 200);
+  assert.equal((await links.fetch(path(link), { ip: '2001:db8:1:2:ffff:ffff:ffff:fffe' })).status, 429, 'another address in the same /64 shares the bucket');
+  assert.equal((await links.fetch(path(link), { ip: '2001:db8:1:3::1' })).status, 200, 'another /64 has its own');
+  assert.equal((await links.fetch(path(link), { ip: '198.51.100.7' })).status, 200);
+  assert.equal((await links.fetch(path(link), { ip: '198.51.100.8' })).status, 200, 'IPv4 by the whole address');
+  assert.equal((await links.fetch(path(link), { ip: '::ffff:198.51.100.7' })).status, 429, 'a mapped IPv4 address is that address');
+  assert.deepEqual(await links.floodCalls(), ['v6:2001:db8:1:2', 'v6:2001:db8:1:2', 'v6:2001:db8:1:3', 'v4:198.51.100.7', 'v4:198.51.100.8', 'v4:198.51.100.7']);
+}));
+
+test('a frozen key outside the location prefix, or with a dot segment, is never read', () => withLinks(async (h, mail, from, links) => {
+  const id = await submit(h, mail, from, [await linkFile(links, bytesOf(10)), await linkFile(links, bytesOf(10))]);
+  const [outside, dotted] = await frozen(h, id);
+  await h.advance(UNDO);
+  // An object of the right size exists at each target, so only the key check stands between it and a download.
+  links.put('deployment', 'elsewhere/secret', bytesOf(10));
+  links.put('deployment', 'secret', bytesOf(10));
+  await links.control('setKey', [id, 0, 'elsewhere/secret']);
+  await links.control('setKey', [id, 1, 'files/../secret']);
+  const before = links.stores.deployment.calls.length;
+  assert.equal((await links.fetch(path(outside, '/download'))).status, 502, 'outside the prefix');
+  assert.equal((await links.fetch(path(dotted, '/download'))).status, 502, 'a dot segment');
+  assert.equal(links.stores.deployment.calls.length, before, 'nothing was read');
+}));
+
+test('a workspace location inside a refused zone is not read at serve time, and without the zones no workspace link is served', async () => {
+  for (const refusedZones of [JSON.stringify(['mail.example', 'example.test']), null]) {
+    await withLinks(async (h, mail, from, links) => {
+      const id = await submit(h, mail, from, [await linkFile(links, bytesOf(10), { kind: 'workspace' }), await linkFile(links, bytesOf(10))]);
+      const [workspace, deployment] = await frozen(h, id);
+      await h.advance(UNDO);
+      assert.equal((await links.fetch(path(workspace, '/download'))).status, 502, String(refusedZones));
+      assert.equal(links.stores.workspace.calls.length, 0, 'nothing was read from the workspace location');
+      assert.equal((await links.fetch(path(deployment, '/download'))).status, 200, 'the deployment location is the operator\'s own');
+    }, { fileLinks: { refusedZones } });
+  }
+});
+
+test('a report after the sent alert was pruned raises no second alert', () => withLinks(async (h, mail, from, links) => {
+  const id = await submit(h, mail, from, [await linkFile(links, bytesOf(10), { expiry: 'never' })]);
+  const [link] = await frozen(h, id);
+  await h.advance(UNDO);
+  for (let n = 1; n <= 10; n++) assert.equal((await links.fetch(path(link, '/report'), { method: 'POST' })).status, 200);
+  await h.backendCron();
+  const reported = async () => (await links.alerts()).filter(alert => alert.source === 'mail:link_reported');
+  assert.equal((await reported()).length, 1);
+  // The sent alert is pruned after the retention window.
+  await h.advance(36 * day);
+  await h.backendCron();
+  assert.deepEqual(await h.directoryRows("SELECT key FROM mail_alerts WHERE key LIKE 'link_reported:%'"), [], 'the sent alert was pruned');
+  assert.equal((await links.fetch(path(link, '/report'), { method: 'POST' })).status, 429, 'a refused report');
+  await h.backendCron();
+  assert.deepEqual(await h.directoryRows("SELECT key FROM mail_alerts WHERE key LIKE 'link_reported:%'"), []);
+  assert.equal((await reported()).length, 1, 'no second alert');
 }));

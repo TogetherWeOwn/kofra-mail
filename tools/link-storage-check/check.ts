@@ -21,29 +21,40 @@ const dnsName = (value: string) => value.length <= 253 && value.split('.').lengt
 const registrable = (host: string) => host.split('.').slice(-2).join('.');
 
 /**
- * The link host (docs/m3-outbound-plan.md, M3-13): LINK_HOST must be a registrable
- * domain separate from the mail app's and the content origin's, so a Safe Browsing
- * flag on one link cannot block reading mail. A shared domain is refused unless
+ * The link host (docs/m3-outbound-plan.md, M3-13). A deploy is link-enabled when
+ * LINK_HOST is set; it then needs LINK_HOSTS (mail-content's served hosts, every
+ * entry valid, LINK_HOST first) and valid https MAIL_APP_ORIGIN and CONTENT_ORIGIN,
+ * and fails closed without them. The current LINK_HOST must be a registrable domain
+ * separate from both origins, so a Safe Browsing flag on one link cannot block
+ * reading mail; older hosts still listed in LINK_HOSTS keep serving their links
+ * and are not held to it. A shared domain is refused unless
  * LINK_HOST_ALLOW_SHARED_DOMAIN=1, which passes with `shared_domain_allowed` so the
- * risk is printed at every deploy. If LINK_HOSTS (mail-content) is given, LINK_HOST is its first entry.
+ * risk is printed at every deploy. Without LINK_HOST, a LINK_HOSTS list (old hosts
+ * still served) must still be valid.
  */
 export function linkHostCheck(env: Record<string, string | undefined>): CheckLine | undefined {
   const host = env.LINK_HOST;
-  if (host === undefined) return undefined;
-  if (!dnsName(host)) return { linkHost: 'LINK_HOST', result: 'invalid' };
-  if (env.LINK_HOSTS !== undefined) {
+  const listed = env.LINK_HOSTS;
+  if (host === undefined && listed === undefined) return undefined;
+  let hosts: string[] | undefined;
+  if (listed !== undefined) {
     // mail-content serves no link host at all if any entry is invalid, so every entry is checked.
-    const hosts = env.LINK_HOSTS.toLowerCase().split(/[\s,]+/).filter(Boolean);
+    hosts = listed.toLowerCase().split(/[\s,]+/).filter(Boolean);
     if (!hosts.length || !hosts.every(entry => /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$/.test(entry))) {
       return { linkHost: 'LINK_HOSTS', result: 'invalid' };
     }
-    if (hosts[0] !== host) return { linkHost: host, result: 'not_first' };
   }
-  const others = [env.MAIL_APP_ORIGIN, env.CONTENT_ORIGIN].flatMap(origin => {
+  if (host === undefined) return { linkHost: 'LINK_HOSTS', result: 'ok' };
+  if (!dnsName(host)) return { linkHost: 'LINK_HOST', result: 'invalid' };
+  if (!hosts) return { linkHost: 'LINK_HOSTS', result: 'invalid' };
+  if (hosts[0] !== host) return { linkHost: host, result: 'not_first' };
+  const origins: string[] = [];
+  for (const [name, origin] of [['MAIL_APP_ORIGIN', env.MAIL_APP_ORIGIN], ['CONTENT_ORIGIN', env.CONTENT_ORIGIN]] as const) {
     const url = origin ? URL.parse(origin) : null;
-    return url ? [url.hostname] : [];
-  });
-  if (!others.some(other => registrable(other) === registrable(host))) return { linkHost: host, result: 'ok' };
+    if (!url || !origin || url.protocol !== 'https:' || url.origin !== origin.replace(/\/$/, '') || !dnsName(url.hostname)) return { linkHost: name, result: 'invalid' };
+    origins.push(url.hostname);
+  }
+  if (!origins.some(other => registrable(other) === registrable(host))) return { linkHost: host, result: 'ok' };
   return { linkHost: host, result: env.LINK_HOST_ALLOW_SHARED_DOMAIN === '1' ? 'shared_domain_allowed' : 'shared_domain' };
 }
 

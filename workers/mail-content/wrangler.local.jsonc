@@ -24,6 +24,7 @@
     "CONTENT_STORAGE_DOMAIN": "objects.example",
     "CONTENT_ACCOUNT_DOMAIN": "account.example",
     "CONTENT_WORKERS_DEV_DOMAIN": "account-example.workers.dev",
-    "LINK_HOSTS": "files.example"
+    "LINK_HOSTS": "files.example",
+    "LINK_REFUSED_ZONES": "[\"mail.example\", \"content.example\", \"files.example\", \"objects.example\", \"account.example\"]"
   }
 }

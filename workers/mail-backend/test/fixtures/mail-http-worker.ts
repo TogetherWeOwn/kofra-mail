@@ -508,6 +508,11 @@ export class HttpMailbox extends Mailbox {
       return { id: ref.id, revision: ref.revision };
     });
   }
+  // Points a frozen link at another object key, as a corrupt record could.
+  setLinkKey(sendId: string, idx: number, key: string) {
+    if (!Number.isSafeInteger(idx) || idx < 0) throw new Error('Invalid fixture link index');
+    this.ctx.storage.sql.exec(`UPDATE mailbox_sends SET record = json_set(record, '$.links[${idx}].key', ?) WHERE id = ?`, key, sendId);
+  }
   // Calls to the mailbox's link capability, for the flood bucket ordering test.
   linkTargetCalls = 0;
   override async fileLinkTarget(...args: Parameters<Mailbox['fileLinkTarget']>) {
@@ -1059,6 +1064,7 @@ export default {
           case 'inUse': return Response.json(await fileLinkUsage(env.DIRECTORY).inUse(args[0] as { workspaceId: string; locationId: string }));
           case 'lookups': return Response.json({ lookups: linkLookups, targets: await box.linkCalls() });
           case 'routesDown': await box.setLinkRoutesDown(args[0] === true); return Response.json(null);
+          case 'setKey': await box.setLinkKey(args[0] as string, args[1] as number, args[2] as string); return Response.json(null);
           default: throw new Error('Unknown fixture link method');
         }
       }

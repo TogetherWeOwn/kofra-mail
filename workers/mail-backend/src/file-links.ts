@@ -79,9 +79,14 @@ export function isLocationRef(value: unknown): value is LinkLocationRef {
   return (ref.kind === 'deployment' && isLocationId(ref.id)) || (ref.kind === 'workspace' && typeof ref.id === 'string' && /^[a-z2-7]{26}$/.test(ref.id));
 }
 
-/** An object key in a link location: printable, no control characters, at most 1,024 bytes. */
-const isObjectKey = (value: unknown): value is string =>
-  typeof value === 'string' && value.length > 0 && byteLength(value) <= 1024 && !/\p{Cc}/u.test(value) && !value.startsWith('/');
+/**
+ * An object key in a link location: printable, no control characters, at most
+ * 1,024 bytes, and no empty, `.` or `..` segment, which URL parsing would
+ * collapse into a path outside the location's bucket or prefix.
+ */
+export const isObjectKey = (value: unknown): value is string =>
+  typeof value === 'string' && value.length > 0 && byteLength(value) <= 1024 && !/\p{Cc}/u.test(value) &&
+  value.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..');
 const isFingerprint = (value: unknown): value is string => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 
 export function isStoredFileLink(value: unknown): value is StoredFileLink {
@@ -205,16 +210,18 @@ export async function linkRouteById(db: D1Database, linkId: string): Promise<Lin
 }
 
 /**
- * Counts one abuse report against a link, at most `LINK_REPORT_CAP`, and stores
- * the operator alert obligation (carrying only the link id) in the same batch.
- * False once the cap is reached.
+ * Counts one abuse report against a link, at most `LINK_REPORT_CAP`, and, for
+ * the link's first report, stores the operator alert obligation (carrying only
+ * the link id) in the same batch. False once the cap is reached.
  */
 export async function reportLink(db: D1Database, tokenHash: string, linkId: string, now: number): Promise<boolean> {
   const [counted] = await db.batch([
     db.prepare(`UPDATE file_links SET reports = reports + 1 WHERE token_hash = ? AND link_id = ? AND reports < ${LINK_REPORT_CAP} RETURNING reports`)
       .bind(tokenHash, linkId),
+    // The alert obligation only on the first report (the count's 0-to-1 step): a refused
+    // or later report never raises it again, also after the sent alert was pruned.
     db.prepare(`INSERT OR IGNORE INTO mail_alerts (key, source, created_at)
-      SELECT ?, 'mail:link_reported', ? WHERE EXISTS (SELECT 1 FROM file_links WHERE token_hash = ? AND reports BETWEEN 1 AND ${LINK_REPORT_CAP})`)
+      SELECT ?, 'mail:link_reported', ? WHERE changes() = 1 AND EXISTS (SELECT 1 FROM file_links WHERE token_hash = ? AND reports = 1)`)
       .bind(`link_reported:${linkId}`, now, tokenHash),
   ]) as D1Result[];
   return (counted.results?.length ?? 0) === 1;

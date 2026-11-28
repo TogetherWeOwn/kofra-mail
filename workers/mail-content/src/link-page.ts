@@ -82,8 +82,13 @@ export function linkPage(input: LinkPageInput): string {
 export const unavailablePage = () => document('Link unavailable',
   '<h1>Link unavailable</h1><p class="file">This link has expired or was removed.</p><p>Ask the sender for a new link.</p>');
 
-export const limitPage = () => document('Download limit reached',
-  '<h1>Download limit reached</h1><p class="file">This file has been downloaded too often.</p><p>Try again later, or ask the sender for a new link.</p>');
+/** The limit page keeps "Report abuse": a link spent by abuse can still be reported. */
+export const limitPage = (token: string) => {
+  if (!/^[A-Za-z0-9_-]{22}$/.test(token)) throw new Error('Invalid link token');
+  return document('Download limit reached', '<h1>Download limit reached</h1><p class="file">This file has been downloaded too often.</p>'
+    + '<p>Try again later, or ask the sender for a new link.</p>'
+    + `<form method="post" action="/f/${token}/report"><button class="report" type="submit">Report abuse</button></form>`);
+};
 
 export const busyPage = () => document('Try again', '<h1>Try again</h1><p class="file">This link cannot be opened right now.</p><p>Try again in a minute.</p>');
 

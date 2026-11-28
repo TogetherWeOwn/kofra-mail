@@ -151,6 +151,8 @@ export type FileLinkOptions = {
   totalFactor?: number;
   // Extra headers the fake providers add to every object GET.
   objectHeaders?: Record<string, string>;
+  // mail-content's LINK_REFUSED_ZONES (a JSON array); null leaves the binding out.
+  refusedZones?: string | null;
 };
 export const LINK_HOST = 'files.example.test';
 const LINK_READ = { accessKeyId: 'link-reader-0001', secretAccessKey: 'link-reader-secret-0001' };
@@ -303,7 +305,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
         CONTENT_STORAGE_DOMAIN: 'object-store.example.test', CONTENT_WORKERS_DEV_DOMAIN: 'account-example.workers.dev',
         ...(fileLinks && { LINK_HOSTS: [LINK_HOST, ...fileLinks.hosts ?? []].join(' '),
           LINK_LOCATIONS: JSON.stringify({ current: 'links', locations: { links: DEPLOYMENT_LOCATION } }),
-          LINK_READ_CREDENTIALS: JSON.stringify({ links: LINK_READ }) }),
+          LINK_READ_CREDENTIALS: JSON.stringify({ links: LINK_READ }),
+          ...(fileLinks.refusedZones !== null && { LINK_REFUSED_ZONES: fileLinks.refusedZones ?? JSON.stringify(['mail.example', 'content.example', LINK_HOST]) }) }),
       },
       serviceBindings: {
         MAIL_LOOKUP: { name: 'mail-backend', entrypoint: 'ContentLookup' },
