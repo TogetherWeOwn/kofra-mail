@@ -7,11 +7,13 @@ import {
   checkLinkLocation, credentialSecret, deploymentLocations, linkSecretViolations, refusedZones,
   type Fetcher, type LinkWorkerRole,
 } from '../../packages/link-storage/src/index.ts';
+import ts from 'typescript';
+import { separateOrigins } from '../../workers/mail-content/src/origins.ts';
 
 export type CheckLine =
   | { location: string; result: 'ok' | 'missing_credentials' | string }
   | { worker: string; result: 'ok' | 'forbidden_secrets' | 'unavailable'; names?: string[] }
-  | { linkHost: string; result: 'ok' | 'invalid' | 'not_first' | 'shared_domain' | 'shared_domain_allowed' }
+  | { linkHost: string; result: 'ok' | 'invalid' | 'not_first' | 'mismatch' | 'shared_domain' | 'shared_domain_allowed' }
   | { config: 'invalid' };
 
 const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -48,12 +50,15 @@ export function linkHostCheck(env: Record<string, string | undefined>): CheckLin
   if (!dnsName(host)) return { linkHost: 'LINK_HOST', result: 'invalid' };
   if (!hosts) return { linkHost: 'LINK_HOSTS', result: 'invalid' };
   if (hosts[0] !== host) return { linkHost: host, result: 'not_first' };
-  const origins: string[] = [];
-  for (const [name, origin] of [['MAIL_APP_ORIGIN', env.MAIL_APP_ORIGIN], ['CONTENT_ORIGIN', env.CONTENT_ORIGIN]] as const) {
-    const url = origin ? URL.parse(origin) : null;
-    if (!url || !origin || url.protocol !== 'https:' || url.origin !== origin.replace(/\/$/, '') || !dnsName(url.hostname)) return { linkHost: name, result: 'invalid' };
-    origins.push(url.hostname);
+  // mail-content's own rule: canonical https origins (no path, no trailing slash) on separate hosts.
+  let origins: string[];
+  try {
+    const { content, app } = separateOrigins({ contentOrigin: env.CONTENT_ORIGIN ?? '', appOrigin: env.MAIL_APP_ORIGIN ?? '' });
+    origins = [app.hostname, content.hostname];
+  } catch {
+    return { linkHost: 'origins', result: 'invalid' };
   }
+  if (!origins.every(dnsName)) return { linkHost: 'origins', result: 'invalid' };
   if (!origins.some(other => registrable(other) === registrable(host))) return { linkHost: host, result: 'ok' };
   return { linkHost: host, result: env.LINK_HOST_ALLOW_SHARED_DOMAIN === '1' ? 'shared_domain_allowed' : 'shared_domain' };
 }
@@ -79,7 +84,29 @@ async function secretNames(env: Record<string, string | undefined>, script: stri
 }
 
 /** Runs the check; `ok` is false if any location or Worker fails. */
-export async function deployCheck(env: Record<string, string | undefined>, request: Fetcher = r => fetch(r)): Promise<{ ok: boolean; lines: CheckLine[] }> {
+/**
+ * `vars.LINK_HOST` of a Wrangler config (JSONC), as mail-backend deploys it; undefined if absent.
+ * Throws if the file cannot be parsed.
+ */
+export function configuredLinkHost(jsonc: string): string | undefined {
+  const { config, error } = ts.parseConfigFileTextToJson('wrangler.jsonc', jsonc);
+  if (error || !config || typeof config !== 'object') throw new Error('Invalid Wrangler config');
+  const host = (config as { vars?: Record<string, unknown> }).vars?.LINK_HOST;
+  if (host !== undefined && typeof host !== 'string') throw new Error('Invalid Wrangler config');
+  return host;
+}
+
+/**
+ * Runs the check. `configHost` is mail-backend's deployed `vars.LINK_HOST`: it is
+ * used when the environment has no LINK_HOST, and a different LINK_HOST in the
+ * environment fails the check (`mismatch`). `ok` is false if anything fails.
+ */
+export async function deployCheck(env: Record<string, string | undefined>, request: Fetcher = r => fetch(r), configHost?: string):
+  Promise<{ ok: boolean; lines: CheckLine[] }> {
+  if (configHost !== undefined && env.LINK_HOST !== undefined && env.LINK_HOST !== configHost) {
+    return { ok: false, lines: [{ linkHost: 'LINK_HOST', result: 'mismatch' }] };
+  }
+  if (configHost !== undefined && env.LINK_HOST === undefined) env = { ...env, LINK_HOST: configHost };
   const locations = deploymentLocations(env.LINK_LOCATIONS);
   const read = credentialSecret(env.LINK_READ_CREDENTIALS);
   const write = credentialSecret(env.LINK_WRITE_CREDENTIALS);
