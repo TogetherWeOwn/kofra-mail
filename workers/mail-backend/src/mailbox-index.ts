@@ -935,7 +935,7 @@ export class MailboxIndex {
       DELETE FROM mailbox_api_uploads; DELETE FROM mailbox_pending_releases; DELETE FROM mailbox_pending_confirmations;
       DELETE FROM mailbox_unusable_sources;
       DELETE FROM mailbox_send_marks; DELETE FROM mailbox_send_fences; DELETE FROM mailbox_send_release_list; DELETE FROM mailbox_send_dispatch;
-      DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
+      DELETE FROM mailbox_send_stalls; DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
       DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);

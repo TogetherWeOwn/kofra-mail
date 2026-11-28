@@ -7,8 +7,11 @@ import { lookupRecipient } from './directory.ts';
 import { receive, type InboundMail } from './inbound.ts';
 import { kofra, type KofraConfig } from './kofra.ts';
 import { MailAlerts } from './mail-alerts.ts';
+import { mailboxName } from './mailbox-name.ts';
 import { Outbox } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
+import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
+import { sendAlertEnvironment } from './send-alert-events.ts';
 
 export type ObjectReferences = {
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
@@ -40,7 +43,8 @@ export type Env = KofraConfig & {
   MAIL_SEND_ENABLED?: string;
   // The bound on clock differences of the send path, in seconds (default 30).
   MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
-  SEND?: { send(message: SendDispatch): Promise<unknown> };
+  MAIL_ENVIRONMENT?: string;
+  SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
   DIRECTORY: D1Database;
   DELIVER: Queue<string>;
   DELIVERY_QUEUE_NAME: string;
@@ -51,9 +55,7 @@ export type Env = KofraConfig & {
   MAIL_STATE: R2Bucket;
 };
 
-export function mailboxName(workspaceId: string, mailboxId: string): string {
-  return JSON.stringify([workspaceId, mailboxId]);
-}
+export { mailboxName } from './mailbox-name.ts';
 
 export function enabled(env: { MAIL_BACKEND_ENABLED?: string }): boolean {
   return env.MAIL_BACKEND_ENABLED === 'on';
@@ -109,14 +111,23 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
   }
 }
 
-export async function handleScheduled(_event: ScheduledController, env: Env): Promise<void> {
+export async function handleScheduled(_event: ScheduledController, env: Env, now = Date.now): Promise<void> {
   if (!enabled(env)) return;
   queueNames(env);
-  const result = await reconcile({
-    outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now: Date.now,
-    send: async id => { await env.DELIVER.send(id); }, alert: mailAlert(env.ALERTS),
-  });
+  // Delayed cron invocations reserve work from the time they actually run.
+  const sendBatch = env.SEND?.sendBatch?.bind(env.SEND);
+  const outbound = env.MAIL_SEND_ENABLED === 'on' && sendBatch
+    ? (async () => {
+      sendAlertEnvironment(env.MAIL_ENVIRONMENT);
+      await reconcileSendResults(env.DIRECTORY, { sendBatch }, now());
+    })().catch(() => console.error({ code: 'send_result_reconcile_failed' }))
+    : undefined;
+  const alert = mailAlert(env.ALERTS);
+  const [result] = await Promise.all([reconcile({
+    outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now,
+    send: async id => { await env.DELIVER.send(id); }, alert, sendAlert: alert,
+  }), outbound]);
   if (result.enqueueErrors || result.alertErrors) console.error({ code: 'mail_reconcile_partial', ...result });
 }
 
-export default { email: handleEmail, queue: handleQueue, scheduled: handleScheduled };
+export default { email: handleEmail, queue: handleQueue, scheduled: (event: ScheduledController, env: Env) => handleScheduled(event, env) };

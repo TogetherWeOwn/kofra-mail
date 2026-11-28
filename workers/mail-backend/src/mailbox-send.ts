@@ -26,6 +26,7 @@ import {
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
 } from './mailbox-send-store.ts';
 import type { TimerKind, TimerRun, TimerTable } from './mailbox-timers.ts';
+import type { SendEventCode } from './send-alert-events.ts';
 import { delayedUntil, finishReleases, RELEASE_BATCH, type SendDispatcher } from './mailbox-send-dispatch.ts';
 import type { QuotaPort, SendFence } from './mailbox-send-quota.ts';
 import { UPLOAD_EXPIRY, unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
@@ -60,6 +61,7 @@ export type SendPorts = {
   // The consumer's side after release (M3-5a): stored results and the drive decisions.
   dispatcher: Pick<SendDispatcher, 'drive' | 'storedSettled'>;
   quota(): QuotaPort | undefined;
+  alert?(code: SendEventCode): Promise<void>;
   // Called after each completed release step; tests inject crashes here.
   checkpoint?(step: SendStep): Promise<void>;
 };
@@ -676,17 +678,23 @@ export class SendDriver {
   // Releases fences in batches the quota call takes at once; an absent reservation is a no-op.
   private async releaseFences(start: Start, fences: SendFence[]): Promise<void> {
     if (!fences.length) return;
-    const quota = this.ports.quota();
-    if (!quota) throw new Error('Send quota binding missing');
-    const scope = { workspaceId: start.scope.workspaceId, mailboxId: start.scope.mailboxId, sendId: this.ref };
-    for (let at = 0; at < fences.length; at += RELEASE_BATCH) await quota.release(scope, fences.slice(at, at + RELEASE_BATCH));
+    try {
+      const quota = this.ports.quota();
+      if (!quota) throw new Error('Send quota binding missing');
+      const scope = { workspaceId: start.scope.workspaceId, mailboxId: start.scope.mailboxId, sendId: this.ref };
+      for (let at = 0; at < fences.length; at += RELEASE_BATCH) await quota.release(scope, fences.slice(at, at + RELEASE_BATCH));
+    } catch {
+      console.error({ code: 'send_quota_release' });
+      await this.ports.alert?.('send_quota_release');
+      throw new Error('Send quota release failed');
+    }
   }
 
   // A held send's never-authorized charges go while it waits for an operator; the list stays until finish or Mark.
   private async releaseHeld(start: Start): Promise<void> {
     const fences = await this.ports.local(() => finishReleases(this.ports.sql, this.ref));
     try { await this.releaseFences(start, fences); }
-    catch (error) { console.error({ code: 'send_quota_release', error: error instanceof Error ? error.message : String(error) }); }
+    catch { /* The alert was queued above; the held send retains the release list. */ }
   }
 
   private async breach(start: Start): Promise<void> {

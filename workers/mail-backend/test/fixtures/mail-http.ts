@@ -122,10 +122,11 @@ interface FixtureOptions {
   inlineCids?: boolean;
   // The send path (M3-3) with fake SEND and EMAIL bindings and manual alarms.
   send?: boolean;
+  configureWorkers?: (backend: WorkerOptions, workers: WorkerOptions[]) => void;
 }
 
 export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
-  send = false }: FixtureOptions = {}) {
+  send = false, configureWorkers }: FixtureOptions = {}) {
   const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
   const contents = outputFiles[0].text;
@@ -156,7 +157,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
-      ...(send && { MAIL_SEND_ENABLED: 'on', MANUAL_ALARMS: 'on' }),
+      ...(send && { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: 'test', MANUAL_ALARMS: 'on' }),
       DELIVERY_QUEUE_NAME: 'mail-deliver-fixture', DEAD_LETTER_QUEUE_NAME: 'mail-dlq-fixture',
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
       ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }) },
@@ -248,6 +249,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       },
     });
   }
+  configureWorkers?.(backend, workers);
   // The send path's structured log events (alert codes and metrics), recorded for assertions.
   const logs: string[] = [];
   const mf = new Miniflare({ host: '127.0.0.1', port: 0, workers, ...((inlineCids || send) && {
@@ -410,8 +412,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       clients.set(principal, client);
       return client;
     };
-    const advance = async (ms: number, parallel = false) => {
-      const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel) });
+    const advance = async (ms: number, parallel = false, alarms = true) => {
+      const res = await call('advance', String(ms), { 'x-fixture-parallel': String(parallel), 'x-fixture-alarms': String(alarms) });
       if (!res.ok) throw new Error(`Fixture advance HTTP ${res.status}: ${await res.text()}`);
       now += ms;
     };
@@ -478,6 +480,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       senderCheckPaused: () => controlAction('sender-check-paused'),
       resumeSenderCheck: () => controlAction('resume-sender-check'),
       failRecordOnce: (attempt: number, times = 1) => controlAction('fail-record-once', `${attempt},${times}`),
+      crashAfterRecordCommit: () => controlAction('crash-after-record-commit'),
       crashAfterClaimRelease: () => controlAction('crash-after-claim-release'),
       crashAfterResultDelete: () => controlAction('crash-after-result-delete'),
       // Holds the next pass through a seam ('select', or 'record:<attempt>') until resumed.
@@ -498,6 +501,13 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       resumeEnqueue: () => controlAction('resume-enqueue'),
       restoreAfter: async (ms: number) => { await controlAction('restore-after', String(ms)); now += ms; },
       m3: send, credentialEpoch: async () => 1,
+      worker: (name: string) => mf.getWorker(name),
+      queue: (binding: string, name: string) => mf.getQueueProducer(binding, name),
+      beginRestore: (principal: 'member' | 'other' = 'member') => controlAction('begin-restore', principal),
+      failClaims: (count: number) => controlAction('fail-claims', String(count)),
+      failedClaims: () => readControl<number>('failed-claims'),
+      backendCron: () => controlAction('backend-cron'),
+      sendEvent: (code: string, principal: 'member' | 'other' = 'member') => controlAction('send-event', JSON.stringify({ code, principal })),
       contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
       sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId), close: () => mf.dispose() };

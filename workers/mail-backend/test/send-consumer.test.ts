@@ -685,8 +685,8 @@ test('unknown and uncoded rejections are ambiguous: three end the send with deli
   }
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['failed:delivery_error']);
   assert.equal(logged(h, 'send_unknown_error').length, 3);
-  assert.equal(logged(h, 'send_unknown_error').filter(line => line.includes("'E_SOMETHING_NEW'")).length, 1);
-  assert.equal(logged(h, 'send_unknown_error').filter(line => line.includes("'uncoded'")).length, 2);
+  assert.ok(logged(h, 'send_unknown_error').every(line => !line.includes('E_SOMETHING_NEW') && !line.includes('uncoded')),
+    'only the stable alert code is logged, never provider data');
   assert.equal(logged(h, 'send_ambiguous_cap').length, 1);
 }));
 

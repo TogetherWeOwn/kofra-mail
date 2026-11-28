@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -185,6 +185,13 @@ test('deploy mode fails closed without the sending worker config', async (t) => 
   assert.deepEqual(fixture.events, []);
 });
 
+test('deploy with the checked-in template fails closed before any D1 request', async t => {
+  const fixture = await directoryFixture(t);
+  await assert.rejects(invokeCli(t, fixture.origin, 'deploy', 'template'), { code: 2, stdout: '', stderr: '' });
+  assert.deepEqual(fixture.calls, []);
+  assert.deepEqual(fixture.events, []);
+});
+
 for (const hasSender of [true, false]) {
   test(`fixture deploy ${hasSender ? 'with senders' : 'without a binding'} logs only counts`, async (t) => {
     const fixture = await directoryFixture(t);
@@ -235,10 +242,13 @@ test('deployment refuses a stale dispatch even when checked out at its original 
   await check(current);
 });
 
-async function invokeCli(t: TestContext, origin: string, mode: string, hasConfig: boolean, wranglerMode = 'empty') {
+async function invokeCli(t: TestContext, origin: string, mode: string, hasConfig: boolean | 'template', wranglerMode = 'empty') {
   const dir = await mkdtemp(join(tmpdir(), 'velmora-sender-allowlist-test-'));
   t.after(() => rm(dir, { recursive: true }));
-  if (hasConfig) await writeFile(join(dir, 'wrangler.jsonc'), '{\n // Wrangler JSONC fixture\n "name":"mail-send", "main":"src/index.ts",\n}\n');
+  if (hasConfig) await writeFile(join(dir, 'wrangler.jsonc'), hasConfig === 'template'
+    ? await readFile(new URL('../../workers/mail-send/wrangler.jsonc', import.meta.url))
+    : JSON.stringify({ name: 'mail-send', main: 'src/index.ts', d1_databases: [{ binding: 'DIRECTORY',
+      database_id: credentials.CLOUDFLARE_D1_DATABASE_ID }] }));
   try {
     return await runFile(process.execPath, [cliFixture, origin, mode, dir, wranglerMode], { env: credentials });
   } finally {

@@ -116,7 +116,7 @@ export function classifySend(settled: SettledSend): SendClass {
 }
 
 const log = (code: string, error?: unknown) =>
-  console.error({ code, ...(error !== undefined && { error: error instanceof Error ? error.name : typeof error }) });
+  console.error({ code, ...(error !== undefined && { errorType: typeof error }) });
 
 function isDispatch(value: unknown): value is SendDispatch {
   const message = value as Partial<SendDispatch> | null;

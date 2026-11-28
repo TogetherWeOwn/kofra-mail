@@ -1,0 +1,30 @@
+{
+  // Production template. Replace the directory ID and resource names per environment.
+  "name": "mail-send",
+  "main": "src/entry.ts",
+  "compatibility_date": "2026-06-25",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "MAIL_SEND_ENABLED": "off",
+    "MAIL_ENVIRONMENT": "production",
+    "SEND_QUEUE_NAME": "send",
+    "SEND_DLQ_NAME": "send-dlq"
+  },
+  "durable_objects": { "bindings": [
+    { "name": "MAILBOX", "class_name": "Mailbox", "script_name": "mail-backend" }
+  ] },
+  "d1_databases": [{
+    "binding": "DIRECTORY",
+    "database_name": "mail-directory",
+    "database_id": "00000000-0000-0000-0000-000000000000"
+  }],
+  "services": [{ "binding": "ALERTS", "service": "mail-alerts" }],
+  "queues": {
+    "producers": [{ "binding": "SEND", "queue": "send" }],
+    "consumers": [
+      { "queue": "send", "max_batch_size": 1, "max_retries": 3, "dead_letter_queue": "send-dlq" },
+      { "queue": "send-dlq", "max_batch_size": 10, "max_retries": 100, "retry_delay": 3600 }
+    ]
+  }
+}

@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS mailbox_send_marks (
 -- ('unapplied': an acceptance that cannot be recorded; 'stuck': an applicable row that keeps failing).
 CREATE TABLE IF NOT EXISTS mailbox_send_result_alerts (send_id TEXT NOT NULL, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
   code TEXT NOT NULL CHECK (code IN ('unapplied', 'stuck')), since INTEGER NOT NULL, PRIMARY KEY (send_id, epoch, attempt, code));
+CREATE TABLE IF NOT EXISTS mailbox_send_stalls (
+  send_id TEXT PRIMARY KEY NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE,
+  stall_since INTEGER NOT NULL, lease_expires_at INTEGER, expiries INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS mailbox_send_stalls_age ON mailbox_send_stalls(stall_since);
+CREATE INDEX IF NOT EXISTS mailbox_send_stalls_expired ON mailbox_send_stalls(expiries) WHERE expiries >= 5;
+-- Unsent one-shot operator events waiting for the directory alert outbox.
+CREATE TABLE IF NOT EXISTS mailbox_send_event_outbox (
+  day INTEGER NOT NULL, code TEXT NOT NULL, occurred_at INTEGER NOT NULL, PRIMARY KEY (day, code)
+);
 CREATE TABLE IF NOT EXISTS mailbox_send_release_list (
   send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, epoch INTEGER NOT NULL, attempt INTEGER NOT NULL,
   PRIMARY KEY (send_id, epoch, attempt)

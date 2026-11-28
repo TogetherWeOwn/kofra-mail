@@ -15,7 +15,7 @@ import { deltaRange, journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
-import { mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
+import { handleScheduled, mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
 import { SendMimeError } from '../../src/send-mime.ts';
@@ -41,6 +41,7 @@ interface FixtureEnv extends Omit<BackendEnv, 'MAILBOX'> {
   CSRF_KEY: string;
   INITIAL_TIME: number;
   CONTROL_KEY: string;
+  SEND_PROBE?: Fetcher;
   CONTENT_PORT?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
   REAL_CONTENT_ORIGIN?: string;
@@ -115,6 +116,29 @@ export class HttpMailbox extends Mailbox {
   // Fails recordResult `times` times for one fence attempt.
   private failRecordAttempt?: number;
   private failRecordTimes = 0;
+  private crashCommittedRecord = false;
+  crashAfterRecordCommit() { this.crashCommittedRecord = true; }
+  protected override async sendRecordCommittedCheckpoint() {
+    if (!this.crashCommittedRecord) return;
+    this.crashCommittedRecord = false;
+    throw new Error('Fixture crash after record commit');
+  }
+  private claimFailures = 0;
+  private claimsFailed = 0;
+  failClaims(count: number) { this.claimFailures = count; }
+  failedClaims() { return this.claimsFailed; }
+  override async claimSend(...args: Parameters<Mailbox['claimSend']>) {
+    if (this.claimFailures > 0) {
+      this.claimFailures--;
+      this.claimsFailed++;
+      throw new Error('Fixture claim unavailable');
+    }
+    return super.claimSend(...args);
+  }
+  async beginFixtureRestore(ws: string, mb: string) {
+    await this.ctx.storage.deleteAll();
+    await this.restoreFromBackup(ws, mb);
+  }
   failRecordOnce(attempt: number, times = 1) { this.failRecordAttempt = attempt; this.failRecordTimes = times; }
   // Holds the next record of one fence attempt, or the next poll right after its select, until resumed.
   // Each pauseAt arms one gate for one pass through the seam, in order; resumeAt releases the oldest waiting pass.
@@ -796,6 +820,23 @@ export default {
       if (req.method !== 'POST' || req.headers.get('x-fixture-control') !== env.CONTROL_KEY) return missing();
       if (url.pathname === '/__fixture/deliver') return incoming(req, env, req.headers.get('x-fixture-to')!, req.headers.get('x-fixture-from')!);
       if (url.pathname === '/__fixture/now') return Response.json(now(env));
+      if (url.pathname === '/__fixture/send-event') {
+        const { code, principal } = await req.json<{ code: string; principal: string }>();
+        const { ws, mailboxId } = env.ACCOUNTS[principal];
+        await env.MAILBOX.getByName(mailboxName(ws, mailboxId!)).recordSendEvent(ws, mailboxId!, code);
+        return new Response(null, { status: 204 });
+      }
+      if (url.pathname === '/__fixture/backend-cron') {
+        const probe = env.SEND_PROBE!;
+        await handleScheduled({ cron: '* * * * *', scheduledTime: now(env), noRetry() {} }, {
+          ...env, SEND: { send: body => probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify(body) }),
+            async sendBatch(batch) {
+              const response = await probe.fetch('https://fixture.internal/notice', { method: 'POST', body: JSON.stringify([...batch].map(({ body }) => body)) });
+              if (!response.ok) throw new Error('Fixture result notice queue unavailable');
+            } },
+        }, () => now(env));
+        return new Response(null, { status: 204 });
+      }
       if (url.pathname === '/__fixture/rate-cap') {
         const { binding, cap } = await req.json<{ binding: string; cap: number }>();
         rateCaps.set(binding, cap);
@@ -872,6 +913,13 @@ export default {
           case '/__fixture/publish-failure': await box.publishFailure(await req.text() === 'true'); break;
           case '/__fixture/purge-trash': return Response.json(await box.purgeTrash(ws));
           case '/__fixture/restore': await box.restoreFixture(ws, mailboxId!); break;
+          case '/__fixture/begin-restore': {
+            const target = env.ACCOUNTS[await req.text()];
+            await env.MAILBOX.getByName(mailboxName(target.ws, target.mailboxId!)).beginFixtureRestore(target.ws, target.mailboxId!);
+            break;
+          }
+          case '/__fixture/fail-claims': await box.failClaims(Number(await req.text())); break;
+          case '/__fixture/failed-claims': return Response.json(await box.failedClaims());
           case '/__fixture/restore-after': {
             time = now(env) + Number(await req.text());
             await box.restoreAfter(ws, mailboxId!, time);
@@ -884,6 +932,7 @@ export default {
           case '/__fixture/pause-sender-check': await box.pauseSenderCheck(await req.text() || 'before'); break;
           case '/__fixture/sender-check-paused': await box.senderCheckPaused(); break;
           case '/__fixture/resume-sender-check': await box.resumeSenderCheck(); break;
+          case '/__fixture/crash-after-record-commit': await box.crashAfterRecordCommit(); break;
           case '/__fixture/fail-record-once': {
             const [attempt, times] = (await req.text()).split(',').map(Number);
             await box.failRecordOnce(attempt, times || 1);
@@ -1003,7 +1052,7 @@ export default {
         if (!Number.isSafeInteger(delta) || delta < 0) return new Response(null, { status: 400 });
         time = now(env) + delta;
         const { results } = await env.DIRECTORY.prepare('SELECT id, workspace_id FROM mailboxes').all<{ id: string; workspace_id: string }>();
-        const alarms = req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
+        const alarms = req.headers.get('x-fixture-alarms') === 'false' ? 0 : req.headers.get('x-fixture-parallel') === 'true' ? 2 : 1;
         await Promise.all(results.map(({ workspace_id, id }) => env.MAILBOX.getByName(mailboxName(workspace_id, id)).advanceClock(time!,
           env.MAIL_DRAFT_UPLOADS_ENABLED === 'on' && workspace_id === env.ACCOUNTS.member.ws && id === env.ACCOUNTS.member.mailboxId ? alarms : 0)));
         return new Response(null, { status: 204 });
