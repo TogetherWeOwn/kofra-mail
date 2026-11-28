@@ -9,8 +9,17 @@ import type { ProviderStart } from './mail-send-worker.ts';
 
 export const SEND = 'send', DLQ = 'send-dlq';
 export const WS = 'w1', MB = 'mailbox-a';
-export const MINUTE = 60_000, HOUR = 60 * MINUTE;
-const START = Date.UTC(2026, 10, 27, 12);
+export const MINUTE = 60_000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
+// The fixture clock starts at the real clock, never at a fixed date. Mailbox
+// calls outside a fixture alarm (a restore's journal wake-up, for example) read
+// the platform clock, which a test cannot set; a test that advances to such a
+// timer jumps the fixture clock to the real time, so a start that falls behind
+// the real clock eventually jumps a test past its quota day.
+// The real quota's daily reset sits a fixed time after the start, so every run
+// reaches the same quota-day boundaries.
+const RESET_AFTER = 3 * HOUR;
+// The quota day (its label) `days` after the one the fixture starts in.
+export const quotaDay = (startedAt: number, days = 0) => new Date(startedAt + RESET_AFTER + (days - 1) * DAY).toISOString().slice(0, 10);
 const entry = fileURLToPath(new NodeURL('./mail-send-worker.ts', import.meta.url));
 const compiled = () => build({ entryPoints: [entry], bundle: true, platform: 'browser', format: 'esm',
   external: ['cloudflare:workers'], write: false });
@@ -53,7 +62,10 @@ export async function startMailSendFixture({ quota = true, email = true, environ
       default: throw new Error('Unexpected outbound fixture request');
     }
   };
-  const h = await startMailHttpFixture({ send: true, startedAt: START, realQuota, configureWorkers(backend, workers) {
+  // Whole minutes: the reset is configured as HH:MM.
+  const startedAt = Math.floor(Date.now() / MINUTE) * MINUTE;
+  const reset = new Date(startedAt + RESET_AFTER).toISOString().slice(11, 16);
+  const h = await startMailHttpFixture({ send: true, startedAt, realQuota: realQuota && { reset, ...realQuota }, configureWorkers(backend, workers) {
     backend.serviceBindings = { ...backend.serviceBindings, SEND_PROBE: probe, ALERTS: probe };
     backend.bindings = { ...backend.bindings, MAIL_ENVIRONMENT: environment };
     workers.push({
