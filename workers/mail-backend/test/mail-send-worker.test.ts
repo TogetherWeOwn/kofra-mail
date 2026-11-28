@@ -6,7 +6,7 @@ import type { SendFence } from '../src/mailbox-send-quota.ts';
 import { TAKE_SEND_NOTICES } from '../src/reconcile-send-results.ts';
 import { isSendEventCode } from '../src/send-alert-events.ts';
 import type { DispatchOutcome, ResultNotice } from '../src/send-consumer.ts';
-import { DLQ, HOUR, MB, MINUTE, SEND, WS, startMailSendFixture } from './fixtures/mail-send.ts';
+import { DLQ, HOUR, MB, MINUTE, SEND, WS, quotaDay, startMailSendFixture } from './fixtures/mail-send.ts';
 
 type Fixture = Awaited<ReturnType<typeof startMailSendFixture>>;
 const run = async (body: (h: Fixture) => Promise<void>, options?: Parameters<typeof startMailSendFixture>[0]) => {
@@ -563,7 +563,7 @@ test('cross-worker real quota shares a gate and delivers one redacted operator a
   assert.deepEqual(await h.batch(SEND, dispatch(first)), ['ack']);
   await assertSent(h, first);
   assert.deepEqual((await quotaCharges(h)).map(({ sendId, day, charges }) => ({ sendId, day, charges })),
-    [{ sendId: first, day: '2026-11-26', charges: 1 }], 'mail-send wrote to the same account object as mail-backend');
+    [{ sendId: first, day: quotaDay(h.startedAt), charges: 1 }], 'mail-send wrote to the same account object as mail-backend');
   const reset = await h.quota<number>('resetAt');
   const delayed = await queued(h, 'real-quota-delayed');
   const blockedToday = [delayed, await queued(h, 'real-quota-also-delayed')];
@@ -579,7 +579,7 @@ test('cross-worker real quota shares a gate and delivers one redacted operator a
   const alerts = () => h.alerts.filter(({ body }) => (JSON.parse(body) as { source: string }).source === `mail:${gateCode}`);
   const expectedAlert = (day: string, time: number) => ({ source: `mail:${gateCode}`, key: `send_quota_gate:test:${day}`,
     title: 'A mail account quota gate was reached', environment: 'test', time });
-  const today = expectedAlert('2026-11-26', firstRefusedAt);
+  const today = expectedAlert(quotaDay(h.startedAt), firstRefusedAt);
   assert.deepEqual(alerts().map(({ body }) => JSON.parse(body)), [today]);
   assert.ok(isSendEventCode(gateCode), 'the quota code is on the operator allow-list');
   assert.equal(h.providerCalls(), 1);
@@ -587,7 +587,7 @@ test('cross-worker real quota shares a gate and delivers one redacted operator a
   assert.deepEqual(await h.batch(SEND, dispatch(delayed)), ['ack']);
   await assertSent(h, delayed);
   const blockedNextDay = await queued(h, 'real-quota-new-day');
-  const tomorrow = expectedAlert('2026-11-27', await h.sends.now());
+  const tomorrow = expectedAlert(quotaDay(h.startedAt, 1), await h.sends.now());
   assert.deepEqual(await h.batch(SEND, dispatch(blockedNextDay)), ['ack']);
   assert.equal((await h.sendState(blockedNextDay)).row?.state, 'delayed');
   await h.quota('runAlarm');
