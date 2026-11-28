@@ -749,8 +749,15 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         () => service.updateMailbox(missing, { displayName: 'Updated' }),
         () => service.createAlias({ mailboxId: missing, address: 'alias@example.com', sendAs: true }, key('alias')),
         () => service.deleteAlias('alias@example.com'),
+        () => service.createLinkLocation({ endpoint: 'https://s3.example.com', region: 'auto', bucket: 'links', pathStyle: true,
+          read: { accessKeyId: 'EXAMPLEREAD', secretAccessKey: 'example-read-secret' },
+          write: { accessKeyId: 'EXAMPLEWRITE', secretAccessKey: 'example-write-secret' } }, key('link-location')),
+        () => service.rotateLinkLocationCredentials(missing, { read: { accessKeyId: 'EXAMPLEREAD', secretAccessKey: 'example-read-secret' },
+          write: { accessKeyId: 'EXAMPLEWRITE', secretAccessKey: 'example-write-secret' } }),
+        () => service.deleteLinkLocation(missing),
       ];
-      for (const call of [() => mail.listDomains(), () => mail.listMailboxes({}), () => mail.listMembers({}), ...writes(mail)]) {
+      for (const call of [() => mail.listDomains(), () => mail.listMailboxes({}), () => mail.listMembers({}), () => mail.listLinkLocations(),
+        ...writes(mail)]) {
         await rejects(call(), 'forbidden');
       }
       const stale = h.as('staleAdmin');
@@ -759,6 +766,7 @@ export function defineConformance(name: string, makeHarness: () => Promise<Confo
         assert.equal(error.maxAgeSeconds, 600);
       }
       await stale.listDomains();
+      await stale.listLinkLocations();
       const domain = { name: 'reauth.example.com', kind: 'secondary' } as const;
       const options = key('admin-replay');
       await h.as('admin').addDomain(domain, options);

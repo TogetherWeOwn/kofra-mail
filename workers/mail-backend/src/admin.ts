@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { workspaceMailBucket } from './directory.ts';
+import { linkCredentialKeyVersions, rewrapLinkCredentials } from './link-credentials.ts';
 import { isDeliveryId, Outbox } from './outbox.ts';
 import { enabled, type Env } from './worker.ts';
 
@@ -20,5 +21,18 @@ export class MailAdmin extends WorkerEntrypoint<Env> {
     workspaceMailBucket(workspaceId);
     const sweeper = this.env.SWEEPER.getByName(workspaceId) as unknown as { rearm(): Promise<void> };
     await sweeper.rearm();
+  }
+
+  // After a LINK_CRED_KEK rotation: rewraps up to `limit` (at most 100) stored link
+  // credentials under the current version. Repeat until it rewraps none.
+  async rewrapLinkCredentials(limit: number): Promise<{ rewrapped: number; failed: number }> {
+    if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+    return rewrapLinkCredentials(this.env, limit);
+  }
+
+  // The KEK versions stored link credentials still use. Remove an old version only once it is not listed.
+  async linkCredentialKeyVersions(): Promise<number[]> {
+    if (!enabled(this.env)) throw new Error('Mail backend is disabled');
+    return linkCredentialKeyVersions(this.env);
   }
 }

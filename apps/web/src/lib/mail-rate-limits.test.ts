@@ -127,14 +127,15 @@ for (const [binding, op, admittedStatus, params, other, key] of bucketCases) {
 
 const missingCases: [Binding, Operation[]][] = [
   ['MAIL_RATE_READS', ['getSession', 'listViews', 'listThreads', 'getThread', 'listLabels', 'listIdentities', 'getSettings',
-    'listDrafts', 'getDraft', 'getSend', 'listSends', 'listDomains', 'listMailboxes', 'listMembers']],
+    'listDrafts', 'getDraft', 'getSend', 'listSends', 'listDomains', 'listMailboxes', 'listMembers', 'listLinkLocations']],
   ['MAIL_RATE_WRITES', ['updateThreads', 'getBodyUrl', 'getAttachmentUrl', 'createLabel', 'renameLabel', 'deleteLabel',
     'updateSettings', 'createDraft', 'replaceDraft', 'deleteDraft', 'deleteUpload']],
   ['MAIL_RATE_UPLOADS', ['createUpload']],
   ['MAIL_RATE_SENDS', ['sendDraft']],
   ['MAIL_RATE_UNDO', ['undoSend']],
   ['MAIL_RATE_UNDO_FLOOD', ['undoSend']],
-  ['MAIL_RATE_ADMIN_WRITES', ['addDomain', 'createMailbox', 'updateMailbox', 'createAlias', 'deleteAlias']],
+  ['MAIL_RATE_ADMIN_WRITES', ['addDomain', 'createMailbox', 'updateMailbox', 'createAlias', 'deleteAlias', 'createLinkLocation',
+    'rotateLinkLocationCredentials', 'deleteLinkLocation']],
 ];
 for (const [binding, ops] of missingCases) {
   test(`${binding} is required on ${ops.join(', ')}`, async () => {

@@ -145,6 +145,9 @@ Errors are RFC 9457 `application/problem+json`, in the same shape as the Kofra A
 | `listMailboxes`, `createMailbox`, `updateMailbox` | `/admin/mailboxes`, `/admin/mailboxes/{mailboxId}` | Admin; writes need re-authentication |
 | `createAlias`, `deleteAlias` | `POST /admin/aliases`, `DELETE /admin/aliases/{address}` | Admin; both need re-authentication |
 | `listMembers` | `GET /admin/members` | Admin; workspace members from the account service |
+| `listLinkLocations`, `createLinkLocation` | `/admin/link-locations` | Admin; create is Idem and needs re-authentication (section 8.7) |
+| `rotateLinkLocationCredentials` | `PUT /admin/link-locations/{locationId}/credentials` | Admin; needs re-authentication |
+| `deleteLinkLocation` | `DELETE /admin/link-locations/{locationId}` | Admin; needs re-authentication; 409 `location_in_use` while anything uses it |
 
 **Not in version 1:**
 - groups;
@@ -304,6 +307,18 @@ These routes need `features.drive`, which needs I1's per-action token exchange a
 - At most `aliasesPerMailbox` per mailbox, otherwise 422 `limit_reached`.
 - With `sendAs: true`, the alias shows as `pending` in the owner's identities until the sending allow-list is redeployed through CI.
 - `deleteAlias` stops delivery to that address at once.
+
+### 8.7 Link storage
+
+File links (outbound plan, M3-13 and M3-15) keep their files in an S3-compatible bucket. There is no built-in provider: the deployment configures one, and a workspace admin can add the workspace's own bucket instead.
+
+- **Locations.** `createLinkLocation` takes `{ endpoint, region, bucket, prefix, pathStyle, read, write }`. `read` is a read-only key, used only to serve downloads; `write` is a read-write key, used for uploads and cleanup. The new location becomes the workspace's `current` one: new links use it. Older locations keep serving the links made with them. A workspace has at most 8 locations (otherwise 422 `limit_reached`). Without a current location, new links use the deployment's storage, if `listLinkLocations` reports `deployment: true`.
+- **Fields never change.** A location's endpoint, region, bucket, prefix and path style are fixed. Moving to another bucket is a new location.
+- **Secrets are write-only.** No route returns a secret or a full access key id; a location reports only each key id's last 4 characters. Secrets are stored encrypted and are never logged.
+- **Credentials rotate in place.** `rotateLinkLocationCredentials` replaces both keys of a location after the new keys pass the save check. The location keeps its id, so its links keep working.
+- **The save check** runs on create and on rotation, before anything is stored. It requires `https:` on port 443 and a DNS name that is not an IP literal or one of the deployment's own or private-use domains. It then runs HeadBucket, a 1-byte probe put, get and delete, a probe multipart upload (create, part, list parts, complete, delete) and a second multipart upload that it aborts. An anonymous read and an anonymous list of the probe must both be refused: a public bucket fails the check. A redirect is never followed. A failure answers 422 `storage_check_failed` with one fixed `reason` (`STORAGE_CHECK_REASONS` in `src/errors.ts` lists them) and nothing from the provider's answer.
+- **Deleting** a location answers 409 `location_in_use` while any live link, pending delete, draft attachment or unfinished upload uses it.
+- **Not configured:** a deployment without the credential encryption key answers 501 `feature_unavailable` to create and rotate.
 
 ## 9. Live updates
 

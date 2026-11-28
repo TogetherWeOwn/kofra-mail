@@ -314,3 +314,41 @@ export interface MailboxPatch { displayName?: string; ownerUserId?: Id }
 export interface AliasInput { mailboxId: Id; address: string; sendAs: boolean }
 
 export interface Member { id: Id; name: string; email: string; status: 'active' | 'invited'; hasMailbox: boolean }
+
+/**
+ * A workspace's own S3-compatible bucket for file links, which overrides the
+ * deployment's link storage for new links (section 8.7). The fields never
+ * change; only the credentials rotate. Secrets are write-only: only each
+ * access key id's last 4 characters are returned.
+ */
+export interface LinkLocation {
+  id: Id;
+  /** `https://<host>`: port 443, no path. */
+  endpoint: string;
+  region: string;
+  bucket: string;
+  /** `''` or a key prefix ending in `/`. */
+  prefix: string;
+  pathStyle: boolean;
+  /** New links use the current location; older locations keep serving the links made with them. */
+  current: boolean;
+  readKeyIdLast4: string;
+  writeKeyIdLast4: string;
+  createdAt: UTCDate;
+  rotatedAt: UTCDate | null;
+}
+export interface LinkCredentialsInput { accessKeyId: string; secretAccessKey: string }
+/** `read` is a read-only key (downloads); `write` a read-write key (uploads and cleanup). */
+export interface LinkLocationCredentials { read: LinkCredentialsInput; write: LinkCredentialsInput }
+export interface LinkLocationInput extends LinkLocationCredentials {
+  endpoint: string;
+  region: string;
+  bucket: string;
+  prefix?: string;
+  pathStyle: boolean;
+}
+export interface LinkLocationList {
+  /** Whether the deployment configures link storage for workspaces without a current location. */
+  deployment: boolean;
+  items: LinkLocation[];
+}
