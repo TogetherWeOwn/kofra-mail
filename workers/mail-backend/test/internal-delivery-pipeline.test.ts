@@ -301,3 +301,22 @@ test('a failed stuck-alert insert never holds up the rows the reconciler took, a
     await h.handoffCron(200);
     assert.deepEqual(await h.directoryRows("SELECT key FROM mail_alerts WHERE key LIKE 'handoff_stuck:%'"), [{ key: `handoff_stuck:${stuck}` }]);
   }));
+
+test('a failed second take still acts on the rows the first page took', () => withInternal(async (h, mail, from) => {
+  await h.box('member', 'crashAtHandoff', 'expand:written');
+  const id = await released(h, mail, from, 'second-take', [OTHER]);
+  const mine = (await handoff(h, id))!;
+  // A full first page: this handoff, due first, and 11 of another workspace's whose sweeper never answers.
+  const now = await h.sends.now();
+  await h.directoryChange('UPDATE internal_handoffs SET release_retry_at = ? WHERE key = ?', now - 2 * hour, mine.key);
+  for (let i = 0; i < 11; i++) {
+    const sendId = `01M8H0000000000000000001${String(i).padStart(2, '0')}`;
+    await h.directoryChange(`INSERT INTO internal_handoffs (key, workspace_id, mailbox_id, send_id, raw_key, sender, addresses, message_id, folder_rev,
+        decision, created_at, plan, expand_retry_at, expanded_at, holder_release_pending, release_retry_at)
+      VALUES (?, 'w2', 'mailbox-z', ?, ?, 'foreign@example.net', '[[0,"a","example.net","a@example.net"]]', ?, 0, 'accepted', ?, '[[0,null]]', ?, ?, 1, ?)`,
+    `internal:w2:mailbox-z:${sendId}`, sendId, `raw/${'a'.repeat(64)}/01M8H00000000000000000GEN0`, sendId, now - hour, now - hour, now - hour, now - hour);
+  }
+  await h.sweeper('w2', 'stallTombstones', true);
+  await h.handoffCron(200, 2);
+  assert.equal((await handoff(h, id))?.holder_release_pending, 0, 'the first page was acted on although the second take failed');
+}));

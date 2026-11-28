@@ -535,7 +535,8 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       // Internal delivery (M3-8): the pipeline's queue consumer for every pending delivery, the reconciler's
       // handoff part (with a bound on each call), a second expander, a principal's mailbox and a workspace's sweeper.
       runDeliveries: () => readControl<string[]>('run-deliveries'),
-      handoffCron: (callMs?: number) => readControl<{ errors: number }>('handoff-cron', callMs === undefined ? '' : String(callMs)),
+      handoffCron: (callMs?: number, failTake?: number) => readControl<{ errors: number }>('handoff-cron',
+        `${callMs ?? ''}${failTake === undefined ? '' : `,${failTake}`}`),
       expand: (key: string) => readControl<string>('expand', key),
       box: <T>(principal: keyof typeof principals, method: string, ...args: unknown[]) => readControl<T>('box', JSON.stringify({ principal, method, args })),
       sweeper: <T>(workspace: string, method: string, ...args: unknown[]) => readControl<T>('sweeper', JSON.stringify({ workspace, method, args })),

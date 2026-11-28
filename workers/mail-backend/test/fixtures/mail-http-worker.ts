@@ -1003,8 +1003,14 @@ export default {
       // M3-8: the pipeline, the reconciler's handoff part, a second expander, and stored state.
       if (url.pathname === '/__fixture/run-deliveries') return Response.json(await runDeliveries(env));
       if (url.pathname === '/__fixture/handoff-cron') {
-        const callMs = Number(await req.text()) || undefined;
-        return Response.json(await reconcileHandoffs(pipelinePorts(env), now(env), callMs));
+        // `callMs`, or `callMs,failTake`: the failTake-th take of release rows fails.
+        const [callMs, failTake] = (await req.text()).split(',').map(value => Number(value) || undefined);
+        const ports = pipelinePorts(env);
+        let takes = 0;
+        if (failTake) ports.db = downable(ports.db, () => false, async query => {
+          if (query.includes('INDEXED BY internal_handoffs_release') && ++takes === failTake) throw new Error('Fixture take failure');
+        });
+        return Response.json(await reconcileHandoffs(ports, now(env), callMs));
       }
       if (url.pathname === '/__fixture/expand') return Response.json(await expandHandoff(pipelinePorts(env), await req.text(), now(env)));
       if (url.pathname === '/__fixture/box') {

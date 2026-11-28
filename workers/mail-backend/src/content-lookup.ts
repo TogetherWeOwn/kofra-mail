@@ -1,10 +1,12 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { workspaceMailBucket } from './directory.ts';
+import { linkReadCredential, type LinkReadCredential } from './link-credentials.ts';
 import { isId } from './mailbox-api-input.ts';
 import type { MailboxContentRecord } from './mailbox-api-messages.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
 
 type LookupEnv = Omit<Env, 'MAILBOX'> & {
+  LINK_CRED_KEK?: string;
   MAILBOX: { getByName(name: string): { contentRecord(ws: string, mb: string, msg: string): Promise<MailboxContentRecord | null> } };
 };
 
@@ -32,5 +34,14 @@ export class ContentLookup extends WorkerEntrypoint<LookupEnv> {
     if (typeof ws !== 'string' || !isId(mb) || !accountId(sub) || !isId(msg) || await owner(this.env, ws, mb) !== sub) return null;
     const row = await this.env.MAILBOX.getByName(mailboxName(ws, mb)).contentRecord(ws, mb, msg);
     return row && { rawKey: row.rawKey, attachments: row.attachments.map(({ part, objectKey }) => ({ part, objectKey })), verdict: row.verdict };
+  }
+
+  /**
+   * The read-only key of a workspace's own link location, for serving downloads
+   * (M3-13). Only the read column is opened; the write key never leaves the backend.
+   */
+  async linkReadCredential(ws: unknown, locationId: unknown): Promise<LinkReadCredential | null> {
+    if (!enabled(this.env) || this.env.MAIL_CONTENT_ENABLED !== 'on') return null;
+    return linkReadCredential(this.env, ws, locationId);
   }
 }

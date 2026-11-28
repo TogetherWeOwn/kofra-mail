@@ -136,5 +136,9 @@ export function createHttpMailService({ baseUrl = API_PREFIX, fetch: fetcher = g
     createAlias: (json, options) => request('createAlias', { json, options }),
     deleteAlias: (address) => request('deleteAlias', { params: { address } }),
     listMembers: (query) => request('listMembers', { query }),
+    listLinkLocations: () => request('listLinkLocations'),
+    createLinkLocation: (json, options) => request('createLinkLocation', { json, options }),
+    rotateLinkLocationCredentials: (locationId, json) => request('rotateLinkLocationCredentials', { params: { locationId }, json }),
+    deleteLinkLocation: (locationId) => request('deleteLinkLocation', { params: { locationId } }),
   };
 }

@@ -76,6 +76,10 @@ export const ROUTES = {
   createAlias: route({ method: 'POST', path: '/admin/aliases', success: 201, idempotency: 'required', access: 'admin', reauth: true }),
   deleteAlias: route({ method: 'DELETE', path: '/admin/aliases/{address}', success: 204, access: 'admin', reauth: true }),
   listMembers: route({ method: 'GET', path: '/admin/members', success: 200, access: 'admin', query: paged }),
+  listLinkLocations: route({ method: 'GET', path: '/admin/link-locations', success: 200, access: 'admin' }),
+  createLinkLocation: route({ method: 'POST', path: '/admin/link-locations', success: 201, idempotency: 'required', access: 'admin', reauth: true }),
+  rotateLinkLocationCredentials: route({ method: 'PUT', path: '/admin/link-locations/{locationId}/credentials', success: 200, access: 'admin', reauth: true }),
+  deleteLinkLocation: route({ method: 'DELETE', path: '/admin/link-locations/{locationId}', success: 204, access: 'admin', reauth: true }),
 } as const satisfies Record<Operation, RouteSpec>;
 
 /** Path parameters of a route, in order. */

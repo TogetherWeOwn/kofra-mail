@@ -1,7 +1,7 @@
 import type {
   AdminMailbox, Alias, AliasInput, ContentUrl, Conversation, Domain, DomainInput, Draft, DraftInput, DriveImport,
-  DriveImportInput, DriveSave, Id, Identity, Label, MailboxInput, MailboxPage, MailboxPatch, Member, Page, Send,
-  SendQuery, Session, Settings, State, ThreadQuery, ThreadSummary, ThreadUpdate, Upload, ViewList,
+  DriveImportInput, DriveSave, Id, Identity, Label, LinkLocation, LinkLocationCredentials, LinkLocationInput, LinkLocationList,
+  MailboxInput, MailboxPage, MailboxPatch, Member, Page, Send, SendQuery, Session, Settings, State, ThreadQuery, ThreadSummary, ThreadUpdate, Upload, ViewList,
 } from './wire.ts';
 
 /** `Idempotency-Key`: 1 to 64 characters of `[A-Za-z0-9_-]`, new per user action, reused on retry. */
@@ -62,6 +62,10 @@ export interface MailService {
   createAlias(input: AliasInput, options: Idempotent): Promise<Alias>;
   deleteAlias(address: string): Promise<void>;
   listMembers(query: { cursor?: string; limit?: number }): Promise<Page<Member>>;
+  listLinkLocations(): Promise<LinkLocationList>;
+  createLinkLocation(input: LinkLocationInput, options: Idempotent): Promise<LinkLocation>;
+  rotateLinkLocationCredentials(locationId: Id, input: LinkLocationCredentials): Promise<LinkLocation>;
+  deleteLinkLocation(locationId: Id): Promise<void>;
 }
 
 export type Operation = keyof MailService;

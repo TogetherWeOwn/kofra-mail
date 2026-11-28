@@ -314,7 +314,14 @@ export async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
 async function takePages<T extends { key: string; attempts: number }>(ports: HandoffPorts, statement: string, now: number): Promise<T[]> {
   const taken: T[] = [];
   for (let page = 0; page < HANDOFF_PAGES; page++) {
-    const { results } = await ports.db.prepare(statement).bind(now, HANDOFF_PAGE).all<T>();
+    let results: T[];
+    try { ({ results } = await ports.db.prepare(statement).bind(now, HANDOFF_PAGE).all<T>()); }
+    catch (error) {
+      // The rows an earlier page took are already moved back: act on them this run.
+      if (!taken.length) throw error;
+      console.error({ code: 'handoff_take_partial' });
+      break;
+    }
     taken.push(...results);
     if (results.length < HANDOFF_PAGE) break;
   }
