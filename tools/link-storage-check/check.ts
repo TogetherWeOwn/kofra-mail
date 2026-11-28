@@ -31,8 +31,13 @@ export function linkHostCheck(env: Record<string, string | undefined>): CheckLin
   const host = env.LINK_HOST;
   if (host === undefined) return undefined;
   if (!dnsName(host)) return { linkHost: 'LINK_HOST', result: 'invalid' };
-  if (env.LINK_HOSTS !== undefined && env.LINK_HOSTS.toLowerCase().split(/[\s,]+/).filter(Boolean)[0] !== host) {
-    return { linkHost: host, result: 'not_first' };
+  if (env.LINK_HOSTS !== undefined) {
+    // mail-content serves no link host at all if any entry is invalid, so every entry is checked.
+    const hosts = env.LINK_HOSTS.toLowerCase().split(/[\s,]+/).filter(Boolean);
+    if (!hosts.length || !hosts.every(entry => /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?(?::\d{1,5})?$/.test(entry))) {
+      return { linkHost: 'LINK_HOSTS', result: 'invalid' };
+    }
+    if (hosts[0] !== host) return { linkHost: host, result: 'not_first' };
   }
   const others = [env.MAIL_APP_ORIGIN, env.CONTENT_ORIGIN].flatMap(origin => {
     const url = origin ? URL.parse(origin) : null;

@@ -161,6 +161,13 @@ test('revokeLink answers only after the publish barrier; the revocation already 
   await h.publishFailure(false);
   assert.equal((await mail.revokeLink(link.id)).state, 'revoked', 'the retry answers once a publish covers it');
   assert.equal((await links.fetch(path(link))).status, 404);
+  // A deletion too: its retry answers 204 only once the deletion is published.
+  await h.publishFailure(true);
+  await assert.rejects(mail.deleteLink(link.id), { code: 'unavailable' });
+  await assert.rejects(mail.deleteLink(link.id), { code: 'unavailable' }, 'a retry still waits for the publish');
+  await h.publishFailure(false);
+  await mail.deleteLink(link.id);
+  assert.deepEqual((await mail.listLinks({})).items, []);
 }));
 
 test('a revocation survives a restore, from the snapshot and from a delta', () => withLinks(async (h, mail, from, links) => {
@@ -438,6 +445,21 @@ test('an internal recipient below the floor at the handoff decision ends link_ex
   assert.deepEqual(await h.runDeliveries(), []);
   assert.deepEqual(await h.box('other', 'messageRows'), []);
   assert.equal((await mail.getSend(id)).recipients[0].reason, 'link_expired');
+}));
+
+test('the handoff floor is read at the decision, after the remote waits before it', () => withLinks(async (h, mail, from, links) => {
+  const id = await submit(h, mail, from, [await linkFile(links, bytesOf(100), { expiry: 1 })], [OTHER]);
+  const [link] = await frozen(h, id);
+  await h.sends.shortHandlerBudget();
+  await h.box('member', 'pauseAt', 'handoff:decide');
+  await h.advance(UNDO);
+  await h.box('member', 'pausedAt', 'handoff:decide');
+  // The run started a day above the floor; by its decision the link is below it.
+  await h.advance(link.expiresAt! - 30 * minute - await h.sends.now(), 'clock-only');
+  await h.box('member', 'resumeAt', 'handoff:decide');
+  await h.sends.driveIdle();
+  assert.deepEqual(await h.directoryRows('SELECT decision, reason FROM internal_handoffs'), [{ decision: 'rejected', reason: 'link_expired' }]);
+  assert.equal(await h.directoryRows('SELECT 1 FROM deliveries').then(rows => rows.length), 0);
 }));
 
 test('an accepted handoff whose sent commit is lost and reruns below the floor is still delivered', () => withLinks(async (h, mail, from, links) => {

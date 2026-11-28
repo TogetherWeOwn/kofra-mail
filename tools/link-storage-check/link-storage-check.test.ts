@@ -106,6 +106,10 @@ test('the link host must be a domain of its own unless the shared-domain overrid
   assert.deepEqual(linkHostCheck({ LINK_HOST: 'https://files.example.com' }), { linkHost: 'LINK_HOST', result: 'invalid' });
   assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'old.example.net files.example.com' }),
     { linkHost: 'files.example.com', result: 'not_first' });
+  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com https://old.example.net' }),
+    { linkHost: 'LINK_HOSTS', result: 'invalid' }, 'mail-content would serve no host at all');
+  assert.deepEqual(linkHostCheck({ LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com, old.example.net' }),
+    { linkHost: 'files.example.com', result: 'ok' });
   assert.equal(linkHostCheck({}), undefined);
   const { fetcher, env } = setup();
   assert.equal((await deployCheck({ ...env, ...origins, LINK_HOST: 'files.mail-suite.example' }, fetcher)).ok, false);

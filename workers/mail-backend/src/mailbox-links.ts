@@ -131,11 +131,14 @@ export function linkPage(sql: SqlStorage, limit: number, now: number, position?:
 
 /**
  * The journal event that revokes a link (and, when `deleting`, deletes it), or
- * null when it already is. Undefined when the link is not the sender's to change:
- * unknown, deleted, or of a send that never released.
+ * null when it already is (the caller still waits for its publish). Undefined
+ * when the link is not the sender's to change: unknown, deleted (for a revoke),
+ * or of a send that never released.
  */
 export function linkStateEvent(sql: SqlStorage, linkId: string, now: number, deleting: boolean):
   { type: 'link_state'; sendId: string; linkId: string; revokedAt: number; deletedAt?: number } | null | undefined {
+  // A deleted link is already gone for its sender; a repeated delete still waits for that deletion to be published.
+  if (deleting && linkRow(sql, linkId)?.deletedAt != null) return null;
   const found = visible(sql, linkId);
   if (!found) return undefined;
   const { row } = found;

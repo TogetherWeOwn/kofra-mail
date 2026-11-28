@@ -174,6 +174,7 @@ export class Mailbox extends DurableObject<Env> {
       checkpoint: step => this.sendCheckpoint(step),
       get handoff() { return self.handoffPorts(); },
       get linkRoutes() { return self.linkRouteDatabase(); },
+      clock: () => this.mailApiNow(),
     };
   }
 

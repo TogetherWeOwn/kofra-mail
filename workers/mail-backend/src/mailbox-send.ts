@@ -68,6 +68,8 @@ export type SendPorts = {
   handoff?: HandoffPorts;
   // The file links' routing table (M3-13, release step 4b); without it a send with links waits.
   linkRoutes?: D1Database;
+  // The current time, for decisions made after remote waits (the handoff's link floor).
+  clock?(): number;
   quota(): QuotaPort | undefined;
   alert?(code: SendEventCode): Promise<void>;
   // Called after each completed release step; tests inject crashes here.
@@ -753,9 +755,11 @@ export class SendDriver {
       await pipeline.sweeper(workspaceId).hold(open.rawKey, handoffHolder(key));
       // Step 2, decide and write: one statement; the first row written is the decision.
       await pipeline.checkpoint?.('handoff:decide');
+      // The link floor (M3-13) is read at the decision, after the routing, the barrier and the hold.
+      const decidedAt = Math.max(this.timer.now, ports.clock?.() ?? this.timer.now);
       await writeHandoff(pipeline.db, { key, workspaceId, mailboxId, sendId: this.ref, rawKey: open.rawKey, sender: record.from.email,
-        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, this.timer.now),
-        now: this.timer.now });
+        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, decidedAt),
+        now: decidedAt });
       await pipeline.checkpoint?.('handoff:decided');
       const row = await readHandoff(pipeline.db, key);
       // It counts as this send's handoff only if it matches this send.
