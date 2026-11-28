@@ -6,7 +6,7 @@
 
 import { hasHeaderControl, indexedAttachmentName, isSafeMessageId } from '../../../contracts/mail-api/src/headers.ts';
 import {
-  buildSendRequest, buildSentCopyFromParts, encodedSentCopySize, SEND_MIME_VERSION, SendMimeInvariantError,
+  buildSendRequest, buildSentCopyFromParts, encodedSentCopySize, LINK_SEND_MIME_VERSION, SEND_MIME_VERSION, SendMimeInvariantError,
   type SendMimeAttachment as SendMimeBuiltAttachment, type SendRequest,
 } from './send-mime.ts';
 
@@ -28,6 +28,7 @@ export type SendMimeMessage = {
   bcc: SendMimeAddress[];
   subject: string;
   text: string;
+  html?: string;
   attachments: SendMimeAttachment[];
   inReplyTo?: string;
   references?: string;
@@ -86,7 +87,7 @@ function cleanMimeMessageV1(message: SendMimeMessage): SendMimeMessage {
   };
 }
 
-function inputFor(message: SendMimeMessage) {
+function inputFor(message: SendMimeMessage, version: number) {
   if (message.replyTo.length > 1) throw new SendMimeInvariantError('More than one frozen Reply-To address');
   return {
     from: message.from,
@@ -100,25 +101,26 @@ function inputFor(message: SendMimeMessage) {
     dateAt: message.date,
     messageId: message.messageId,
     boundary: message.boundary,
-    builderVersion: SEND_MIME_VERSION,
+    builderVersion: version,
+    ...(version === LINK_SEND_MIME_VERSION && { html: message.html }),
   };
 }
 
-const sentCopyMimeBuilder: SendMimeBuilder = {
-  version: SEND_MIME_VERSION,
+const sentCopyMimeBuilder = (version: number): SendMimeBuilder => ({
+  version,
   encodedSize(raw) {
     const message = cleanMimeMessageV1(raw);
-    return encodedSentCopySize({ ...inputFor(message), attachments: message.attachments });
+    return encodedSentCopySize({ ...inputFor(message, version), attachments: message.attachments });
   },
   async build(raw, parts) {
     const message = cleanMimeMessageV1(raw);
-    return buildSentCopyFromParts({ ...inputFor(message), attachments: message.attachments }, parts);
+    return buildSentCopyFromParts({ ...inputFor(message, version), attachments: message.attachments }, parts);
   },
   async request(raw, parts) {
     const message = cleanMimeMessageV1(raw);
-    return buildSendRequest({ ...inputFor(message), attachments: await attachmentsOf(message, parts) });
+    return buildSendRequest({ ...inputFor(message, version), attachments: await attachmentsOf(message, parts) });
   },
-};
+});
 
 async function attachmentsOf(message: SendMimeMessage, parts: SendMimeParts): Promise<SendMimeBuiltAttachment[]> {
   const attachments: SendMimeBuiltAttachment[] = [];
@@ -130,4 +132,6 @@ async function attachmentsOf(message: SendMimeMessage, parts: SendMimeParts): Pr
   return attachments;
 }
 
-export const defaultMimeBuilders = () => mimeBuilders(sentCopyMimeBuilder);
+export const defaultMimeBuilders = () => ({
+  ...mimeBuilders(sentCopyMimeBuilder(SEND_MIME_VERSION), sentCopyMimeBuilder(LINK_SEND_MIME_VERSION)), current: SEND_MIME_VERSION,
+});

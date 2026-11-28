@@ -2,7 +2,7 @@ import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { Operation } from '../../../contracts/mail-api/src/service.ts';
 import type { Label, Settings } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
-import { draftInput, draftObjectKeys, draftRef, draftRefs, draftUploadIds, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft } from './mailbox-api-drafts.ts';
+import { draftInput, draftLinkUploadIds, draftObjectKeys, draftRef, draftRefs, draftUploadIds, encodeDraftObject, readDraft, readDraftObject, readDraftPage, sender, wireDraft, type ResolveLinkUpload } from './mailbox-api-drafts.ts';
 import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult, type Committed } from './mailbox-api-idempotency.ts';
 import type { HttpMailboxWrite } from './mailbox-http-write.ts';
 import { unusableSource, uploadReferenced, uploadRow, UPLOAD_EXPIRY } from './mailbox-upload.ts';
@@ -36,7 +36,8 @@ export class MailboxApi {
   constructor(private readonly index: MailboxIndex, private readonly sql: SqlStorage, private readonly workspaceId: string,
     private readonly mailboxId: string, private readonly incarnation: string, private readonly now: number,
     private readonly timers?: TimerTable, private readonly preparedKey?: PreparedApiKey,
-    private readonly clock: () => number = () => now, private readonly uploadsEnabled = false) {}
+    private readonly clock: () => number = () => now, private readonly uploadsEnabled = false,
+    private readonly resolveLink?: ResolveLinkUpload, private readonly rescheduleLinks?: (ids: string[]) => Promise<void>) {}
 
   // The published position is part of the state: what a send reports changes when a publish covers it.
   private state() { return mailboxState(this.incarnation, this.index.journal.revision(), this.index.journal.flushed()); }
@@ -87,6 +88,11 @@ export class MailboxApi {
 
   private draftUploads(id: string): string[] {
     return this.sql.exec<{ id: string }>('SELECT upload_id AS id FROM mailbox_api_draft_uploads WHERE draft_id = ?', id)
+      .toArray().map(row => row.id);
+  }
+
+  private draftLinkUploads(id: string): string[] {
+    return this.sql.exec<{ id: string }>('SELECT upload_id AS id FROM mailbox_link_claims WHERE draft_id = ? AND send_id IS NULL', id)
       .toArray().map(row => row.id);
   }
 
@@ -195,12 +201,14 @@ export class MailboxApi {
         return { body: await readDraft(this.index, ref) };
       }
       case 'createDraft': return this.withKey(operation, params, input, options, async commit => {
-        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, this.uploadsEnabled);
-        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
-        const ref = await this.index.prepareApiDraft(crypto.randomUUID(), encodeDraftObject(draft), this.now, attachmentKeys);
+        const id = crypto.randomUUID();
+        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, undefined, this.uploadsEnabled,
+          this.resolveLink && (upload => this.resolveLink!(id, upload)));
+        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft), linkUploadIds = draftLinkUploadIds(draft);
+        const ref = await this.index.prepareApiDraft(id, encodeDraftObject(draft), this.now, attachmentKeys);
         const { holder: _holder, ...replay } = ref;
         try {
-          commit({ draft: replay }, { type: 'draft', ...ref, attachmentKeys, uploadIds },
+          commit({ draft: replay }, { type: 'draft', ...ref, attachmentKeys, uploadIds, ...(linkUploadIds.length && { linkUploadIds }) },
             () => this.rescheduleUploads(uploadIds));
         } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
         return wireDraft(ref, draft);
@@ -210,12 +218,15 @@ export class MailboxApi {
         const previous = need(draftRef(this.sql, params.draftId));
         if (previous.revision !== options.ifMatch) return fail('revision_mismatch');
         const oldUploads = this.draftUploads(previous.id);
-        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now,
-          await readDraftObject(this.index, previous), this.uploadsEnabled);
-        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft);
+        const priorDraft = await readDraftObject(this.index, previous);
+        const draft = await draftInput(this.sql, this.index, input, canSendAs, this.now, priorDraft, this.uploadsEnabled,
+          this.resolveLink && (upload => this.resolveLink!(previous.id, upload)));
+        const attachmentKeys = draftObjectKeys(draft), uploadIds = draftUploadIds(draft), linkUploadIds = draftLinkUploadIds(draft);
+        const dropped = this.draftLinkUploads(previous.id).filter(id => !linkUploadIds.includes(id));
+        if (dropped.length) await this.rescheduleLinks?.(dropped);
         const ref = await this.index.prepareApiDraft(previous.id, encodeDraftObject(draft), this.now, attachmentKeys);
         try {
-          this.index.changeMany([{ type: 'draft', ...ref, attachmentKeys, uploadIds }],
+          this.index.changeMany([{ type: 'draft', ...ref, attachmentKeys, uploadIds, ...(linkUploadIds.length || dropped.length ? { linkUploadIds } : {}) }],
             () => this.rescheduleUploads([...oldUploads, ...uploadIds]));
         } catch (error) { await this.index.releaseDraft(ref, attachmentKeys); throw error; }
         return { body: wireDraft(ref, draft) };
@@ -227,6 +238,8 @@ export class MailboxApi {
         const uploads = this.draftUploads(previous.id);
         const hasObjects = this.sql.exec('SELECT 1 FROM mailbox_api_draft_objects WHERE draft_id = ? LIMIT 1', previous.id).toArray().length;
         if (!this.uploadsEnabled && hasObjects) return fail('not_implemented');
+        const linkIds = this.draftLinkUploads(previous.id);
+        if (linkIds.length) await this.rescheduleLinks?.(linkIds);
         this.index.changeMany([{ type: 'draft_delete', id: previous.id, deferRelease: true }],
           () => this.rescheduleUploads(uploads));
         return {};

@@ -98,6 +98,7 @@ type Ready = { index: MailboxIndex; epoch: number; restoredAt: number };
 
 export type DispatchPorts = {
   sql: SqlStorage;
+  linkFloorMs?: number;
   // In the work lane: whether the mailbox is ready for this scope (it may start a restore).
   ready(scope: DispatchScope): Promise<boolean>;
   // Synchronous, inside a step: the ready mailbox's index and recovery fences.
@@ -437,7 +438,7 @@ export class SendDispatcher {
         return { status: 'refused' };
       }
       // The link floor (M3-13): every file link needs an hour of life left at the claim.
-      if (linkFloorBelow(m.row.record.links, ctx.now)) {
+      if (linkFloorBelow(m.row.record.links, ctx.now, this.ports.linkFloorMs)) {
         this.commit(m, ready, timers, grace(m, 'link_expired', ctx), true);
         return { status: 'refused' };
       }
@@ -652,7 +653,7 @@ export class SendDispatcher {
       const marked = new Set(m.markSet(fence).map(mark => mark.idx));
       if (recipients.length !== marked.size || !recipients.every(idx => marked.has(idx) && m.recipient(idx)?.state === 'attempting')) return stale();
       // The link floor (M3-13), again immediately before the EMAIL call.
-      if (linkFloorBelow(m.row.record.links, ctx.now)) {
+      if (linkFloorBelow(m.row.record.links, ctx.now, this.ports.linkFloorMs)) {
         this.commit(m, ready, timers, grace(m, 'link_expired', ctx), true);
         return { status: 'stale' };
       }

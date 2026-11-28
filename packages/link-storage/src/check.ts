@@ -174,6 +174,13 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     const secondId = uploadIdPattern.exec(await boundedText(second) ?? '')?.[1];
     if (!secondId) throw new CheckFailure('multipart');
     cleanup.push(() => call(credentials.write, 'DELETE', objectAt(multipartKey, new URLSearchParams({ uploadId: secondId }).toString())).then(discard));
+    // The sweeper must be able to find a session whose initiation reply was lost.
+    const sessions = new URL(bucket);
+    sessions.search = new URLSearchParams({ uploads: '', prefix: multipartKey, 'max-uploads': '32' }).toString();
+    const listing = await boundedText(expect(await call(credentials.write, 'GET', sessions), [200], 'multipart', 'multipart')) ?? '';
+    if (![...listing.matchAll(/<Upload>([\s\S]*?)<\/Upload>/g)].some(([, item]) => item.includes(`<Key>${multipartKey}</Key>`) && uploadIdPattern.exec(item)?.[1] === secondId)) {
+      throw new CheckFailure('multipart');
+    }
     discard(expect(await call(credentials.write, 'DELETE', objectAt(multipartKey, new URLSearchParams({ uploadId: secondId }).toString())),
       [200, 204], 'multipart', 'multipart'));
     cleanup.pop();

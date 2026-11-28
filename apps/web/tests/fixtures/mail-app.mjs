@@ -70,7 +70,20 @@ function terminate() { void close().finally(() => { if (process.connected) proce
 process.once('SIGTERM', terminate);
 process.once('SIGINT', terminate);
 try {
-  http = createHttpServer((req, res) => {
+  http = createHttpServer(async (req, res) => {
+    if (req.method === 'POST' && req.url === '/__fixture/release-upload' && process.argv.includes('--file-links') && backend) {
+      try {
+        const mail = backend.as('demo');
+        const draft = (await mail.listDrafts({})).items.find(draft => draft.attachments.some(file => file.kind === 'file_link'));
+        if (!draft) { res.writeHead(404).end(); return; }
+        const send = await mail.sendDraft(draft.id, { idempotencyKey: 'playwright-uploaded-link', ifMatch: draft.revision });
+        await backend.advance(10_000, 'all-mailboxes');
+        const link = (await mail.listLinks({})).items.find(link => link.sendId === send.id);
+        if (link?.state !== 'live') { res.writeHead(409).end(); return; }
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ path: new URL(link.url).pathname }));
+      } catch { res.writeHead(500).end(); }
+      return;
+    }
     if (server) server.middlewares(req, res);
     else res.writeHead(503).end();
   }).listen(0, '127.0.0.1');
@@ -101,7 +114,7 @@ try {
     if (!addr || typeof addr === 'string') throw new Error('Content fixture did not obtain a port.');
     realContent = { appOrigin, contentOrigin: `http://localhost:${addr.port}` };
   }
-  const fileLinks = realContent && process.argv.includes('--file-links') ? { hosts: [new URL(realContent.contentOrigin).host] } : undefined;
+  const fileLinks = realContent && process.argv.includes('--file-links') ? { hosts: [new URL(realContent.contentOrigin).host], uploads: true } : undefined;
   backend = await startMailHttpFixture({ demo: true, realContent, inlineCids, ...(fileLinks && { send: true, fileLinks }) });
   const fileLink = fileLinks ? await sendFileLink(backend) : undefined;
   process.env.MAIL_DEV_API_ORIGIN = backend.origin;

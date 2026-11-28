@@ -11,6 +11,8 @@ import type { LinkExpiry } from '../../../contracts/mail-api/src/wire.ts';
 import { newLocationId } from '../../../packages/link-storage/src/store.ts';
 import { isLocationId } from '../../../packages/link-storage/src/location.ts';
 import type { LinkLocationUsage } from '../../../packages/link-storage/src/store.ts';
+import { isLinkFileName, isLinkHost, isLinkUploadId, type LinkLocationRef, type StoredFileLink } from './link-values.ts';
+export { isLinkFileName, isLinkHost, isLinkUploadId, type LinkLocationRef, type StoredFileLink } from './link-values.ts';
 
 export const HOUR_MS = 60 * 60_000;
 export const DAY_MS = 24 * HOUR_MS;
@@ -23,16 +25,12 @@ export const LINK_TOTAL_FACTOR = 1000;
 // Reports one link can take; the operator alert carries only the link id.
 export const LINK_REPORT_CAP = 10;
 
-/** Where a link's object lives: a deployment location (`LINK_LOCATIONS`) or a workspace's own. */
-export type LinkLocationRef = { kind: 'deployment' | 'workspace'; id: string };
-/** A draft's file link: the completed upload's object (written by the link upload path, M3-15b). */
-export type StoredFileLink = { location: LinkLocationRef; key: string; fingerprint: string };
 /** One link frozen in a send's record; every field of the sent bytes and of serving comes from here. */
 export type SendLink = {
   id: string; token: string; host: string; name: string; size: number;
   /** `dateAt + N days`, or null for a link that never expires. */
   expiresAt: number | null;
-  location: LinkLocationRef; key: string; fingerprint: string;
+  location: LinkLocationRef; key: string; fingerprint: string; uploadId?: string;
 };
 
 const encoder = new TextEncoder();
@@ -62,17 +60,6 @@ export const isTokenHash = (value: unknown): value is string => typeof value ===
 export const newLinkId = (): string => newLocationId();
 export const isLinkId = (value: unknown): value is string => typeof value === 'string' && /^[a-z2-7]{26}$/.test(value);
 
-/** A link host: a lowercase DNS name of at least two labels, no port. */
-export function isLinkHost(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length > 253) return false;
-  const labels = value.split('.');
-  return labels.length >= 2 && labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)) && !/^\d+$/.test(labels.at(-1)!);
-}
-
-/** A file name as uploads take it (contract section 8.4): 1 to 255 UTF-8 bytes, no control characters, `/` or `\`. */
-export const isLinkFileName = (value: unknown): value is string =>
-  typeof value === 'string' && value.length > 0 && byteLength(value) <= 255 && !/[\p{Cc}/\\]/u.test(value);
-
 export function isLocationRef(value: unknown): value is LinkLocationRef {
   const ref = (value ?? {}) as Partial<LinkLocationRef>;
   if (!value || typeof value !== 'object' || Object.keys(value).length !== 2) return false;
@@ -91,7 +78,8 @@ const isFingerprint = (value: unknown): value is string => typeof value === 'str
 
 export function isStoredFileLink(value: unknown): value is StoredFileLink {
   const link = (value ?? {}) as Partial<StoredFileLink>;
-  return !!value && typeof value === 'object' && isLocationRef(link.location) && isObjectKey(link.key) && isFingerprint(link.fingerprint);
+  return !!value && typeof value === 'object' && isLocationRef(link.location) && isObjectKey(link.key) && isFingerprint(link.fingerprint) &&
+    (link.uploadId === undefined || isLinkUploadId(link.uploadId));
 }
 
 export function validSendLinks(value: unknown): value is SendLink[] {
@@ -101,7 +89,8 @@ export function validSendLinks(value: unknown): value is SendLink[] {
     const link = (entry ?? {}) as Partial<SendLink>;
     if (!entry || typeof entry !== 'object' || !isLinkId(link.id) || !isLinkToken(link.token) || !isLinkHost(link.host) ||
         !isLinkFileName(link.name) || !count(link.size) || !(link.expiresAt === null || (count(link.expiresAt) && link.expiresAt <= 8.64e15)) ||
-        !isLocationRef(link.location) || !isObjectKey(link.key) || !isFingerprint(link.fingerprint)) return false;
+        !isLocationRef(link.location) || !isObjectKey(link.key) || !isFingerprint(link.fingerprint) ||
+        (link.uploadId !== undefined && !isLinkUploadId(link.uploadId))) return false;
     if (ids.has(link.id) || tokens.has(link.token)) return false;
     ids.add(link.id);
     tokens.add(link.token);
@@ -110,14 +99,23 @@ export function validSendLinks(value: unknown): value is SendLink[] {
 }
 
 /** `dateAt + N days` (UTC), or null for `'never'`, so the printed date and the replayed bytes agree. */
-export function linkExpiresAt(dateAt: number, expiry: LinkExpiry): number | null {
+export function linkExpiresAt(dateAt: number, expiry: LinkExpiry, testSeconds?: number): number | null {
   if (!isLinkExpiry(expiry)) throw new Error('Invalid link expiry');
-  return expiry === 'never' ? null : dateAt + expiry * DAY_MS;
+  return expiry === 'never' ? null : dateAt + (testSeconds === undefined ? expiry * DAY_MS : testSeconds * 1000);
 }
 
-/** True if a link of the send has less than `LINK_FLOOR_MS` of life left at `now`. */
-export function linkFloorBelow(links: readonly SendLink[] | undefined, now: number): boolean {
-  return (links ?? []).some(link => link.expiresAt !== null && link.expiresAt - now < LINK_FLOOR_MS);
+/** Undefined when off; null means the configured override was refused. */
+export function linkTestExpirySeconds(env: { MAIL_ENVIRONMENT?: string; LINK_TEST_EXPIRY_SECONDS?: string }): number | undefined | null {
+  const raw = env.LINK_TEST_EXPIRY_SECONDS;
+  if (raw === undefined) return undefined;
+  if (env.MAIL_ENVIRONMENT !== 'test' || !/^[0-9]{1,8}$/.test(raw)) return null;
+  const value = Number(raw);
+  return value >= 30 ? value : null;
+}
+
+/** True if a link of the send has less than the release floor of life left at `now`. */
+export function linkFloorBelow(links: readonly SendLink[] | undefined, now: number, floor = LINK_FLOOR_MS): boolean {
+  return (links ?? []).some(link => link.expiresAt !== null && link.expiresAt - now < floor);
 }
 
 /** Whether a frozen link is still within its lifetime at `now`. */
@@ -152,6 +150,20 @@ export function linkTextLines(links: readonly SendLink[] | undefined): string[] 
     `${withoutBidi(link.name)} (${formatSize(link.size)}): ${linkUrl(link)} (${link.expiresAt === null ? 'no expiry date' : `until ${formatExpiry(link.expiresAt)}`})`)];
 }
 
+const htmlEscape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
+
+/** The linked-copy MIME version's HTML alternative, with no raw sender markup. */
+export function linkedBodyHtml(body: string, links: readonly SendLink[]): string {
+  const lines = htmlEscape(body).replace(/\r\n|\r|\n/g, '<br>');
+  const list = links.map(link => {
+    const name = htmlEscape(withoutBidi(link.name));
+    const url = htmlEscape(linkUrl(link));
+    const expiry = link.expiresAt === null ? 'no expiry date' : `until ${formatExpiry(link.expiresAt)}`;
+    return `<li>${name} (${formatSize(link.size)}): <a href="${url}">${url}</a> (${expiry})</li>`;
+  });
+  return `<p>${lines}</p><p>Files shared with download links:</p><ul>${list.join('')}</ul>`;
+}
+
 /** A draft's expiry choice: the default when absent; undefined if invalid. */
 export function draftLinkExpiry(value: unknown): LinkExpiry | undefined {
   if (value === undefined) return LIMITS.linkExpiryDefaultDays;
@@ -165,9 +177,9 @@ export type LinkRoute = { linkId: string; workspaceId: string; mailboxId: string
 // Release step 4b: one row per link, INSERT OR IGNORE. A workspace location
 // must be `active` in the same statement (M3-15a): a location being deleted
 // takes no new reference, and the row is written on a later run.
-const ROUTE_INSERT = `INSERT OR IGNORE INTO file_links (token_hash, link_id, workspace_id, mailbox_id, location_kind, location_id, created_at)
-  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
-  WHERE ?5 = 'deployment' OR EXISTS (SELECT 1 FROM link_storage_locations
+const ROUTE_INSERT = `INSERT OR IGNORE INTO file_links (token_hash, link_id, workspace_id, mailbox_id, location_kind, location_id, created_at, upload_id)
+  SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+  WHERE ?8 IS NOT NULL OR ?5 = 'deployment' OR EXISTS (SELECT 1 FROM link_storage_locations
     WHERE workspace_id = ?3 AND location_id = ?6 AND state = 'active')`;
 
 export type RouteOutcome = 'routed' | 'retry' | 'breach';
@@ -181,7 +193,7 @@ export async function routeLinks(db: D1Database, workspaceId: string, mailboxId:
   if (!links.length) return 'routed';
   const hashes = await Promise.all(links.map(link => linkTokenHash(link.token)));
   await db.batch(links.map((link, i) => db.prepare(ROUTE_INSERT)
-    .bind(hashes[i], link.id, workspaceId, mailboxId, link.location.kind, link.location.id, now)));
+    .bind(hashes[i], link.id, workspaceId, mailboxId, link.location.kind, link.location.id, now, link.uploadId ?? null)));
   const { results } = await db.withSession('first-primary').prepare(`SELECT token_hash AS hash, link_id AS linkId, workspace_id AS workspaceId,
       mailbox_id AS mailboxId FROM file_links WHERE token_hash IN (SELECT value FROM json_each(?))`)
     .bind(JSON.stringify(hashes)).all<{ hash: string; linkId: string; workspaceId: string; mailboxId: string }>();
@@ -228,17 +240,17 @@ export async function reportLink(db: D1Database, tokenHash: string, linkId: stri
 }
 
 /**
- * M3-15a's usage port, for links: a workspace location is in use while any link
- * routed through it exists. A revoked or expired link still counts, because its
- * object stays until the link lifecycle (M3-15b) deletes it. Draft attachments
- * and unfinished uploads are M3-15b's part of this port: until it ships, no
- * link upload can be created, so none can exist.
+ * The registry pins a workspace location from reservation through confirmed
+ * deletion. Routing rows never keep an already-deleted registered object alive.
+ * A legacy route without a registry id still uses the location conservatively.
  */
 export function fileLinkUsage(db: D1Database): LinkLocationUsage {
   return {
     async inUse({ workspaceId, locationId }) {
-      const row = await db.withSession('first-primary').prepare(`SELECT 1 AS used FROM file_links
-        WHERE workspace_id = ? AND location_kind = 'workspace' AND location_id = ? LIMIT 1`).bind(workspaceId, locationId).first();
+      const row = await db.withSession('first-primary').prepare(`SELECT 1 AS used FROM link_objects
+        WHERE workspace_id = ?1 AND location_kind = 'workspace' AND location_id = ?2 AND state <> 'deleted'
+        UNION ALL SELECT 1 AS used FROM file_links WHERE workspace_id = ?1 AND location_kind = 'workspace' AND location_id = ?2 AND upload_id IS NULL
+        LIMIT 1`).bind(workspaceId, locationId).first();
       return row !== null;
     },
   };

@@ -1,9 +1,9 @@
 import type { AlertEvent } from './deliver.ts';
 import type { HandoffStuckAlert } from './internal-handoff.ts';
 import { isDeliveryId } from './outbox.ts';
-import { isLinkId } from './file-links.ts';
+import { isLinkId, isLinkUploadId } from './file-links.ts';
 
-export type LinkReportedAlert = { code: 'link_reported'; key: string };
+export type LinkReportedAlert = { code: 'link_reported' | 'link_confirm_stale' | 'delete_failed'; key: string };
 import { dailySendAlert, dailySendAlertKey, type DailySendAlert, type SendEventCode } from './send-alert-events.ts';
 
 const DLQ_PREFIX = 'delivery_dlq:';
@@ -60,6 +60,11 @@ export class MailAlerts {
       if (key.startsWith(LINK_REPORTED_PREFIX)) {
         const linkId = key.slice(LINK_REPORTED_PREFIX.length);
         return { key, event: isLinkId(linkId) ? { code: 'link_reported' as const, key: linkId } : undefined };
+      }
+      for (const code of ['link_confirm_stale', 'delete_failed'] as const) {
+        if (!key.startsWith(`${code}:`)) continue;
+        const upload = key.slice(code.length + 1);
+        return { key, event: isLinkUploadId(upload) ? { code, key: upload } : undefined };
       }
       const prefix = [FAILED_PREFIX, STUCK_PREFIX, DLQ_PREFIX].find(p => key.startsWith(p)) ?? DLQ_PREFIX;
       const code = prefix === FAILED_PREFIX ? 'delivery_failed' : prefix === STUCK_PREFIX ? 'delivery_stuck' : 'delivery_dlq';

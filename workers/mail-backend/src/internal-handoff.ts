@@ -70,8 +70,8 @@ export const deliveryHolder = (id: string) => `delivery:${id}`;
 // link of the send has less than an hour left, from the frozen `expiresAt`
 // values, checked just before that statement. Expansion never re-checks expiry:
 // an accepted handoff is delivered with its links as they are.
-export function handoffLinkFloorBelow(record: SendRecord, now: number): boolean {
-  return linkFloorBelow(record.links, now);
+export function handoffLinkFloorBelow(record: SendRecord, now: number, floor?: number): boolean {
+  return linkFloorBelow(record.links, now, floor);
 }
 
 const COLUMNS = `key, workspace_id AS workspaceId, mailbox_id AS mailboxId, send_id AS sendId, raw_key AS rawKey, sender,

@@ -20,7 +20,7 @@ import type { MailboxIndex } from './mailbox-index.ts';
 import type { SendMimeBuilders, SendMimeMessage, SendMimeParts } from './mailbox-send-mime.ts';
 import type { SendRequest } from './send-mime.ts';
 import { senderActive, senderState } from './mailbox-send-sender.ts';
-import { SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
+import { LINK_SEND_MIME_VERSION, SendMimeError, SendMimeInvariantError, sendMimeBoundary, sendMimeMessageId } from './send-mime.ts';
 import {
   dispatchRow, unpublishedProgress, DRIVE_BACKOFF_MAX_MS, DRIVE_BACKOFF_MS, ledger, SEND_DRIVE, sendPage, sendRawHolder, sendRow, sentCopyId,
   TERMINAL, validSendId, wireSend, type SendRow, type SendRowState,
@@ -39,7 +39,7 @@ import {
   acknowledgeHandoff, bounded, expandHandoff, HANDOFF_CALL_MS, HANDOFF_KEY_MAX, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
 } from './internal-handoff.ts';
 import { ulid } from 'ulid';
-import { isLinkHost, linkExpiresAt, linkTextLines, newLinkId, newLinkToken, routeLinks, type SendLink } from './file-links.ts';
+import { isLinkHost, linkedBodyHtml, linkExpiresAt, linkTextLines, newLinkId, newLinkToken, routeLinks, type SendLink } from './file-links.ts';
 
 export type SendScope = { workspaceId: string; mailboxId: string; holderScope: string };
 // `epoch` and `restoredAt`: the recovery fence of the send path (section 2.5).
@@ -68,6 +68,8 @@ export type SendPorts = {
   handoff?: HandoffPorts;
   // The file links' routing table (M3-13, release step 4b); without it a send with links waits.
   linkRoutes?: D1Database;
+  headLink?(scope: { workspaceId: string; mailboxId: string }, link: SendLink): Promise<boolean>;
+  linkFloorMs?: number;
   // The current time, for decisions made after remote waits (the handoff's link floor).
   clock?(): number;
   quota(): QuotaPort | undefined;
@@ -107,6 +109,8 @@ export function mimeMessage(record: SendRecord, draft: DraftObject): SendMimeMes
     to: field('to'), cc: field('cc'), bcc: field('bcc'), subject: draft.fields.subject,
     // File links (M3-13) from the frozen record only, so a rerun builds identical bytes.
     text: [draft.fields.body, ...links, ...linkTextLines(record.links)].join('\r\n'),
+    ...(record.builderVersion === LINK_SEND_MIME_VERSION && record.links?.length &&
+      { html: linkedBodyHtml([draft.fields.body, ...links].join('\r\n'), record.links) }),
     attachments: files(draft).map(({ wire }) => ({ name: wire.name, type: wire.type, size: wire.size })),
     ...(draft.replyHeaders?.inReplyTo ? { inReplyTo: draft.replyHeaders.inReplyTo } : {}),
     ...(draft.replyHeaders?.references ? { references: draft.replyHeaders.references } : {}),
@@ -167,7 +171,7 @@ export class SendApi {
   constructor(private readonly index: MailboxIndex, private readonly sql: SqlStorage, private readonly scope: SendScope,
     private readonly incarnation: string, private readonly timers: TimerTable, private readonly mime: SendMimeBuilders,
     private readonly directory: DirectoryDatabase, private readonly clock: () => number, private readonly journalDue: (timers: TimerTable) => void,
-    private readonly linkHost?: string) {}
+    private readonly linkHost?: string, private readonly testLinkSeconds?: number | null) {}
 
   private replayed(operation: 'sendDraft' | 'undoSend', key: string, fingerprint: string, now: number) {
     const row = committedKey(this.sql, key);
@@ -225,16 +229,17 @@ export class SendApi {
       attachment.wire.kind === 'message' && 'part' in attachment && attachment.part
         ? [{ messageId: attachment.wire.messageId, part: attachment.wire.part, ...attachment.part }] : []);
     const undoSeconds = settingsUndoSeconds(this.sql), replyTo = replyToFromSettings(this.sql), attachmentKeys = draftObjectKeys(draft);
-    const builder = this.mime.get(this.mime.current)!;
     // File links (M3-13): each gets its id and 128-bit token once; the host and the
     // expiry are frozen with them, so the printed date and the replayed bytes agree.
     const fileLinks = (draft.attachments ?? []).flatMap(attachment => attachment.wire.kind === 'file_link' && 'link' in attachment
       ? [{ wire: attachment.wire, link: attachment.link }] : []);
     if (fileLinks.length > LIMITS.fileLinksPerMessage) return invalid('/attachments', 'too_many');
-    if (fileLinks.length && !isLinkHost(this.linkHost)) return fail('feature_unavailable');
+    if (fileLinks.length && (!isLinkHost(this.linkHost) || this.testLinkSeconds === null)) return fail('feature_unavailable');
+    const builder = this.mime.get(fileLinks.some(({ link }) => link.uploadId) ? LINK_SEND_MIME_VERSION : this.mime.current);
+    if (!builder) return fail('unavailable');
     const minted = fileLinks.map(() => ({ id: newLinkId(), token: newLinkToken() }));
     const linksAt = (dateAt: number): SendLink[] => fileLinks.map(({ wire, link }, i) => ({ ...minted[i], host: this.linkHost!, name: wire.name,
-      size: wire.size, expiresAt: linkExpiresAt(dateAt, wire.expiry), location: link.location, key: link.key, fingerprint: link.fingerprint }));
+      size: wire.size, expiresAt: linkExpiresAt(dateAt, wire.expiry, this.testLinkSeconds ?? undefined), ...link }));
     const frozen = (at: number, source: Pick<DraftObjectRef, 'rawKey' | 'revision' | 'updatedAt'> & { holder: string }): SendRecord => {
       const id = ulid(at);
       const mimeId = id.toLowerCase();
@@ -560,15 +565,20 @@ export class SendDriver {
     if (!await this.senderValid(start.scope, record)) failure = 'invalid_sender';
     // A lost source is never read: its object may be gone.
     else if (await this.sourceLost(record)) failure = 'delivery_error';
-    // A draft revision that no longer matches its digest is unusable, like a lost source.
-    else if (!(draft = await this.draftOf(start, record))) failure = 'delivery_error';
-    else {
-      let withinLimits: boolean;
-      try { withinLimits = this.withinLimits(record, draft); }
-      catch (error) { return this.mimeRefusal(start, kinds, error); }
-      if (!withinLimits) failure = 'message_too_large';
-      // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
-      else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
+    if (!failure) {
+      if (ports.headLink) for (const link of record.links ?? []) {
+        if (!await ports.headLink(start.scope, link)) return this.fail(start, kinds, 'delivery_error', true);
+      }
+      // A draft revision that no longer matches its digest is unusable, like a lost source.
+      if (!(draft = await this.draftOf(start, record))) failure = 'delivery_error';
+      else {
+        let withinLimits: boolean;
+        try { withinLimits = this.withinLimits(record, draft); }
+        catch (error) { return this.mimeRefusal(start, kinds, error); }
+        if (!withinLimits) failure = 'message_too_large';
+        // A forwarded part that no longer decodes to the bytes attached is unusable, like a lost source.
+        else if (!(forwarded = await this.forwardedParts(start, record, draft))) failure = 'delivery_error';
+      }
     }
     if (failure || !draft || !forwarded) return this.fail(start, kinds, failure ?? 'delivery_error', draft === null || !forwarded);
     // Step 3: build, register (holders before PUT), then PUT.
@@ -758,7 +768,7 @@ export class SendDriver {
       // The link floor (M3-13) is read at the decision, after the routing, the barrier and the hold.
       const decidedAt = Math.max(this.timer.now, ports.clock?.() ?? this.timer.now);
       await writeHandoff(pipeline.db, { key, workspaceId, mailboxId, sendId: this.ref, rawKey: open.rawKey, sender: record.from.email,
-        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, decidedAt),
+        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, decidedAt, this.ports.linkFloorMs),
         now: decidedAt });
       await pipeline.checkpoint?.('handoff:decided');
       const row = await readHandoff(pipeline.db, key);

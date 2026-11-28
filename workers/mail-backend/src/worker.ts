@@ -14,6 +14,8 @@ import { Outbox, type DeliverySource } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
 import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
 import { sendAlertEnvironment } from './send-alert-events.ts';
+import { sweepLinkObjects, type LinkDisposition } from './link-sweep.ts';
+import type { LinkDatabase } from '../../../packages/link-storage/src/store.ts';
 
 export type ObjectReferences = {
   register(kind: ObjectKind, digest: string, holder: string): Promise<string>;
@@ -33,10 +35,11 @@ export type SweeperReferences = ObjectReferences & {
 };
 // The send queue's dispatch message (section 1): ids only.
 export type SendDispatch = { kind: 'dispatch'; ws: string; mb: string; sendId: string };
-export type MailboxDelivery = { deliver(id: string): Promise<'indexed' | 'deferred' | 'rejected'> };
+export type MailboxDelivery = { deliver(id: string): Promise<'indexed' | 'deferred' | 'rejected'>;
+  linkObjectDisposition?(ws: string, mb: string, upload: string): Promise<LinkDisposition> };
 type Namespace<T> = { getByName(name: string): T };
 
-export type Env = KofraConfig & {
+export type Env = KofraConfig & import('./link-uploads.ts').LinkUploadEnv & {
   MAIL_BACKEND_ENABLED?: string;
   MAIL_LOCAL_API?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
@@ -53,6 +56,7 @@ export type Env = KofraConfig & {
   // File links (M3-13): the host new links are made on (a DNS name; each link freezes it),
   // and the per-link download budgets as multiples of the file size (100 per hour, 1,000 in total by default).
   LINK_HOST?: string;
+  LINK_TEST_EXPIRY_SECONDS?: string;
   LINK_HOURLY_FACTOR?: string;
   LINK_TOTAL_FACTOR?: string;
   SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
@@ -154,11 +158,14 @@ export async function handleScheduled(_event: ScheduledController, env: Env, now
     : undefined;
   // Internal handoffs (M3-8): unexpanded accepted handoffs, pending holder releases and old tombstones.
   const handoffs = reconcileHandoffs(handoffPorts(env), now()).catch(() => console.error({ code: 'handoff_reconcile_failed' }));
+  const links = env.MAIL_FILE_LINKS_ENABLED === 'on' && sweepLinkObjects(env.DIRECTORY.withSession('first-primary') as unknown as LinkDatabase,
+    env, now(), (ws, mb, id) => env.MAILBOX.getByName(mailboxName(ws, mb)).linkObjectDisposition?.(ws, mb, id) ?? Promise.resolve({ state: 'retry' }))
+    .catch(() => console.error({ code: 'link_sweep_failed' }));
   const alert = mailAlert(env.ALERTS);
   const [result] = await Promise.all([reconcile({
     outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now,
     send: async id => { await env.DELIVER.send(id); }, alert, sendAlert: alert,
-  }), outbound, handoffs]);
+  }), outbound, handoffs, links]);
   if (result.enqueueErrors || result.alertErrors) console.error({ code: 'mail_reconcile_partial', ...result });
 }
 

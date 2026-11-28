@@ -15,6 +15,7 @@ export const ERROR_STATUS = {
   address_taken: 409,
   domain_exists: 409,
   location_in_use: 409,
+  upload_in_use: 409,
   send_not_pending: 409,
   idempotency_in_progress: 409,
   revision_mismatch: 412,

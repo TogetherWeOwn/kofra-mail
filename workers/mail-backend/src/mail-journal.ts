@@ -62,7 +62,7 @@ export type JournalEvent =
   | { type: 'setting'; kind: 'filter' | 'send-as'; id: string; definition: string }
   | { type: 'api_settings'; definition: string }
   | { type: 'draft'; id: string; rawKey: string; holder: string; revision?: string; updatedAt?: number;
-      uploadIds?: string[]; attachmentKeys?: string[] }
+      uploadIds?: string[]; attachmentKeys?: string[]; linkUploadIds?: string[] }
   | { type: 'draft_delete'; id: string; deferRelease?: true }
   | { type: 'api_upload'; id: string; objectKey: string; name: string; mediaType: string; size: number; expiresAt: number; holder?: string }
   | { type: 'api_upload_delete'; id: string; objectKey: string }
@@ -91,7 +91,7 @@ export type JournalEvent =
   // (`terminal` starts the finish rule), its dispatch row, and the ledger rows,
   // fences, Mark sets and release-list entries it changed, all as absolute values.
   // A file link revoked (and, with `deletedAt`, deleted) by its sender or an operator (M3-13).
-  | { type: 'link_state'; sendId: string; linkId: string; revokedAt: number; deletedAt?: number }
+  | { type: 'link_state'; sendId: string; linkId: string; revokedAt?: number; deletedAt?: number; expiredAt?: number }
   | { type: 'send_progress'; id: string; state: SendProgressState; terminal?: true; dispatch: SendDispatchRow;
       recipients?: SendLedgerChange[]; fences?: SendFenceRow[]; marks?: SendMarkRow[];
       releaseAdd?: { epoch: number; attempt: number }[]; releaseRemove?: { epoch: number; attempt: number }[] };

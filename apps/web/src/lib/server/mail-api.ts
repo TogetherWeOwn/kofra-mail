@@ -3,6 +3,8 @@ import type { ContentUrl, MailErrorCode, Member, Operation, Problem, RouteSpec, 
 import { contentFrameUrl, separateContentOrigin } from '../content-origin.ts';
 import { LINK_STORAGE_OPS, runLinkStorage, type LinkStorageEnvironment } from './link-storage.ts';
 import { Directory, type DirectoryDatabase } from './mail-directory.ts';
+import { LINK_UPLOAD_OPS, linkUploadGate, linkUploadsAvailable, runLinkUpload, workspaceLinkLimits, type LinkUploadEnv } from '../../../../../workers/mail-backend/src/link-uploads.ts';
+import type { LinkDatabase } from '@kofra/link-storage';
 
 export interface LocalPrincipal {
   userId: string;
@@ -37,7 +39,8 @@ interface RateLimitBinding {
 }
 type RateLimitBindings = Partial<Record<(typeof rateBindings)[RateBucket], RateLimitBinding>>;
 
-export interface MailApiEnvironment extends RateLimitBindings, LinkStorageEnvironment {
+export interface MailApiEnvironment extends RateLimitBindings, LinkStorageEnvironment, LinkUploadEnv {
+  MAIL_RATE_LINK_PARTS?: RateLimitBinding;
   MAIL_LOCAL_API?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
   MAIL_SEND_ENABLED?: string;
@@ -61,8 +64,6 @@ const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
 const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend']);
 const uploads = new Set<Operation>(['createUpload', 'deleteUpload']);
 const drive = new Set<Operation>(['saveAttachmentToDrive', 'importFromDrive']);
-// Link uploads (M3-15b) are not served yet: features.fileLinks stays off.
-const linkUploads = new Set<Operation>(['createLinkUpload', 'getLinkUpload', 'putLinkPart', 'completeLinkUpload', 'deleteLinkUpload']);
 const matchers = (Object.entries(ROUTES) as [Operation, RouteSpec][]).map(([op, route]) => ({
   op, route, pattern: new RegExp(`^${API_PREFIX}${route.path.replace(/\{([A-Za-z]+)\}/g, '(?<$1>[^/]+)')}$`),
 }));
@@ -93,7 +94,7 @@ function rateBinding(env: MailApiEnvironment, bucket: RateBucket): RateLimitBind
   return fail('unavailable');
 }
 
-async function checkRate(binding: RateLimitBinding, bucket: RateBucket, key: string): Promise<void> {
+async function checkRate(binding: RateLimitBinding, bucket: RateBucket | 'link_parts', key: string): Promise<void> {
   let success: unknown;
   try {
     success = (await binding.limit({ key }))?.success;
@@ -196,7 +197,11 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     if (route.access !== 'admin' && op !== 'getSession' && !mailbox) fail('forbidden');
     const sendEnabled = env.MAIL_SEND_ENABLED === 'on';
     if ((m3.has(op) && !sendEnabled) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
-    if (drive.has(op) || linkUploads.has(op)) fail('feature_unavailable');
+    const linkOp = LINK_UPLOAD_OPS.has(op);
+    if (drive.has(op) || (linkOp && !linkUploadGate(env))) fail('feature_unavailable');
+    const linkDb = (env.DIRECTORY.withSession?.('first-primary') ?? env.DIRECTORY) as unknown as LinkDatabase;
+    if (linkOp && !await linkUploadsAvailable(linkDb, env, principal.workspaceId)) fail('feature_unavailable');
+    if (linkOp && typeof env.MAIL_RATE_LINK_PARTS?.limit !== 'function') fail('unavailable');
     const contentOrigin = env.MAIL_CONTENT_ENABLED === 'on' ? separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true) : undefined;
     const content = contentOrigin ? env.MAIL_CONTENT : undefined;
     const contentUrl = op === 'getBodyUrl' || op === 'getAttachmentUrl';
@@ -213,6 +218,8 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
         undoParams = parsePath(pattern, url.pathname);
         await checkRate(undo, 'undo', JSON.stringify([mailbox.id, undoParams.sendId]));
       }
+    } else if (op === 'putLinkPart') {
+      await checkRate(env.MAIL_RATE_LINK_PARTS!, 'link_parts', principal.userId);
     } else {
       const bucket = route.method === 'GET' ? 'reads' : route.access === 'admin' ? 'admin_writes'
         : op === 'createUpload' ? 'uploads' : 'writes';
@@ -226,7 +233,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     if (ifMatch !== undefined && !keyPattern.test(ifMatch)) fail('invalid_request', { errors: [{ field: '/If-Match', code: 'invalid' }] });
     // Mailbox creates reserve their key inside the mailbox before consuming
     // the HTTP body or validating operation-specific query fields.
-    const keyedMailbox = op === 'createDraft' || op === 'createLabel' || op === 'createUpload';
+    const keyedMailbox = op === 'createDraft' || op === 'createLabel' || op === 'createUpload' || op === 'createLinkUpload';
     const httpWrite = keyedMailbox ? { stream: request.body, mediaType: request.headers.get('content-type') ?? '',
       contentLength: request.headers.get('content-length'), query: [...url.searchParams] } : undefined;
     const query = httpWrite ? {} : parseQuery(url, route);
@@ -239,6 +246,8 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
       result = LINK_STORAGE_OPS.has(op)
         ? await runLinkStorage(op, { db: env.DIRECTORY, workspaceId: principal.workspaceId, principal, env, params, input, idempotencyKey })
         : await directory.run(op, params, input, idempotencyKey);
+    } else if (linkOp && op !== 'createLinkUpload' && mailbox) {
+      result = await runLinkUpload(op, { db: linkDb, env, ws: principal.workspaceId, mb: mailbox.id, now: Date.now(), input, idempotencyKey, request, params });
     } else if (op === 'listIdentities' && mailbox) {
       result = { body: { items: await directory.identities(mailbox.id) } };
     } else {
@@ -260,8 +269,9 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
         const session: Session = {
           user: { id: principal.userId, name: principal.name }, mailbox: mailbox ? { id: mailbox.id, primaryAddress: mailbox.primary_address } : undefined,
           workspace: { id: principal.workspaceId, role: principal.role }, csrfToken: principal.csrfToken,
-          authTime: new Date(principal.authTime).toISOString(), limits: LIMITS,
-          features: { drive: false, htmlContent: Boolean(content), m3: sendEnabled, fileLinks: false },
+          authTime: new Date(principal.authTime).toISOString(), limits: { ...LIMITS, linkFileBytes: workspaceLinkLimits(env, principal.workspaceId).file },
+          features: { drive: false, htmlContent: Boolean(content), m3: sendEnabled,
+            fileLinks: !!mailbox && !!env.MAIL_RATE_LINK_PARTS && await linkUploadsAvailable(linkDb, env, principal.workspaceId) },
           state: (result.body as { state: string }).state,
         };
         result = { body: session };

@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Operation } from '../../../contracts/mail-api/src/service.ts';
+import { MailApiError } from '../../../contracts/mail-api/src/errors.ts';
 import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions, type MailboxApiResult, type MailContentResult, type PreparedApiKey } from './mailbox-api.ts';
 import { checkReplayInput, createQuery, readMailboxJson, type HttpMailboxWrite } from './mailbox-http-write.ts';
 import { ApiFault, canonical, cursorPosition, fail, isId, makeCursor, pageLimit, utf8 } from './mailbox-api-input.ts';
@@ -24,7 +25,7 @@ import {
 import { MailboxWork } from './mailbox-work.ts';
 import { defaultMimeBuilders, type SendMimeBuilders } from './mailbox-send-mime.ts';
 import { markSendHeld, SendApi, sendDrive, sendRequestFor, type SendCommit, type SendPorts, type SendStep } from './mailbox-send.ts';
-import { SEND_DRIVE, UnpublishedSend, unpublishedProgress, validSendId } from './mailbox-send-store.ts';
+import { SEND_DRIVE, sendRow, UnpublishedSend, unpublishedProgress, validSendId } from './mailbox-send-store.ts';
 import { SendStalls } from './mailbox-send-stalls.ts';
 import {
   SendDispatcher, sendClockSkewMs, type AbandonAnswer, type AuthorizeAnswer, type ClaimAnswer, type DelayAnswer, type MarkAnswer, type ProviderResult,
@@ -33,8 +34,11 @@ import {
 import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
 import { HANDOFF_CALL_MS, type HandoffPorts, type HandoffStep } from './internal-handoff.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
-import { isLinkId, linkTokenHash } from './file-links.ts';
-import { chargeLink, fileLink, linkBudget, linkPage, linkStateEvent, linkTarget, liveLink, type ChargeAnswer, type LinkTarget } from './mailbox-links.ts';
+import { isLinkId, isLinkUploadId, linkTestExpirySeconds, linkTokenHash } from './file-links.ts';
+import { LINK_UPLOAD_OPS, linkObject, linkUploadGate, objectMultipart, runLinkUpload, storedLink } from './link-uploads.ts';
+import type { LinkDatabase } from '../../../packages/link-storage/src/store.ts';
+import { chargeLink, fileLink, linkBudget, linkPage, linkRow, linkStateEvent, linkTarget, liveLink, type ChargeAnswer, type LinkTarget } from './mailbox-links.ts';
+import type { LinkDisposition } from './link-sweep.ts';
 import { sha256 } from './bytes.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -45,7 +49,6 @@ import { enabled, mailboxName, type Env } from './worker.ts';
 export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
 const HELD_RECHECK_MS = 15 * 60_000;
-const LINK_UPLOAD_OPERATIONS = new Set<Operation>(['createLinkUpload', 'getLinkUpload', 'putLinkPart', 'completeLinkUpload', 'deleteLinkUpload']);
 type TimerClaim = TimerRow & { token: string; until: number; retained?: boolean };
 const thenable = (value: unknown): value is PromiseLike<unknown> => typeof (value as { then?: unknown } | null)?.then === 'function';
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
@@ -174,6 +177,15 @@ export class Mailbox extends DurableObject<Env> {
       checkpoint: step => this.sendCheckpoint(step),
       get handoff() { return self.handoffPorts(); },
       get linkRoutes() { return self.linkRouteDatabase(); },
+      linkFloorMs: typeof linkTestExpirySeconds(this.env) === 'number' ? 30_000 : undefined,
+      headLink: async (scope, link) => {
+        if (!link.uploadId) return true; // M3-13's already frozen link format.
+        const db = this.linkDatabase();
+        const row = await linkObject(db, scope.workspaceId, scope.mailboxId, link.uploadId);
+        if (!row || row.state === 'retiring' || row.state === 'deleted' || row.object_key !== link.key || row.fingerprint !== link.fingerprint) return false;
+        const head = await (await objectMultipart(db, this.env, row)).head();
+        return head?.size === link.size && head.version === row.version_id;
+      },
       clock: () => this.mailApiNow(),
     };
   }
@@ -223,6 +235,7 @@ export class Mailbox extends DurableObject<Env> {
       local: this.local,
       exclusive: (io, step) => this.exclusiveStep(io, step),
       senderCheckpoint: phase => this.sendSenderCheckpoint(phase),
+      linkFloorMs: typeof linkTestExpirySeconds(this.env) === 'number' ? 30_000 : undefined,
       beforeRecord: fence => this.sendRecordCheckpoint(fence),
       afterRecordCommit: () => this.sendRecordCommittedCheckpoint(),
       afterClaimRelease: () => this.sendReleaseCheckpoint(),
@@ -445,7 +458,7 @@ export class Mailbox extends DurableObject<Env> {
       const timers = this.timerTable();
       try {
         const api = new SendApi(index, this.ctx.storage.sql, { ...scope, holderScope: this.ctx.id.toString() }, life.incarnation, timers,
-          this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table), this.env.LINK_HOST);
+          this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table), this.env.LINK_HOST, linkTestExpirySeconds(this.env));
         if (operation === 'getSend' || operation === 'listSends') {
           const body = operation === 'getSend' ? api.getSend(params) : await api.listSends(params, options.cursorScope);
           // A send's consumer state is reported only once published (section 2.1), like its terminal state.
@@ -453,7 +466,19 @@ export class Mailbox extends DurableObject<Env> {
           if (!unpublished) return { result: { body } };
           return published ? fail('mailbox_restoring', { retryAfterSeconds: 1 }) : { reread: unpublished };
         }
-        return { commit: operation === 'sendDraft' ? await api.sendDraft(params, options) : await api.undoSend(params, options) };
+        if (write && linkUploadGate(this.env)) {
+          const key = apiKey(options.idempotencyKey);
+          const pending = this.ctx.storage.sql.exec('SELECT 1 FROM mailbox_api_in_progress WHERE key = ? AND expires_at > ?', key, this.mailApiNow()).toArray();
+          if (pending.length) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+          await this.assertNoLinkUploadKey(scope, key);
+        }
+        if (operation === 'sendDraft') {
+          const claims = this.ctx.storage.sql.exec<{ upload_id: string }>(
+            'SELECT upload_id FROM mailbox_link_claims WHERE draft_id = ? AND send_id IS NULL', params.draftId ?? '').toArray();
+          if (claims.length) await this.rescheduleLinkObjects(scope, claims.map(row => row.upload_id));
+          return { commit: await api.sendDraft(params, options) };
+        }
+        return { commit: await api.undoSend(params, options) };
       } finally {
         timers.revoke();
         await this.rearm();
@@ -510,7 +535,7 @@ export class Mailbox extends DurableObject<Env> {
       }
       await this.armFor(SETTINGS_FLUSH_MS);
       let seq: number | undefined;
-      try { seq = this.commitLinkState(index, params.linkId ?? '', now, operation === 'deleteLink'); }
+      try { seq = await this.commitLinkState(scope, index, params.linkId ?? '', now, operation === 'deleteLink'); }
       finally { await this.rearm(); }
       if (seq === undefined) return operation === 'deleteLink' ? { result: { status: 204 } } : fail('not_found');
       return { seq };
@@ -525,10 +550,13 @@ export class Mailbox extends DurableObject<Env> {
   // In the work lane: journals a link's revocation (or deletion) and returns the
   // seq a publish must cover before the answer; undefined when the link is not
   // this mailbox's to change.
-  private commitLinkState(index: MailboxIndex, linkId: string, now: number, deleting: boolean): number | undefined {
+  private async commitLinkState(scope: Scope, index: MailboxIndex, linkId: string, now: number, deleting: boolean): Promise<number | undefined> {
     const sql = this.ctx.storage.sql;
     const event = linkStateEvent(sql, linkId, now, deleting);
     if (event === undefined) return undefined;
+    const row = linkRow(sql, linkId);
+    const uploadId = row && sendRow(sql, row.sendId)?.record.links?.[row.idx]?.uploadId;
+    if (uploadId) await this.rescheduleLinkObjects(scope, [uploadId]);
     // Already revoked: the answer still waits for the publish that covers it.
     if (event === null) return index.journal.revision();
     const timers = this.timerTable();
@@ -536,6 +564,47 @@ export class Mailbox extends DurableObject<Env> {
       index.changeMany([event], () => this.journalDue(timers));
     } finally { timers.revoke(); }
     return index.journal.revision();
+  }
+
+  /** Registry sweeps see the same serialized, published ownership that a restore can recover. */
+  async linkObjectDisposition(workspaceId: string, mailboxId: string, uploadId: string): Promise<LinkDisposition> {
+    const scope = { workspaceId, mailboxId };
+    if (!isLinkUploadId(uploadId) || !this.scoped(scope)) return { state: 'retry' };
+    const index = this.index(workspaceId), sql = this.ctx.storage.sql;
+    const evaluate = () => this.work.run(async (): Promise<LinkDisposition | { publish: number; close: boolean }> => {
+      if (!await this.ready(index, scope) || this.lifecycleState() !== 'ready') return { state: 'retry' };
+      if (index.journal.flushed() < index.journal.revision()) return { publish: index.journal.revision(), close: false };
+      const claim = sql.exec<{ send_id: string | null }>('SELECT send_id FROM mailbox_link_claims WHERE upload_id = ?', uploadId).toArray()[0];
+      if (!claim) return { state: 'unused' };
+      if (!claim.send_id) return { state: 'held', next: null };
+      const send = sendRow(sql, claim.send_id);
+      const link = send?.record.links?.find(link => link.uploadId === uploadId);
+      const row = link && linkRow(sql, link.id);
+      if (!send || !link || !row) return { state: 'retry' };
+      if (row.revokedAt !== null || row.expiredAt !== null || (send.state === 'failed' && send.queuedSeq === null)) return { state: 'closed' };
+      const now = this.mailApiNow();
+      if (send.queuedSeq === null) return { state: 'held', next: now + 60_000 };
+      if (link.expiresAt === null || link.expiresAt > now) return { state: 'held', next: link.expiresAt };
+      await this.armFor(SETTINGS_FLUSH_MS);
+      const timers = this.timerTable();
+      try {
+        index.changeMany([{ type: 'link_state', sendId: send.id, linkId: link.id, expiredAt: link.expiresAt }], () => this.journalDue(timers));
+      } finally { timers.revoke(); await this.rearm(); }
+      return { publish: index.journal.revision(), close: true };
+    });
+    for (let step = 0; step < 2; step++) {
+      const decision = await evaluate();
+      if ('state' in decision) return decision;
+      if (!await this.publishThrough(decision.publish)) break;
+      if (decision.close) return { state: 'closed' };
+    }
+    return { state: 'retry' };
+  }
+
+  private async linkObjectPresent(workspaceId: string, mailboxId: string, link: import('./file-links.ts').SendLink): Promise<boolean> {
+    if (!link.uploadId) return true;
+    const row = await linkObject(this.linkDatabase(), workspaceId, mailboxId, link.uploadId);
+    return !!row && (row.state === 'complete' || row.state === 'deleting') && row.object_key === link.key && row.fingerprint === link.fingerprint;
   }
 
   // mail-content's view of a link (M3-13), through ContentLookup only: whether
@@ -552,9 +621,14 @@ export class Mailbox extends DurableObject<Env> {
     if (!token || await linkTokenHash(token) !== tokenHash) return { status: 'gone' };
     // Read again after the hash: a revocation that committed meanwhile is seen.
     if (this.lifecycleState() !== 'ready') return { status: 'unavailable' };
+    const before = liveLink(sql, linkId, this.mailApiNow());
+    if (!before) return { status: 'gone' };
+    try { if (!await this.linkObjectPresent(workspaceId, mailboxId, before.link)) return { status: 'gone' }; }
+    catch { return { status: 'unavailable' }; }
+    if (this.lifecycleState() !== 'ready') return { status: 'unavailable' };
     const now = this.mailApiNow();
     const live = liveLink(sql, linkId, now);
-    return live ? linkTarget(live, sql, now, linkBudget(this.env)) : { status: 'gone' };
+    return live?.link.token === before.link.token ? linkTarget(live, sql, now, linkBudget(this.env)) : { status: 'gone' };
   }
 
   // Charges a download response's bytes to a live link (M3-13): one synchronous
@@ -562,6 +636,11 @@ export class Mailbox extends DurableObject<Env> {
   async chargeFileLink(workspaceId: string, mailboxId: string, linkId: string, bytes: number): Promise<ChargeAnswer | 'unavailable'> {
     if (!enabled(this.env) || this.env.MAIL_CONTENT_ENABLED !== 'on' || !this.scoped({ workspaceId, mailboxId }) || !isLinkId(linkId) ||
         !Number.isSafeInteger(bytes) || bytes < 0) return 'gone';
+    if (this.lifecycleState() !== 'ready') return 'unavailable';
+    const live = liveLink(this.ctx.storage.sql, linkId, this.mailApiNow());
+    if (!live) return 'gone';
+    try { if (!await this.linkObjectPresent(workspaceId, mailboxId, live.link)) return 'gone'; }
+    catch { return 'unavailable'; }
     if (this.lifecycleState() !== 'ready') return 'unavailable';
     return chargeLink(this.ctx.storage.sql, linkId, bytes, this.mailApiNow(), linkBudget(this.env));
   }
@@ -575,7 +654,7 @@ export class Mailbox extends DurableObject<Env> {
     const seq = await this.work.run(async () => {
       if (!await this.ready(index, scope) || index.lifecycle<Lifecycle>()?.state !== 'ready') return 'retry' as const;
       await this.armFor(SETTINGS_FLUSH_MS);
-      try { return this.commitLinkState(index, linkId, this.mailApiNow(), false); }
+      try { return await this.commitLinkState(scope, index, linkId, this.mailApiNow(), false); }
       finally { await this.rearm(); }
     });
     if (seq === 'retry') return 'retry';
@@ -691,7 +770,7 @@ export class Mailbox extends DurableObject<Env> {
     try {
       // The executing operation durably reserves its key before awaiting the
       // object write. A retry can observe this without waiting in the work lane.
-      if (isIdempotentCreate(operation) && isId(options.idempotencyKey) && storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' &&
+      if ((isIdempotentCreate(operation) || operation === 'createLinkUpload') && isId(options.idempotencyKey) && storedLifecycle<Lifecycle>(this.ctx.storage)?.state === 'ready' &&
           this.ctx.storage.sql.exec(`SELECT 1 FROM mailbox_api_in_progress p WHERE p.key = ? AND p.expires_at > ?
             AND NOT EXISTS (SELECT 1 FROM mailbox_api_idempotency r WHERE r.key = p.key AND r.expires_at > ?)`,
           options.idempotencyKey, now, now).toArray().length) {
@@ -701,9 +780,10 @@ export class Mailbox extends DurableObject<Env> {
         if (this.env.MAIL_SEND_ENABLED !== 'on') return { error: { code: 'not_implemented' } };
         return await this.sendApi(scope, operation, params, options);
       }
-      // File links (M3-13); link uploads are M3-15b's and not served yet.
       if (operation === 'listLinks' || operation === 'revokeLink' || operation === 'deleteLink') return await this.linkApi(scope, operation, params, options);
-      if (LINK_UPLOAD_OPERATIONS.has(operation)) return { error: { code: 'feature_unavailable' } };
+      if (operation === 'createLinkUpload') return await this.createRegisteredLinkUpload(scope, input, options, now);
+      // Only the create's small JSON goes through the mailbox. File bytes never do.
+      if (LINK_UPLOAD_OPS.has(operation)) return { error: { code: 'feature_unavailable' } };
       const http = options.httpWrite;
       if (operation === 'createUpload') return await this.createUpload(scope, params, http ?? input as UploadBody, options.idempotencyKey, now, http);
       if (http && (operation === 'createDraft' || operation === 'createLabel')) {
@@ -722,11 +802,71 @@ export class Mailbox extends DurableObject<Env> {
       }
     } catch (error) {
       if (error instanceof ApiFault) return { error: error.problem };
+      if (error instanceof MailApiError) {
+        const { code, retryAfterSeconds, limit, errors } = error.problem;
+        return { error: { code, retryAfterSeconds, limit, errors } };
+      }
       return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
     } finally {
       const stream = options.httpWrite?.stream;
       if (stream && !stream.locked) void stream.cancel().catch(() => {});
     }
+  }
+
+  private linkDatabase(): LinkDatabase {
+    return this.env.DIRECTORY.withSession('first-primary') as unknown as LinkDatabase;
+  }
+
+  private async assertNoLinkUploadKey(scope: Scope, key: string): Promise<void> {
+    if (!linkUploadGate(this.env)) return;
+    const prior = await this.linkDatabase().prepare(`SELECT state FROM link_objects
+      WHERE workspace_id = ? AND mailbox_id = ? AND idem_key = ? AND idem_expires > ?`)
+      .bind(scope.workspaceId, scope.mailboxId, key, this.mailApiNow()).first<{ state: string }>();
+    if (prior?.state === 'opening') return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+    if (prior) return fail('idempotency_key_reused');
+  }
+
+  private async createRegisteredLinkUpload(scope: Scope, input: unknown, options: MailboxApiOptions, now: number): Promise<MailboxApiResult> {
+    if (!linkUploadGate(this.env)) return fail('feature_unavailable');
+    const key = apiKey(options.idempotencyKey), sql = this.ctx.storage.sql, index = this.index(scope.workspaceId);
+    const reservation = await this.work.run(async () => {
+      if (!await this.ready(index, scope) || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const held = reserveApiKey(sql, key, this.mailApiNow());
+      // Link creation commits its result in D1, so a committed mailbox result here belongs to another operation.
+      return 'row' in held ? fail('idempotency_key_reused') : held;
+    });
+    try {
+      const http = options.httpWrite;
+      if (http) createQuery(http, false);
+      const body = http ? await this.jsonWrites.run(() => readMailboxJson(http, reservation.expiresAt - this.mailApiNow())) : input;
+      if (!ownsApiKey(sql, key, reservation.token, this.mailApiNow())) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return fail('invalid_request');
+      return await runLinkUpload('createLinkUpload', { db: this.linkDatabase(), env: this.env, ws: scope.workspaceId, mb: scope.mailboxId,
+        now, input: body as Record<string, unknown>, params: {}, idempotencyKey: key,
+        reserve: write => this.work.run(async () => {
+          if (this.lifecycleState() !== 'ready' || !ownsApiKey(sql, key, reservation.token, this.mailApiNow())) return false;
+          await write();
+          return true;
+        }) });
+    } finally { await this.work.run(async () => clearApiKey(sql, key, reservation.token)); }
+  }
+
+  private async rescheduleLinkObjects(scope: Scope, ids: string[]): Promise<void> {
+    const db = this.linkDatabase(), now = this.mailApiNow();
+    await db.batch(ids.map(id => db.prepare(`UPDATE link_objects SET sweep_at = MIN(COALESCE(sweep_at, ?), ?), wake_rev = wake_rev + 1,
+      confirm_since = CASE WHEN confirmed = 0 THEN COALESCE(confirm_since, ?) ELSE NULL END
+      WHERE workspace_id = ? AND mailbox_id = ? AND id = ? AND state = 'complete'`).bind(now, now, now, scope.workspaceId, scope.mailboxId, id)));
+  }
+
+  private async resolveLinkUpload(scope: Scope, draftId: string, uploadId: string) {
+    if (!isLinkUploadId(uploadId)) return fail('not_found');
+    const claim = this.ctx.storage.sql.exec<{ draft_id: string; send_id: string | null }>(
+      'SELECT draft_id, send_id FROM mailbox_link_claims WHERE upload_id = ?', uploadId).toArray()[0];
+    if (claim && (claim.draft_id !== draftId || claim.send_id)) return fail('upload_in_use');
+    const row = await linkObject(this.linkDatabase(), scope.workspaceId, scope.mailboxId, uploadId);
+    if (!row || row.state !== 'complete' || (row.abandoned && !claim)) return fail('not_found');
+    await this.rescheduleLinkObjects(scope, [uploadId]);
+    return { name: row.name, size: row.size, link: storedLink(row) };
   }
 
   private async executeMailApi(scope: Scope, operation: Operation, params: Record<string, string>, input: unknown,
@@ -736,12 +876,15 @@ export class Mailbox extends DurableObject<Env> {
       if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
       const life = index.lifecycle<Lifecycle>();
       if (life?.state !== 'ready' || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      if (!preparedKey && isIdempotentCreate(operation) && linkUploadGate(this.env)) await this.assertNoLinkUploadKey(scope, apiKey(options.idempotencyKey));
       const mutation = mailApiMutation(operation);
       if (mutation) await this.armFor(operation === 'updateThreads' ? FLAGS_FLUSH_MS : SETTINGS_FLUSH_MS);
       const timers = mutation ? this.timerTable() : undefined;
       try {
         return await new MailboxApi(index, this.ctx.storage.sql, scope.workspaceId, scope.mailboxId, life.incarnation, this.mailApiNow(),
-          timers, preparedKey, () => this.mailApiNow(), this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on').call(operation, params, input, options);
+          timers, preparedKey, () => this.mailApiNow(), this.env.MAIL_DRAFT_UPLOADS_ENABLED === 'on',
+          linkUploadGate(this.env) ? (draftId, uploadId) => this.resolveLinkUpload(scope, draftId, uploadId) : undefined,
+          ids => this.rescheduleLinkObjects(scope, ids)).call(operation, params, input, options);
       } finally {
         if (timers) { timers.revoke(); await this.rearm(); }
       }
@@ -755,6 +898,7 @@ export class Mailbox extends DurableObject<Env> {
     const index = this.index(scope.workspaceId);
     const reservation = await this.work.run(async () => {
       if (!await this.ready(index, scope) || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      await this.assertNoLinkUploadKey(scope, key);
       return reserveApiKey(sql, key, this.mailApiNow());
     });
     const committed = 'row' in reservation;
@@ -781,6 +925,7 @@ export class Mailbox extends DurableObject<Env> {
     const index = this.index(scope.workspaceId);
     const reservation = await this.work.run(async () => {
       if (!await this.ready(index, scope) || index.unindexed('', 1).length) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      await this.assertNoLinkUploadKey(scope, key);
       return reserveApiKey(sql, key, this.mailApiNow());
     });
     try {

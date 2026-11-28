@@ -13,11 +13,11 @@
   import Trash2 from '@lucide/svelte/icons/trash';
   import X from '@lucide/svelte/icons/x';
   import { onMount } from 'svelte';
-  import { isMailApiError, type AddressInput, type Identity, type MailService } from '@kofra/mail-contract';
+  import { attachmentBudget, isMailApiError, LIMITS, type AddressInput, type Identity, type Limits, type MailService } from '@kofra/mail-contract';
   import { mailAction } from './mail-action';
 
-  let { initial, restoredEdits, identities, api, m3, onClose, onStatus }: {
-    initial: ComposeDraft; restoredEdits?: DraftEdits; identities: Identity[]; api: MailService; m3: boolean;
+  let { initial, restoredEdits, identities, api, m3, fileLinks = false, limits = LIMITS, onClose, onStatus }: {
+    initial: ComposeDraft; restoredEdits?: DraftEdits; identities: Identity[]; api: MailService; m3: boolean; fileLinks?: boolean; limits?: Limits;
     onClose: () => void; onStatus: (message: string) => void;
   } = $props();
   const addressText = (items: AddressInput[]) => items.map(({ email }) => email).join(', ');
@@ -52,6 +52,45 @@
   let conflict = $state(false);
   let modal: HTMLDialogElement;
   const create = mailAction();
+  let customExpiry = $state<Record<string, boolean>>({});
+  function expiryChoice(file: Extract<DraftAttachment, { kind: 'file_link' }>) {
+    return customExpiry[file.linkUploadId] || (typeof file.expiry === 'number' && ![7, 30, 90].includes(file.expiry)) ? 'custom' : String(file.expiry);
+  }
+  function chooseExpiry(file: Extract<DraftAttachment, { kind: 'file_link' }>, value: string) {
+    customExpiry[file.linkUploadId] = value === 'custom';
+    file.expiry = value === 'never' ? 'never' : value === 'custom' ? (typeof file.expiry === 'number' ? file.expiry : 30) : Number(value);
+  }
+  async function addFiles(event: Event) {
+    const picker = event.currentTarget as HTMLInputElement;
+    const selected = [...(picker.files ?? [])];
+    picker.value = '';
+    if (pending || !fileLinks || !selected.length) return;
+    pending = true; error = '';
+    try {
+      for (const file of selected) {
+        const inline = form.attachments.filter(file => file.kind === 'upload' || file.kind === 'message');
+        const remaining = attachmentBudget(limits, form.body) - inline.reduce((n, file) => n + file.size, 0);
+        if (inline.length < limits.attachmentsPerMessage && file.size <= remaining) {
+          const upload = await api.createUpload({ name: file.name, type: file.type || 'application/octet-stream', bytes: file }, { idempotencyKey: crypto.randomUUID() });
+          form.attachments.push({ kind: 'upload', uploadId: upload.id, name: upload.name, type: upload.type, size: upload.size });
+        } else {
+          if (form.attachments.filter(item => item.kind === 'file_link').length >= limits.fileLinksPerMessage) throw new Error('Too many download links on this draft.');
+          const upload = await api.createLinkUpload({ name: file.name, size: file.size }, { idempotencyKey: crypto.randomUUID() });
+          try {
+            for (let i = 0; i < upload.parts; i++) {
+              await api.putLinkPart(upload.id, i + 1, { bytes: file.slice(i * upload.partSize, (i + 1) * upload.partSize) });
+            }
+            const complete = await api.completeLinkUpload(upload.id);
+            form.attachments.push({ kind: 'file_link', linkUploadId: complete.id, name: complete.name, size: complete.size, expiry: limits.linkExpiryDefaultDays });
+          } catch (cause) {
+            void api.deleteLinkUpload(upload.id).catch(() => {});
+            throw cause;
+          }
+        }
+      }
+    } catch (cause) { failure(cause); }
+    finally { pending = false; }
+  }
   function addresses(value: string, original: AddressInput[]) {
     if (value === addressText(original)) return original.map((item) => ({ ...item }));
     return value.split(/[,;\n]/).map((item) => item.trim()).filter(Boolean).map((email) => ({ email }));
@@ -130,10 +169,30 @@
       <label class="compose-field">Subject<input disabled={pending} bind:value={form.subject} /></label>
     </div>
     <textarea aria-label="Message body" class="compose-body" disabled={pending} bind:value={form.body}></textarea>
+    {#if form.attachments.some(file => file.kind === 'file_link')}
+      <p class="notice" role="status">Files that do not fit are shared as download links.</p>
+    {/if}
     {#if form.attachments.length}
       <ul class="compose-files" aria-label="Attached files">
         {#each form.attachments as file, index (`${attachmentKey(file)}:${index}`)}
-          <li><Paperclip size={15} /><span>{file.name}{file.kind === 'link' ? ' (Drive link)' : file.kind === 'file_link' ? ' (download link)' : ''}</span><button type="button" class="icon" aria-label={`Remove ${file.name}`} disabled={pending} onclick={() => form.attachments.splice(index, 1)}><X size={16} /></button></li>
+          <li>
+            <Paperclip size={15} /><span>{file.name}{file.kind === 'link' ? ' (Drive link)' : file.kind === 'file_link' ? ' (download link)' : ''}</span>
+            {#if file.kind === 'file_link' && fileLinks}
+              <select aria-label={`Expiry for ${file.name}`} value={expiryChoice(file)} disabled={pending} onchange={(event) => chooseExpiry(file, event.currentTarget.value)}>
+                <option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option>
+                <option value="never">Never</option><option value="custom">Custom</option>
+              </select>
+              {#if expiryChoice(file) === 'custom'}
+                <input aria-label={`Expiry days for ${file.name}`} type="number" min="1" max={limits.linkExpiryMaxDays} step="1" disabled={pending}
+                  value={file.expiry} onchange={(event) => {
+                    const days = event.currentTarget.valueAsNumber;
+                    if (Number.isInteger(days) && days >= 1 && days <= limits.linkExpiryMaxDays) file.expiry = days;
+                    else event.currentTarget.value = String(file.expiry);
+                  }} />
+              {/if}
+            {/if}
+            <button type="button" class="icon" aria-label={`Remove ${file.name}`} disabled={pending} onclick={() => form.attachments.splice(index, 1)}><X size={16} /></button>
+          </li>
         {/each}
       </ul>
     {/if}
@@ -142,7 +201,7 @@
     <p id="send-availability" class="compose-availability muted">{m3 ? 'Sending is not supported in this version of Mail.' : 'Sending not available yet'}</p>
     <footer class="compose-actions">
       <button class="pill primary" type="button" disabled aria-describedby="send-availability">Send</button>
-      <label class="file-picker icon" title="Upload attachments"><Paperclip size={20} /><input type="file" multiple aria-label="Upload attachments" disabled /></label>
+      <label class="file-picker icon" title="Upload attachments"><Paperclip size={20} /><input type="file" multiple aria-label="Upload attachments" disabled={pending || !fileLinks} onchange={addFiles} /></label>
       <button class="icon" type="button" aria-label="Attach from Drive" disabled><HardDrive size={20} /></button>
       <span class="toolbar-spacer"></span><button class="pill" type="button" disabled={pending || conflict} onclick={save}>Save draft</button>
       <button class="icon" type="button" aria-label="Discard draft" disabled={pending || conflict} onclick={discard}><Trash2 size={19} /></button>

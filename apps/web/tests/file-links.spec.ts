@@ -9,6 +9,26 @@ test.use({ realContent: true, fileLinks: true });
 
 const BIDI = /[\p{Bidi_Control}]/u;
 
+test('compose switches a large attachment to a downloadable link', async ({ page, origins }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Compose', exact: true }).click();
+  await page.getByRole('textbox', { name: 'To', exact: true }).fill('friend@example.net');
+  const bytes = Buffer.alloc(4 * 1024 * 1024, 91);
+  const picker = page.getByLabel('Upload attachments');
+  await expect(picker).toBeEnabled();
+  await picker.setInputFiles({ name: 'large.bin', mimeType: 'application/octet-stream', buffer: bytes });
+  await expect(page.getByText('large.bin (download link)')).toBeVisible();
+  await expect(page.getByText('Files that do not fit are shared as download links.')).toBeVisible();
+  await page.getByRole('button', { name: 'Save draft', exact: true }).click();
+  await expect(page.getByRole('dialog')).not.toBeVisible();
+  const release = await page.request.post(`${origins.appOrigin}/__fixture/release-upload`);
+  expect(release.status()).toBe(200);
+  const { path } = await release.json();
+  expect((await page.goto(`${origins.contentOrigin}${path}`))?.status()).toBe(200);
+  const [download] = await Promise.all([page.waitForEvent('download'), page.getByRole('link', { name: 'Download' }).click()]);
+  expect(createHash('sha256').update(await readFile((await download.path())!)).digest('hex')).toBe(createHash('sha256').update(bytes).digest('hex'));
+});
+
 test('a recipient downloads a linked file from its page, and hostile names render as text', async ({ page, origins }) => {
   const link = origins.fileLink!;
   const dialogs: string[] = [];

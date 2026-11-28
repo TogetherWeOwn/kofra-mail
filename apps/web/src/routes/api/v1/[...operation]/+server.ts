@@ -3,7 +3,7 @@ import { env } from '$env/dynamic/private';
 import type { RequestHandler } from './$types';
 import { handleMailApi } from '$lib/server/mail-api';
 
-const forwardHeaders = ['accept', 'content-type', 'x-csrf-token', 'idempotency-key', 'if-match'];
+const forwardHeaders = ['accept', 'content-type', 'content-length', 'x-csrf-token', 'idempotency-key', 'if-match'];
 const handle: RequestHandler = ({ request, platform, url }) => {
   // Vite has no Durable Object bindings. Its local test relay is compiled out
   // of the Worker build and neither sends cookies nor forwards account selection.

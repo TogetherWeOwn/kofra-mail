@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS mailbox_send_handoffs (send_id TEXT PRIMARY KEY, retr
 -- this hour and in total. Losing it to a restore is acceptable.
 CREATE TABLE IF NOT EXISTS mailbox_send_links (
   link_id TEXT PRIMARY KEY, send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, idx INTEGER NOT NULL,
-  created_at INTEGER NOT NULL, revoked_at INTEGER, deleted_at INTEGER, UNIQUE (send_id, idx)
+  created_at INTEGER NOT NULL, revoked_at INTEGER, deleted_at INTEGER, expired_at INTEGER, UNIQUE (send_id, idx)
 );
 CREATE INDEX IF NOT EXISTS mailbox_send_link_page ON mailbox_send_links(created_at DESC, link_id DESC) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS mailbox_link_routes (send_id TEXT PRIMARY KEY);
@@ -170,6 +170,11 @@ CREATE TABLE IF NOT EXISTS mailbox_api_draft_objects (
   draft_id TEXT NOT NULL REFERENCES drafts(id) ON DELETE CASCADE, object_key TEXT NOT NULL,
   PRIMARY KEY (draft_id, object_key)
 );
+-- Ownership is derived only from draft and send journal events and snapshots.
+CREATE TABLE IF NOT EXISTS mailbox_link_claims (
+  upload_id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, send_id TEXT
+);
+CREATE INDEX IF NOT EXISTS mailbox_link_draft ON mailbox_link_claims(draft_id) WHERE send_id IS NULL;
 CREATE TABLE IF NOT EXISTS mailbox_pending_releases (
   seq INTEGER NOT NULL, object_key TEXT NOT NULL, holder TEXT NOT NULL, retry_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (seq, object_key, holder)
@@ -214,6 +219,7 @@ const ADDED_COLUMNS = [
   ['messages', 'folder_rev', 'folder_rev INTEGER NOT NULL DEFAULT 0'],
   ['mailbox_sends', 'raw_key', 'raw_key TEXT'],
   ['mailbox_sends', 'released_at', 'released_at INTEGER'],
+  ['mailbox_send_links', 'expired_at', 'expired_at INTEGER'],
 ] as const;
 const upgraded = new WeakSet<SqlStorage>();
 

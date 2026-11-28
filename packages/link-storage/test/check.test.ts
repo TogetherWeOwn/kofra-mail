@@ -31,9 +31,10 @@ test('a private bucket with both keys passes, signed, and leaves nothing behind'
     ['GetObject', WRITE.accessKeyId, 200], ['PutObject', READ.accessKeyId, 403], ['DeleteObject', READ.accessKeyId, 403], ['GetObject', null, 403], ['ListObjects', null, 403],
     ['CreateMultipart', WRITE.accessKeyId, 200], ['UploadPart', WRITE.accessKeyId, 200], ['ListParts', WRITE.accessKeyId, 200],
     ['CompleteMultipart', WRITE.accessKeyId, 200], ['DeleteObject', WRITE.accessKeyId, 204],
-    ['CreateMultipart', WRITE.accessKeyId, 200], ['AbortMultipart', WRITE.accessKeyId, 204], ['DeleteObject', WRITE.accessKeyId, 204],
+    ['CreateMultipart', WRITE.accessKeyId, 200], ['ListMultipartUploads', WRITE.accessKeyId, 200], ['AbortMultipart', WRITE.accessKeyId, 204],
+    ['DeleteObject', WRITE.accessKeyId, 204],
   ]);
-  assert.ok(s3.calls.every(({ op, key }) => op === 'HeadBucket' || op === 'ListObjects' ? key === '' : key.startsWith('riaklo/link-probe-')));
+  assert.ok(s3.calls.every(({ op, key }) => op === 'HeadBucket' || op === 'ListObjects' || op === 'ListMultipartUploads' ? key === '' : key.startsWith('riaklo/link-probe-')));
   assert.equal(s3.objects.size, 0);
   assert.equal(s3.uploads.size, 0);
 });

@@ -145,6 +145,8 @@ interface FixtureOptions {
 }
 
 export type FileLinkOptions = {
+  uploads?: boolean;
+  deploymentOnly?: boolean;
   // Extra hosts the content Worker serves links on (the Playwright bridge's host).
   hosts?: string[];
   hourlyFactor?: number;
@@ -156,6 +158,7 @@ export type FileLinkOptions = {
 };
 export const LINK_HOST = 'files.example.test';
 const LINK_READ = { accessKeyId: 'link-reader-0001', secretAccessKey: 'link-reader-secret-0001' };
+const LINK_WRITE = { accessKeyId: 'link-writer-0001', secretAccessKey: 'link-writer-secret-0001' };
 const LINK_WS_READ = { accessKeyId: 'ws-reader-0001', secretAccessKey: 'ws-reader-secret-0001' };
 const LINK_WS_WRITE = { accessKeyId: 'ws-writer-0001', secretAccessKey: 'ws-writer-secret-0001' };
 const LINK_KEK = JSON.stringify({ current: '1', keys: { 1: Buffer.alloc(32, 7).toString('base64') } });
@@ -189,9 +192,11 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
   const realContent = content ?? (fileLinks ? { appOrigin: 'https://mail.example', contentOrigin: 'https://content.example' } : undefined);
   const linkStores = fileLinks && {
     deployment: fakeS3({ host: 'links.example.test', bucket: DEPLOYMENT_LOCATION.bucket, objectHeaders: fileLinks.objectHeaders,
-      keys: { [LINK_READ.accessKeyId]: { secret: LINK_READ.secretAccessKey, ops: new Set(['GetObject']) } } }),
+      keys: { [LINK_READ.accessKeyId]: { secret: LINK_READ.secretAccessKey, ops: new Set(['GetObject']) },
+        [LINK_WRITE.accessKeyId]: { secret: LINK_WRITE.secretAccessKey, ops: new Set(['GetObject', 'CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart', 'ListMultipartUploads', 'DeleteObject', 'DeleteObjectVersion']) } } }),
     workspace: fakeS3({ host: 'ws-links.example.test', bucket: WORKSPACE_LOCATION.bucket, objectHeaders: fileLinks.objectHeaders,
-      keys: { [LINK_WS_READ.accessKeyId]: { secret: LINK_WS_READ.secretAccessKey, ops: new Set(['GetObject']) } } }),
+      keys: { [LINK_WS_READ.accessKeyId]: { secret: LINK_WS_READ.secretAccessKey, ops: new Set(['GetObject']) },
+        [LINK_WS_WRITE.accessKeyId]: { secret: LINK_WS_WRITE.secretAccessKey, ops: new Set(['GetObject', 'CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart', 'ListMultipartUploads', 'DeleteObject', 'DeleteObjectVersion']) } } }),
   };
   const principals = { ...accounts, ...(longIds ? longAccounts : {}) } as typeof accounts & Partial<typeof longAccounts>;
   const draftsUploads = uploads || send;
@@ -238,12 +243,21 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       KOFRA_S3_ENDPOINT: 'https://object-store.example.test', KOFRA_S3_ACCESS_KEY_ID: 'fixture', KOFRA_S3_SECRET_ACCESS_KEY: 'fixture',
       ...(realContent && { MAIL_CONTENT_ENABLED: 'on', REAL_CONTENT_ORIGIN: realContent.contentOrigin }),
       ...(fileLinks && { LINK_HOST, LINK_CRED_KEK: LINK_KEK,
+        ...(fileLinks.uploads && { MAIL_FILE_LINKS_ENABLED: 'on', LINK_REFUSED_ZONES: JSON.stringify(['mail.example', 'content.example', LINK_HOST]),
+          LINK_LOCATIONS: JSON.stringify({ current: 'links', locations: { links: DEPLOYMENT_LOCATION } }),
+          LINK_WRITE_CREDENTIALS: JSON.stringify({ links: LINK_WRITE }) }),
         ...(fileLinks.hourlyFactor && { LINK_HOURLY_FACTOR: String(fileLinks.hourlyFactor) }),
         ...(fileLinks.totalFactor && { LINK_TOTAL_FACTOR: String(fileLinks.totalFactor) }) }) },
     ...(realContent && { serviceBindings: { MAIL_CONTENT: { name: 'mail-content', entrypoint: 'ContentMint' },
       ...(fileLinks && { ALERTS: { name: 'link-alerts' } }) } }),
     outboundService: async (req: LocalRequest) => {
       const { host, pathname } = new NodeURL(req.url);
+      const store = host === 'links.example.test' ? linkStores?.deployment : host === 'ws-links.example.test' ? linkStores?.workspace : undefined;
+      if (store && fileLinks?.uploads) {
+        const answer = await store.fetch(new Request(req.url, { method: req.method, headers: Object.fromEntries(req.headers),
+          ...(req.method === 'GET' || req.method === 'HEAD' ? {} : { body: await req.arrayBuffer() }) }));
+        return new LocalResponse(req.method === 'HEAD' ? null : answer.body, { status: answer.status, headers: Object.fromEntries(answer.headers) });
+      }
       assert.equal(host, 'object-store.example.test');
       if (pathname === '/fixture-body-read' && req.method === 'POST') {
         watchedBody?.resolve();
@@ -382,7 +396,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     // Miniflare's synchronous Node binding proxy for each prepared statement.
     await controlAction('seed-directory', JSON.stringify(await directoryMigrationBatches({ localApi: true })));
     // A workspace link location of w1 (M3-15a's row, sealed under the fixture KEK).
-    if (fileLinks) {
+    if (fileLinks && !fileLinks.deploymentOnly) {
       const kek = await linkKek(LINK_KEK);
       const db = await mf.getD1Database('DIRECTORY', 'mail-backend');
       await db.batch(await new LinkStorageStore(db as unknown as LinkDatabase).createStatements(kek!, accounts.member.ws, WORKSPACE_LOCATION_ID,
@@ -456,7 +470,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       refuseMime: (phase: 'size' | 'build', code: 'invalid_header' | 'message_too_large' | 'invalid_wire') =>
         controlAction('refuse-mime', JSON.stringify({ phase, code })),
       ids: () => readControl<string[]>('send-ids'),
-      rateCap: (binding: 'MAIL_RATE_SENDS' | 'MAIL_RATE_UNDO' | 'MAIL_RATE_UNDO_FLOOD', cap: number) =>
+      rateCap: (binding: 'MAIL_RATE_SENDS' | 'MAIL_RATE_UNDO' | 'MAIL_RATE_UNDO_FLOOD' | 'MAIL_RATE_LINK_PARTS', cap: number) =>
         controlAction('rate-cap', JSON.stringify({ binding, cap })),
       releaseFailure: (failing: boolean) => controlAction('send-release-failure', String(failing)),
       driver: (id: string) => readControl<{ send_id: string; backoff: number; held: number } | null>('send-driver', id),
