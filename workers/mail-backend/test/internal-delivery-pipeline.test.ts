@@ -267,3 +267,37 @@ for (const stage of ['expansion', 'release'] as const) {
     assert.equal(stage === 'expansion' ? row.expanded_at : row.holder_release_pending, stage === 'expansion' ? null : 1, 'still failing');
   }));
 }
+
+test('the outbox refuses a rejected handoff row without its reason', () => withInternal(async h => {
+  const insert = (reason: string | null) => h.directoryChange(`INSERT INTO internal_handoffs (key, workspace_id, mailbox_id, send_id, raw_key, sender,
+      addresses, message_id, folder_rev, decision, reason, created_at) VALUES (?, 'w1', 'mailbox-a', ?, ?, ?, '[[0,"other","example.com","other@example.com"]]', ?,
+      0, 'rejected', ?, 0)`, `internal:w1:mailbox-a:${reason ?? 'none'}`, 'x', `raw/${'c'.repeat(64)}/01M8H00000000000000000GEN0`, MEMBER, 'x', reason)
+    .then(() => 'written', () => 'refused');
+  assert.equal(await insert('invalid_sender'), 'written');
+  assert.equal(await insert(null), 'refused');
+}));
+
+test('a failed stuck-alert insert never holds up the rows the reconciler took, and the alert is inserted on a later attempt', () =>
+  withInternal(async (h, mail, from) => {
+    await h.box('member', 'crashAtHandoff', 'expand:written');
+    const id = await released(h, mail, from, 'alert-outage', [OTHER]);
+    const mine = (await handoff(h, id))!;
+    await h.directoryChange('UPDATE internal_handoffs SET release_attempts = 11 WHERE key = ?', mine.key);
+    // Another workspace's flagged handoff whose sweeper never answers, also about to reach the threshold.
+    const stuck = 'internal:w2:mailbox-z:01M8H000000000000000000099';
+    const now = await h.sends.now();
+    await h.directoryChange(`INSERT INTO internal_handoffs (key, workspace_id, mailbox_id, send_id, raw_key, sender, addresses, message_id, folder_rev,
+        decision, created_at, plan, expand_retry_at, expanded_at, holder_release_pending, release_retry_at, release_attempts)
+      VALUES (?, 'w2', 'mailbox-z', '01M8H000000000000000000099', ?, 'foreign@example.net', '[[0,"a","example.net","a@example.net"]]', 'x', 0,
+        'accepted', ?, '[[0,null]]', ?, ?, 1, ?, 11)`, stuck, `raw/${'a'.repeat(64)}/01M8H00000000000000000GEN0`, now - hour, now - hour, now - hour, now - hour);
+    await h.sweeper('w2', 'stallTombstones', true);
+    await h.directoryChange('ALTER TABLE mail_alerts RENAME TO mail_alerts_unavailable');
+    await h.advance(10 * minute, 'clock-only');
+    await h.handoffCron(200);
+    assert.equal((await handoff(h, id))?.holder_release_pending, 0, 'released although the alert insert failed');
+    await h.directoryChange('ALTER TABLE mail_alerts_unavailable RENAME TO mail_alerts');
+    assert.deepEqual(await h.directoryRows("SELECT key FROM mail_alerts WHERE key LIKE 'handoff_stuck:%'"), []);
+    await h.advance(2 * hour, 'clock-only');
+    await h.handoffCron(200);
+    assert.deepEqual(await h.directoryRows("SELECT key FROM mail_alerts WHERE key LIKE 'handoff_stuck:%'"), [{ key: `handoff_stuck:${stuck}` }]);
+  }));

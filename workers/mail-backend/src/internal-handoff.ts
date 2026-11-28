@@ -318,8 +318,12 @@ async function takePages<T extends { key: string; attempts: number }>(ports: Han
     taken.push(...results);
     if (results.length < HANDOFF_PAGE) break;
   }
+  // A failed alert insert never holds up the taken rows; the next attempt, still past the threshold, inserts it again.
   const stuck = taken.filter(row => row.attempts >= HANDOFF_STUCK_ATTEMPTS);
-  if (stuck.length) await ports.db.batch(stuck.map(row => ports.db.prepare(STUCK_ALERT).bind(row.key, now)));
+  if (stuck.length) {
+    await ports.db.batch(stuck.map(row => ports.db.prepare(STUCK_ALERT).bind(row.key, now)))
+      .catch(() => console.error({ code: 'handoff_stuck_alert_failed', count: stuck.length }));
+  }
   return taken;
 }
 

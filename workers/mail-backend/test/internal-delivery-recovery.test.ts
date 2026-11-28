@@ -423,3 +423,24 @@ test('a sender restore just before a pending handoff\'s 24-hour deadline keeps t
   await h.advance(hour);
   assert.equal(await stalled(), 1, 'alerted 24 hours after the release, not after the restore');
 }));
+
+test('a claim right after a restore never moves a delayed send\'s drive row past its pending handoff', () => withInternal(async (h, mail, from) => {
+  await outboxDown(h, true);
+  const id = await released(h, mail, from, 'claim-after-restore', [OUTSIDE, OTHER]);
+  await h.consumer('scriptEmail', [{ result: 'reject', code: 'E_DAILY_LIMIT_EXCEEDED' }]);
+  assert.deepEqual((await drain(h)).map(({ step }) => step), ['delayed']);
+  // The quota wait is published, so the restore brings the send back delayed.
+  await h.advance(2 * minute);
+  assert.equal((await h.sendState(id)).flushed.flushed, (await h.sendState(id)).flushed.modseq);
+  await restoreMember(h, false);
+  const restored = await h.sendState(id);
+  assert.equal(restored.row?.state, 'delayed');
+  const due = restored.drive[0];
+  assert.ok(due <= await h.sends.now(), 'the epilogue drives a pending handoff now');
+  // A queued dispatch reaches the restored send before its drive row runs.
+  assert.deepEqual(await h.consumer('consume', { kind: 'dispatch', ws: WS, mb: 'mailbox-a', sendId: id }), { ack: true, step: 'not_now' });
+  assert.ok((await h.sendState(id)).drive[0] <= due, 'still due for the handoff, not at the quota reset');
+  await outboxDown(h, false);
+  await h.advance(0);
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['external:pending', 'internal:sent']);
+}));

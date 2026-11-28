@@ -20,7 +20,7 @@ CREATE TABLE internal_handoffs (
   folder_rev INTEGER NOT NULL CHECK (folder_rev = 0),
   decision TEXT NOT NULL CHECK (decision IN ('accepted', 'rejected')),
   reason TEXT CHECK ((decision = 'accepted' AND reason IS NULL)
-    OR (decision = 'rejected' AND reason IN ('invalid_sender', 'link_expired'))),
+    OR (decision = 'rejected' AND reason IS NOT NULL AND reason IN ('invalid_sender', 'link_expired'))),
   created_at INTEGER NOT NULL,
   -- The routing decision: written once, inside its own statement, from the directory.
   plan TEXT CHECK (plan IS NULL OR (decision = 'accepted' AND json_valid(plan))),

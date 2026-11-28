@@ -373,7 +373,7 @@ export class SendDispatcher {
       if (m.terminal || !m.openExternals().length) this.stalls.clear(m.row.id);
       this.ports.journalDue(timers);
     }
-    if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, handoffBound(this.ports.sql, m.row.id, driveAt));
+    if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, handoffBound(this.ports.sql, timers, m.row.id, driveAt));
     // A report or a state change resets the drive backoff; a claim does not.
     if (report) this.ports.sql.exec('UPDATE mailbox_send_drivers SET backoff = 0 WHERE send_id = ?', m.row.id);
     return event ? ready.index.journal.revision() : 0;
@@ -422,7 +422,7 @@ export class SendDispatcher {
       const ctx = this.ctx(ready);
       const gated = this.gate(m, ctx, ready.index.journal.flushed());
       if (gated) {
-        if (gated.driveAt !== undefined) timers.set(SEND_DRIVE, id, handoffBound(ports.sql, id, gated.driveAt));
+        if (gated.driveAt !== undefined) timers.set(SEND_DRIVE, id, handoffBound(ports.sql, timers, id, gated.driveAt));
         return gated.answer;
       }
       if (sender === undefined) {
@@ -1088,7 +1088,7 @@ export class SendDispatcher {
     this.expirePreMark(row.id, now, timers);
     if (m.d.heldAt !== null) {
       // Held after repeated crashes of our own: never failed, never claimed; an operator resumes it.
-      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, now + HOLD_RECHECK_MS));
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, now + HOLD_RECHECK_MS));
       return releaseList(this.ports.sql, row.id).length ? 'release' : null;
     }
     if (m.d.graceUntil !== null) {
@@ -1103,7 +1103,7 @@ export class SendDispatcher {
         this.commit(m, r, timers, null);
       }
       if (now < until) {
-        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, until));
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, until));
         return null;
       }
       // The hold ended without a result: the protected recipients fail too.
@@ -1123,7 +1123,7 @@ export class SendDispatcher {
     }
     if (m.state === 'delayed') {
       if (m.d.delayedUntil !== null && now < m.d.delayedUntil) {
-        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.delayedUntil));
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, m.d.delayedUntil));
         return null;
       }
       m.state = 'queued';
@@ -1135,18 +1135,18 @@ export class SendDispatcher {
     // drive row keeps the backoff its handler set before acting (5 minutes doubling to 1 hour).
     if (!m.openExternals().length) return null;
     if (m.lease() && leaseLive(m.d.leaseUntil, ctx)) {
-      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.leaseUntil! + ctx.skew));
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, m.d.leaseUntil! + ctx.skew));
       return null;
     }
     for (const entry of m.openExternals()) {
       const fence = entry.state === 'attempting' ? m.attemptingFence(entry.idx) : undefined;
       if (fence && leaseLive(fence.leaseUntil, ctx)) {
-        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, fence.leaseUntil + ctx.skew));
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, fence.leaseUntil + ctx.skew));
         return null;
       }
     }
     if (now < m.d.nextAttemptAt) {
-      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.nextAttemptAt));
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, timers, row.id, m.d.nextAttemptAt));
       return null;
     }
     return 'enqueue';
@@ -1155,11 +1155,16 @@ export class SendDispatcher {
 
 // Section 2.2: while an internal recipient is not yet handed off, a move of the
 // drive row takes the earlier of the step's own time and the handoff's next
-// retry, so a quota wait, a lease or a backoff never postpones an internal delivery.
-function handoffBound(sql: SqlStorage, id: string, at: number): number {
-  const retry = sql.exec<{ at: number }>(`SELECT h.retry_at AS at FROM mailbox_send_handoffs h WHERE h.send_id = ?1 AND EXISTS (
-    SELECT 1 FROM mailbox_send_recipients r WHERE r.send_id = ?1 AND r.kind = 'internal' AND r.state = 'pending')`, id).toArray()[0]?.at;
-  return Math.max(1, retry === undefined ? at : Math.min(at, retry));
+// retry, so a quota wait, a lease or a backoff never postpones an internal
+// delivery. Before the handoff's first try has recorded its retry (after a
+// restore, which clears that local row), the row's current due time is the
+// first try, and no move passes it either.
+function handoffBound(sql: SqlStorage, timers: TimerTable, id: string, at: number): number {
+  const { retry, pending } = sql.exec<{ retry: number | null; pending: number }>(`SELECT
+    (SELECT retry_at FROM mailbox_send_handoffs WHERE send_id = ?1) AS retry,
+    EXISTS (SELECT 1 FROM mailbox_send_recipients WHERE send_id = ?1 AND kind = 'internal' AND state = 'pending') AS pending`, id).one();
+  const bound = pending ? retry ?? timers.due(SEND_DRIVE, id) : null;
+  return Math.max(1, bound === null ? at : Math.min(at, bound));
 }
 
 // Finish rule step 3's quota part: every fence on the release list.
