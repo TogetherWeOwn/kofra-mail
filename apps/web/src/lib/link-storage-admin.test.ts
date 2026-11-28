@@ -112,6 +112,8 @@ test('an admin adds a private bucket; only the key ids\' last 4 characters come 
   const retry = await f.call('createLinkLocation', { json: location, key: 'create-1' });
   assert.deepEqual([retry.status, retry.body], [201, body]);
   assert.equal((await f.call('createLinkLocation', { json: { ...location, bucket: 'other' }, key: 'create-1' })).body.code, 'idempotency_key_reused');
+  assert.equal((await f.call('createLinkLocation', { json: { ...location, extra: true }, key: 'create-1' })).body.code, 'idempotency_key_reused');
+  assert.equal((await f.call('createLinkLocation', { json: { ...location, read: { ...READ, extra: 1 } }, key: 'create-1' })).body.code, 'idempotency_key_reused');
   const listed = await f.call('listLinkLocations');
   assert.deepEqual(listed.body, { deployment: true, items: [body] });
   assert.equal(f.db.dump('link_storage_locations').length, 1);
@@ -147,6 +149,36 @@ test('the save check refuses with a fixed code and stores nothing', async (t) =>
   }
 });
 
+test('a retry while the check runs answers idempotency_in_progress, and a failed check releases the key', async (t) => {
+  const f = fixture(t);
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let first = true;
+  const s3 = f.s3;
+  t.mock.method(globalThis, 'fetch', async (request: Request) => {
+    if (first) { first = false; await gate; }
+    return s3.fetch(request);
+  });
+  const pending = f.call('createLinkLocation', { json: location, key: 'create-1' });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const busy = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  assert.deepEqual([busy.status, busy.body.code, busy.body.retryAfterSeconds], [409, 'idempotency_in_progress', 1]);
+  release();
+  const done = await pending;
+  assert.equal(done.status, 201);
+  assert.deepEqual(await f.call('createLinkLocation', { json: location, key: 'create-1' }), { status: 201, body: done.body });
+  // A check that fails leaves no key behind: the same key runs again.
+  const g = fixture(t, { s3: { anonymous: ['GetObject'] } });
+  assert.equal((await g.call('createLinkLocation', { json: location, key: 'create-2' })).body.reason, 'public_bucket');
+  assert.equal(g.db.dump('directory_api_keys').length, 0);
+  assert.equal((await g.call('createLinkLocation', { json: location, key: 'create-2' })).body.reason, 'public_bucket');
+  // One key for both roles is refused before any request.
+  const h = fixture(t);
+  const same = await h.call('createLinkLocation', { json: { ...location, read: WRITE }, key: 'create-3' });
+  assert.deepEqual([same.status, same.body.reason, h.sent.length], [422, 'read_key_writable', 0]);
+  noSecrets(f);
+});
+
 test('credentials rotate in place, only after the new keys pass the check', async (t) => {
   const f = fixture(t);
   const { body: created } = await f.call('createLinkLocation', { json: location, key: 'create-1' });
@@ -179,7 +211,8 @@ test('deleting a location that still has live links is refused', async (t) => {
   inUse = false;
   assert.equal((await f.call('deleteLinkLocation', { params: { locationId: created.id } })).status, 204);
   assert.deepEqual((await f.call('listLinkLocations')).body.items, []);
-  assert.equal((await f.call('deleteLinkLocation', { params: { locationId: created.id } })).status, 404);
+  // DELETE answers 204 whether or not the location still exists (contract section 5), without asking the usage port again.
+  assert.equal((await f.call('deleteLinkLocation', { params: { locationId: created.id } })).status, 204);
   assert.deepEqual(asked, [`${admin.workspaceId}/${created.id}`, `${admin.workspaceId}/${created.id}`]);
 });
 

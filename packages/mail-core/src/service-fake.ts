@@ -1087,7 +1087,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       async listLinkLocations() { return { deployment: false, items: [] }; },
       async createLinkLocation() { return fail('feature_unavailable'); },
       async rotateLinkLocationCredentials() { return fail('feature_unavailable'); },
-      async deleteLinkLocation() { return fail('not_found'); },
+      async deleteLinkLocation() {},
     };
     // All callers get detached snapshots; access checks precede route validation and replay.
     return new Proxy(service, {

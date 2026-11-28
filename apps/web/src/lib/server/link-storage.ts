@@ -45,6 +45,9 @@ const invalid = (field: string): never => fail('invalid_request', { errors: [{ f
 const iso = (ms: number) => new Date(ms).toISOString();
 const locationIdPattern = /^[a-z2-7]{26}$/;
 const createFields = ['endpoint', 'region', 'bucket', 'prefix', 'pathStyle', 'read', 'write'];
+// An idempotency record whose operation is still running (contract section 5).
+const IN_PROGRESS = '';
+const IN_PROGRESS_MS = 5 * 60_000;
 
 function asLinkLocation(row: StoredLocation): LinkLocation {
   return {
@@ -99,15 +102,18 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       if (!key) return fail('precondition_required');
       const { kek, zones } = await writeConfig(ctx.env);
       const input = ctx.input;
-      // The key's fingerprint covers every field except the secrets, so no derivative of a secret is stored.
-      const pair = (value: unknown) => value && typeof value === 'object' ? (value as Record<string, unknown>).accessKeyId : undefined;
-      const fingerprint = await sha256(JSON.stringify([op, input.endpoint, input.region, input.bucket, input.prefix ?? '', input.pathStyle,
-        pair(input.read), pair(input.write)]));
+      // The key's fingerprint covers the whole body except the secret values (each
+      // credential counts by its key id and field names), so nothing derived from a secret is stored.
+      const shape = (value: unknown) => value && typeof value === 'object' && !Array.isArray(value)
+        ? { accessKeyId: (value as Record<string, unknown>).accessKeyId, fields: Object.keys(value).sort() } : value;
+      const fingerprint = await sha256(JSON.stringify([op, Object.keys(input).sort().map(name =>
+        [name, name === 'read' || name === 'write' ? shape(input[name]) : input[name]])]));
       const replay = async () => {
         const row = await db.prepare('SELECT fingerprint, result FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND expires_at > ?')
           .bind(ws, key, now).first<{ fingerprint: string; result: string }>();
         if (!row) return undefined;
         if (row.fingerprint !== fingerprint) return fail('idempotency_key_reused');
+        if (row.result === IN_PROGRESS) return fail('idempotency_in_progress', { retryAfterSeconds: 1 });
         return { body: JSON.parse(row.result) as LinkLocation, replayed: true };
       };
       const earlier = await replay();
@@ -117,26 +123,45 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       if (!parsed.ok) return parsed.reason === 'endpoint' ? fail('storage_check_failed', { reason: 'endpoint' }) : invalid(parsed.field || '/');
       const credentials = credentialPair(input);
       if ((await store.list(ws)).length >= MAX_WORKSPACE_LOCATIONS) return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
-      const verdict = await check(parsed.fields, credentials, zones);
-      if (!verdict.ok) return fail('storage_check_failed', { reason: verdict.reason });
-      const locationId = newLocationId();
-      const body = asLinkLocation({ ...parsed.fields, workspaceId: ws, locationId, current: true, readKeyLast4: credentials.read.keyIdLast4,
-        writeKeyLast4: credentials.write.keyIdLast4, createdAt: now, rotatedAt: null });
+      // Mark the key in progress before the check's first request (contract section 5); a marker
+      // left by a crash expires after 5 minutes, longer than the check's own request deadlines.
       try {
         await db.batch([
           db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND expires_at <= ?').bind(ws, key, now),
-          db.prepare(`INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) SELECT ?, ?, ?, ?, ? WHERE ${HAS_ROOM}`)
-            .bind(ws, key, fingerprint, JSON.stringify(body), now + LIMITS.idempotencyRetentionSeconds * 1000, ws),
-          ...await store.createStatements(kek, ws, locationId, parsed.fields, credentials, now),
+          db.prepare('INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) VALUES (?, ?, ?, ?, ?)')
+            .bind(ws, key, fingerprint, IN_PROGRESS, now + IN_PROGRESS_MS),
         ]);
       } catch {
-        // A racing request with the same key won; never expose the database error.
-        const raced = await replay();
-        if (raced) return raced;
-        return fail('unavailable');
+        return (await replay()) ?? fail('unavailable');
       }
-      if (await store.get(ws, locationId)) return { body };
-      return (await replay()) ?? fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
+      let committed = false;
+      try {
+        const verdict = await check(parsed.fields, credentials, zones);
+        if (!verdict.ok) return fail('storage_check_failed', { reason: verdict.reason });
+        const locationId = newLocationId();
+        const body = asLinkLocation({ ...parsed.fields, workspaceId: ws, locationId, current: true, readKeyLast4: credentials.read.keyIdLast4,
+          writeKeyLast4: credentials.write.keyIdLast4, createdAt: now, rotatedAt: null });
+        try {
+          await db.batch([
+            db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, IN_PROGRESS),
+            db.prepare(`INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) SELECT ?, ?, ?, ?, ? WHERE ${HAS_ROOM}`)
+              .bind(ws, key, fingerprint, JSON.stringify(body), now + LIMITS.idempotencyRetentionSeconds * 1000, ws),
+            ...await store.createStatements(kek, ws, locationId, parsed.fields, credentials, now),
+          ]);
+        } catch {
+          // Never expose the database error.
+          return fail('unavailable');
+        }
+        committed = true;
+        if (await store.get(ws, locationId)) return { body };
+        return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
+      } finally {
+        // A failed operation releases its key, so a retry runs again.
+        if (!committed) {
+          await db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, IN_PROGRESS).run()
+            .catch(() => {});
+        }
+      }
     }
 
     case 'rotateLinkLocationCredentials': {
@@ -157,7 +182,8 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       const usage = ctx.env.LINK_USAGE;
       if (!usage || typeof usage.inUse !== 'function') return fail('feature_unavailable');
       const locationId = ctx.params.locationId;
-      if (!locationIdPattern.test(locationId)) return fail('not_found');
+      // DELETE answers 204 whether or not the location exists (contract section 5).
+      if (!locationIdPattern.test(locationId)) return {};
       let outcome: Awaited<ReturnType<LinkStorageStore['delete']>>;
       try {
         outcome = await store.delete(ws, locationId, usage);
@@ -165,7 +191,6 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
         return fail('unavailable');
       }
       if (outcome === 'in_use') return fail('location_in_use');
-      if (outcome === 'not_found') return fail('not_found');
       return {};
     }
 

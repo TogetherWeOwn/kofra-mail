@@ -48,12 +48,13 @@ export const ERROR_CODES = Object.keys(ERROR_STATUS) as MailErrorCode[];
  * - `endpoint`: not `https:` on port 443, an IP literal, or a refused host;
  * - `redirect`: the endpoint answered a 3xx, which is never followed;
  * - `public_bucket`: an anonymous read or list of the probe object was not refused;
+ * - `read_key_writable`: the read-only key is the write key, or may write or delete;
  * - `auth`: a key was refused for an object or bucket operation it needs;
  * - `bucket`: the bucket is missing or answered unexpectedly;
  * - `multipart`: a multipart operation (create, part, list parts, complete, abort) failed;
  * - `network`: the endpoint could not be reached in time.
  */
-export const STORAGE_CHECK_REASONS = ['endpoint', 'redirect', 'public_bucket', 'auth', 'bucket', 'multipart', 'network'] as const;
+export const STORAGE_CHECK_REASONS = ['endpoint', 'redirect', 'public_bucket', 'read_key_writable', 'auth', 'bucket', 'multipart', 'network'] as const;
 export type StorageCheckReason = (typeof STORAGE_CHECK_REASONS)[number];
 
 /** A field-level problem inside `invalid_request` or `invalid_header`; `field` is a JSON Pointer into the request body. */

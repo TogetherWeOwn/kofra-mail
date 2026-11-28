@@ -3,10 +3,10 @@
 // public, redirecting or broken. No real provider or credential is involved.
 import { AwsV4Signer } from 'aws4fetch';
 
-export type S3Op = 'HeadBucket' | 'PutObject' | 'GetObject' | 'DeleteObject' | 'ListObjects' | 'CreateMultipart'
+export type S3Op = 'HeadBucket' | 'PutObject' | 'GetObject' | 'DeleteObject' | 'DeleteObjectVersion' | 'ListObjects' | 'CreateMultipart'
   | 'UploadPart' | 'ListParts' | 'CompleteMultipart' | 'AbortMultipart';
-export const ALL_OPS: readonly S3Op[] = ['HeadBucket', 'PutObject', 'GetObject', 'DeleteObject', 'ListObjects', 'CreateMultipart',
-  'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart'];
+export const ALL_OPS: readonly S3Op[] = ['HeadBucket', 'PutObject', 'GetObject', 'DeleteObject', 'DeleteObjectVersion', 'ListObjects',
+  'CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart'];
 export const READ_OPS: readonly S3Op[] = ['GetObject'];
 export const MULTIPART_OPS: readonly S3Op[] = ['CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart'];
 
@@ -23,6 +23,8 @@ export interface FakeS3Options {
   redirect?: number;
   /** Answer a 200 error document to CompleteMultipartUpload. */
   completeError?: boolean;
+  /** Keep every written version; a DELETE without `versionId` only adds a delete marker. */
+  versioning?: boolean;
 }
 
 export interface FakeCall { op: S3Op | 'unknown'; key: string; signedBy: string | null; status: number }
@@ -31,6 +33,16 @@ export function fakeS3(options: FakeS3Options) {
   const region = options.region ?? 'auto';
   const objects = new Map<string, Uint8Array<ArrayBuffer>>();
   const uploads = new Map<string, Map<number, Uint8Array<ArrayBuffer>>>();
+  // Stored versions (with versioning on): delete markers are not kept here.
+  const versions: { key: string; versionId: string }[] = [];
+  let versionCounter = 0;
+  const write = (key: string, body: Uint8Array<ArrayBuffer>): Record<string, string> => {
+    objects.set(key, body);
+    if (!options.versioning) return {};
+    const versionId = `v${++versionCounter}`;
+    versions.push({ key, versionId });
+    return { 'x-amz-version-id': versionId };
+  };
   const calls: FakeCall[] = [];
   let uploadCounter = 0;
 
@@ -71,6 +83,7 @@ export function fakeS3(options: FakeS3Options) {
     if (method === 'GET' && query.has('uploadId')) return 'ListParts';
     if (method === 'POST' && query.has('uploadId')) return 'CompleteMultipart';
     if (method === 'DELETE' && query.has('uploadId')) return 'AbortMultipart';
+    if (method === 'DELETE' && query.has('versionId') && query.size === 1) return 'DeleteObjectVersion';
     if (query.size) return 'unknown';
     return ({ PUT: 'PutObject', GET: 'GetObject', HEAD: 'GetObject', DELETE: 'DeleteObject' } as const)[method as 'PUT'] ?? 'unknown';
   }
@@ -96,13 +109,20 @@ export function fakeS3(options: FakeS3Options) {
     const uploadId = url.searchParams.get('uploadId') ?? '';
     switch (op) {
       case 'HeadBucket': return record(new Response(null, { status: 200 }));
-      case 'PutObject': objects.set(where.key, body); return record(new Response(null, { status: 200, headers: { etag: '"put"' } }));
+      case 'PutObject': return record(new Response(null, { status: 200, headers: { etag: '"put"', ...write(where.key, body) } }));
       case 'GetObject': {
         const value = objects.get(where.key);
         if (!value) return record(error('NoSuchKey', 404));
         return record(new Response(request.method === 'HEAD' ? null : value, { status: 200 }));
       }
       case 'DeleteObject': objects.delete(where.key); return record(new Response(null, { status: 204 }));
+      case 'DeleteObjectVersion': {
+        const versionId = url.searchParams.get('versionId');
+        const index = versions.findIndex(v => v.key === where.key && v.versionId === versionId);
+        if (index !== -1) versions.splice(index, 1);
+        if (!versions.some(v => v.key === where.key)) objects.delete(where.key);
+        return record(new Response(null, { status: 204 }));
+      }
       case 'ListObjects': {
         const prefix = url.searchParams.get('prefix') ?? '';
         const keys = [...objects.keys()].filter(k => k.startsWith(prefix)).map(k => `<Contents><Key>${k}</Key></Contents>`).join('');
@@ -129,13 +149,15 @@ export function fakeS3(options: FakeS3Options) {
         const parts = uploads.get(uploadId);
         if (!parts) return record(error('NoSuchUpload', 404));
         if (options.completeError) return record(xml('<Error><Code>InternalError</Code></Error>'));
-        objects.set(where.key, new Uint8Array(Buffer.concat([...parts.values()])));
+        const headers = write(where.key, new Uint8Array(Buffer.concat([...parts.values()])));
         uploads.delete(uploadId);
-        return record(xml(`<CompleteMultipartUploadResult><Key>${where.key}</Key><ETag>"done"</ETag></CompleteMultipartUploadResult>`));
+        const done = xml(`<CompleteMultipartUploadResult><Key>${where.key}</Key><ETag>"done"</ETag></CompleteMultipartUploadResult>`);
+        for (const [name, value] of Object.entries(headers)) done.headers.set(name, value);
+        return record(done);
       }
       case 'AbortMultipart': uploads.delete(uploadId); return record(new Response(null, { status: 204 }));
     }
   }
 
-  return { fetch: handle, objects, uploads, calls };
+  return { fetch: handle, objects, uploads, versions, calls };
 }

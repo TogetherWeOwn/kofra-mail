@@ -4,7 +4,9 @@
 // In order: the endpoint rules; HeadBucket; a 1-byte probe put and get; an
 // anonymous GET and an anonymous list of the probe, both of which must be
 // refused; a probe multipart (create, part, ListParts, complete, delete); a
-// second multipart that is created and aborted; then the probe delete. The
+// second multipart that is created and aborted; then the probe delete. The read
+// key must read the probe but be refused a write and a delete. Probes are
+// deleted by version id where the provider returns one. The
 // answer is one fixed reason code. Provider bodies, headers and statuses are
 // never returned or logged.
 
@@ -12,7 +14,7 @@ import type { S3Credentials } from './credentials.ts';
 import { locationFields, type LinkLocationFields } from './location.ts';
 import { boundedText, bucketUrl, discard, objectUrl, s3Request, type Fetcher } from './s3.ts';
 
-export const LINK_CHECK_REASONS = ['endpoint', 'redirect', 'public_bucket', 'auth', 'bucket', 'multipart', 'network'] as const;
+export const LINK_CHECK_REASONS = ['endpoint', 'redirect', 'public_bucket', 'read_key_writable', 'auth', 'bucket', 'multipart', 'network'] as const;
 export type LinkCheckReason = (typeof LINK_CHECK_REASONS)[number];
 export type LinkCheckResult = { ok: true } | { ok: false; reason: LinkCheckReason };
 
@@ -30,6 +32,7 @@ class CheckFailure extends Error {
 
 const PROBE_BYTES = 'k';
 const uploadIdPattern = /<UploadId>([A-Za-z0-9._~+/=-]{1,1024})<\/UploadId>/;
+const versionIdPattern = /^[A-Za-z0-9._~+/=-]{1,1024}$/;
 
 /**
  * Runs the check for `fields` with the read-only and read-write credentials.
@@ -75,15 +78,43 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     return url;
   };
 
+  // In a versioned bucket a plain DELETE only adds a delete marker, so each probe
+  // is deleted by the version id its write returned (if the provider returned one).
+  const versionOf = (response: Response) => {
+    const id = response.headers.get('x-amz-version-id');
+    return id && versionIdPattern.test(id) ? id : undefined;
+  };
+  const removal = (key: string, versionId: string | undefined) =>
+    objectAt(key, versionId === undefined ? '' : new URLSearchParams({ versionId }).toString());
+
   try {
+    // A read-only key must not be the write key.
+    if (credentials.read.reveal().accessKeyId === credentials.write.reveal().accessKeyId) throw new CheckFailure('read_key_writable');
     const bucket = bucketUrl(location);
     discard(expect(await call(credentials.write, 'HEAD', bucket), [200], 'auth', 'bucket'));
 
-    discard(expect(await call(credentials.write, 'PUT', objectAt(probeKey), PROBE_BYTES,
-      { 'content-type': 'application/octet-stream' }), [200], 'auth', 'bucket'));
-    cleanup.push(() => call(credentials.write, 'DELETE', objectAt(probeKey)).then(discard));
+    const put = expect(await call(credentials.write, 'PUT', objectAt(probeKey), PROBE_BYTES,
+      { 'content-type': 'application/octet-stream' }), [200], 'auth', 'bucket');
+    discard(put);
+    const probeVersion = versionOf(put);
+    cleanup.push(() => call(credentials.write, 'DELETE', removal(probeKey, probeVersion)).then(discard));
     const got = expect(await call(credentials.read, 'GET', objectAt(probeKey)), [200], 'auth', 'bucket');
     if (await boundedText(got, 1024) !== PROBE_BYTES) throw new CheckFailure('bucket');
+
+    // The read key is read-only: it may neither write nor delete.
+    const readKey = `${probeKey}-r`;
+    const readPut = await call(credentials.read, 'PUT', objectAt(readKey), PROBE_BYTES, { 'content-type': 'application/octet-stream' });
+    discard(readPut);
+    if (readPut.ok) {
+      const written = versionOf(readPut);
+      cleanup.push(() => call(credentials.write, 'DELETE', removal(readKey, written)).then(discard));
+      throw new CheckFailure('read_key_writable');
+    }
+    if (readPut.status !== 401 && readPut.status !== 403) throw new CheckFailure('bucket');
+    const readDelete = await call(credentials.read, 'DELETE', removal(probeKey, probeVersion));
+    discard(readDelete);
+    if (readDelete.ok) throw new CheckFailure('read_key_writable');
+    if (readDelete.status !== 401 && readDelete.status !== 403) throw new CheckFailure('bucket');
 
     // The bucket must be private: an anonymous read and an anonymous list are both refused.
     const anonymous = await call(undefined, 'GET', objectAt(probeKey));
@@ -99,8 +130,8 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     const created = expect(await call(credentials.write, 'POST', objectAt(multipartKey, 'uploads')), [200], 'multipart', 'multipart');
     const uploadId = uploadIdPattern.exec(await boundedText(created) ?? '')?.[1];
     if (!uploadId) throw new CheckFailure('multipart');
-    let completed = false;
-    cleanup.push(() => completed ? call(credentials.write, 'DELETE', objectAt(multipartKey)).then(discard)
+    let completed: { versionId: string | undefined } | undefined;
+    cleanup.push(() => completed ? call(credentials.write, 'DELETE', removal(multipartKey, completed.versionId)).then(discard)
       : call(credentials.write, 'DELETE', objectAt(multipartKey, new URLSearchParams({ uploadId }).toString())).then(discard));
     const part = expect(await call(credentials.write, 'PUT', objectAt(multipartKey, new URLSearchParams({ partNumber: '1', uploadId }).toString()),
       PROBE_BYTES), [200], 'multipart', 'multipart');
@@ -113,11 +144,12 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     const completion = `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${etag.replace(/[<>&]/g, '')}</ETag></Part></CompleteMultipartUpload>`;
     const complete = expect(await call(credentials.write, 'POST', objectAt(multipartKey, new URLSearchParams({ uploadId }).toString()),
       completion, { 'content-type': 'application/xml' }), [200], 'multipart', 'multipart');
+    const completeVersion = versionOf(complete);
     // S3 can answer 200 with an error document to a Complete.
     const result = await boundedText(complete);
     if (!result || !result.includes('<CompleteMultipartUploadResult') || result.includes('<Error>')) throw new CheckFailure('multipart');
-    completed = true;
-    discard(expect(await call(credentials.write, 'DELETE', objectAt(multipartKey)), [200, 204], 'multipart', 'multipart'));
+    completed = { versionId: completeVersion };
+    discard(expect(await call(credentials.write, 'DELETE', removal(multipartKey, completeVersion)), [200, 204], 'multipart', 'multipart'));
     cleanup.pop();
 
     // A second multipart upload, created and aborted.
@@ -129,7 +161,7 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
       [200, 204], 'multipart', 'multipart'));
     cleanup.pop();
 
-    discard(expect(await call(credentials.write, 'DELETE', objectAt(probeKey)), [200, 204], 'auth', 'bucket'));
+    discard(expect(await call(credentials.write, 'DELETE', removal(probeKey, probeVersion)), [200, 204], 'auth', 'bucket'));
     cleanup.length = 0;
     return { ok: true };
   } catch (error) {

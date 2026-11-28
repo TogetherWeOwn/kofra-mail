@@ -28,7 +28,7 @@ test('a private bucket with both keys passes, signed, and leaves nothing behind'
   assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: true });
   assert.deepEqual(s3.calls.map(({ op, signedBy, status }) => [op, signedBy, status]), [
     ['HeadBucket', WRITE.accessKeyId, 200], ['PutObject', WRITE.accessKeyId, 200], ['GetObject', READ.accessKeyId, 200],
-    ['GetObject', null, 403], ['ListObjects', null, 403],
+    ['PutObject', READ.accessKeyId, 403], ['DeleteObject', READ.accessKeyId, 403], ['GetObject', null, 403], ['ListObjects', null, 403],
     ['CreateMultipart', WRITE.accessKeyId, 200], ['UploadPart', WRITE.accessKeyId, 200], ['ListParts', WRITE.accessKeyId, 200],
     ['CompleteMultipart', WRITE.accessKeyId, 200], ['DeleteObject', WRITE.accessKeyId, 204],
     ['CreateMultipart', WRITE.accessKeyId, 200], ['AbortMultipart', WRITE.accessKeyId, 204], ['DeleteObject', WRITE.accessKeyId, 204],
@@ -36,6 +36,36 @@ test('a private bucket with both keys passes, signed, and leaves nothing behind'
   assert.ok(s3.calls.every(({ op, key }) => op === 'HeadBucket' || op === 'ListObjects' ? key === '' : key.startsWith('riaklo/link-probe-')));
   assert.equal(s3.objects.size, 0);
   assert.equal(s3.uploads.size, 0);
+});
+
+test('in a versioned bucket every probe version is deleted, not hidden behind a delete marker', async () => {
+  const s3 = provider({ versioning: true });
+  assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: true });
+  assert.deepEqual(s3.versions, []);
+  assert.equal(s3.objects.size, 0);
+  assert.ok(s3.calls.filter(({ op }) => op === 'DeleteObjectVersion').length >= 2);
+  // A write key that may not delete versions fails, and leaves no probe it could have removed.
+  const keys = { [READ.accessKeyId]: { secret: READ.secretAccessKey, ops: new Set<S3Op>(READ_OPS) },
+    [WRITE.accessKeyId]: { secret: WRITE.secretAccessKey, ops: new Set<S3Op>(ALL_OPS.filter(op => op !== 'DeleteObjectVersion')) } };
+  const limited = provider({ versioning: true, keys });
+  assert.equal((await checkLinkLocation(fields, credentials, zones, { fetch: limited.fetch })).ok, false);
+});
+
+test('a read key that may write or delete, or is the write key, fails the check', async (t) => {
+  for (const extra of ['PutObject', 'DeleteObject', 'DeleteObjectVersion'] as S3Op[]) {
+    await t.test(extra, async () => {
+      const keys = { [READ.accessKeyId]: { secret: READ.secretAccessKey, ops: new Set<S3Op>([...READ_OPS, extra]) },
+        [WRITE.accessKeyId]: { secret: WRITE.secretAccessKey, ops: new Set<S3Op>(ALL_OPS) } };
+      const s3 = provider({ versioning: extra === 'DeleteObjectVersion', keys });
+      assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: false, reason: 'read_key_writable' });
+      assert.equal(s3.objects.size, 0);
+    });
+  }
+  let sent = 0;
+  const same = { read: credentials.write, write: credentials.write };
+  assert.deepEqual(await checkLinkLocation(fields, same, zones, { fetch: async (r) => { sent++; return provider().fetch(r); } }),
+    { ok: false, reason: 'read_key_writable' });
+  assert.equal(sent, 0);
 });
 
 test('a virtual-hosted bucket is addressed under the endpoint', async () => {
