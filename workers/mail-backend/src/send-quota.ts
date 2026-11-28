@@ -5,6 +5,7 @@ import { LEASE_MS, RELEASE_BATCH, sendClockSkewMs } from './mailbox-send-dispatc
 import { fenceBefore, sameFence, validFence, type QuotaAnswer, type QuotaPort, type QuotaScope, type SendFence } from './mailbox-send-quota.ts';
 import { validSendId } from './mailbox-send-store.ts';
 import { MailboxWork } from './mailbox-work.ts';
+import { sendAlertEnvironment } from './send-alert-events.ts';
 import { RESERVATION_GRACE_MS } from './send-consumer.ts';
 
 export type SendQuotaConfig = {
@@ -12,6 +13,7 @@ export type SendQuotaConfig = {
   MAIL_SEND_MONTHLY_CEILING?: string;
   MAIL_SEND_DAILY_RESET_UTC?: string;
   MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
+  MAIL_ENVIRONMENT?: string;
   ALERTS?: AlertBinding;
 };
 
@@ -20,6 +22,7 @@ const DAY_MS = 24 * HOUR_MS;
 const FENCE_RETENTION_MS = 35 * DAY_MS;
 const ALERT_RETENTION_MS = 2 * DAY_MS;
 const ALERT_RETRY_MS = 60_000;
+const ALERT_ATTEMPT_TIMEOUT_MS = 10_000;
 const PRUNE_PAGE = 32;
 const ALERT_CODE = 'send_quota_gate_hit';
 const SCHEMA = `
@@ -170,18 +173,24 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
       this.pruneAlerts(now);
       // First attempts and least recently attempted alerts go first so that a
       // rejected page cannot block newer alerts behind it.
-      const rows = this.sql.exec<{ day: string }>(`SELECT day FROM quota_gate_alerts
+      const rows = this.sql.exec<{ day: string; created_at: number }>(`SELECT day, created_at FROM quota_gate_alerts
         WHERE sent_at IS NULL ORDER BY last_attempt_at NULLS FIRST, created_at LIMIT ?`, PRUNE_PAGE).toArray();
       if (rows.length) await this.armAlert(now + ALERT_RETRY_MS);
       return rows;
     });
+    if (!pending.length) return;
+    let environment: string;
+    try { environment = sendAlertEnvironment(this.env.MAIL_ENVIRONMENT); }
+    catch { return; } // The retry stays armed; do not post or mark sent without a valid environment.
     const deliver = mailAlert(this.env.ALERTS);
-    for (const { day } of pending) {
+    for (const { day, created_at } of pending) {
       const attempted = this.sql.exec(`UPDATE quota_gate_alerts SET last_attempt_at = max(coalesce(last_attempt_at, 0), ?)
         WHERE day = ? AND sent_at IS NULL RETURNING day`, this.now(), day).toArray();
       if (!attempted.length) continue;
-      try { await deliver({ code: ALERT_CODE, key: `send_quota_gate:${day}` }); }
-      catch { continue; } // Missing binding or non-2xx: never acknowledge, retry on the next alarm.
+      try {
+        await deliver({ code: ALERT_CODE, key: `send_quota_gate:${environment}:${day}`, environment, time: created_at },
+          AbortSignal.timeout(ALERT_ATTEMPT_TIMEOUT_MS));
+      } catch { continue; } // Missing binding, timeout or non-2xx: keep pending for the next alarm.
       this.sql.exec('UPDATE quota_gate_alerts SET sent_at = ? WHERE day = ? AND sent_at IS NULL', this.now(), day);
     }
   }
@@ -206,8 +215,9 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
       if ((!confirm && expiresAt <= now) || this.stale(scope, fence, recipients, confirm, now)) return { status: 'stale' };
       const rows = recipients.map(i => this.sql.exec<Charge>(`SELECT day, month, expires_at FROM quota_charges
         WHERE ws = ? AND mb = ? AND send_id = ? AND epoch = ? AND attempt = ? AND recipient = ?`, ...key, i).toArray()[0]);
-      // A recent expired row can be re-admitted, but neither a missing row nor a refused reserve can be confirmed.
-      if (confirm && rows.some(row => row === undefined || (row.expires_at !== null && row.expires_at < now - HOUR_MS))) return { status: 'stale' };
+      // Apply both retention cutoffs even when the bounded prune page did not reach this row.
+      if (confirm && rows.some(row => row === undefined || row.month < previousMonth ||
+        (row.expires_at !== null && row.expires_at < now - HOUR_MS))) return { status: 'stale' };
       if (!confirm) {
         for (const i of recipients) {
           // A refused claim still fences off older calls for these recipients.

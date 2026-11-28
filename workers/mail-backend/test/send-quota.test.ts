@@ -16,6 +16,8 @@ const JAN = at('2027-01-01T15:00:00Z');
 const scope = (name: string, mailboxId = 'mb') => ({ workspaceId: 'ws', mailboxId,
   sendId: `01${createHash('sha256').update(name).digest('hex').slice(0, 24).toUpperCase()}` });
 const fence = (attempt = 1, epoch = 0) => ({ epoch, attempt });
+const gateAlert = (environment = 'test') => ({ source: 'mail:send_quota_gate_hit', key: `send_quota_gate:${environment}:2026-11-29`,
+  title: 'A mail account quota gate was reached', environment, time: NOW });
 type ObjectMethods = Pick<InstanceType<typeof FixtureSendQuota>, 'reserve' | 'confirm' | 'release' | 'resetAt' | 'setTime' | 'balances' |
   'retained' | 'runAlarm' | 'alarmDue'>;
 const stub = (mf: Miniflare) => {
@@ -30,10 +32,10 @@ const stub = (mf: Miniflare) => {
 const entry = fileURLToPath(new NodeURL('./fixtures/send-quota-worker.ts', import.meta.url));
 let bundle: ReturnType<typeof build> | undefined;
 
-type AlertHandler = (body: unknown) => number;
+type AlertHandler = (body: unknown, idempotencyKey: string | null) => number | Promise<number>;
 async function withQuota(run: (quota: ReturnType<typeof stub>, restart: (alert?: AlertHandler) => Promise<ReturnType<typeof stub>>, logs: string[]) => Promise<void>,
-  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00', alert, autoAlarm = false }: {
-    daily?: string; monthly?: string; now?: number; persist?: boolean; reset?: string; alert?: AlertHandler; autoAlarm?: boolean;
+  { daily = '10', monthly = '100', now = NOW, persist = false, reset = '15:00', alert, autoAlarm = false, environment = 'test' }: {
+    daily?: string; monthly?: string; now?: number; persist?: boolean; reset?: string; alert?: AlertHandler; autoAlarm?: boolean; environment?: string;
   } = {}) {
   const { outputFiles } = await (bundle ??= build({ entryPoints: [entry], bundle: true, write: false, format: 'esm', external: ['cloudflare:workers'] }));
   const directory = persist ? await mkdtemp('/var/tmp/velmora-riaklo-m3-6-quota-') : undefined;
@@ -44,8 +46,9 @@ async function withQuota(run: (quota: ReturnType<typeof stub>, restart: (alert?:
     durableObjects: { SEND_QUOTA: { className: 'FixtureSendQuota', useSQLite: true } },
     durableObjectsPersist: directory && join(directory, 'do'),
     bindings: { INITIAL_TIME: now, MAIL_SEND_DAILY_QUOTA: daily, MAIL_SEND_MONTHLY_CEILING: monthly, MAIL_SEND_DAILY_RESET_UTC: reset,
-      AUTO_ALERT_ALARM: autoAlarm },
-    ...(handler && { serviceBindings: { ALERTS: async (req: LocalRequest) => new LocalResponse(null, { status: handler(await req.json()) }) } }),
+      AUTO_ALERT_ALARM: autoAlarm, MAIL_ENVIRONMENT: environment },
+    ...(handler && { serviceBindings: { ALERTS: async (req: LocalRequest) =>
+      new LocalResponse(null, { status: await handler(await req.json(), req.headers.get('idempotency-key')) }) } }),
   });
   let runtime = start(alert);
   try {
@@ -172,8 +175,7 @@ test('alarm submits only redacted gate alerts and marks them sent only after a 2
     assert.notEqual(await quota.alarmDue(), null, 'non-2xx keeps a retry scheduled');
     const reopened = await restart();
     await reopened.runAlarm();
-    const payload = { source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' };
-    assert.deepEqual(deliveries, [payload, payload]);
+    assert.deepEqual(deliveries, [gateAlert(), gateAlert()]);
     assert.equal((await reopened.retained()).alerts[0].sent_at, NOW);
     await reopened.runAlarm();
     assert.equal(deliveries.length, 2, 'already acknowledged alerts are not posted again');
@@ -188,6 +190,66 @@ test('missing alert binding preserves the undelivered alert and the quota refusa
   assert.notEqual(await quota.alarmDue(), null);
 }, { daily: '2' }));
 
+test('a shared operator endpoint accepts both environments on the same quota day', async () => {
+  const accepted = new Map<string, unknown>();
+  for (const environment of ['staging', 'production']) {
+    await withQuota(async quota => {
+      assert.equal((await quota.reserve(scope('same-day'), fence(), [0], [], NOW + 1000)).status, 'exhausted');
+      await quota.runAlarm();
+      assert.equal((await quota.retained()).alerts[0].sent_at, NOW);
+    }, { monthly: '0', environment, alert(body, key) {
+      // Both simulations feed a single endpoint which deduplicates by the request header.
+      assert.ok(key);
+      if (!accepted.has(key)) accepted.set(key, body);
+      return 204;
+    } });
+  }
+  assert.equal(accepted.size, 2, 'the receiver did not deduplicate one environment into the other');
+  assert.deepEqual([...accepted], ['staging', 'production'].map(environment => [gateAlert(environment).key, gateAlert(environment)]));
+});
+
+test('a hung quota alert request times out and a later alarm delivers the pending row', async () => {
+  const hung = Promise.withResolvers<number>();
+  let attempts = 0;
+  await withQuota(async quota => {
+    assert.equal((await quota.reserve(scope('hung-alert'), fence(), [0], [], NOW + 1000)).status, 'exhausted');
+    const first = quota.runAlarm();
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([first, new Promise<never>((_, reject) => {
+        watchdog = setTimeout(() => reject(new Error('quota alarm did not return while the operator endpoint was hung')), 13_000);
+      })]);
+    } finally {
+      clearTimeout(watchdog);
+      hung.resolve(503); // Release the fake host handler if the test fails, or after the Worker aborts.
+      await first;
+    }
+    assert.equal(attempts, 1);
+    const pending = (await quota.retained()).alerts[0];
+    assert.equal(pending.last_attempt_at, NOW);
+    assert.equal(pending.sent_at, null);
+    assert.notEqual(await quota.alarmDue(), null);
+    const retryAt = NOW + 60_000;
+    await quota.setTime(retryAt);
+    await quota.runAlarm();
+    const delivered = (await quota.retained()).alerts[0];
+    assert.equal(attempts, 2);
+    assert.equal(delivered.last_attempt_at, retryAt);
+    assert.equal(delivered.sent_at, retryAt);
+  }, { monthly: '0', alert: () => ++attempts === 1 ? hung.promise : 204 });
+});
+
+test('an invalid alert environment leaves the quota alert pending without posting', async () => {
+  let posts = 0;
+  await withQuota(async quota => {
+    assert.equal((await quota.reserve(scope('invalid-environment'), fence(), [0], [], NOW + 1000)).status, 'exhausted');
+    await quota.runAlarm();
+    assert.equal((await quota.retained()).alerts[0].sent_at, null, 'invalid environment cannot acknowledge the alert');
+    assert.notEqual(await quota.alarmDue(), null, 'the pending alert has a retry scheduled');
+  }, { monthly: '0', environment: 'not an environment', alert: () => { posts++; return 204; } });
+  assert.equal(posts, 0);
+});
+
 test('pruning removes only old month charges and retains confirmed charges in this and the previous month', () => withQuota(async quota => {
   for (const [name, clock] of [['old', '2026-10-10T16:00:00Z'], ['previous', '2026-11-10T16:00:00Z'], ['current', '2026-12-16T16:00:00Z']] as const) {
     await quota.setTime(at(clock));
@@ -197,6 +259,24 @@ test('pruning removes only old month charges and retains confirmed charges in th
   assert.deepEqual((await quota.retained()).charges.map(row => row.sendId), [scope('previous').sendId, scope('current').sendId]);
   assert.deepEqual(await quota.confirm(scope('previous'), fence(), [0]), { status: 'stale' }, 'a retained charge cannot be confirmed after its fence ages out');
 }));
+
+test('confirmation rejects a prior-month charge beyond retention even if its prune page did not reach it', () => withQuota(async quota => {
+  const january = at('2027-01-31T16:00:00Z');
+  const march = at('2027-03-01T16:00:00Z');
+  // The first scope sorts ahead of the target on the same month/expiry index.
+  const page = { ...scope('month-prune-page'), sendId: '01000000000000000000000000' };
+  const target = { ...scope('month-prune-target'), sendId: '01FFFFFFFFFFFFFFFFFFFFFFFF' };
+  const recipients = Array.from({ length: 32 }, (_, i) => i);
+  assert.equal((await quota.reserve(page, fence(), recipients, [], january + 1000)).status, 'ok');
+  assert.equal((await quota.confirm(page, fence(), recipients)).status, 'ok');
+  assert.equal((await quota.reserve(target, fence(), [0], [], january + 1000)).status, 'ok');
+  assert.equal((await quota.confirm(target, fence(), [0])).status, 'ok');
+  await quota.setTime(march); // 29 days, so the newest fence is still retained.
+  assert.deepEqual(await quota.confirm(target, fence(), [0]), { status: 'stale' });
+  const retained = await quota.retained();
+  assert.ok(retained.newest.includes(target.sendId));
+  assert.deepEqual(retained.charges, [{ sendId: target.sendId, day: '2027-01-31', expires_at: null }]);
+}, { daily: '100', now: at('2027-01-31T16:00:00Z') }));
 
 test('pruning expires old provisional records but keeps live and recently expired ones', () => withQuota(async quota => {
   const old = scope('expired-old');
@@ -238,7 +318,7 @@ test('an unsent gate alert survives three days without the binding and sends onc
   await reopened.setTime(restoredAt);
   await reopened.runAlarm();
   await reopened.runAlarm();
-  assert.deepEqual(deliveries, [{ source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' }]);
+  assert.deepEqual(deliveries, [gateAlert()]);
   assert.deepEqual((await reopened.retained()).alerts.map(row => row.sent_at), [restoredAt]);
 }, { daily: '2', persist: true }));
 
@@ -248,8 +328,7 @@ test('a persisted alarm wakes the reopened quota object without a manual alarm c
   await restart(body => { delivered.resolve(body); return 204; });
   const timeout = setTimeout(() => delivered.reject(new Error('No automatic quota alarm after restart')), 8000);
   try {
-    assert.deepEqual(await delivered.promise,
-      { source: 'mail:send_quota_gate_hit', key: 'send_quota_gate:2026-11-29', title: 'A mail account quota gate was reached' });
+    assert.deepEqual(await delivered.promise, gateAlert());
   } finally { clearTimeout(timeout); }
 }, { daily: '2', persist: true, autoAlarm: true }));
 
@@ -283,13 +362,13 @@ test('an alarm page of rejected quota alerts does not starve a newer alert', asy
     assert.deepEqual(accepted, []);
     await quota.setTime(NOW + 32 * dayMs + 60_000);
     await quota.runAlarm();
-    assert.deepEqual(accepted, [`send_quota_gate:${newest}`], 'the second alarm reaches the new alert despite older failures');
+    assert.deepEqual(accepted, [`send_quota_gate:test:${newest}`], 'the second alarm reaches the new alert despite older failures');
     assert.equal(attempted, 64);
     assert.equal((await quota.retained()).alerts.filter(row => row.sent_at === null).length, 32, 'failed deliveries stay pending');
   }, { monthly: '0', alert(body) {
     attempted++;
     const { key } = body as { key: string };
-    if (key !== `send_quota_gate:${newest}`) return 503;
+    if (key !== `send_quota_gate:test:${newest}`) return 503;
     accepted.push(key);
     return 204;
   } });
