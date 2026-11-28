@@ -239,6 +239,31 @@ test('a hung quota alert request times out and a later alarm delivers the pendin
   }, { monthly: '0', alert: () => ++attempts === 1 ? hung.promise : 204 });
 });
 
+test('the storage alarm wakes again after a slow quota alert page outlasts its retry deadline', async () => {
+  const hung = Promise.withResolvers<number>();
+  const retried = Promise.withResolvers<unknown>();
+  let firstPostAt: number | undefined;
+  await withQuota(async quota => {
+    assert.equal((await quota.reserve(scope('slow-alarm-page'), fence(), [0], [], NOW + 1000)).status, 'exhausted');
+    const watchdog = setTimeout(() => retried.reject(new Error('No automatic quota retry after the slow alarm page')), 15_000);
+    try {
+      assert.deepEqual(await retried.promise, gateAlert());
+    } finally {
+      clearTimeout(watchdog);
+      hung.resolve(503); // Unblock the local service binding so Miniflare can dispose.
+    }
+  }, { monthly: '0', autoAlarm: true, alert(body) {
+    if (firstPostAt === undefined) {
+      firstPostAt = performance.now();
+      // The real delivery timeout (10 s) outlasts the fixture's storage alarm delay (250 ms).
+      return hung.promise;
+    }
+    if (performance.now() - firstPostAt <= 250) retried.reject(new Error('The first alarm page did not outlast the retry delay'));
+    else retried.resolve(body);
+    return 204;
+  } });
+});
+
 test('an invalid alert environment leaves the quota alert pending without posting', async () => {
   let posts = 0;
   await withQuota(async quota => {
