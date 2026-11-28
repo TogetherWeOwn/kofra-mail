@@ -188,6 +188,7 @@ export class HttpMailbox extends Mailbox {
   crashAtHandoff(step: string, times = 1) { this.handoffCrash = times > 0 ? { step, times } : undefined; }
   private outboxDown = false;
   setOutboxDown(down: boolean) { this.outboxDown = down; }
+  shortenHandoffBound(ms: number) { this.handoffCallMs = ms; }
   protected override async handoffCheckpoint(step: HandoffStep) {
     await this.gate(step);
     const crash = this.handoffCrash;
@@ -982,7 +983,7 @@ export default {
       if (url.pathname === '/__fixture/expand') return Response.json(await expandHandoff(pipelinePorts(env), await req.text(), now(env)));
       if (url.pathname === '/__fixture/box') {
         const { principal, method, args } = await req.json<{ principal: string; method: string; args: unknown[] }>();
-        const allowed = ['pauseAt', 'pausedAt', 'resumeAt', 'crashAtHandoff', 'setOutboxDown', 'messageRows', 'receipts', 'rawText', 'fileSentAgain',
+        const allowed = ['pauseAt', 'pausedAt', 'resumeAt', 'crashAtHandoff', 'setOutboxDown', 'shortenHandoffBound', 'messageRows', 'receipts', 'rawText', 'fileSentAgain',
           'sendState', 'sendIds', 'publishFailure', 'timers', 'restoreFixture'];
         if (!allowed.includes(method)) throw new Error('Unknown fixture mailbox method');
         const { ws, mailboxId } = env.ACCOUNTS[principal];

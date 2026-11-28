@@ -36,7 +36,7 @@ import { parseObjectKey } from './object-key.ts';
 import { parseMail, RawDigestMismatch } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
 import {
-  acknowledgeHandoff, expandHandoff, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
+  acknowledgeHandoff, bounded, expandHandoff, HANDOFF_CALL_MS, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
 } from './internal-handoff.ts';
 import { ulid } from 'ulid';
 
@@ -622,8 +622,10 @@ export class SendDriver {
     const { row } = start;
     if (row.queuedSeq === null) return;
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
-    // Release step 6, gated like the claim on the published release; then the external state.
-    await this.handoff(start);
+    // Release step 6, gated like the claim on the published release; then the
+    // external state. A stalled handoff never holds the external recipients past
+    // its bound; its own steps may still finish, each a conditional commit.
+    await bounded(this.handoff(start), 3 * (this.ports.handoff?.callMs ?? HANDOFF_CALL_MS)).catch(() => console.error({ code: 'send_handoff_retry' }));
     // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
     // Until every stored result is recorded, nothing is enqueued: a retry could resend an accepted call.
     // First, best effort, every stored result that can apply now: a terminal
@@ -669,9 +671,12 @@ export class SendDriver {
       if (!rows.some(entry => entry.state === 'pending')) return null;
       // The handler's re-arm is the handoff's next retry: while an internal row
       // is pending, no later move of the drive row passes it (section 2.2).
+      // Its first try also starts the handoff's stall clock; the backup lane, which raises the alert, learns of it then.
       const retry = timers.due(SEND_DRIVE, this.ref);
-      if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at) VALUES (?, ?)
-        ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry);
+      const first = !ports.sql.exec('SELECT 1 FROM mailbox_send_handoffs WHERE send_id = ?', this.ref).toArray().length;
+      if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at, since) VALUES (?, ?, ?)
+        ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry, this.timer.now);
+      if (retry !== null && first) ports.journalDue(timers);
       // A send queued before the raw key was kept on its row falls back to its sent copy's index row.
       const rawKey = ports.sql.exec<{ rawKey: string | null }>(`SELECT coalesce(s.raw_key, (SELECT m.raw_key FROM messages m WHERE m.id = s.message_id))
         AS rawKey FROM mailbox_sends s WHERE s.id = ?`, this.ref).one().rawKey;
@@ -703,9 +708,11 @@ export class SendDriver {
       if (!row || row.workspaceId !== workspaceId || row.mailboxId !== mailboxId || row.sendId !== this.ref || row.rawKey !== open.rawKey) {
         return this.breach(start);
       }
-      // An accepted handoff goes to the pipeline at once; the reconciler expands it if this fails.
+      // An accepted handoff goes to the pipeline at once, within a bound, so a
+      // stalled sweeper or outbox never holds up the ledger commit or the external
+      // recipients; the reconciler finishes an expansion this attempt did not.
       if (row.decision === 'accepted') {
-        try { await expandHandoff(pipeline, key, this.timer.now); }
+        try { await bounded(expandHandoff(pipeline, key, this.timer.now), pipeline.callMs ?? HANDOFF_CALL_MS); }
         catch { console.error({ code: 'handoff_expand_retry' }); }
       }
       // Step 3: `sent` (handed to our inbound pipeline), or failed with the decision's reason.

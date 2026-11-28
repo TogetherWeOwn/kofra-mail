@@ -26,6 +26,8 @@ export type HandoffPorts = {
   enqueue?(deliveryId: string): Promise<void>;
   // A test seam at each step; does nothing in production.
   checkpoint?(step: HandoffStep): Promise<void>;
+  // The bound on one inline expansion in the drive handler (HANDOFF_CALL_MS when absent).
+  callMs?: number;
 };
 // [ledger index, normalized local part, domain, the address as the sender wrote it]
 export type HandoffAddress = [idx: number, local: string, domain: string, email: string];
@@ -287,7 +289,7 @@ const PRUNE = `DELETE FROM internal_handoffs WHERE key IN (
     WHERE prune_after IS NOT NULL AND prune_after <= ?1 ORDER BY prune_after, key LIMIT ?2)
   AND holder_release_pending = 0`;
 
-async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
+export async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([work, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('Handoff call timed out')), ms); })]);

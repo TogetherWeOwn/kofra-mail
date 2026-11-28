@@ -233,3 +233,20 @@ test('a handoff repeated after processing but before the acknowledgement mark wr
     await h.runDeliveries();
     assert.equal((await messages(h, 'other')).length, 1);
   }));
+
+test('a stalled handoff holder release never holds up the sender\'s ledger or its external recipients', () => withInternal(async (h, mail, from) => {
+  await h.box('member', 'shortenHandoffBound', 200);
+  await h.sweeper(WS, 'stallTombstones', true);
+  const id = await released(h, mail, from, 'stalled-release', ['friend@example.net', OTHER]);
+  await h.sends.driveIdle();
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['external:pending', 'internal:sent'], 'handed off although the expansion has not returned');
+  assert.ok((await h.sends.queue()).some(entry => entry.sendId === id), 'the external recipient was enqueued');
+  assert.equal((await handoff(h, id))?.holder_release_pending, 1, 'the children are written; the release is still pending');
+  await h.sweeper(WS, 'stallTombstones', false);
+  await h.advance(10 * minute, 'clock-only');
+  await h.handoffCron();
+  assert.equal((await handoff(h, id))?.holder_release_pending, 0, 'the reconciler finished the release');
+  assert.deepEqual((await h.consumer<{ step: string }[]>('drain', WS, 'mailbox-a')).map(({ step }) => step).filter(step => step !== 'refused'), ['recorded']);
+  await h.runDeliveries();
+  assert.equal((await messages(h, 'other')).length, 1);
+}));

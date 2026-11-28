@@ -355,6 +355,29 @@ test('five consumer crashes after the authorization hold the send; it never fail
   assert.equal((await calls(h)).length, 0);
 }));
 
+test('a held mixed send whose externals a late confirmation ended finishes when its handoff completes (M3-8)', () => withConsumer(async (h, mail, from) => {
+  await outbox(h, true);
+  const id = await queued(h, mail, from, 'held-handoff', MIXED);
+  let fence;
+  for (let round = 0; round < 5; round++) {
+    await crashAt(h, 'after:authorizeDispatch');
+    const crashed = await consume(h, id);
+    fence = fenceOf(crashed);
+    await until(h, await leaseOf(h, id, crashed) + SKEW);
+  }
+  assert.deepEqual(await consume(h, id), { ack: true, step: 'not_now' });
+  assert.ok((await h.sendState(id)).dispatch?.held_at, 'held');
+  // The last authorized call did reach the provider: its confirmed result arrives late, under a stale fence.
+  assert.deepEqual(await h.sendRpc('recordResult', id, fence, { kind: 'accepted', messageId: 'late-provider-id' }), { status: 'recorded' });
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['sent', 'pending'], 'only the internal row is open');
+  await outbox(h, false);
+  await h.advance(hour);
+  await h.advance(hour);
+  const done = await finished(h, id);
+  assert.deepEqual(ledgerOf(done), ['sent', 'sent']);
+  assert.equal(done.row?.state, 'sent', 'never left held once every recipient was terminal');
+}));
+
 test('recordResult throws once after an accepted send(): the stored result is recorded, and each recipient gets exactly one call', () => withConsumer(async (h, mail, from) => {
   const id = await queued(h, mail, from, 'record-throws', { to: [{ email: 'friend@example.net' }, { email: 'second@example.net' }] });
   await h.consumer('failNext', 'recordResult');

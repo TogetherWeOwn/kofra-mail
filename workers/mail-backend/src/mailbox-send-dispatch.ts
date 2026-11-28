@@ -370,7 +370,7 @@ export class SendDispatcher {
     const event = m.event();
     if (event) {
       ready.index.commitEvents([event]);
-      if (m.terminal || (!m.openExternals().length && !m.pendingInternals().length)) this.stalls.clear(m.row.id);
+      if (m.terminal || !m.openExternals().length) this.stalls.clear(m.row.id);
       this.ports.journalDue(timers);
     }
     if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, handoffBound(this.ports.sql, m.row.id, driveAt));
@@ -1065,10 +1065,14 @@ export class SendDispatcher {
   // pending internal rows end `sent` (handed to the inbound pipeline) or, for a
   // rejected handoff, `failed` with its reason. Journalled; the finish rule
   // publishes them before they are reported.
+  // When that makes every recipient terminal it runs finish rule step 1 itself,
+  // as a stale-fence record does, so a send held after crashes of our own whose
+  // external recipients a late confirmation ended still finishes.
   handedOff(index: MailboxIndex, row: SendRow, timers: TimerTable, ready: Omit<Ready, 'index'>, reason: string | null): void {
     const m = new SendModel(this.ports.sql, row);
+    const r: Ready = { ...ready, index };
     for (const entry of m.pendingInternals()) m.setRecipient(entry.idx, reason === null ? 'sent' : 'failed', reason);
-    this.commit(m, { ...ready, index }, timers, null, true);
+    this.commit(m, r, timers, m.allTerminal() ? finish(m, this.ctx(r)) : null, true);
   }
 
   // The drive handler's decision for a released send (section 2.2's table,
@@ -1077,9 +1081,8 @@ export class SendDispatcher {
     const m = new SendModel(this.ports.sql, row);
     const r: Ready = { ...ready, index };
     const ctx: Ctx = { now, epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
-    // A handoff still pending 24 hours after release raises the stall alert too (release step 6).
     const watch = () => {
-      if (this.ports.sending && (m.openExternals().length || m.pendingInternals().length) && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
+      if (this.ports.sending && m.openExternals().length && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
     };
     if (m.state === 'queued' || m.state === 'sending') watch();
     this.expirePreMark(row.id, now, timers);

@@ -366,3 +366,18 @@ test('a handoff still pending 24 hours after release raises the stall alert, onc
   await nextDrive(h, id);
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['internal:sent']);
 }));
+
+test('a mixed send\'s external activity never postpones the stall alert of its pending handoff', () => withInternal(async (h, mail, from) => {
+  await outboxDown(h, true);
+  const id = await released(h, mail, from, 'stall-mixed', [OUTSIDE, OTHER]);
+  const stalled = async () => (await h.directoryRows("SELECT source FROM mail_alerts WHERE source = 'mail:send_stalled'")).length;
+  await h.advance(23 * hour);
+  // The external recipient reaches the provider (Mark) 23 hours in, and is told to try later.
+  await h.consumer('scriptEmail', [{ result: 'reject', code: 'E_RATE_LIMIT_EXCEEDED' }]);
+  assert.ok((await drain(h)).some(({ step }) => step === 'recorded'));
+  assert.equal(await stalled(), 0);
+  await h.advance(2 * hour);
+  await h.advance(hour);
+  assert.equal(await stalled(), 1, 'the handoff has been pending more than 24 hours');
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['external:pending', 'internal:pending']);
+}));
