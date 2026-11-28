@@ -111,12 +111,22 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
       throw new CheckFailure('read_key_writable');
     }
     if (readPut.status !== 401 && readPut.status !== 403) throw new CheckFailure('bucket');
-    const readDelete = await call(credentials.read, 'DELETE', removal(probeKey, probeVersion));
-    discard(readDelete);
-    if (readDelete.ok) throw new CheckFailure('read_key_writable');
-    if (readDelete.status !== 401 && readDelete.status !== 403) throw new CheckFailure('bucket');
+    // An ordinary DELETE (of a key that does not exist) and, in a versioned bucket, a version
+    // DELETE of the probe: S3 grants the two separately, and either could hide or remove link files.
+    const readDeletes = [objectAt(readKey), ...(probeVersion === undefined ? [] : [removal(probeKey, probeVersion)])];
+    for (const url of readDeletes) {
+      const readDelete = await call(credentials.read, 'DELETE', url);
+      discard(readDelete);
+      if (readDelete.ok) {
+        const marker = versionOf(readDelete);
+        if (url.search === '' && marker !== undefined) cleanup.push(() => call(credentials.write, 'DELETE', removal(readKey, marker)).then(discard));
+        throw new CheckFailure('read_key_writable');
+      }
+      if (readDelete.status !== 401 && readDelete.status !== 403) throw new CheckFailure('bucket');
+    }
 
-    // The bucket must be private: an anonymous read and an anonymous list are both refused.
+    // The bucket must be private: an anonymous read and an anonymous list of the probe are both refused.
+    // This sees only the probe key; a policy that opens other keys or prefixes cannot be detected here.
     const anonymous = await call(undefined, 'GET', objectAt(probeKey));
     discard(anonymous);
     if (anonymous.status !== 401 && anonymous.status !== 403) throw new CheckFailure('public_bucket');

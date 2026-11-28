@@ -22,7 +22,7 @@ mail-content gets a workspace override's read-only key from the backend's `Conte
 ## Checks
 
 - **Endpoint rules:** `https:` on port 443, a DNS name (no IP literal), no user information, path, query or fragment, and outside `localhost`, `local`, `internal`, `arpa`, `workers.dev` and the configured zones, with all their subdomains. Requests use `redirect: 'manual'`, and any 3xx is an error.
-- **The check** (`checkLinkLocation`): HeadBucket; a 1-byte probe put, get (with the read key) and delete; a PUT and a DELETE with the read key, which must be refused (and the two keys must differ); an anonymous GET and an anonymous list of the probe, which must answer 401 or 403; a probe multipart upload (create, part, ListParts, complete, delete); and a second one that is aborted. Probes are deleted by the version id the provider returns, so a versioned bucket keeps no probe versions. It answers one fixed reason: `endpoint`, `redirect`, `public_bucket`, `read_key_writable`, `auth`, `bucket`, `multipart` or `network`.
+- **The check** (`checkLinkLocation`): HeadBucket; a 1-byte probe put, get (with the read key) and delete; a PUT and a DELETE with the read key, which must be refused (and the two keys must differ); an anonymous GET and an anonymous list of the probe, which must answer 401 or 403 (this sees only the probe key: a policy that makes other keys public cannot be detected, so the location must be private as a whole); a probe multipart upload (create, part, ListParts, complete, delete); and a second one that is aborted. Probes are deleted by the version id the provider returns, so a versioned bucket keeps no probe versions. It answers one fixed reason: `endpoint`, `redirect`, `public_bucket`, `read_key_writable`, `auth`, `bucket`, `multipart` or `network`.
 - **Deploy time:** `node tools/link-storage-check/cli.ts` runs the check on every deployment location from its own environment and, with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, compares each Worker's secret names with the table above (`LINK_WORKERS` overrides the Worker names). It prints ids, names and codes only.
 
 ## Workspace overrides
@@ -34,6 +34,6 @@ An admin adds the workspace's own location through `createLinkLocation` (contrac
 ## Rotating the KEK
 
 1. Add a new version to `LINK_CRED_KEK` and switch `current` to it.
-2. Deploy. Credentials are rewrapped under the new version on their next use.
-3. Run `MailAdmin.rewrapLinkCredentials(100)` until it rewraps none.
+2. Deploy. Credentials are rewrapped under the new version on their next use by mail-web or the sweeper (the content lookup only reads).
+3. Run `MailAdmin.rewrapLinkCredentials(100, next)`, passing back each answer's `next`, until `next` is null. Values it cannot open are counted in `failed` and left in place.
 4. Remove the old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it.

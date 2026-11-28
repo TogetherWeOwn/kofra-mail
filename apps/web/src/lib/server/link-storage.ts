@@ -191,6 +191,8 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
         return fail('unavailable');
       }
       if (outcome === 'in_use') return fail('location_in_use');
+      // Another delete is still checking its usage: its answer is not known yet.
+      if (outcome === 'pending') return fail('unavailable', { retryAfterSeconds: 1 });
       return {};
     }
 

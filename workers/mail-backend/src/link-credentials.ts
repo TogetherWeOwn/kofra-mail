@@ -24,18 +24,19 @@ export async function linkReadCredential(env: LinkCredentialEnv, ws: unknown, lo
   const kek = await linkKek(env.LINK_CRED_KEK);
   if (!kek) return null;
   try {
-    const credentials = await store(env).credential(kek, ws, loc, 'read');
+    // A lookup only reads: no rewrap here (the operator job and write paths rewrap).
+    const credentials = await store(env).credential(kek, ws, loc, 'read', { rewrap: false });
     return credentials && credentials.reveal();
   } catch {
     return null;
   }
 }
 
-/** The bounded operator rewrap job after a KEK rotation (at most 100 credentials per call). */
-export async function rewrapLinkCredentials(env: LinkCredentialEnv, limit: number) {
+/** The bounded operator rewrap job after a KEK rotation (at most 100 credentials per call); pass `next` back until null. */
+export async function rewrapLinkCredentials(env: LinkCredentialEnv, limit: number, cursor: string | null = null) {
   const kek = await linkKek(env.LINK_CRED_KEK);
   if (!kek) throw new Error('Link credential KEK unavailable');
-  return store(env).rewrapStale(kek, limit);
+  return store(env).rewrapStale(kek, limit, cursor);
 }
 
 /** The KEK versions still in use; a version can be removed from the secret once it is not listed. */

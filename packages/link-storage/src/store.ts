@@ -68,6 +68,17 @@ const sealedColumns = {
  */
 export const HAS_ROOM = `(SELECT count(*) FROM link_storage_locations WHERE workspace_id = ?) < ${MAX_WORKSPACE_LOCATIONS}`;
 
+function rewrapCursor(cursor: string | null): [number, number, string, string] {
+  if (cursor === null) return [0, 0, '', ''];
+  let value: unknown;
+  try { value = typeof cursor === 'string' && cursor.length <= 256 ? JSON.parse(cursor) : undefined; } catch { value = undefined; }
+  if (!Array.isArray(value) || value.length !== 4) throw new Error('Invalid rewrap cursor');
+  const [role, version, ws, loc] = value;
+  if ((role !== 0 && role !== 1) || !Number.isSafeInteger(version) || version < 0 || version > 255
+    || typeof ws !== 'string' || ws.length > 58 || typeof loc !== 'string' || loc.length > 26) throw new Error('Invalid rewrap cursor');
+  return [role, version, ws, loc];
+}
+
 /** A new location id: 128 random bits as 26 lowercase base32 characters. */
 export function newLocationId(): string {
   const alphabet = 'abcdefghijklmnopqrstuvwxyz234567';
@@ -142,12 +153,18 @@ export class LinkStorageStore {
   /**
    * Deletes a location unless something still uses it. It first marks the row
    * `deleting`, so no new reference can be written (writers require `active`),
-   * then asks `usage`; a location in use is set back to `active`.
+   * then asks `usage`; a location in use is set back to `active`. While another
+   * delete is checking, the answer is `pending`.
    */
-  async delete(workspaceId: string, locationId: string, usage: LinkLocationUsage): Promise<'deleted' | 'in_use' | 'not_found'> {
+  async delete(workspaceId: string, locationId: string, usage: LinkLocationUsage): Promise<'deleted' | 'in_use' | 'pending' | 'not_found'> {
     const marked = await this.#db.prepare(`UPDATE link_storage_locations SET state = 'deleting'
       WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(workspaceId, locationId).run();
-    if (!marked.meta.changes) return 'not_found';
+    if (!marked.meta.changes) {
+      // Another delete of this location may be checking its usage right now.
+      const pending = await this.#db.prepare(`SELECT 1 AS pending FROM link_storage_locations
+        WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`).bind(workspaceId, locationId).first();
+      return pending ? 'pending' : 'not_found';
+    }
     let used = true;
     try {
       used = await usage.inUse({ workspaceId, locationId });
@@ -158,23 +175,32 @@ export class LinkStorageStore {
       }
     }
     if (used !== false) return 'in_use';
-    await this.#db.prepare(`DELETE FROM link_storage_locations WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`)
-      .bind(workspaceId, locationId).run();
+    try {
+      await this.#db.prepare(`DELETE FROM link_storage_locations WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`)
+        .bind(workspaceId, locationId).run();
+    } catch (error) {
+      // A failed delete must not leave the row hidden but still counted against the workspace.
+      await this.#db.prepare(`UPDATE link_storage_locations SET state = 'active'
+        WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`).bind(workspaceId, locationId).run().catch(() => {});
+      throw error;
+    }
     return 'deleted';
   }
 
   /**
-   * Opens one credential of an active location. A value sealed under an older KEK
-   * version is rewrapped under the current one (a conditional update, so a
-   * concurrent rotation always wins). Null if there is no such location.
+   * Opens one credential of an active location. Unless `rewrap` is false (read-only
+   * callers such as the content lookup), a value sealed under an older KEK version is
+   * rewrapped under the current one (a conditional update, so a concurrent rotation
+   * always wins). Null if there is no such location.
    */
-  async credential(kek: LinkKek, workspaceId: string, locationId: string, role: CredentialRole): Promise<S3Credentials | null> {
+  async credential(kek: LinkKek, workspaceId: string, locationId: string, role: CredentialRole,
+    { rewrap = true }: { rewrap?: boolean } = {}): Promise<S3Credentials | null> {
     const column = sealedColumns[role];
     const row = await this.#db.prepare(`SELECT ${column.version} AS key_version, ${column.sealed} AS sealed FROM link_storage_locations
       WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(workspaceId, locationId).first<SealedRow>();
     if (!row) return null;
     const credentials = await openCredential(kek, workspaceId, locationId, role, row.key_version, row.sealed);
-    if (row.key_version !== kek.current) await this.#rewrap(kek, workspaceId, locationId, role, row, credentials);
+    if (rewrap && row.key_version !== kek.current) await this.#rewrap(kek, workspaceId, locationId, role, row, credentials);
     return credentials;
   }
 
@@ -189,30 +215,58 @@ export class LinkStorageStore {
   }
 
   /**
-   * The bounded operator rewrap job: rewraps up to `limit` credentials sealed under
-   * a version other than the current one. Returns how many it rewrapped and how
-   * many it could not open (left as they are, never deleted).
+   * The bounded operator rewrap job: rewraps up to `limit` (at most 100) credentials
+   * sealed under a version other than the current one, walking each role's stale
+   * versions in index order. Values it cannot open are counted and left as they are,
+   * and the walk moves past them. Pass `next` back until it is null.
    */
-  async rewrapStale(kek: LinkKek, limit: number): Promise<{ rewrapped: number; failed: number }> {
-    const bound = Math.max(1, Math.min(100, Math.floor(limit)));
+  async rewrapStale(kek: LinkKek, limit: number, cursor: string | null = null):
+    Promise<{ rewrapped: number; failed: number; next: string | null }> {
+    const bound = Math.max(1, Math.min(100, Math.floor(limit) || 1));
+    let [role, version, ws, loc] = rewrapCursor(cursor);
     let rewrapped = 0;
     let failed = 0;
-    for (const role of ['read', 'write'] as const) {
-      const column = sealedColumns[role];
+    let budget = bound;
+    const roles = ['read', 'write'] as const;
+    // The next stale version of a column after `after`, by index seeks; 0 if none.
+    const nextVersion = async (column: string, after: number): Promise<number> => {
+      for (;;) {
+        const row = await this.#db.prepare(`SELECT ${column} AS version FROM link_storage_locations WHERE ${column} > ? ORDER BY ${column} LIMIT 1`)
+          .bind(after).first<{ version: number }>();
+        if (!row) return 0;
+        if (row.version !== kek.current) return row.version;
+        after = row.version;
+      }
+    };
+    while (role < roles.length && budget > 0) {
+      const column = sealedColumns[roles[role]];
+      if (version === 0) {
+        version = await nextVersion(column.version, 0);
+        if (version === 0) { role++; continue; }
+      }
       const { results } = await this.#db.prepare(`SELECT workspace_id, location_id, ${column.version} AS key_version, ${column.sealed} AS sealed
-        FROM link_storage_locations WHERE ${column.version} < ? OR ${column.version} > ? LIMIT ?`)
-        .bind(kek.current, kek.current, bound - rewrapped - failed).all<SealedRow & { workspace_id: string; location_id: string }>();
+        FROM link_storage_locations WHERE ${column.version} = ? AND (workspace_id, location_id) > (?, ?)
+        ORDER BY workspace_id, location_id LIMIT ?`).bind(version, ws, loc, budget).all<SealedRow & { workspace_id: string; location_id: string }>();
       for (const row of results) {
         try {
-          const credentials = await openCredential(kek, row.workspace_id, row.location_id, role, row.key_version, row.sealed);
-          if (await this.#rewrap(kek, row.workspace_id, row.location_id, role, row, credentials)) rewrapped++;
+          const credentials = await openCredential(kek, row.workspace_id, row.location_id, roles[role], row.key_version, row.sealed);
+          if (await this.#rewrap(kek, row.workspace_id, row.location_id, roles[role], row, credentials)) rewrapped++;
         } catch {
           failed++;
         }
+        ws = row.workspace_id;
+        loc = row.location_id;
       }
-      if (rewrapped + failed >= bound) break;
+      const asked = budget;
+      budget -= results.length;
+      if (results.length < asked) {
+        version = await nextVersion(column.version, version);
+        ws = '';
+        loc = '';
+        if (version === 0) role++;
+      }
     }
-    return { rewrapped, failed };
+    return { rewrapped, failed, next: role < roles.length ? JSON.stringify([role, version, ws, loc]) : null };
   }
 
   /** Every KEK version a stored credential uses. An old version can be removed once it is not listed. */

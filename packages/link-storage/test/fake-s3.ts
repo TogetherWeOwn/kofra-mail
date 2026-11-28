@@ -35,6 +35,7 @@ export function fakeS3(options: FakeS3Options) {
   const uploads = new Map<string, Map<number, Uint8Array<ArrayBuffer>>>();
   // Stored versions (with versioning on): delete markers are not kept here.
   const versions: { key: string; versionId: string }[] = [];
+  const markers: { key: string; versionId: string }[] = [];
   let versionCounter = 0;
   const write = (key: string, body: Uint8Array<ArrayBuffer>): Record<string, string> => {
     objects.set(key, body);
@@ -115,11 +116,20 @@ export function fakeS3(options: FakeS3Options) {
         if (!value) return record(error('NoSuchKey', 404));
         return record(new Response(request.method === 'HEAD' ? null : value, { status: 200 }));
       }
-      case 'DeleteObject': objects.delete(where.key); return record(new Response(null, { status: 204 }));
+      case 'DeleteObject': {
+        objects.delete(where.key);
+        if (!options.versioning) return record(new Response(null, { status: 204 }));
+        // Versioned: the versions stay; a delete marker hides them.
+        const markerId = `m${++versionCounter}`;
+        markers.push({ key: where.key, versionId: markerId });
+        return record(new Response(null, { status: 204, headers: { 'x-amz-version-id': markerId, 'x-amz-delete-marker': 'true' } }));
+      }
       case 'DeleteObjectVersion': {
         const versionId = url.searchParams.get('versionId');
         const index = versions.findIndex(v => v.key === where.key && v.versionId === versionId);
         if (index !== -1) versions.splice(index, 1);
+        const marker = markers.findIndex(v => v.key === where.key && v.versionId === versionId);
+        if (marker !== -1) markers.splice(marker, 1);
         if (!versions.some(v => v.key === where.key)) objects.delete(where.key);
         return record(new Response(null, { status: 204 }));
       }
@@ -159,5 +169,5 @@ export function fakeS3(options: FakeS3Options) {
     }
   }
 
-  return { fetch: handle, objects, uploads, versions, calls };
+  return { fetch: handle, objects, uploads, versions, markers, calls };
 }

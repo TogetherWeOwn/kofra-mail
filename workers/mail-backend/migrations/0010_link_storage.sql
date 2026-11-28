@@ -43,6 +43,6 @@ CREATE TABLE link_storage_locations (
   PRIMARY KEY (workspace_id, location_id)
 );
 CREATE UNIQUE INDEX link_storage_current ON link_storage_locations (workspace_id) WHERE current = 1;
--- The rewrap job's and the version check's indexed lookups by key version.
-CREATE INDEX link_storage_read_version ON link_storage_locations (read_key_version);
-CREATE INDEX link_storage_write_version ON link_storage_locations (write_key_version);
+-- The rewrap job's ordered walk and the version check's seeks, by key version.
+CREATE INDEX link_storage_read_version ON link_storage_locations (read_key_version, workspace_id, location_id);
+CREATE INDEX link_storage_write_version ON link_storage_locations (write_key_version, workspace_id, location_id);

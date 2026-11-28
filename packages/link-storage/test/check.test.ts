@@ -42,7 +42,11 @@ test('in a versioned bucket every probe version is deleted, not hidden behind a 
   const s3 = provider({ versioning: true });
   assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: true });
   assert.deepEqual(s3.versions, []);
+  assert.deepEqual(s3.markers, []);
   assert.equal(s3.objects.size, 0);
+  // The read key is refused both an ordinary and a version DELETE.
+  assert.deepEqual(s3.calls.filter(({ signedBy, op }) => signedBy === READ.accessKeyId && op !== 'GetObject').map(({ op, status }) => [op, status]),
+    [['PutObject', 403], ['DeleteObject', 403], ['DeleteObjectVersion', 403]]);
   assert.ok(s3.calls.filter(({ op }) => op === 'DeleteObjectVersion').length >= 2);
   // A write key that may not delete versions fails, and leaves no probe it could have removed.
   const keys = { [READ.accessKeyId]: { secret: READ.secretAccessKey, ops: new Set<S3Op>(READ_OPS) },
@@ -56,9 +60,14 @@ test('a read key that may write or delete, or is the write key, fails the check'
     await t.test(extra, async () => {
       const keys = { [READ.accessKeyId]: { secret: READ.secretAccessKey, ops: new Set<S3Op>([...READ_OPS, extra]) },
         [WRITE.accessKeyId]: { secret: WRITE.secretAccessKey, ops: new Set<S3Op>(ALL_OPS) } };
-      const s3 = provider({ versioning: extra === 'DeleteObjectVersion', keys });
-      assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: false, reason: 'read_key_writable' });
-      assert.equal(s3.objects.size, 0);
+      // A version DELETE only exists in a versioned bucket.
+      for (const versioning of extra === 'DeleteObjectVersion' ? [true] : [false, true]) {
+        const s3 = provider({ versioning, keys });
+        assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: s3.fetch }), { ok: false, reason: 'read_key_writable' },
+          `${extra} versioning=${versioning}`);
+        assert.equal(s3.objects.size, 0);
+        assert.deepEqual([s3.versions, s3.markers], [[], []]);
+      }
     });
   }
   let sent = 0;

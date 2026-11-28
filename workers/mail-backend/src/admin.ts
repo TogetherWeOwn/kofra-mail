@@ -24,10 +24,10 @@ export class MailAdmin extends WorkerEntrypoint<Env> {
   }
 
   // After a LINK_CRED_KEK rotation: rewraps up to `limit` (at most 100) stored link
-  // credentials under the current version. Repeat until it rewraps none.
-  async rewrapLinkCredentials(limit: number): Promise<{ rewrapped: number; failed: number }> {
+  // credentials under the current version. Pass `next` back until it is null.
+  async rewrapLinkCredentials(limit: number, cursor: string | null = null): Promise<{ rewrapped: number; failed: number; next: string | null }> {
     if (!enabled(this.env)) throw new Error('Mail backend is disabled');
-    return rewrapLinkCredentials(this.env, limit);
+    return rewrapLinkCredentials(this.env, limit, cursor);
   }
 
   // The KEK versions stored link credentials still use. Remove an old version only once it is not listed.

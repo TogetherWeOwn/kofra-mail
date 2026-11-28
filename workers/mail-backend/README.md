@@ -36,4 +36,4 @@ A refusal records one `send_quota_gate_hit` alert per quota day. An alarm sends 
 
 ### Link storage credentials
 
-Migration `0010_link_storage.sql` adds the link storage tables (`packages/link-storage`). Bind the `LINK_CRED_KEK` secret here and in mail-web, never in mail-content. `ContentLookup.linkReadCredential(ws, locationId)` gives mail-content a workspace location's read-only key and opens nothing else. After a KEK rotation, run `MailAdmin.rewrapLinkCredentials(100)` until it rewraps none, and remove an old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it.
+Migration `0010_link_storage.sql` adds the link storage tables (`packages/link-storage`). Bind the `LINK_CRED_KEK` secret here and in mail-web, never in mail-content. `ContentLookup.linkReadCredential(ws, locationId)` gives mail-content a workspace location's read-only key, opens nothing else and writes nothing. After a KEK rotation, run `MailAdmin.rewrapLinkCredentials(100, next)` until `next` is null, and remove an old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it.

@@ -121,6 +121,8 @@ test('a location still in use cannot be deleted', async () => {
   const usage = (answer: boolean | Error): LinkLocationUsage => ({ async inUse({ workspaceId, locationId }) {
     // While the check runs, the row is `deleting`: no new reference may be attached to it.
     seen.push(String(db.raw.prepare('SELECT state FROM link_storage_locations WHERE location_id = ?').get(locationId)?.state));
+    // A second delete meanwhile learns that the first is still deciding, not that the location is gone.
+    assert.equal(await store.delete(workspaceId, locationId, { inUse: async () => false }), 'pending');
     assert.equal(await store.get(workspaceId, locationId), null);
     assert.equal(await store.rotate(k, workspaceId, locationId, rotated, 5), false);
     if (answer instanceof Error) throw answer;
@@ -168,10 +170,12 @@ test('rotation of the KEK: lazy rewrap on use, a bounded job, and the versions s
   const row = (ws: string) => db.raw.prepare('SELECT read_key_version, write_key_version FROM link_storage_locations WHERE workspace_id = ?').get(ws);
   assert.deepEqual({ ...row('ws-a') }, { read_key_version: 2, write_key_version: 1 });
   assert.deepEqual(await store.keyVersionsInUse(), [1, 2]);
-  // The operator job rewraps at most `limit` per call.
-  assert.deepEqual(await store.rewrapStale(v2, 2), { rewrapped: 2, failed: 0 });
-  assert.deepEqual(await store.rewrapStale(v2, 100), { rewrapped: 3, failed: 0 });
-  assert.deepEqual(await store.rewrapStale(v2, 100), { rewrapped: 0, failed: 0 });
+  // The operator job rewraps at most `limit` per call and resumes from its cursor.
+  const first = await store.rewrapStale(v2, 2);
+  assert.deepEqual([first.rewrapped, first.failed, typeof first.next], [2, 0, 'string']);
+  assert.deepEqual(await store.rewrapStale(v2, 100, first.next), { rewrapped: 3, failed: 0, next: null });
+  assert.deepEqual(await store.rewrapStale(v2, 100), { rewrapped: 0, failed: 0, next: null });
+  await assert.rejects(store.rewrapStale(v2, 1, 'not a cursor'), /Invalid rewrap cursor/);
   assert.deepEqual(await store.keyVersionsInUse(), [2]);
   // Version 1 can now be removed, and everything still opens.
   const only2 = (await linkKek(JSON.stringify({ current: '2', keys: { 2: keyBytes(2) } })))!;
@@ -179,7 +183,47 @@ test('rotation of the KEK: lazy rewrap on use, a bounded job, and the versions s
   // A value that cannot be opened is counted and left alone.
   db.raw.prepare(`UPDATE link_storage_locations SET read_key_version = 3 WHERE workspace_id = 'ws-c'`).run();
   const v4 = await kek(4, [2, 4]);
-  assert.deepEqual(await store.rewrapStale(v4, 100), { rewrapped: 5, failed: 1 });
+  assert.deepEqual(await store.rewrapStale(v4, 100), { rewrapped: 5, failed: 1, next: null });
+});
+
+test('the rewrap job moves past values it cannot open', async () => {
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const v1 = await kek(1, [1]);
+  for (const ws of ['ws-a', 'ws-b', 'ws-c']) await created(store, db, v1, ws);
+  // Two unreadable read values (under a missing version 3) come first in the walk.
+  db.raw.prepare(`UPDATE link_storage_locations SET read_key_version = 3 WHERE workspace_id IN ('ws-a', 'ws-b')`).run();
+  const v2 = await kek(2, [1, 2]);
+  let next: string | null = null;
+  const totals = { rewrapped: 0, failed: 0 };
+  let calls = 0;
+  do {
+    const step = await store.rewrapStale(v2, 2, next);
+    totals.rewrapped += step.rewrapped;
+    totals.failed += step.failed;
+    next = step.next;
+    assert.ok(++calls < 10);
+  } while (next !== null);
+  assert.deepEqual(totals, { rewrapped: 4, failed: 2 });
+  assert.deepEqual(await store.keyVersionsInUse(), [2, 3]);
+});
+
+test('a content-lookup read does not rewrap, and a failed final delete keeps the location', async () => {
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const id = await created(store, db, await kek(1, [1]));
+  const v2 = await kek(2, [1, 2]);
+  const before = JSON.stringify(db.dump('link_storage_locations'));
+  assert.deepEqual((await store.credential(v2, 'ws-a', id, 'read', { rewrap: false }))!.reveal(), READ);
+  assert.equal(JSON.stringify(db.dump('link_storage_locations')), before);
+  // The final DELETE fails once: the row is active again, visible and deletable later.
+  const failing = { ...db, prepare(sql: string) {
+    const statement = db.prepare(sql);
+    return sql.startsWith('DELETE FROM link_storage_locations') ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
+  } };
+  await assert.rejects(new LinkStorageStore(failing).delete('ws-a', id, { inUse: async () => false }), /d1 down/);
+  assert.ok(await store.get('ws-a', id));
+  assert.equal(await store.delete('ws-a', id, { inUse: async () => false }), 'deleted');
 });
 
 test('a deployment location id is never silently repointed', async () => {

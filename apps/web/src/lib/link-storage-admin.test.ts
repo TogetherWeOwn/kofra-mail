@@ -153,14 +153,17 @@ test('a retry while the check runs answers idempotency_in_progress, and a failed
   const f = fixture(t);
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
+  let reached!: () => void;
+  const started = new Promise<void>((resolve) => { reached = resolve; });
   let first = true;
   const s3 = f.s3;
   t.mock.method(globalThis, 'fetch', async (request: Request) => {
-    if (first) { first = false; await gate; }
+    if (first) { first = false; reached(); await gate; }
     return s3.fetch(request);
   });
   const pending = f.call('createLinkLocation', { json: location, key: 'create-1' });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  // The first request is inside its check before the retry starts.
+  await started;
   const busy = await f.call('createLinkLocation', { json: location, key: 'create-1' });
   assert.deepEqual([busy.status, busy.body.code, busy.body.retryAfterSeconds], [409, 'idempotency_in_progress', 1]);
   release();
@@ -203,10 +206,17 @@ test('credentials rotate in place, only after the new keys pass the check', asyn
 test('deleting a location that still has live links is refused', async (t) => {
   let inUse = true;
   const asked: string[] = [];
-  const f = fixture(t, { usage: { async inUse({ workspaceId, locationId }) { asked.push(`${workspaceId}/${locationId}`); return inUse; } } });
+  let concurrent: { status: number; body: { code: string; retryAfterSeconds?: number } } | undefined;
+  const f = fixture(t, { usage: { async inUse({ workspaceId, locationId }) {
+    asked.push(`${workspaceId}/${locationId}`);
+    // A second delete while this one checks is told to retry, not that the location is gone.
+    concurrent ??= await f.call('deleteLinkLocation', { params: { locationId } });
+    return inUse;
+  } } });
   const { body: created } = await f.call('createLinkLocation', { json: location, key: 'create-1' });
   const refused = await f.call('deleteLinkLocation', { params: { locationId: created.id } });
   assert.deepEqual([refused.status, refused.body.code], [409, 'location_in_use']);
+  assert.deepEqual([concurrent?.status, concurrent?.body.code, concurrent?.body.retryAfterSeconds], [503, 'unavailable', 1]);
   assert.deepEqual((await f.call('listLinkLocations')).body.items, [created]);
   inUse = false;
   assert.equal((await f.call('deleteLinkLocation', { params: { locationId: created.id } })).status, 204);
