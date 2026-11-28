@@ -4,8 +4,11 @@
 -- decision; a later insert for the same key is ignored. The row carries the
 -- internal recipient addresses (never their mailboxes, which are resolved when
 -- the plan is written) as [ledger index, normalized local part, domain, address].
+-- The key fits the supported maxima (workspace 58, mailbox 128, send 26: 223
+-- characters) with headroom, up to 248 so its `handoff:` holder fits the
+-- sweeper's 256-character holder bound.
 CREATE TABLE internal_handoffs (
-  key TEXT PRIMARY KEY NOT NULL CHECK (length(key) BETWEEN 1 AND 200),
+  key TEXT PRIMARY KEY NOT NULL CHECK (length(key) BETWEEN 1 AND 248),
   workspace_id TEXT NOT NULL,
   mailbox_id TEXT NOT NULL,
   send_id TEXT NOT NULL,

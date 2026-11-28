@@ -14,6 +14,7 @@ import { parseObjectKey } from './object-key.ts';
 import type { SendRecord } from './mail-journal.ts';
 import type { SweeperReferences } from './worker.ts';
 
+export type HandoffStuckAlert = { code: 'handoff_stuck'; key: string };
 export type HandoffSweeper = Pick<SweeperReferences, 'hold' | 'register' | 'releaseTombstoned'>;
 export type HandoffStep = 'handoff:hold' | 'handoff:decide' | 'handoff:decided' | 'handoff:commit'
   | 'expand:plan' | 'expand:held' | 'expand:written' | 'expand:released';
@@ -45,12 +46,22 @@ export const HANDOFF_TOMBSTONE_MS = 7 * DAY;
 export const HANDOFF_RETRY_MS = 5 * 60_000;
 const HANDOFF_RETRY_MAX_MS = 60 * 60_000;
 export const HANDOFF_PAGE = 12;
+// A full page is followed by one more, taken after the first page's rows moved
+// back, so one workspace's page of failing rows never delays another's past the
+// run in which it falls due.
+const HANDOFF_PAGES = 2;
+// After this many attempts at one expansion or release, the operator is alerted once per handoff.
+export const HANDOFF_STUCK_ATTEMPTS = 12;
 const PRUNE_PAGE = 100;
 // One reconciler sweeper or storage call; a workspace whose sweeper hangs never holds up another's.
 export const HANDOFF_CALL_MS = 10_000;
 
 export const handoffKey = (workspaceId: string, mailboxId: string, sendId: string) => `internal:${workspaceId}:${mailboxId}:${sendId}`;
 export const handoffHolder = (key: string) => `handoff:${key}`;
+// The longest handoff key: its holder must fit the sweeper's 256-character bound,
+// and the table's CHECK matches. The supported maxima (workspace ids 58, mailbox
+// ids 128 as the send path's quota scope bounds them, send ids 26) give 223.
+export const HANDOFF_KEY_MAX = 256 - handoffHolder('').length;
 export const deliveryHolder = (id: string) => `delivery:${id}`;
 
 // M3-13 dependency. Release step 6.2 rejects a handoff with `link_expired` when
@@ -277,12 +288,14 @@ const TAKE_EXPANSIONS = `WITH due AS MATERIALIZED (
     SELECT key FROM internal_handoffs INDEXED BY internal_handoffs_expand
     WHERE decision = 'accepted' AND expanded_at IS NULL AND expand_retry_at <= ?1 ORDER BY expand_retry_at, key LIMIT ?2)
   UPDATE internal_handoffs SET expand_retry_at = ?1 + ${backoff('expand_attempts')}, expand_attempts = expand_attempts + 1
-  WHERE key IN (SELECT key FROM due) RETURNING key`;
+  WHERE key IN (SELECT key FROM due) RETURNING key, expand_attempts AS attempts`;
 const TAKE_RELEASES = `WITH due AS MATERIALIZED (
     SELECT key FROM internal_handoffs INDEXED BY internal_handoffs_release
     WHERE holder_release_pending = 1 AND release_retry_at <= ?1 ORDER BY release_retry_at, key LIMIT ?2)
   UPDATE internal_handoffs SET release_retry_at = ?1 + ${backoff('release_attempts')}, release_attempts = release_attempts + 1
-  WHERE key IN (SELECT key FROM due) RETURNING key, workspace_id AS workspaceId, raw_key AS rawKey`;
+  WHERE key IN (SELECT key FROM due) RETURNING key, workspace_id AS workspaceId, raw_key AS rawKey, release_attempts AS attempts`;
+// Our own stall alerts instead of failing (section 2.4): one alert row per handoff.
+const STUCK_ALERT = `INSERT OR IGNORE INTO mail_alerts (key, source, created_at) VALUES ('handoff_stuck:' || ?1, 'mail:handoff_stuck', ?2)`;
 // A handoff with a pending release is never deleted.
 const PRUNE = `DELETE FROM internal_handoffs WHERE key IN (
     SELECT key FROM internal_handoffs INDEXED BY internal_handoffs_prune
@@ -298,12 +311,24 @@ export async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
 
 // The one-minute reconciler's part: expansions the drive handler could not
 // finish, handoff holders whose release failed, and tombstones past their time.
+async function takePages<T extends { key: string; attempts: number }>(ports: HandoffPorts, statement: string, now: number): Promise<T[]> {
+  const taken: T[] = [];
+  for (let page = 0; page < HANDOFF_PAGES; page++) {
+    const { results } = await ports.db.prepare(statement).bind(now, HANDOFF_PAGE).all<T>();
+    taken.push(...results);
+    if (results.length < HANDOFF_PAGE) break;
+  }
+  const stuck = taken.filter(row => row.attempts >= HANDOFF_STUCK_ATTEMPTS);
+  if (stuck.length) await ports.db.batch(stuck.map(row => ports.db.prepare(STUCK_ALERT).bind(row.key, now)));
+  return taken;
+}
+
 export async function reconcileHandoffs(ports: HandoffPorts, now: number, callMs = HANDOFF_CALL_MS): Promise<{ errors: number }> {
   let errors = 0;
-  const expansions = await ports.db.prepare(TAKE_EXPANSIONS).bind(now, HANDOFF_PAGE).all<{ key: string }>();
-  await Promise.all(expansions.results.map(({ key }) => bounded(expandHandoff(ports, key, now), callMs).catch(() => { errors++; })));
-  const releases = await ports.db.prepare(TAKE_RELEASES).bind(now, HANDOFF_PAGE).all<{ key: string; workspaceId: string; rawKey: string }>();
-  await Promise.all(releases.results.map(row => bounded(releaseHandoffHolder(ports, row), callMs).catch(() => { errors++; })));
+  const expansions = await takePages<{ key: string; attempts: number }>(ports, TAKE_EXPANSIONS, now);
+  await Promise.all(expansions.map(({ key }) => bounded(expandHandoff(ports, key, now), callMs).catch(() => { errors++; })));
+  const releases = await takePages<{ key: string; workspaceId: string; rawKey: string; attempts: number }>(ports, TAKE_RELEASES, now);
+  await Promise.all(releases.map(row => bounded(releaseHandoffHolder(ports, row), callMs).catch(() => { errors++; })));
   await ports.db.prepare(PRUNE).bind(now, PRUNE_PAGE).run();
   if (errors) console.error({ code: 'handoff_reconcile_partial', count: errors });
   return { errors };

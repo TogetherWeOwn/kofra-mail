@@ -62,12 +62,13 @@ test('a crash after the holds and before the write repeats with the same ids and
 test('an alias revoked after the expander started but before its plan commits is not in the plan', () => withInternal(async (h, mail, from) => {
   await addAlias(h, 'leaving@example.com', 'mailbox-b');
   await h.sends.shortHandlerBudget();
-  await h.box('member', 'pauseAt', 'expand:plan');
+  // Held at the D1 boundary, just before the plan statement runs.
+  await h.box('member', 'pauseStatement', 'UPDATE internal_handoffs SET plan');
   const id = await submit(mail, from, 'revoked', ['leaving@example.com']);
   await h.advance(UNDO);
-  await h.box('member', 'pausedAt', 'expand:plan');
+  await h.box('member', 'statementPaused');
   await deleteAlias(h, 'leaving@example.com');
-  await h.box('member', 'resumeAt', 'expand:plan');
+  await h.box('member', 'resumeStatement');
   await h.sends.driveIdle();
   assert.deepEqual(JSON.parse((await handoff(h, id))!.plan!), [[0, null]]);
   // The short handler budget runs the drive on real time added to the fixture clock.
@@ -165,7 +166,7 @@ test('a rejected handoff: internal rows end invalid_sender; after the publish th
     assert.notEqual((await h.sends.generation(done.raw_key))?.retry_at ?? null, null, 'retired by the sweep');
   }));
 
-test('flagged handoffs whose sweeper calls keep timing out do not stop another workspace\'s release within one reconciler interval', () =>
+test('flagged handoffs whose sweeper calls keep timing out do not delay another workspace\'s release past the first run in which it is due', () =>
   withInternal(async (h, mail, from) => {
     await h.box('member', 'crashAtHandoff', 'expand:written');
     const id = await released(h, mail, from, 'other-workspace', [OTHER]);
@@ -185,10 +186,7 @@ test('flagged handoffs whose sweeper calls keep timing out do not stop another w
     const started = Date.now();
     assert.equal((await h.handoffCron(200)).errors, 12, 'each stalled call ends at its bound');
     assert.ok(Date.now() - started < 5_000, 'the run does not wait for a stalled sweeper');
-    assert.equal((await handoff(h, id))?.holder_release_pending, 1, 'the page was full of earlier rows');
-    await h.advance(minute, 'clock-only');
-    await h.handoffCron(200);
-    assert.equal((await handoff(h, id))?.holder_release_pending, 0, 'released on the next run: the stalled rows moved back');
+    assert.equal((await handoff(h, id))?.holder_release_pending, 0, 'released in the same run, behind a full page of failing rows');
     assert.ok(!(await liveHolders(h, mine.raw_key)).includes(`handoff:${mine.key}`));
   }));
 
@@ -250,3 +248,22 @@ test('a stalled handoff holder release never holds up the sender\'s ledger or it
   await h.runDeliveries();
   assert.equal((await messages(h, 'other')).length, 1);
 }));
+
+for (const stage of ['expansion', 'release'] as const) {
+  test(`a handoff ${stage} that keeps failing raises one handoff_stuck alert after 12 attempts`, () => withInternal(async (h, mail, from) => {
+    // The drive's own attempt dies; from then on every reconciler attempt fails at the sweeper.
+    await h.box('member', 'crashAtHandoff', stage === 'expansion' ? 'expand:plan' : 'expand:written');
+    const id = await released(h, mail, from, `stuck-${stage}`, [OTHER]);
+    await h.sweeper(WS, stage === 'expansion' ? 'failHolds' : 'failTombstones', true);
+    const key = handoffKeyOf(id);
+    const alerts = () => h.directoryRows('SELECT key, source FROM mail_alerts WHERE key = ?', `handoff_stuck:${key}`);
+    for (let run = 1; run <= 14; run++) {
+      await h.advance(hour, 'clock-only');
+      await h.handoffCron(200);
+      assert.equal((await alerts()).length, run >= 12 ? 1 : 0, `after ${run} attempts`);
+    }
+    assert.deepEqual(await alerts(), [{ key: `handoff_stuck:${key}`, source: 'mail:handoff_stuck' }], 'once per handoff');
+    const row = (await handoff(h, id))!;
+    assert.equal(stage === 'expansion' ? row.expanded_at : row.holder_release_pending, stage === 'expansion' ? null : 1, 'still failing');
+  }));
+}

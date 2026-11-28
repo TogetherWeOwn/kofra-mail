@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS mailbox_send_drivers (
 CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
 -- Local, like the drivers: the next retry of a send's internal handoff (M3-8),
 -- which no move of the drive row passes while an internal recipient is pending,
--- and since when the handoff has been tried: its own stall clock, which no
--- external activity moves.
+-- and its stall clock's start (the send's release, from its journalled
+-- undo_until), which no external activity or restore moves.
 CREATE TABLE IF NOT EXISTS mailbox_send_handoffs (send_id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, since INTEGER NOT NULL);
 -- The consumer's side of the state machine (section 2.4, M3-5), non-derived
 -- like the ledger. mailbox_send_dispatch holds a send's attempt counter, its

@@ -46,9 +46,9 @@ export class SendStalls {
 
   clear(id: string): void { this.sql.exec('DELETE FROM mailbox_send_stalls WHERE send_id = ?', id); }
 
-  // A handoff still pending 24 hours after it was first tried raises the
-  // stall alert too (release step 6, M3-8), on its own clock: a mixed send's
-  // external activity and quota waits never move it.
+  // A handoff still pending 24 hours after release raises the stall alert too
+  // (release step 6, M3-8), on its own clock: a mixed send's external activity,
+  // quota waits and restores never move it.
   handoffNext(): number {
     const first = this.sql.exec<{ since: number | null }>(`SELECT min(h.since) AS since FROM mailbox_send_handoffs h WHERE EXISTS (
       SELECT 1 FROM mailbox_send_recipients r WHERE r.send_id = h.send_id AND r.kind = 'internal' AND r.state = 'pending')`).one().since;

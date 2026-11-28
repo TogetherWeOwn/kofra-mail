@@ -36,7 +36,7 @@ import { parseObjectKey } from './object-key.ts';
 import { parseMail, RawDigestMismatch } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
 import {
-  acknowledgeHandoff, bounded, expandHandoff, HANDOFF_CALL_MS, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
+  acknowledgeHandoff, bounded, expandHandoff, HANDOFF_CALL_MS, HANDOFF_KEY_MAX, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
 } from './internal-handoff.ts';
 import { ulid } from 'ulid';
 
@@ -671,11 +671,15 @@ export class SendDriver {
       if (!rows.some(entry => entry.state === 'pending')) return null;
       // The handler's re-arm is the handoff's next retry: while an internal row
       // is pending, no later move of the drive row passes it (section 2.2).
-      // Its first try also starts the handoff's stall clock; the backup lane, which raises the alert, learns of it then.
+      // The stall clock counts from the release, from the send's journalled
+      // undo_until (release runs once it passes), so a restore, which clears this
+      // local row, rebuilds the same deadline. The backup lane, which raises the
+      // alert, learns of the row on its first write.
       const retry = timers.due(SEND_DRIVE, this.ref);
       const first = !ports.sql.exec('SELECT 1 FROM mailbox_send_handoffs WHERE send_id = ?', this.ref).toArray().length;
-      if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at, since) VALUES (?, ?, ?)
-        ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry, this.timer.now);
+      if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at, since)
+        SELECT ?1, ?2, undo_until FROM mailbox_sends WHERE id = ?1
+        ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry);
       if (retry !== null && first) ports.journalDue(timers);
       // A send queued before the raw key was kept on its row falls back to its sent copy's index row.
       const rawKey = ports.sql.exec<{ rawKey: string | null }>(`SELECT coalesce(s.raw_key, (SELECT m.raw_key FROM messages m WHERE m.id = s.message_id))
@@ -687,6 +691,8 @@ export class SendDriver {
       const { record } = start.row;
       if (!open.rawKey) throw new Error('Released send without its raw key');
       const key = handoffKey(workspaceId, mailboxId, this.ref);
+      // Never left to the table's CHECK, which INSERT OR IGNORE would turn into a silent no-op.
+      if (key.length > HANDOFF_KEY_MAX) return this.breach(start);
       // The internal recipients' addresses, never their mailboxes: those are resolved at expansion.
       const addresses = open.idxs.map((idx): HandoffAddress => {
         const { email } = record.recipients[idx];

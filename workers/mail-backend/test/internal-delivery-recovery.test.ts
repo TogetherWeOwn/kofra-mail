@@ -217,7 +217,7 @@ test('a sender restore after self-filing replays the file_sent row through the c
     assert.equal(await h.eventCount('message'), 0, 'never through ingest');
   }));
 
-test('a sender restore replays a file_sent row only if the folder_rev matches, and as a no-op without the sent copy', () =>
+test('a sender restore replays a file_sent row only if the folder_rev matches', () =>
   withInternal(async (h, mail, from) => {
     await addAlias(h, 'o4@example.com', 'mailbox-b');
     await outboxDown(h, true);
@@ -234,13 +234,30 @@ test('a sender restore replays a file_sent row only if the folder_rev matches, a
     const [copy, ...extra] = await messages(h, 'member');
     assert.deepEqual(extra, []);
     assert.deepEqual([folderOf(copy.flags), copy.folder_rev], ['archive', 2], 'its folder_rev changed since release: it stays');
-    // With the sent copy gone, the replayed filing is a no-op.
-    await mail.updateThreads({ ids: [thread], set: { folder: 'trash' } });
+  }));
+
+test('a sender restore replays a file_sent row whose sent copy is gone as a no-op, from beyond the backup cursor', () =>
+  withInternal(async (h, mail, from) => {
+    await outboxDown(h, true);
+    const id = await released(h, mail, from, 'replay-gone', [MEMBER]);
+    // The sent copy is deleted and the backup covers the deletion, before the child exists.
+    await mail.updateThreads({ ids: [(await mail.listThreads({ view: 'sent' })).items[0].id], set: { folder: 'trash' } });
     await h.advance(31 * day, 'clock-only');
     assert.equal(await h.purgeTrash(), 1);
-    await h.forceSnapshot();
-    await restoreMember(h);
+    assert.ok(await h.forceSnapshot());
+    await outboxDown(h, false);
+    await nextDrive(h, id);
+    const [child] = await children(h);
+    assert.equal(child.kind, 'file_sent');
+    await h.runDeliveries();
+    // The live filing found no copy: only its receipt, not yet published, so the restore replays the child row.
+    const { flushed } = await h.sendState(id);
+    assert.ok(flushed.flushed < flushed.modseq, 'the filing is beyond the published state');
     assert.deepEqual(await messages(h, 'member'), []);
+    await restoreMember(h, false);
+    assert.ok((await h.box<string[]>('member', 'receipts')).includes(child.id), 'the child was replayed');
+    assert.equal(await h.eventCount('file_sent'), 1, 'through the conditional filing, never ingest');
+    assert.deepEqual(await messages(h, 'member'), [], 'no message: never ingested');
   }));
 
 test('an outbox write failing for 30 minutes leaves the rows pending and fails nothing; the handoff completes after recovery', () =>
@@ -308,12 +325,22 @@ test('the sender deletes the sent copy and the sweeper runs while the outbox is 
 const changeOwner = (h: Fixture) => h.directoryChange("UPDATE mailboxes SET user_id = 'new-admin' WHERE workspace_id = 'w1' AND id = 'mailbox-a'");
 const deactivateSender = (h: Fixture) => h.directoryChange("UPDATE addresses SET send_as_policy = 'pending' WHERE address_norm = ?", MEMBER);
 
-for (const change of ['owner', 'alias'] as const) {
-  test(`${change === 'owner' ? 'an owner change' : 'the sending identity removed'} while the outbox is down ends the internal rows invalid_sender; nothing delivered`,
-    () => withInternal(async (h, mail, from) => {
+for (const change of ['owner', 'identity', 'deleted alias'] as const) {
+  const title = { owner: 'an owner change', identity: 'the sending identity deactivated', 'deleted alias': 'the sending alias deleted' }[change];
+  test(`${title} while the outbox is down ends the internal rows invalid_sender; nothing delivered`,
+    () => withInternal(async (h, mail, primary) => {
+      // The deleted-alias case sends from an active send-as alias of the mailbox and then deletes it.
+      let from = primary;
+      if (change === 'deleted alias') {
+        ({ address: from } = await h.as('admin').createAlias({ mailboxId: 'mailbox-a', address: 'sales@example.com', sendAs: true }, key('alias')));
+        await h.sends.activateAlias(from);
+      }
       await outboxDown(h, true);
-      const id = await released(h, mail, from, `down-${change}`, [OTHER]);
-      await (change === 'owner' ? changeOwner(h) : deactivateSender(h));
+      const id = await released(h, mail, from, `down-${change.replace(' ', '-')}`, [OTHER]);
+      assert.deepEqual(ledgerOf(await h.sendState(id)), ['internal:pending']);
+      if (change === 'owner') await changeOwner(h);
+      else if (change === 'identity') await deactivateSender(h);
+      else await h.as('admin').deleteAlias(from);
       await outboxDown(h, false);
       await nextDrive(h, id);
       const state = await h.sendState(id);
@@ -324,21 +351,22 @@ for (const change of ['owner', 'alias'] as const) {
       await h.runDeliveries();
       assert.deepEqual(await messages(h, 'other'), []);
       // The member who lost the mailbox can no longer read it; the identity's owner still can.
-      if (change === 'alias') assert.deepEqual((await mail.getSend(id)).recipients.map(({ state: s, reason }) => `${s}:${reason}`), ['failed:invalid_sender']);
+      if (change !== 'owner') assert.deepEqual((await mail.getSend(id)).recipients.map(({ state: s, reason }) => `${s}:${reason}`), ['failed:invalid_sender']);
     }));
 }
 
 for (const when of ['before', 'after'] as const) {
   test(`an owner change committing while the handoff statement is in flight, ${when} it: ${when === 'before' ? 'rejected, nothing delivered' : 'no longer recalls it'}`,
     () => withInternal(async (h, mail, from) => {
-      const point = when === 'before' ? 'handoff:decide' : 'handoff:decided';
+      // Held at the D1 boundary: just before the decision statement runs, or just before its row is read back.
+      const statement = when === 'before' ? 'INSERT OR IGNORE INTO internal_handoffs' : 'FROM internal_handoffs WHERE key = ?';
       await h.sends.shortHandlerBudget();
-      await h.box('member', 'pauseAt', point);
+      await h.box('member', 'pauseStatement', statement);
       const id = await submit(mail, from, `inflight-${when}`, [OTHER]);
       await h.advance(UNDO);
-      await h.box('member', 'pausedAt', point);
+      await h.box('member', 'statementPaused');
       await changeOwner(h);
-      await h.box('member', 'resumeAt', point);
+      await h.box('member', 'resumeStatement');
       await h.sends.driveIdle();
       await h.advance(minute);
       await h.runDeliveries();
@@ -380,4 +408,18 @@ test('a mixed send\'s external activity never postpones the stall alert of its p
   await h.advance(hour);
   assert.equal(await stalled(), 1, 'the handoff has been pending more than 24 hours');
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['external:pending', 'internal:pending']);
+}));
+
+test('a sender restore just before a pending handoff\'s 24-hour deadline keeps the deadline from the release', () => withInternal(async (h, mail, from) => {
+  await outboxDown(h, true);
+  const id = await released(h, mail, from, 'stall-restore', [OTHER]);
+  const stalled = async () => (await h.directoryRows("SELECT source FROM mail_alerts WHERE source = 'mail:send_stalled'")).length;
+  await h.advance(23 * hour);
+  await restoreMember(h, false);
+  assert.deepEqual(ledgerOf(await h.sendState(id)), ['internal:pending']);
+  assert.equal(await stalled(), 0);
+  await h.advance(minute);
+  await h.advance(2 * hour);
+  await h.advance(hour);
+  assert.equal(await stalled(), 1, 'alerted 24 hours after the release, not after the restore');
 }));

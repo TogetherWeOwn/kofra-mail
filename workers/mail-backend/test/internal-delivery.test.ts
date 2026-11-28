@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { EmailCall } from './fixtures/send-consumer.ts';
+import { LONG_WS, type SendStateView } from './fixtures/mail-http.ts';
 import {
   addAlias, ADMIN, children, deleteAlias, emailCalls, folderOf, handoff, handoffKeyOf, hour, ledgerOf, liveHolders, MEMBER, messages, minute,
   moveAlias, OTHER, outboxDown, OUTSIDE, released, SENT_FLAG, submit, UNDO, withInternal, WS, type Fixture,
@@ -138,9 +139,10 @@ test('an alias moved to the sender after release files the sent copy, from Archi
     assert.deepEqual(extra, []);
     assert.deepEqual([copy.id, folderOf(copy.flags), copy.folder_rev], [id, 'inbox', 1]);
     assert.deepEqual(await messages(h, 'other'), []);
-    // A delivery repeated after the filing leaves the copy where the user put it.
+    // A delivery repeated through the outbox after the filing leaves the copy where the user put it.
     await mail.updateThreads({ ids: [await sentCopyThread(h)], set: { folder: 'archive' } });
-    await h.box('member', 'fileSentAgain', child.id, id, 0);
+    await h.directoryChange("UPDATE deliveries SET state = 'pending', done_at = NULL, next_attempt_at = 0 WHERE id = ?", child.id);
+    assert.deepEqual(await h.runDeliveries(), [child.id], 'redelivered through the real outbox');
     const [after] = await messages(h, 'member');
     assert.deepEqual([folderOf(after.flags), after.folder_rev], ['archive', 2]);
   }));
@@ -286,3 +288,23 @@ test('a duplicate dispatch during a pending handoff changes nothing, and the han
   assert.equal((await messages(h, 'other')).length, 1);
   assert.equal((await h.consumer<EmailCall[]>('emailCalls')).length, 1);
 }));
+
+test('workspace, mailbox and send ids at their longest supported lengths are handed off and delivered', () => withInternal(async h => {
+  const sender = h.as('longSender');
+  const { mailbox } = await sender.getSession();
+  assert.ok(mailbox);
+  assert.deepEqual([LONG_WS.length, mailbox.id.length], [58, 128]);
+  const id = await submit(sender, mailbox.primaryAddress, 'long', ['recipient@long.example']);
+  await h.advance(UNDO, 'all-mailboxes');
+  const key = `internal:${LONG_WS}:${mailbox.id}:${id}`;
+  assert.equal(key.length, 223);
+  const [row] = await h.directoryRows('SELECT decision, expanded_at FROM internal_handoffs WHERE key = ?', key);
+  assert.equal(row?.decision, 'accepted', 'the handoff row was written');
+  assert.ok(row?.expanded_at);
+  assert.deepEqual(ledgerOf(await h.box<SendStateView>('longSender', 'sendState', id)), ['internal:sent']);
+  await h.runDeliveries();
+  const [copy, ...extra] = await messages(h, 'longRecipient');
+  assert.deepEqual(extra, []);
+  assert.equal(copy?.subject, 'Internal hello');
+  assert.equal(copy?.auth, 'internal');
+}, { longIds: true }));

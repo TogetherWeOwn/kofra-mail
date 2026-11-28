@@ -31,6 +31,13 @@ const accounts: Record<Principal | 'invited' | 'demo', FixturePrincipal> = {
   invited: { userId: 'invited', name: 'An invitee', ws: 'w1', role: 'member', address: 'invited@example.com', status: 'invited' },
   demo: { userId: 'demo', name: 'Alex Morgan', ws: 'w1', role: 'admin', mailboxId: 'mailbox-demo', address: 'alex@example.com' },
 };
+// Two mailboxes whose workspace and mailbox ids have the longest supported lengths (58 and 128).
+export const LONG_WS = `long-${'w'.repeat(53)}`;
+const longMailbox = (n: number) => `mailbox-${'m'.repeat(119)}${n}`;
+const longAccounts: Record<'longSender' | 'longRecipient', FixturePrincipal> = {
+  longSender: { userId: 'long-sender', name: 'Long Sender', ws: LONG_WS, role: 'member', mailboxId: longMailbox(1), address: 'sender@long.example' },
+  longRecipient: { userId: 'long-recipient', name: 'Long Recipient', ws: LONG_WS, role: 'member', mailboxId: longMailbox(2), address: 'recipient@long.example' },
+};
 
 const CRLF = '\r\n';
 const base64 = (bytes: string | Uint8Array) => Buffer.from(bytes).toString('base64').replace(/.{1,76}/g, `$&${CRLF}`).trimEnd();
@@ -125,10 +132,13 @@ interface FixtureOptions {
   configureWorkers?: (backend: WorkerOptions, workers: WorkerOptions[]) => void;
   realQuota?: { daily?: string; monthly?: string; reset?: string };
   fixedSendId?: string;
+  // Adds the longSender and longRecipient accounts.
+  longIds?: boolean;
 }
 
 export async function startMailHttpFixture({ demo = false, draftsUploads: uploads = false, startedAt = Date.now(), realContent, inlineCids = false,
-  send = false, configureWorkers, realQuota, fixedSendId }: FixtureOptions = {}) {
+  send = false, configureWorkers, realQuota, fixedSendId, longIds = false }: FixtureOptions = {}) {
+  const principals = { ...accounts, ...(longIds ? longAccounts : {}) } as typeof accounts & Partial<typeof longAccounts>;
   const draftsUploads = uploads || send;
   const { outputFiles } = await (bundle ??= compiled());
   let contents = outputFiles[0].text;
@@ -163,7 +173,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       SEND_QUOTA: { className: realQuota ? 'RealSendQuota' : 'FakeSendQuota', useSQLite: true },
       SEND_CONSUMER: { className: 'SendConsumer', useSQLite: true } },
     r2Buckets: ['MAIL_STATE'], d1Databases: ['DIRECTORY'],
-    bindings: { ACCOUNTS: accounts, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
+    bindings: { ACCOUNTS: principals, CONTROL_KEY: control, CSRF_KEY: crypto.randomUUID(), INITIAL_TIME: now, ...(demo && { DEFAULT_ACCOUNT: 'demo' }),
       MAIL_BACKEND_ENABLED: 'on', MAIL_RECOVERY_ENABLED: 'on', MAIL_LOCAL_API: 'on',
       ...(draftsUploads && { MAIL_DRAFT_UPLOADS_ENABLED: 'on' }),
       ...(send && { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: 'test', MANUAL_ALARMS: 'on' }),
@@ -408,7 +418,7 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
     };
     const ancestryById = new Map<string, string[]>();
     const clients = new Map<string, ReturnType<typeof createHttpMailService>>();
-    const as = (principal: keyof typeof accounts) => {
+    const as = (principal: keyof typeof principals) => {
       const cached = clients.get(principal);
       if (cached) return cached;
       const client = createHttpMailService({ baseUrl: `${origin}/api/v1`, fetch: (input, init) => {
@@ -527,10 +537,10 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       runDeliveries: () => readControl<string[]>('run-deliveries'),
       handoffCron: (callMs?: number) => readControl<{ errors: number }>('handoff-cron', callMs === undefined ? '' : String(callMs)),
       expand: (key: string) => readControl<string>('expand', key),
-      box: <T>(principal: keyof typeof accounts, method: string, ...args: unknown[]) => readControl<T>('box', JSON.stringify({ principal, method, args })),
+      box: <T>(principal: keyof typeof principals, method: string, ...args: unknown[]) => readControl<T>('box', JSON.stringify({ principal, method, args })),
       sweeper: <T>(workspace: string, method: string, ...args: unknown[]) => readControl<T>('sweeper', JSON.stringify({ workspace, method, args })),
-      deliverRaw: async (mime: string, to: keyof typeof accounts, from: string) => {
-        const res = await call('deliver', mime, { 'x-fixture-to': accounts[to].address, 'x-fixture-from': from });
+      deliverRaw: async (mime: string, to: keyof typeof principals, from: string) => {
+        const res = await call('deliver', mime, { 'x-fixture-to': principals[to]!.address, 'x-fixture-from': from });
         if (!res.ok) throw new Error(`Fixture delivery HTTP ${res.status}: ${await res.text()}`);
         return res.json() as Promise<{ threadId: string; messageId: string }>;
       },

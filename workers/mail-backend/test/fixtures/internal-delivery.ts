@@ -8,7 +8,7 @@ import { startMailHttpFixture } from './mail-http.ts';
 // M3-8), run in local workerd against the real Mailbox objects, the real
 // Sweeper, the real D1 outbox and the delivery pipeline's real deliver().
 export type Fixture = Awaited<ReturnType<typeof startMailHttpFixture>>;
-export type Principal = 'member' | 'other' | 'admin';
+export type Principal = 'member' | 'other' | 'admin' | 'longSender' | 'longRecipient';
 export const WS = 'w1', MB = 'mailbox-a';
 export const second = 1000, minute = 60 * second, hour = 60 * minute, day = 24 * hour;
 export const UNDO = 10 * second;
