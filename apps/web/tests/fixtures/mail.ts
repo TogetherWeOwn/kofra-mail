@@ -3,18 +3,22 @@ import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { test as playwright } from '@playwright/test';
 
-interface Origins { appOrigin: string; contentOrigin: string }
+// `fileLink`: a sent file link (M3-13) on the content bridge, with the values its page must show.
+interface FileLinkFixture { path: string; name: string; senderName: string; senderEmail: string; size: number; sha256: string }
+interface Origins { appOrigin: string; contentOrigin: string; fileLink?: FileLinkFixture }
 function isOrigins(value: unknown): value is Origins {
   return !!value && typeof value === 'object' && 'appOrigin' in value && 'contentOrigin' in value
     && typeof value.appOrigin === 'string' && typeof value.contentOrigin === 'string';
 }
 
-export const test = playwright.extend<{ origins: Origins; contentOriginEnabled: boolean; realContent: boolean; inlineCids: boolean }>({
+export const test = playwright.extend<{ origins: Origins; contentOriginEnabled: boolean; realContent: boolean; inlineCids: boolean; fileLinks: boolean }>({
   contentOriginEnabled: [true, { option: true }],
   realContent: [false, { option: true }],
   inlineCids: [false, { option: true }],
-  origins: async ({ contentOriginEnabled, realContent, inlineCids }, use) => {
-    const flags = [...(contentOriginEnabled ? [] : ['--plain']), ...(realContent ? ['--real-content'] : []), ...(inlineCids ? ['--inline-cids'] : [])];
+  fileLinks: [false, { option: true }],
+  origins: async ({ contentOriginEnabled, realContent, inlineCids, fileLinks }, use) => {
+    const flags = [...(contentOriginEnabled ? [] : ['--plain']), ...(realContent ? ['--real-content'] : []), ...(inlineCids ? ['--inline-cids'] : []),
+      ...(fileLinks ? ['--file-links'] : [])];
     const child = fork(fileURLToPath(new URL('./mail-app.mjs', import.meta.url)), flags, {
       cwd: fileURLToPath(new URL('../../', import.meta.url)),
     });

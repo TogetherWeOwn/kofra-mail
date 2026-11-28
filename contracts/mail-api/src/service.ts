@@ -1,7 +1,8 @@
 import type {
   AdminMailbox, Alias, AliasInput, ContentUrl, Conversation, Domain, DomainInput, Draft, DraftInput, DriveImport,
-  DriveImportInput, DriveSave, Id, Identity, Label, LinkLocation, LinkLocationCredentials, LinkLocationInput, LinkLocationList,
-  MailboxInput, MailboxPage, MailboxPatch, Member, Page, Send, SendQuery, Session, Settings, State, ThreadQuery, ThreadSummary, ThreadUpdate, Upload, ViewList,
+  DriveImportInput, DriveSave, FileLink, Id, Identity, Label, LinkLocation, LinkLocationCredentials, LinkLocationInput, LinkLocationList,
+  LinkUpload, LinkUploadInput, MailboxInput, MailboxPage, MailboxPatch, Member, Page, Send, SendQuery, Session, Settings, State, ThreadQuery,
+  ThreadSummary, ThreadUpdate, Upload, ViewList,
 } from './wire.ts';
 
 /** `Idempotency-Key`: 1 to 64 characters of `[A-Za-z0-9_-]`, new per user action, reused on retry. */
@@ -10,6 +11,8 @@ export interface Idempotent { idempotencyKey: string }
 export interface Conditional { ifMatch: string }
 
 export interface UploadInput { name: string; type: string; bytes: Blob }
+/** One part of a link upload: exactly `partSize` bytes, or the remainder for the last part. */
+export interface LinkPartInput { bytes: Blob }
 
 /**
  * The Mail API. One method per HTTP route in `ROUTES`; the method name is the
@@ -53,6 +56,15 @@ export interface MailService {
   createUpload(input: UploadInput, options: Idempotent): Promise<Upload>;
   deleteUpload(uploadId: Id): Promise<void>;
   importFromDrive(input: DriveImportInput, options: Idempotent): Promise<DriveImport>;
+
+  createLinkUpload(input: LinkUploadInput, options: Idempotent): Promise<LinkUpload>;
+  getLinkUpload(uploadId: Id): Promise<LinkUpload>;
+  putLinkPart(uploadId: Id, partNumber: number, input: LinkPartInput): Promise<void>;
+  completeLinkUpload(uploadId: Id): Promise<LinkUpload>;
+  deleteLinkUpload(uploadId: Id): Promise<void>;
+  listLinks(query: { cursor?: string; limit?: number }): Promise<Page<FileLink>>;
+  revokeLink(linkId: Id): Promise<FileLink>;
+  deleteLink(linkId: Id): Promise<void>;
 
   listDomains(): Promise<{ items: Domain[] }>;
   addDomain(input: DomainInput, options: Idempotent): Promise<Domain>;

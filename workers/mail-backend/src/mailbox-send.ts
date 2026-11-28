@@ -39,6 +39,7 @@ import {
   acknowledgeHandoff, bounded, expandHandoff, HANDOFF_CALL_MS, HANDOFF_KEY_MAX, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
 } from './internal-handoff.ts';
 import { ulid } from 'ulid';
+import { isLinkHost, linkExpiresAt, linkTextLines, newLinkId, newLinkToken, routeLinks, type SendLink } from './file-links.ts';
 
 export type SendScope = { workspaceId: string; mailboxId: string; holderScope: string };
 // `epoch` and `restoredAt`: the recovery fence of the send path (section 2.5).
@@ -65,6 +66,10 @@ export type SendPorts = {
   dispatcher: Pick<SendDispatcher, 'drive' | 'storedSettled' | 'handedOff'>;
   // The internal handoff and the pipeline's expansion (M3-8); without it internal recipients wait.
   handoff?: HandoffPorts;
+  // The file links' routing table (M3-13, release step 4b); without it a send with links waits.
+  linkRoutes?: D1Database;
+  // The current time, for decisions made after remote waits (the handoff's link floor).
+  clock?(): number;
   quota(): QuotaPort | undefined;
   alert?(code: SendEventCode): Promise<void>;
   // Called after each completed release step; tests inject crashes here.
@@ -99,7 +104,9 @@ export function mimeMessage(record: SendRecord, draft: DraftObject): SendMimeMes
   return {
     messageId: record.messageId, boundary: record.boundary, date: record.dateAt,
     from: { email: record.from.email, ...(record.from.name ? { name: record.from.name } : {}) }, replyTo: record.replyTo,
-    to: field('to'), cc: field('cc'), bcc: field('bcc'), subject: draft.fields.subject, text: [draft.fields.body, ...links].join('\r\n'),
+    to: field('to'), cc: field('cc'), bcc: field('bcc'), subject: draft.fields.subject,
+    // File links (M3-13) from the frozen record only, so a rerun builds identical bytes.
+    text: [draft.fields.body, ...links, ...linkTextLines(record.links)].join('\r\n'),
     attachments: files(draft).map(({ wire }) => ({ name: wire.name, type: wire.type, size: wire.size })),
     ...(draft.replyHeaders?.inReplyTo ? { inReplyTo: draft.replyHeaders.inReplyTo } : {}),
     ...(draft.replyHeaders?.references ? { references: draft.replyHeaders.references } : {}),
@@ -159,7 +166,8 @@ export type SendCommit = { seq: number; sendId?: string; answer: () => Promise<{
 export class SendApi {
   constructor(private readonly index: MailboxIndex, private readonly sql: SqlStorage, private readonly scope: SendScope,
     private readonly incarnation: string, private readonly timers: TimerTable, private readonly mime: SendMimeBuilders,
-    private readonly directory: DirectoryDatabase, private readonly clock: () => number, private readonly journalDue: (timers: TimerTable) => void) {}
+    private readonly directory: DirectoryDatabase, private readonly clock: () => number, private readonly journalDue: (timers: TimerTable) => void,
+    private readonly linkHost?: string) {}
 
   private replayed(operation: 'sendDraft' | 'undoSend', key: string, fingerprint: string, now: number) {
     const row = committedKey(this.sql, key);
@@ -218,6 +226,15 @@ export class SendApi {
         ? [{ messageId: attachment.wire.messageId, part: attachment.wire.part, ...attachment.part }] : []);
     const undoSeconds = settingsUndoSeconds(this.sql), replyTo = replyToFromSettings(this.sql), attachmentKeys = draftObjectKeys(draft);
     const builder = this.mime.get(this.mime.current)!;
+    // File links (M3-13): each gets its id and 128-bit token once; the host and the
+    // expiry are frozen with them, so the printed date and the replayed bytes agree.
+    const fileLinks = (draft.attachments ?? []).flatMap(attachment => attachment.wire.kind === 'file_link' && 'link' in attachment
+      ? [{ wire: attachment.wire, link: attachment.link }] : []);
+    if (fileLinks.length > LIMITS.fileLinksPerMessage) return invalid('/attachments', 'too_many');
+    if (fileLinks.length && !isLinkHost(this.linkHost)) return fail('feature_unavailable');
+    const minted = fileLinks.map(() => ({ id: newLinkId(), token: newLinkToken() }));
+    const linksAt = (dateAt: number): SendLink[] => fileLinks.map(({ wire, link }, i) => ({ ...minted[i], host: this.linkHost!, name: wire.name,
+      size: wire.size, expiresAt: linkExpiresAt(dateAt, wire.expiry), location: link.location, key: link.key, fingerprint: link.fingerprint }));
     const frozen = (at: number, source: Pick<DraftObjectRef, 'rawKey' | 'revision' | 'updatedAt'> & { holder: string }): SendRecord => {
       const id = ulid(at);
       const mimeId = id.toLowerCase();
@@ -226,7 +243,7 @@ export class SendApi {
         messageId: sendMimeMessageId(mimeId, { email: from }), boundary: sendMimeBoundary(mimeId),
         ownerUserId: options.userId!, from: { email: from, name }, replyTo, builderVersion: builder.version,
         draft: { rawKey: source.rawKey, holder: source.holder, revision: source.revision, updatedAt: source.updatedAt },
-        attachmentKeys, uploadIds, recipients, parts,
+        attachmentKeys, uploadIds, recipients, parts, ...(fileLinks.length && { links: linksAt(at + undoSeconds * 1000) }),
       };
     };
     const tooLarge = (record: SendRecord) => {
@@ -622,6 +639,9 @@ export class SendDriver {
     const { row } = start;
     if (row.queuedSeq === null) return;
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
+    // Step 4b (M3-13): every file link's routing row, after the 4a barrier and
+    // before the handoff and the enqueue, so no recipient gets a link that cannot route.
+    if (!await this.routeLinks(start)) return;
     // Release step 6, gated like the claim on the published release; then the
     // external state. A stalled handoff never holds the external recipients past
     // its bound; its own steps may still finish, each a conditional commit.
@@ -654,6 +674,36 @@ export class SendDriver {
     if (!this.ports.queue) throw new Error('Send queue binding missing');
     await this.ports.queue.send({ kind: 'dispatch', ws: start.scope.workspaceId, mb: start.scope.mailboxId, sendId: this.ref });
     await this.ports.checkpoint?.('enqueued');
+  }
+
+  // Release step 4b (M3-13): INSERT OR IGNORE of each link's routing row, then
+  // a read-back. True once every row names this send's link; a row still missing
+  // (its workspace location is being deleted) waits for the drive row's backoff.
+  private async routeLinks(start: Start): Promise<boolean> {
+    const links = start.row.record.links ?? [];
+    if (!links.length) return true;
+    const { ports } = this;
+    if (await ports.local(() => ports.sql.exec('SELECT 1 FROM mailbox_link_routes WHERE send_id = ?', this.ref).toArray().length === 1)) return true;
+    if (!ports.linkRoutes) return false;
+    const { workspaceId, mailboxId } = start.scope;
+    let outcome: Awaited<ReturnType<typeof routeLinks>>;
+    try { outcome = await routeLinks(ports.linkRoutes, workspaceId, mailboxId, links, this.timer.now); }
+    catch {
+      console.error({ code: 'link_route_retry' });
+      return false;
+    }
+    if (outcome === 'breach') {
+      await this.breach(start);
+      return false;
+    }
+    if (outcome === 'retry') {
+      console.error({ code: 'link_route_retry' });
+      return false;
+    }
+    await ports.local(() => {
+      if (this.current(start)) ports.sql.exec('INSERT OR IGNORE INTO mailbox_link_routes VALUES (?)', this.ref);
+    });
+    return true;
   }
 
   // Release step 6 (section 2.4; M3-8): hold, decide and write, then commit the
@@ -705,9 +755,11 @@ export class SendDriver {
       await pipeline.sweeper(workspaceId).hold(open.rawKey, handoffHolder(key));
       // Step 2, decide and write: one statement; the first row written is the decision.
       await pipeline.checkpoint?.('handoff:decide');
+      // The link floor (M3-13) is read at the decision, after the routing, the barrier and the hold.
+      const decidedAt = Math.max(this.timer.now, ports.clock?.() ?? this.timer.now);
       await writeHandoff(pipeline.db, { key, workspaceId, mailboxId, sendId: this.ref, rawKey: open.rawKey, sender: record.from.email,
-        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, this.timer.now),
-        now: this.timer.now });
+        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, decidedAt),
+        now: decidedAt });
       await pipeline.checkpoint?.('handoff:decided');
       const row = await readHandoff(pipeline.db, key);
       // It counts as this send's handoff only if it matches this send.

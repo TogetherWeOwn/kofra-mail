@@ -3,6 +3,7 @@ import type { MailAlerts } from './mail-alerts.ts';
 import { STUCK_RETRIES, type Outbox } from './outbox.ts';
 import type { DailySendAlert } from './send-alert-events.ts';
 import type { HandoffStuckAlert } from './internal-handoff.ts';
+import type { LinkReportedAlert } from './mail-alerts.ts';
 
 export const RETENTION_MS = 35 * 24 * 60 * 60 * 1000;
 
@@ -11,7 +12,7 @@ type ReconcilePorts = {
   mailAlerts?: Pick<MailAlerts, 'pending' | 'reserveSend' | 'sent' | 'deferred' | 'prune' | 'recordFailed' | 'recordStuck'>;
   now(): number;
   send(id: string): Promise<void>;
-  alert: (event: Parameters<Alert>[0] | HandoffStuckAlert) => Promise<void>;
+  alert: (event: Parameters<Alert>[0] | HandoffStuckAlert | LinkReportedAlert) => Promise<void>;
   sendAlert?(event: DailySendAlert): Promise<void>;
 };
 

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import test from 'node:test';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { after } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { ALL_OPS, fakeS3, READ_OPS, type S3Op } from '../../packages/link-storage/test/fake-s3.ts';
-import { deployCheck } from './check.ts';
+import { configuredLinkHost, deployCheck, linkHostCheck } from './check.ts';
 
 // Synthetic values only: a local fake S3 endpoint and a fake Cloudflare API.
 const READ = { accessKeyId: 'FAKEREADKEY0001', secretAccessKey: 'fake-read-secret-value-0001' };
@@ -72,7 +74,8 @@ test('the CLI prints only fixed codes', () => {
   const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
   let output = '';
   try {
-    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, LINK_LOCATIONS: 'x', LINK_WRITE_CREDENTIALS: JSON.stringify({ main: WRITE }) }, encoding: 'utf8' });
+    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, LINK_LOCATIONS: 'x', LINK_WRITE_CREDENTIALS: JSON.stringify({ main: WRITE }),
+      LINK_BACKEND_CONFIG: noHostConfig() }, encoding: 'utf8' });
   } catch (error) {
     const failure = error as { status: number; stdout: string; stderr: string };
     assert.equal(failure.status, 1);
@@ -93,3 +96,86 @@ test('mail-content never names a write credential or the KEK, and mail-web never
     for (const path of paths) assert.doesNotMatch(readFileSync(path, 'utf8'), forbidden, path);
   }
 });
+
+test('the link host must be a domain of its own unless the shared-domain override is set, and the CLI then warns', async () => {
+  const origins = { MAIL_APP_ORIGIN: 'https://mail.mail-suite.example', CONTENT_ORIGIN: 'https://content.mail-content.example' };
+  const check = (host: string, extra: Record<string, string> = {}) => linkHostCheck({ ...origins, LINK_HOST: host, LINK_HOSTS: host, ...extra });
+  assert.deepEqual(check('files.mail-links.example'), { linkHost: 'files.mail-links.example', result: 'ok' });
+  assert.deepEqual(check('files.mail-suite.example'), { linkHost: 'files.mail-suite.example', result: 'shared_domain' });
+  assert.deepEqual(check('files.mail-content.example'), { linkHost: 'files.mail-content.example', result: 'shared_domain' });
+  assert.deepEqual(check('files.mail-suite.example', { LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }),
+    { linkHost: 'files.mail-suite.example', result: 'shared_domain_allowed' });
+  assert.deepEqual(check('files.mail-suite.example', { LINK_HOST_ALLOW_SHARED_DOMAIN: 'yes' }),
+    { linkHost: 'files.mail-suite.example', result: 'shared_domain' }, 'only the exact override');
+  assert.deepEqual(check('https://files.example.com'), { linkHost: 'LINK_HOSTS', result: 'invalid' });
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'https://files.example.com', LINK_HOSTS: 'files.example.com' }),
+    { linkHost: 'LINK_HOST', result: 'invalid' });
+  // Only the current host must be separate: an old shared host may stay listed for its links.
+  assert.deepEqual(check('files.mail-links.example', { LINK_HOSTS: 'files.mail-links.example old.mail-suite.example' }),
+    { linkHost: 'files.mail-links.example', result: 'ok' });
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'old.example.net files.example.com' }), { linkHost: 'files.example.com', result: 'not_first' });
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'files.example.com https://old.example.net' }),
+    { linkHost: 'LINK_HOSTS', result: 'invalid' }, 'mail-content would serve no host at all');
+  assert.deepEqual(check('files.example.com', { LINK_HOSTS: 'files.example.com, old.example.net' }), { linkHost: 'files.example.com', result: 'ok' });
+  // A link-enabled deploy fails closed without its served hosts or either origin.
+  assert.deepEqual(linkHostCheck({ ...origins, LINK_HOST: 'files.example.com' }), { linkHost: 'LINK_HOSTS', result: 'invalid' });
+  // mail-content's own origin rule: canonical https origins (no path, no trailing slash) on separate hosts.
+  for (const [name, value] of [['MAIL_APP_ORIGIN', undefined], ['MAIL_APP_ORIGIN', 'mail.example.com'], ['CONTENT_ORIGIN', undefined],
+    ['CONTENT_ORIGIN', 'http://content.example.org'], ['CONTENT_ORIGIN', 'https://content.example.org/path'],
+    ['CONTENT_ORIGIN', 'https://content.mail-content.example/'], ['MAIL_APP_ORIGIN', 'https://mail.mail-suite.example/'],
+    ['CONTENT_ORIGIN', 'https://mail.mail-suite.example'], ['CONTENT_ORIGIN', 'https://mail.mail-suite.example:8443']] as const) {
+    const env: Record<string, string | undefined> = { ...origins, LINK_HOST: 'files.example.com', LINK_HOSTS: 'files.example.com', [name]: value };
+    assert.deepEqual(linkHostCheck(env), { linkHost: 'origins', result: 'invalid' }, `${name}=${value}`);
+  }
+  // Without LINK_HOST the deploy is not link-enabled: nothing is required, and a listed old host must still be valid.
+  assert.equal(linkHostCheck({}), undefined);
+  assert.deepEqual(linkHostCheck({ LINK_HOSTS: 'old.example.net' }), { linkHost: 'LINK_HOSTS', result: 'ok' });
+  assert.deepEqual(linkHostCheck({ LINK_HOSTS: 'old.example.net/x' }), { linkHost: 'LINK_HOSTS', result: 'invalid' });
+  const { fetcher, env } = setup();
+  const shared = { ...origins, LINK_HOST: 'files.mail-suite.example', LINK_HOSTS: 'files.mail-suite.example' };
+  assert.equal((await deployCheck({ ...env, ...shared }, fetcher)).ok, false);
+  assert.equal((await deployCheck({ ...env, ...shared, LINK_HOST_ALLOW_SHARED_DOMAIN: '1' }, fetcher)).ok, true);
+  const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
+  let stderr = '';
+  try {
+    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, ...shared, LINK_HOST_ALLOW_SHARED_DOMAIN: '1', LINK_BACKEND_CONFIG: noHostConfig() },
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) { stderr = (error as { stderr: string }).stderr; }
+  assert.match(stderr, /LINK_HOST shares a registrable domain/);
+});
+
+test('without LINK_HOST in the environment the check uses mail-backend\'s configured LINK_HOST, and a different one fails', async () => {
+  const backend = readFileSync(fileURLToPath(new URL('../../workers/mail-backend/wrangler.jsonc', import.meta.url)), 'utf8');
+  const configured = configuredLinkHost(backend);
+  assert.equal(configured, 'files.riaklo.com', 'the production template sets the owner-chosen host');
+  assert.equal(configuredLinkHost('{ // no link host\n "vars": { "MAIL_ENVIRONMENT": "production" } }'), undefined);
+  assert.throws(() => configuredLinkHost('{ "vars": { "LINK_HOST": 7 } }'));
+  const { fetcher, env } = setup();
+  const origins = { MAIL_APP_ORIGIN: 'https://mail.mail-suite.example', CONTENT_ORIGIN: 'https://content.mail-content.example' };
+  const fallback = await deployCheck({ ...env, ...origins, LINK_HOSTS: 'files.mail-links.example' }, fetcher, 'files.mail-links.example');
+  assert.deepEqual(fallback.lines.at(-1), { linkHost: 'files.mail-links.example', result: 'ok' }, 'the configured host is checked');
+  assert.equal(fallback.ok, true);
+  const unlisted = await deployCheck({ ...env, ...origins }, fetcher, 'files.mail-links.example');
+  assert.deepEqual(unlisted.lines.at(-1), { linkHost: 'LINK_HOSTS', result: 'invalid' }, 'the configured host makes the deploy link-enabled');
+  const differs = await deployCheck({ ...env, ...origins, LINK_HOST: 'other.mail-links.example', LINK_HOSTS: 'other.mail-links.example' }, fetcher,
+    'files.mail-links.example');
+  assert.deepEqual(differs, { ok: false, lines: [{ linkHost: 'LINK_HOST', result: 'mismatch' }] });
+  const cli = fileURLToPath(new URL('./cli.ts', import.meta.url));
+  let failure: { status: number; stdout: string } | undefined;
+  try {
+    execFileSync(process.execPath, [cli], { env: { PATH: process.env.PATH, LINK_HOST: 'other.mail-links.example' }, encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) { failure = error as { status: number; stdout: string }; }
+  assert.equal(failure?.status, 1, 'the CLI exits 1 when the environment and wrangler.jsonc disagree');
+  assert.equal(failure?.stdout, '{"linkHost":"LINK_HOST","result":"mismatch"}\n');
+});
+
+const scratch: string[] = [];
+after(() => { for (const dir of scratch) rmSync(dir, { recursive: true }); });
+function noHostConfig(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'link-check-'));
+  scratch.push(dir);
+  const file = join(dir, 'wrangler.jsonc');
+  writeFileSync(file, '{ "vars": {} }');
+  return file;
+}

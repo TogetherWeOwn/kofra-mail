@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 import { indexedAttachmentName } from '../../../contracts/mail-api/src/headers.ts';
 import { sha256 } from '../../mail-backend/src/bytes.ts';
 import { serveImage } from './image-handler.ts';
+import { linkHosts, serveFileLink, type FileLinkEnv, type FileLinkLookup } from './file-link.ts';
 import { contentUrlKeys, type ContentUrlKeys } from './keys.ts';
 import { MimeBusy } from './mime-budget.ts';
 import { checkedRecord, decodedBytes, EXTERNAL_PART_BYTES, proveAttachment, readOnlyObjects,
@@ -18,8 +19,8 @@ export interface MailLookupPort {
   mailboxOwner(ws: string, mb: string): Promise<string | null>;
   messageRecord(ws: string, mb: string, sub: string, msg: string): Promise<unknown>;
 }
-export type ContentEnv = ContentStoreConfig & {
-  MAIL_LOOKUP: MailLookupPort;
+export type ContentEnv = ContentStoreConfig & Omit<FileLinkEnv, 'MAIL_LOOKUP'> & {
+  MAIL_LOOKUP: MailLookupPort & Partial<FileLinkLookup>;
   ACCOUNT_EPOCH: AccountEpochPort;
   MAIL_CONTENT_ENABLED?: string;
   CONTENT_LOCAL_LOOPBACK?: string;
@@ -197,9 +198,16 @@ async function handleContent(request: Request, env: ContentEnv, io: Runtime,
   return result?.response ?? new Response(null, { status, headers: contentSecurityHeaders(origins) });
 }
 
+// A link host serves only /f/ (M3-13); a host that is also the content origin (local tests only) serves both by path.
+function linkRequest(request: Request, env: ContentEnv): boolean {
+  const url = new URL(request.url);
+  if (!linkHosts(env.LINK_HOSTS).includes(url.host.toLowerCase())) return false;
+  return url.pathname.startsWith('/f/') || url.origin !== (env.CONTENT_ORIGIN ?? '');
+}
+
 export async function serveContent(request: Request, env: ContentEnv, io: Runtime = runtime,
     ctx?: Pick<ExecutionContext, 'waitUntil'>): Promise<Response> {
-  const response = await handleContent(request, env, io, ctx);
+  const response = linkRequest(request, env) ? await serveFileLink(request, env) : await handleContent(request, env, io, ctx);
   response.headers.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
   return response;
 }

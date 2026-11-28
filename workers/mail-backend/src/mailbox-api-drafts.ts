@@ -1,5 +1,5 @@
 import { hasHeaderControl, type ThreadingHeaders } from '../../../contracts/mail-api/src/headers.ts';
-import { LIMITS } from '../../../contracts/mail-api/src/limits.ts';
+import { isLinkExpiry, LIMITS } from '../../../contracts/mail-api/src/limits.ts';
 import type { AddressInput, Draft, DraftAttachment, DraftInput } from '../../../contracts/mail-api/src/wire.ts';
 import { sha256 } from './bytes.ts';
 import { attachmentRow, displayOf, messageRow, partNumber } from './mailbox-api-messages.ts';
@@ -8,6 +8,7 @@ import type { ApiDraftRef, MailboxIndex } from './mailbox-index.ts';
 import { decodedAttachment, MAX_INDEXED_ATTACHMENTS, parseMail, readMailMime } from './parse-mail.ts';
 import { unusableSource, uploadReferenced, uploadRow } from './mailbox-upload.ts';
 import { ObjectInvalidError } from './object-errors.ts';
+import { draftLinkExpiry, isLinkFileName, isStoredFileLink, type StoredFileLink } from './file-links.ts';
 import { parseObjectKey } from './object-key.ts';
 
 export type DraftObjectRef = Omit<ApiDraftRef, 'holder'>;
@@ -16,7 +17,9 @@ export type DraftObjectRef = Omit<ApiDraftRef, 'holder'>;
 export type PartFingerprint = { digest: string; size: number };
 type StoredAttachment =
   | { wire: Extract<DraftAttachment, { kind: 'link' }> }
-  | { wire: Exclude<DraftAttachment, { kind: 'link' }>; key: string; part?: PartFingerprint };
+  // A file link (M3-13): a completed link upload's object, sent as a download link.
+  | { wire: Extract<DraftAttachment, { kind: 'file_link' }>; link: StoredFileLink }
+  | { wire: Exclude<DraftAttachment, { kind: 'link' | 'file_link' }>; key: string; part?: PartFingerprint };
 export type DraftObject = { version: 1; fields: Omit<DraftInput, 'attachments'>;
   attachments?: StoredAttachment[]; replyHeaders?: ThreadingHeaders };
 
@@ -83,6 +86,9 @@ function isStoredAttachment(value: unknown): boolean {
   if (!isRecord(value) || !isRecord(value.wire) || !isText(value.wire.name)) return false;
   const { wire } = value;
   if (wire.kind === 'link') return isBounded(wire.url, LIMITS.linkUrlBytes) && isBounded(wire.name, LIMITS.linkNameBytes);
+  if (wire.kind === 'file_link') {
+    return isId(wire.linkUploadId) && isLinkFileName(wire.name) && isCount(wire.size) && isLinkExpiry(wire.expiry) && isStoredFileLink(value.link);
+  }
   // An upload is an att/ object; a forwarded part is inside its raw/ source or its own att/ object.
   const kind = isText(value.key) ? parseObjectKey(value.key)?.kind : undefined;
   return isText(wire.type) && isCount(wire.size) &&
@@ -99,8 +105,9 @@ export function sendableDraftObject(draft: DraftObject): boolean {
     lists.reduce<number>((sum, list) => sum + (list as unknown[]).length, 0) <= LIMITS.recipientsPerMessage &&
     isBounded(fields.subject, LIMITS.subjectBytes, true) && isBounded(fields.body, LIMITS.bodyBytes) &&
     optional(fields.inReplyTo, isId) && optional(fields.forwardOf, isId) &&
-    // The save path keeps at most pageSizeMax attachments, links included.
-    optional(attachments, list => Array.isArray(list) && list.length <= LIMITS.pageSizeMax && list.every(isStoredAttachment)) &&
+    // The save path keeps at most pageSizeMax attachments, links included, and at most fileLinksPerMessage file links.
+    optional(attachments, list => Array.isArray(list) && list.length <= LIMITS.pageSizeMax && list.every(isStoredAttachment) &&
+      list.filter(entry => (entry as StoredAttachment).wire.kind === 'file_link').length <= LIMITS.fileLinksPerMessage) &&
     // The v1 builder leaves out unsafe threading values (cleanMimeMessageV1).
     optional(replyHeaders, headers => isRecord(headers) && optional(headers.inReplyTo, isText) && optional(headers.references, isText));
 }
@@ -187,9 +194,10 @@ export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: un
   if (rawTo.length + rawCc.length + rawBcc.length > LIMITS.recipientsPerMessage) {
     return fail('too_many_recipients', { limit: LIMITS.recipientsPerMessage });
   }
-  if (attachments.filter(value => value?.kind !== 'link').length > LIMITS.attachmentsPerMessage) {
+  if (attachments.filter(value => value?.kind !== 'link' && value?.kind !== 'file_link').length > LIMITS.attachmentsPerMessage) {
     return fail('too_many_attachments', { limit: LIMITS.attachmentsPerMessage });
   }
+  if (attachments.filter(value => value?.kind === 'file_link').length > LIMITS.fileLinksPerMessage) return invalid('/attachments', 'too_many');
   // Link attachments do not consume send attachment slots; bound their validation cost separately.
   if (attachments.length > LIMITS.pageSizeMax) return invalid('/attachments', 'too_many');
   const subject = text(args.subject, LIMITS.subjectBytes, '/subject', true);
@@ -244,6 +252,21 @@ export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: un
         if (/\p{Cc}/u.test(name)) return invalid(`${path}/name`);
         if (enableAttachments) stored.push({ wire: { kind: 'link', url: urlText, name } });
         break;
+      }
+      case 'file_link': {
+        const ref = object(value, ['kind', 'linkUploadId', 'expiry'], path);
+        const linkUploadId = requireId(ref.linkUploadId, `${path}/linkUploadId`);
+        const expiry = draftLinkExpiry(ref.expiry);
+        if (expiry === undefined) return invalid(`${path}/expiry`);
+        if (!enableAttachments) break;
+        // A file link already on the draft keeps its upload; only the expiry choice may change.
+        const carried = previous?.attachments?.find(({ wire }) => wire.kind === 'file_link' && wire.linkUploadId === linkUploadId);
+        if (carried && 'link' in carried && carried.wire.kind === 'file_link') {
+          stored.push({ wire: { ...carried.wire, expiry }, link: carried.link });
+          break;
+        }
+        // Link uploads (M3-15b) attach here once they exist; until then none can be found.
+        return fail('not_found');
       }
       default: return invalid(`${path}/kind`);
     }

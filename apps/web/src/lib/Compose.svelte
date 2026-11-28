@@ -1,5 +1,5 @@
 <script module lang="ts">
-  import type { Draft, DraftAttachment, DraftInput } from '@kofra/mail-contract';
+  import type { Draft, DraftAttachment, DraftAttachmentRef, DraftInput } from '@kofra/mail-contract';
   export type ComposeDraft = Draft | (Omit<DraftInput, 'attachments'> & { attachments: DraftAttachment[] });
   export type DraftEdits = {
     to: string; cc: string; bcc: string; subject: string; body: string; inReplyTo?: string;
@@ -58,12 +58,15 @@
   }
   onMount(() => { modal.showModal(); });
 
-  function attachmentRef(attachment: DraftAttachment) {
+  function attachmentRef(attachment: DraftAttachment): DraftAttachmentRef {
     if (attachment.kind === 'upload') return { kind: attachment.kind, uploadId: attachment.uploadId };
     if (attachment.kind === 'message') return { kind: attachment.kind, messageId: attachment.messageId, part: attachment.part };
+    // A file link keeps its upload and expiry choice when the draft is saved again.
+    if (attachment.kind === 'file_link') return { kind: attachment.kind, linkUploadId: attachment.linkUploadId, expiry: attachment.expiry };
     return { kind: attachment.kind, url: attachment.url, name: attachment.name };
   }
   function attachmentKey(file: DraftAttachment) {
+    if (file.kind === 'file_link') return `file_link:${file.linkUploadId}`;
     return file.kind === 'upload' ? `upload:${file.uploadId}` : file.kind === 'message' ? `message:${file.messageId}:${file.part}` : `link:${file.url}`;
   }
   function input(): DraftInput {
@@ -130,7 +133,7 @@
     {#if form.attachments.length}
       <ul class="compose-files" aria-label="Attached files">
         {#each form.attachments as file, index (`${attachmentKey(file)}:${index}`)}
-          <li><Paperclip size={15} /><span>{file.name}{file.kind === 'link' ? ' (Drive link)' : ''}</span><button type="button" class="icon" aria-label={`Remove ${file.name}`} disabled={pending} onclick={() => form.attachments.splice(index, 1)}><X size={16} /></button></li>
+          <li><Paperclip size={15} /><span>{file.name}{file.kind === 'link' ? ' (Drive link)' : file.kind === 'file_link' ? ' (download link)' : ''}</span><button type="button" class="icon" aria-label={`Remove ${file.name}`} disabled={pending} onclick={() => form.attachments.splice(index, 1)}><X size={16} /></button></li>
         {/each}
       </ul>
     {/if}

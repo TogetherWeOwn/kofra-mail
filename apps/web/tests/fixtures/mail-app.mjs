@@ -17,6 +17,35 @@ const { startMailHttpFixture } = await import(fixture.href);
 let backend;
 let contentHttp;
 
+const { DEPLOYMENT_LOCATION } = await import(fixture.href);
+const { locationFingerprint } = await import(new URL('../../../../packages/link-storage/src/location.ts', import.meta.url).href);
+
+// A file link (M3-13) sent from the demo mailbox, with a hostile file name and
+// sender name, released so its page is live on the content bridge's host.
+async function sendFileLink(fixture) {
+  const rlo = String.fromCodePoint(0x202e);
+  const name = `<img src=x onerror="window.pwned=1">${rlo}fdp.exe`;
+  const senderName = `<script>window.pwned=2</script>${rlo}Alex`;
+  const bytes = Uint8Array.from({ length: 300_000 }, (_, i) => (i * 7 + 3) & 0xff);
+  const mail = fixture.as('demo');
+  const { mailbox } = await mail.getSession();
+  await fixture.activatePrimary(mailbox.primaryAddress);
+  await fixture.directoryChange('INSERT OR REPLACE INTO mailbox_profiles (workspace_id, mailbox_id, display_name) VALUES (?, ?, ?)',
+    'w1', mailbox.id, senderName);
+  const key = `${DEPLOYMENT_LOCATION.prefix}ws/w1/${mailbox.id}/playwright`;
+  fixture.links.put('deployment', key, bytes);
+  const link = { location: { kind: 'deployment', id: 'links' }, key, fingerprint: await locationFingerprint(DEPLOYMENT_LOCATION) };
+  const draft = await fixture.links.control('seedDraft', [{ from: mailbox.primaryAddress, to: ['friend@example.net'],
+    links: [{ linkUploadId: 'playwright', name, size: bytes.byteLength, expiry: 30, link }] }], 'demo');
+  await mail.sendDraft(draft.id, { idempotencyKey: 'playwright-file-link', ifMatch: draft.revision });
+  await fixture.advance(10_000, 'all-mailboxes');
+  const [sent] = (await mail.listLinks({})).items;
+  if (sent?.state !== 'live') throw new Error('The fixture file link did not go live.');
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  return { path: new URL(sent.url).pathname, name, senderName, senderEmail: mailbox.primaryAddress, size: bytes.byteLength,
+    sha256: Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('') };
+}
+
 const scratch = await mkdtemp(join(tmpdir(), 'velmora-mail-e2e-'));
 /** @type {ViteDevServer | undefined} */
 let server;
@@ -72,7 +101,9 @@ try {
     if (!addr || typeof addr === 'string') throw new Error('Content fixture did not obtain a port.');
     realContent = { appOrigin, contentOrigin: `http://localhost:${addr.port}` };
   }
-  backend = await startMailHttpFixture({ demo: true, realContent, inlineCids });
+  const fileLinks = realContent && process.argv.includes('--file-links') ? { hosts: [new URL(realContent.contentOrigin).host] } : undefined;
+  backend = await startMailHttpFixture({ demo: true, realContent, inlineCids, ...(fileLinks && { send: true, fileLinks }) });
+  const fileLink = fileLinks ? await sendFileLink(backend) : undefined;
   process.env.MAIL_DEV_API_ORIGIN = backend.origin;
   process.env.MAIL_DEMO_CONTENT_ORIGIN = process.argv.includes('--plain') ? '' : backend.contentOrigin;
 
@@ -88,7 +119,7 @@ try {
       watch: { ignored: [fileURLToPath(new URL('../../.svelte-kit', import.meta.url)), '**/.svelte-kit/**'] },
     },
   });
-  if (process.send) process.send({ appOrigin, contentOrigin: backend.contentOrigin });
+  if (process.send) process.send({ appOrigin, contentOrigin: backend.contentOrigin, ...(fileLink && { fileLink }) });
   else console.info(appOrigin);
 } catch (cause) {
   await close();

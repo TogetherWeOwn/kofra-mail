@@ -61,6 +61,8 @@ const loopback = new Set(['localhost', '127.0.0.1', '[::1]']);
 const m3 = new Set<Operation>(['sendDraft', 'listSends', 'getSend', 'undoSend']);
 const uploads = new Set<Operation>(['createUpload', 'deleteUpload']);
 const drive = new Set<Operation>(['saveAttachmentToDrive', 'importFromDrive']);
+// Link uploads (M3-15b) are not served yet: features.fileLinks stays off.
+const linkUploads = new Set<Operation>(['createLinkUpload', 'getLinkUpload', 'putLinkPart', 'completeLinkUpload', 'deleteLinkUpload']);
 const matchers = (Object.entries(ROUTES) as [Operation, RouteSpec][]).map(([op, route]) => ({
   op, route, pattern: new RegExp(`^${API_PREFIX}${route.path.replace(/\{([A-Za-z]+)\}/g, '(?<$1>[^/]+)')}$`),
 }));
@@ -73,7 +75,7 @@ const jsonFields: Partial<Record<Operation, readonly string[]>> = {
   createDraft: ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'attachments', 'inReplyTo', 'forwardOf'],
   addDomain: ['name', 'kind', 'aliasOf'], createMailbox: ['primaryAddress', 'displayName', 'ownerUserId'],
   updateMailbox: ['displayName', 'ownerUserId'], createAlias: ['mailboxId', 'address', 'sendAs'],
-  rotateLinkLocationCredentials: ['read', 'write'],
+  rotateLinkLocationCredentials: ['read', 'write'], createLinkUpload: ['name', 'size'],
 };
 jsonFields.replaceDraft = jsonFields.createDraft;
 
@@ -194,7 +196,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
     if (route.access !== 'admin' && op !== 'getSession' && !mailbox) fail('forbidden');
     const sendEnabled = env.MAIL_SEND_ENABLED === 'on';
     if ((m3.has(op) && !sendEnabled) || (uploads.has(op) && env.MAIL_DRAFT_UPLOADS_ENABLED !== 'on')) fail('not_implemented');
-    if (drive.has(op)) fail('feature_unavailable');
+    if (drive.has(op) || linkUploads.has(op)) fail('feature_unavailable');
     const contentOrigin = env.MAIL_CONTENT_ENABLED === 'on' ? separateContentOrigin(env.MAIL_CONTENT_ORIGIN, url, true) : undefined;
     const content = contentOrigin ? env.MAIL_CONTENT : undefined;
     const contentUrl = op === 'getBodyUrl' || op === 'getAttachmentUrl';
@@ -259,7 +261,7 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
           user: { id: principal.userId, name: principal.name }, mailbox: mailbox ? { id: mailbox.id, primaryAddress: mailbox.primary_address } : undefined,
           workspace: { id: principal.workspaceId, role: principal.role }, csrfToken: principal.csrfToken,
           authTime: new Date(principal.authTime).toISOString(), limits: LIMITS,
-          features: { drive: false, htmlContent: Boolean(content), m3: sendEnabled },
+          features: { drive: false, htmlContent: Boolean(content), m3: sendEnabled, fileLinks: false },
           state: (result.body as { state: string }).state,
         };
         result = { body: session };

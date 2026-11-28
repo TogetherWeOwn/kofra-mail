@@ -7,6 +7,7 @@ import type { SendFence } from './mailbox-send-quota.ts';
 import { parseObjectKey } from './object-key.ts';
 import { isDeliveryId } from './outbox.ts';
 import { isSendMimeBoundary } from './send-mime.ts';
+import { validSendLinks } from './file-links.ts';
 
 // The one timer kind of a send (section 2.2), keyed by send id.
 export const SEND_DRIVE = 'send_drive';
@@ -17,7 +18,7 @@ export const DRIVE_BACKOFF_MAX_MS = 60 * 60_000;
 // Internal states; releasing and queued report as `sending`.
 export type SendRowState = 'pending' | 'releasing' | 'queued' | 'sending' | 'delayed' | 'sent' | 'partial' | 'failed' | 'cancelled';
 export const TERMINAL: readonly SendRowState[] = ['sent', 'partial', 'failed', 'cancelled'];
-export const SEND_FAILURES: readonly SendFailure[] = ['invalid_sender', 'message_too_large', 'delivery_error'];
+export const SEND_FAILURES: readonly SendFailure[] = ['invalid_sender', 'message_too_large', 'delivery_error', 'link_expired'];
 
 export type SendRow = {
   id: string; draftId: string; state: SendRowState; createdAt: number; undoUntil: number; holder: string;
@@ -219,7 +220,8 @@ export function checkSendRecord(record: SendRecord): void {
       keys.some(key => typeof key !== 'string' || !parseObjectKey(key)) || !Array.isArray(uploads) ||
       uploads.length > LIMITS.attachmentsPerMessage || uploads.some(id => !bounded(id, 64)) || !Array.isArray(recipients) ||
       !recipients.length || recipients.length > LIMITS.recipientsPerMessage || !recipients.every(value => validAddress(value, true)) ||
-      !Array.isArray(parts) || parts.length > LIMITS.attachmentsPerMessage || !parts.every(validPart)) {
+      !Array.isArray(parts) || parts.length > LIMITS.attachmentsPerMessage || !parts.every(validPart) ||
+      (r.links !== undefined && !validSendLinks(r.links))) {
     throw new Error('Invalid send record');
   }
 }

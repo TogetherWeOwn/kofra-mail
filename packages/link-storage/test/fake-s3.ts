@@ -27,6 +27,8 @@ export interface FakeS3Options {
   anonymousRefusal?: number;
   /** Keep every written version; a DELETE without `versionId` only adds a delete marker. */
   versioning?: boolean;
+  /** Extra headers on every object GET, as a hostile or careless provider might send. */
+  objectHeaders?: Record<string, string>;
 }
 
 export interface FakeCall { op: S3Op | 'unknown'; key: string; signedBy: string | null; status: number }
@@ -117,7 +119,20 @@ export function fakeS3(options: FakeS3Options) {
       case 'GetObject': {
         const value = objects.get(where.key);
         if (!value) return record(error('NoSuchKey', 404));
-        return record(new Response(request.method === 'HEAD' ? null : value, { status: 200 }));
+        const extra = options.objectHeaders ?? {};
+        // One byte range, as S3 serves it: 206 with Content-Range, or 416 past the end.
+        const range = /^bytes=(\d*)-(\d*)$/.exec(request.headers.get('range') ?? '');
+        if (range && (range[1] || range[2])) {
+          const size = value.byteLength;
+          const start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+          const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+          if (start >= size || end < start) return record(new Response(null, { status: 416, headers: { 'content-range': `bytes */${size}` } }));
+          const part = value.slice(start, end + 1);
+          return record(new Response(request.method === 'HEAD' ? null : part, { status: 206, headers: { ...extra,
+            'content-range': `bytes ${start}-${end}/${size}`, 'content-length': String(part.byteLength) } }));
+        }
+        return record(new Response(request.method === 'HEAD' ? null : value, { status: 200,
+          headers: { ...extra, 'content-length': String(value.byteLength) } }));
       }
       case 'DeleteObject': {
         objects.delete(where.key);

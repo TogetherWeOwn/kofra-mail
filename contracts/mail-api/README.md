@@ -141,6 +141,11 @@ Errors are RFC 9457 `application/problem+json`, in the same shape as the Kofra A
 | `createUpload` | `POST /uploads?name=` | Idem; the raw file is the body |
 | `deleteUpload` | `DELETE /uploads/{uploadId}` | |
 | `importFromDrive` | `POST /drive/imports` | Idem; `{ pickId, mode }` |
+| `createLinkUpload`, `getLinkUpload` | `POST /link-uploads`, `GET /link-uploads/{uploadId}` | Create is Idem; 501 until `features.fileLinks` (section 8.8) |
+| `putLinkPart` | `PUT /link-uploads/{uploadId}/parts/{partNumber}` | The raw part is the body |
+| `completeLinkUpload`, `deleteLinkUpload` | `POST /link-uploads/{uploadId}/complete`, `DELETE /link-uploads/{uploadId}` | |
+| `listLinks` | `GET /links` | The mailbox's file links, newest first |
+| `revokeLink`, `deleteLink` | `POST /links/{linkId}/revoke`, `DELETE /links/{linkId}` | Section 8.8 |
 | `listDomains`, `addDomain` | `/admin/domains` | Admin; add is Idem and needs re-authentication |
 | `listMailboxes`, `createMailbox`, `updateMailbox` | `/admin/mailboxes`, `/admin/mailboxes/{mailboxId}` | Admin; writes need re-authentication |
 | `createAlias`, `deleteAlias` | `POST /admin/aliases`, `DELETE /admin/aliases/{address}` | Admin; both need re-authentication |
@@ -228,7 +233,7 @@ The M2 admin screen's group form stays demo-only until groups are designed.
 - `upload`: an unexpired upload of this mailbox.
 - `message`: an attachment part of a message in this mailbox (forwarding). Its name is the one the index stored: names from third-party mail and Drive have control characters, `/` and `\` removed when indexed (`indexedAttachmentName`), and the outbound MIME encodes every name that is not a plain token (RFC 2231). The draft holds a reference on that part, so Trash expiry of the source message cannot remove it before the draft is sent or deleted.
 - `link`: a credential-free `https:` URL; it is sent as a link in the body and does not count toward `attachmentsPerMessage`.
-- **Deferred: revocable file links.** A link to an upload that outside recipients can open (`/f/<token>`, expiring and revocable one by one) is not in version 1; it is a planned M3 package. Until then a draft whose encoded size exceeds `outboundMessageBytes` is refused at send with `message_too_large`, and the client offers to remove files or, when `features.drive` is on, to share them as a Drive link (workspace members only).
+- `file_link`: a completed link upload of this mailbox, sent as a revocable download link (section 8.8). It does not count toward `attachmentsPerMessage`; a draft has at most `fileLinksPerMessage` of them. A draft whose encoded size exceeds `outboundMessageBytes` is refused at send with `message_too_large`; the client then offers to send large files as file links (when `features.fileLinks` is on), to remove them or, when `features.drive` is on, to share them as a Drive link (workspace members only).
 - An upload referred to by a draft does not expire.
 
 **`sendDraft` checks** (each a 422 code, except the subject length, 400 `invalid_request`):
@@ -319,10 +324,21 @@ File links (outbound plan, M3-13 and M3-15) keep their files in an S3-compatible
 - **The save check** runs on create and on rotation, before anything is stored. It requires `https:` on port 443 and a DNS name that is not an IP literal or one of the deployment's own or private-use domains. It then runs HeadBucket, a 1-byte probe put, get and delete, a probe multipart upload (create, part, list parts, complete, delete) and a second multipart upload that it aborts. The write key must also read the probe (a write-signed HEAD). An anonymous read and an anonymous list of the probe must both be refused (any 4xx except 408 and 429, which fail the check with `bucket` because a timeout or rate limit says nothing about access), so a bucket that is public as a whole on its S3 endpoint fails the check. Providers that publish buckets elsewhere are not covered: Cloudflare R2 makes a bucket public only through r2.dev or a custom domain, never the S3 endpoint, so the check cannot detect a public R2 bucket. The check sees only its own probe key: it cannot detect a policy that makes other keys or prefixes anonymously readable, so the admin must keep every key of the location private. The read key must read the probe and be refused a write and a delete, and must not be the write key. In a versioned bucket the probes are deleted by version id. A redirect is never followed. A failure answers 422 `storage_check_failed` with one fixed `reason` (`STORAGE_CHECK_REASONS` in `src/errors.ts` lists them) and nothing from the provider's answer.
 - **Deleting** a location that does not exist answers 204 (section 5). For an existing one:
   - 409 `location_in_use` while any live link, pending delete, draft attachment or unfinished upload uses it, and 204 once nothing does;
-  - 501 `feature_unavailable` while the deployment cannot yet tell what uses a location (until file links, M3-13 and M3-15b, are deployed): the location is never deleted on a guess;
+  - 501 `feature_unavailable` while the deployment cannot tell what uses a location (no usage check is bound): the location is never deleted on a guess;
   - 503 `unavailable` with `Retry-After` while another delete of it is still checking its usage; retry to learn the outcome.
 - **While a delete checks,** the location is listed with `state: 'deleting'`. Its links keep working, and new links wait with 503 instead of using another location. If the delete is refused or does not finish, the location is `active` again within a minute.
 - **Not configured:** a deployment without the credential encryption key answers 501 `feature_unavailable` to create and rotate.
+
+### 8.8 File links
+
+A file too large to attach can be sent as a link (outbound plan, M3-13 and M3-15). Each recipient gets `https://<link host>/f/<token>`: a download page on a host separate from the mail app and the content origin, with the file kept in the workspace's link storage (section 8.7).
+
+- **Uploads.** `createLinkUpload` (`{ name, size }`, Idem) starts an upload of at most `linkFileBytes`; the client sends each part with `putLinkPart` (every part `linkPartBytes`, the last the remainder) and then `completeLinkUpload`. `getLinkUpload` reports the upload for a resumed client, and `deleteLinkUpload` abandons it. Only a `complete` upload can be attached. While `Session.features.fileLinks` is off, these routes answer 501 `feature_unavailable`.
+- **Attaching.** A draft refers to a completed upload with `{ kind: 'file_link', linkUploadId, expiry }`. `expiry` is a number of days (7, 30 or 90 are offered; any whole number from 1 to `linkExpiryMaxDays` is accepted) or `'never'`, and defaults to `linkExpiryDefaultDays`. Any other expiry, or more than `fileLinksPerMessage` file links, answers 400 `invalid_request`; an upload that is not this mailbox's, or not complete, answers 404 `not_found`. A `file_link` already on the draft keeps its upload when the draft is saved again; only its expiry may change.
+- **At send.** `sendDraft` fixes each link: a random 128-bit token on the deployment's link host, the file's name and size, and `expiresAt`, the message's `Date` plus the chosen days (UTC), so the date printed in the message and the link's real expiry agree. A deployment without a link host answers 501 `feature_unavailable` to a draft with file links. Below the body the message lists one line per link: its name, size, URL and `until <date> UTC` or `no expiry date`.
+- **When a link works.** From the release of the message (never during its undo window, and never after an undo) until the sender revokes or deletes it, or until `expiresAt`. Every link must have at least an hour left when the message is handed to the provider, and when it is handed to a recipient in the same workspace; otherwise those recipients end `failed` with reason `link_expired` and nothing is sent to them. A message already handed on keeps its links as they are.
+- **Managing links.** `listLinks` pages the mailbox's links, newest first, each `pending` (not released yet), `live`, `expired` or `revoked`. `revokeLink` stops a link at once (a download already streaming may finish) and answers once the revocation is durable; until then it answers 503 `unavailable` with `Retry-After`, and the client retries. `deleteLink` revokes the link and removes it from the list; like every DELETE it answers 204 for an unknown link.
+- **The download page** shows the file's name and size, the sender, until when it is available, a Download button and "Report abuse". It runs no script and shows every name as text. Every request, after a per-IP flood limit, checks that the link is live; an unknown, revoked or expired link answers the same 404, so a token reveals nothing. Each link serves at most 100 times its size per hour and 1,000 times its size in total (a Range request counts only the bytes it asks for) and answers 429 past either. Downloads are always `application/octet-stream` attachments; files are neither previewed nor scanned for viruses. Reports reach the operator, who can revoke a link.
 
 ## 9. Live updates
 
@@ -353,6 +369,9 @@ File links (outbound plan, M3-13 and M3-15) keep their files in an S3-compatible
 | Message text in a response | 64 KiB | contract; the full text is on the content origin |
 | Idempotency keys / unattached uploads kept | 24 h / 24 h | contract |
 | Content URL lifetime | 5 minutes | content-origin design |
+| File links per message | 32 | contract |
+| File link expiry | 7, 30 (default) or 90 days offered; 1 to 3,650 days or never accepted | product |
+| File link size / upload part | 2 GiB / 16 MiB | product; outbound plan, M3-15 |
 | Remote image | 5 MiB, at most 3 redirects | content-origin design |
 | Spam and Trash retention | 30 days | product |
 
@@ -456,6 +475,8 @@ The harness (`src/harness.ts`) provides sessions for six principals in two works
     - An address containing `,`, `<` or `>` answers `invalid_recipients` at send, and a long ASCII display name with `"`, `,` and `<…>` stays one recipient.
 22. **Owner change before release:** a send made just before an admin moves the mailbox to another member ends `failed` with `invalid_sender` for each recipient, with no sent copy.
 23. **State:** the routes with `state: true` report the same value at the same moment; a delivery, a label, a thread update, a draft and a send each move it.
+24. **M3 gate** (implementations without M3 only): sends, undo and uploads answer `not_implemented`, and so does a draft with any attachment, a `file_link` included.
+25. **File links:** while `features.fileLinks` is off, every link upload route answers `feature_unavailable`; `listLinks` is an empty page that validates `limit` and `cursor`; `revokeLink` of an unknown link answers `not_found` and `deleteLink` answers 204. A draft's `file_link` to an unknown upload answers `not_found`, an invalid expiry (0, more than `linkExpiryMaxDays`, a fraction, another string, `null`) and more than `fileLinksPerMessage` file links answer `invalid_request`.
 
 ## 12. Moving the M2 UI to this contract
 

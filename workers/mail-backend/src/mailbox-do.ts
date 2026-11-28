@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Operation } from '../../../contracts/mail-api/src/service.ts';
 import { MailboxApi, isIdempotentCreate, mailApiMutation, type MailboxApiOptions, type MailboxApiResult, type MailContentResult, type PreparedApiKey } from './mailbox-api.ts';
 import { checkReplayInput, createQuery, readMailboxJson, type HttpMailboxWrite } from './mailbox-http-write.ts';
-import { ApiFault, fail, isId } from './mailbox-api-input.ts';
+import { ApiFault, canonical, cursorPosition, fail, isId, makeCursor, pageLimit, utf8 } from './mailbox-api-input.ts';
 import { apiKey, clearApiKey, fingerprintOf, ownsApiKey, replayApiKey, reserveApiKey, resultEvent, scheduleResult } from './mailbox-api-idempotency.ts';
 import { idemExpiry, uploadExpiry } from './mailbox-expiry.ts';
 import { IDEM_EXPIRY, IN_PROGRESS_TTL_MS, UPLOAD_EXPIRY, UPLOAD_TTL_MS, readUpload, uploadMediaType, uploadName, wireUpload, type UploadBody } from './mailbox-upload.ts';
@@ -33,6 +33,9 @@ import {
 import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
 import { HANDOFF_CALL_MS, type HandoffPorts, type HandoffStep } from './internal-handoff.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
+import { isLinkId, linkTokenHash } from './file-links.ts';
+import { chargeLink, fileLink, linkBudget, linkPage, linkStateEvent, linkTarget, liveLink, type ChargeAnswer, type LinkTarget } from './mailbox-links.ts';
+import { sha256 } from './bytes.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
 
@@ -42,6 +45,7 @@ import { enabled, mailboxName, type Env } from './worker.ts';
 export type MailboxDeliveryResult = 'indexed' | 'deferred' | 'rejected';
 
 const HELD_RECHECK_MS = 15 * 60_000;
+const LINK_UPLOAD_OPERATIONS = new Set<Operation>(['createLinkUpload', 'getLinkUpload', 'putLinkPart', 'completeLinkUpload', 'deleteLinkUpload']);
 type TimerClaim = TimerRow & { token: string; until: number; retained?: boolean };
 const thenable = (value: unknown): value is PromiseLike<unknown> => typeof (value as { then?: unknown } | null)?.then === 'function';
 const ALERT_COOLDOWN_MS = 24 * 60 * 60_000;
@@ -169,8 +173,13 @@ export class Mailbox extends DurableObject<Env> {
       alert: code => this.sendOperatorEvent(code),
       checkpoint: step => this.sendCheckpoint(step),
       get handoff() { return self.handoffPorts(); },
+      get linkRoutes() { return self.linkRouteDatabase(); },
+      clock: () => this.mailApiNow(),
     };
   }
+
+  // The database release step 4b writes file links' routing rows to (M3-13); a test seam for an outage.
+  protected linkRouteDatabase(): D1Database { return this.env.DIRECTORY; }
 
   // The internal handoff and the pipeline's expansion (M3-8), in the directory database.
   protected handoffPorts(): HandoffPorts {
@@ -436,7 +445,7 @@ export class Mailbox extends DurableObject<Env> {
       const timers = this.timerTable();
       try {
         const api = new SendApi(index, this.ctx.storage.sql, { ...scope, holderScope: this.ctx.id.toString() }, life.incarnation, timers,
-          this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table));
+          this.sendMime, this.env.DIRECTORY, () => this.mailApiNow(), table => this.journalDue(table), this.env.LINK_HOST);
         if (operation === 'getSend' || operation === 'listSends') {
           const body = operation === 'getSend' ? api.getSend(params) : await api.listSends(params, options.cursorScope);
           // A send's consumer state is reported only once published (section 2.1), like its terminal state.
@@ -475,6 +484,103 @@ export class Mailbox extends DurableObject<Env> {
       answered = answer();
     }
     return { error: { code: 'idempotency_in_progress', retryAfterSeconds: 1 } };
+  }
+
+  // The sender's file links (M3-13): a page of them, or a revocation or deletion.
+  // A change answers only after a publish covers it (the publish barrier), so a
+  // restore can never bring back a link its sender was told is revoked.
+  private async linkApi(scope: Scope, operation: 'listLinks' | 'revokeLink' | 'deleteLink', params: Record<string, string>,
+    options: MailboxApiOptions): Promise<MailboxApiResult> {
+    const index = this.index(scope.workspaceId);
+    const sql = this.ctx.storage.sql;
+    const outcome = await this.work.run(async (): Promise<{ result: MailboxApiResult } | { seq: number }> => {
+      if (!await this.ready(index, scope)) return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const life = index.lifecycle<Lifecycle>();
+      if (life?.state !== 'ready') return fail('mailbox_restoring', { retryAfterSeconds: 1 });
+      const now = this.mailApiNow();
+      if (operation === 'listLinks') {
+        const { cursor, ...query } = params;
+        const limit = pageLimit(query.limit);
+        const pageScope = await sha256(utf8(canonical([scope.workspaceId, scope.mailboxId, life.incarnation, options.cursorScope ?? null, 'listLinks', query])));
+        const items = linkPage(sql, limit + 1, now, cursorPosition(cursor, pageScope));
+        const more = items.length > limit;
+        if (more) items.pop();
+        const last = items.at(-1);
+        return { result: { body: { items, nextCursor: more && last ? makeCursor(pageScope, [Date.parse(last.createdAt), last.id]) : null } } };
+      }
+      await this.armFor(SETTINGS_FLUSH_MS);
+      let seq: number | undefined;
+      try { seq = this.commitLinkState(index, params.linkId ?? '', now, operation === 'deleteLink'); }
+      finally { await this.rearm(); }
+      if (seq === undefined) return operation === 'deleteLink' ? { result: { status: 204 } } : fail('not_found');
+      return { seq };
+    });
+    if ('result' in outcome) return outcome.result;
+    if (!await this.publishThrough(outcome.seq)) return { error: { code: 'unavailable', retryAfterSeconds: 1 } };
+    if (operation === 'deleteLink') return { status: 204 };
+    const body = await this.work.run(async () => fileLink(sql, params.linkId ?? '', this.mailApiNow()));
+    return body ? { body } : { error: { code: 'not_found' } };
+  }
+
+  // In the work lane: journals a link's revocation (or deletion) and returns the
+  // seq a publish must cover before the answer; undefined when the link is not
+  // this mailbox's to change.
+  private commitLinkState(index: MailboxIndex, linkId: string, now: number, deleting: boolean): number | undefined {
+    const sql = this.ctx.storage.sql;
+    const event = linkStateEvent(sql, linkId, now, deleting);
+    if (event === undefined) return undefined;
+    // Already revoked: the answer still waits for the publish that covers it.
+    if (event === null) return index.journal.revision();
+    const timers = this.timerTable();
+    try {
+      index.changeMany([event], () => this.journalDue(timers));
+    } finally { timers.revoke(); }
+    return index.journal.revision();
+  }
+
+  // mail-content's view of a link (M3-13), through ContentLookup only: whether
+  // it is live, and what to show and serve. `tokenHash` must match the frozen
+  // token, so a routing row can never open another link. It never initializes
+  // or restores a mailbox; one that is not ready answers `unavailable`.
+  async fileLinkTarget(workspaceId: string, mailboxId: string, linkId: string, tokenHash: string): Promise<LinkTarget | { status: 'gone' | 'unavailable' }> {
+    if (!enabled(this.env) || this.env.MAIL_CONTENT_ENABLED !== 'on' || !this.scoped({ workspaceId, mailboxId }) || !isLinkId(linkId)) {
+      return { status: 'gone' };
+    }
+    if (this.lifecycleState() !== 'ready') return { status: 'unavailable' };
+    const sql = this.ctx.storage.sql;
+    const token = liveLink(sql, linkId, this.mailApiNow())?.link.token;
+    if (!token || await linkTokenHash(token) !== tokenHash) return { status: 'gone' };
+    // Read again after the hash: a revocation that committed meanwhile is seen.
+    if (this.lifecycleState() !== 'ready') return { status: 'unavailable' };
+    const now = this.mailApiNow();
+    const live = liveLink(sql, linkId, now);
+    return live ? linkTarget(live, sql, now, linkBudget(this.env)) : { status: 'gone' };
+  }
+
+  // Charges a download response's bytes to a live link (M3-13): one synchronous
+  // check-and-increment, never interleaved with another charge.
+  async chargeFileLink(workspaceId: string, mailboxId: string, linkId: string, bytes: number): Promise<ChargeAnswer | 'unavailable'> {
+    if (!enabled(this.env) || this.env.MAIL_CONTENT_ENABLED !== 'on' || !this.scoped({ workspaceId, mailboxId }) || !isLinkId(linkId) ||
+        !Number.isSafeInteger(bytes) || bytes < 0) return 'gone';
+    if (this.lifecycleState() !== 'ready') return 'unavailable';
+    return chargeLink(this.ctx.storage.sql, linkId, bytes, this.mailApiNow(), linkBudget(this.env));
+  }
+
+  // The operator's revocation of one link (M3-13), found by id or token hash in
+  // the routing table; answered after a publish covers it.
+  async operatorRevokeLink(workspaceId: string, mailboxId: string, linkId: string): Promise<'revoked' | 'not_found' | 'retry'> {
+    const scope = { workspaceId, mailboxId };
+    this.verifyScope(scope);
+    const index = this.index(workspaceId);
+    const seq = await this.work.run(async () => {
+      if (!await this.ready(index, scope) || index.lifecycle<Lifecycle>()?.state !== 'ready') return 'retry' as const;
+      await this.armFor(SETTINGS_FLUSH_MS);
+      try { return this.commitLinkState(index, linkId, this.mailApiNow(), false); }
+      finally { await this.rearm(); }
+    });
+    if (seq === 'retry') return 'retry';
+    if (seq === undefined) return 'not_found';
+    return await this.publishThrough(seq) ? 'revoked' : 'retry';
   }
 
   // Registers a timer kind. Call from the constructor.
@@ -595,6 +701,9 @@ export class Mailbox extends DurableObject<Env> {
         if (this.env.MAIL_SEND_ENABLED !== 'on') return { error: { code: 'not_implemented' } };
         return await this.sendApi(scope, operation, params, options);
       }
+      // File links (M3-13); link uploads are M3-15b's and not served yet.
+      if (operation === 'listLinks' || operation === 'revokeLink' || operation === 'deleteLink') return await this.linkApi(scope, operation, params, options);
+      if (LINK_UPLOAD_OPERATIONS.has(operation)) return { error: { code: 'feature_unavailable' } };
       const http = options.httpWrite;
       if (operation === 'createUpload') return await this.createUpload(scope, params, http ?? input as UploadBody, options.idempotencyKey, now, http);
       if (http && (operation === 'createDraft' || operation === 'createLabel')) {

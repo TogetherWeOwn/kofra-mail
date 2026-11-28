@@ -12,6 +12,9 @@
     "MAIL_SWEEP_ENABLED": "off",
     "MAIL_SEND_ENABLED": "off",
     "MAIL_ENVIRONMENT": "production",
+    // File links (M3-13): the host new links are made on. A subdomain of the product's domain for now,
+    // with LINK_HOST_ALLOW_SHARED_DOMAIN=1 in the deploy check; move to a dedicated domain later.
+    "LINK_HOST": "files.riaklo.com",
     "DELIVERY_QUEUE_NAME": "mail-deliver",
     "DEAD_LETTER_QUEUE_NAME": "mail-deliver-dlq"
   },

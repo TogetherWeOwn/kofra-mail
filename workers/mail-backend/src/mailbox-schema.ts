@@ -48,6 +48,22 @@ CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, sinc
 -- and its stall clock's start (the send's journalled release time), which no
 -- external activity or restore moves.
 CREATE TABLE IF NOT EXISTS mailbox_send_handoffs (send_id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, since INTEGER NOT NULL);
+-- File links (M3-13). mailbox_send_links is derived from each send's frozen
+-- record (one row per link, written with the send) plus the journalled
+-- link_state events (revoked and deleted times), and it is in snapshots.
+-- mailbox_link_routes is local: the sends whose routing rows release step 4b
+-- wrote; a restore clears it and the next run repeats the idempotent insert.
+-- mailbox_link_counters is local, never journalled: the bytes each link served
+-- this hour and in total. Losing it to a restore is acceptable.
+CREATE TABLE IF NOT EXISTS mailbox_send_links (
+  link_id TEXT PRIMARY KEY, send_id TEXT NOT NULL REFERENCES mailbox_sends(id) ON DELETE CASCADE, idx INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, revoked_at INTEGER, deleted_at INTEGER, UNIQUE (send_id, idx)
+);
+CREATE INDEX IF NOT EXISTS mailbox_send_link_page ON mailbox_send_links(created_at DESC, link_id DESC) WHERE deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS mailbox_link_routes (send_id TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS mailbox_link_counters (
+  link_id TEXT PRIMARY KEY, hour INTEGER NOT NULL, hour_bytes INTEGER NOT NULL, total_bytes INTEGER NOT NULL
+);
 -- The consumer's side of the state machine (section 2.4, M3-5), non-derived
 -- like the ledger. mailbox_send_dispatch holds a send's attempt counter, its
 -- live lease (fence = recovery epoch and attempt), the next attempt time, the

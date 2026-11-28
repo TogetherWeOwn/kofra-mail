@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
+import { LIMITS as limits, MailApiError, ROUTES, VIEWS, hasHeaderControl, indexedAttachmentName, isLinkExpiry, isSafeMessageId, problem, threadingHeaders } from '@kofra/mail-contract';
 import type {
   Address, AddressInput, AdminMailbox, Alias, Conditional, ConformanceHarness, Domain, Draft, DraftAttachment,
-  DraftInput, FieldError, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
+  DraftInput, FieldError, FileLink, Folder, Id, Idempotent, Identity, Label, MailErrorCode, MailService, Member,
   Message, Operation, Page, Principal, Send, Settings, TestMessage, ThreadingHeaders, ThreadSummary, Upload, View,
 } from '@kofra/mail-contract';
 
@@ -70,7 +70,7 @@ function outboundMimeBytes(draft: Draft, from: Address, threading: ThreadingHead
   const fields = foldedHeaderFields(draft, from, threading, '<demo-00000000@mail.example>', '2026-11-22T12:00:00Z');
   const lines = Object.entries(fields).map(([name, value]) => `${headerName(name)}: ${value}`);
   let size = bytes(`${lines.join('\r\n')}\r\n`);
-  const files = draft.attachments.filter((attachment) => attachment.kind !== 'link');
+  const files = draft.attachments.filter((attachment) => attachment.kind !== 'link' && attachment.kind !== 'file_link');
   const links = draft.attachments.flatMap((attachment) => attachment.kind === 'link' ? [`${attachment.name}: ${attachment.url}`] : []);
   const text = [draft.body, ...links].join('\r\n');
   const bodySize = bytes('Content-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n') + base64MimeBytes(bytes(text));
@@ -449,8 +449,11 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
     if (input.to.length + input.cc.length + input.bcc.length > limits.recipientsPerMessage) {
       fail('too_many_recipients', { limit: limits.recipientsPerMessage });
     }
-    if (input.attachments.filter((attachment) => attachment?.kind !== 'link').length > limits.attachmentsPerMessage) {
+    if (input.attachments.filter((attachment) => attachment?.kind !== 'link' && attachment?.kind !== 'file_link').length > limits.attachmentsPerMessage) {
       fail('too_many_attachments', { limit: limits.attachmentsPerMessage });
+    }
+    if (input.attachments.filter((attachment) => attachment?.kind === 'file_link').length > limits.fileLinksPerMessage) {
+      invalid('/attachments', 'too_many');
     }
   }
   function makeDraft(box: Mailbox, draftId: Id, input: DraftInput, previous?: Draft): Draft {
@@ -502,6 +505,13 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           if (typeof ref.name !== 'string' || /\p{Cc}/u.test(ref.name)) invalid(`${field}/name`);
           if (bytes(ref.name) > limits.linkNameBytes) invalid(`${field}/name`, 'too_long');
           return { kind: 'link', url: ref.url, name: ref.name };
+        }
+        case 'file_link': {
+          fields(ref, ['kind', 'linkUploadId', 'expiry']);
+          if (ref.expiry !== undefined && !isLinkExpiry(ref.expiry, limits)) invalid(`${field}/expiry`);
+          if (typeof ref.linkUploadId !== 'string') invalid(`${field}/linkUploadId`);
+          // The fake has no link storage (features.fileLinks is off): no link upload exists.
+          return need<DraftAttachment>(undefined);
         }
         default: return invalid(`${field}/kind`);
       }
@@ -607,7 +617,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       from, to: draft.to.map(address), cc: draft.cc.map(address), bcc: draft.bcc.map(address), date, receivedAt: date, subject: draft.subject,
       text: [draft.body, ...draft.attachments.flatMap((a) => a.kind === 'link' ? [`${a.name}: ${a.url}`] : [])].join('\n'),
       hasHtml: false, remoteImages: false, size,
-      attachments: draft.attachments.flatMap((a, i) => a.kind === 'link' ? [] : [{ part: i + 1, name: a.name, type: a.type, size: a.size, inline: false }]),
+      attachments: draft.attachments.flatMap((a, i) => a.kind === 'link' || a.kind === 'file_link' ? [] : [{ part: i + 1, name: a.name, type: a.type, size: a.size, inline: false }]),
       verdict: { level: 'none', reasons: [] }, send: { id: send.id, state: 'sent' },
     }, {
       messageId: `<${send.id}@mail.example>`, references,
@@ -710,7 +720,7 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
           user: { id: user.id, name: user.name },
           ...(box && { mailbox: { id: box.directory.id, primaryAddress: box.directory.primaryAddress } }),
           workspace: { id: workspace.id, role: admin ? 'admin' : 'member' },
-          csrfToken, authTime: iso(authTime), limits, features: { drive, htmlContent: true }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
+          csrfToken, authTime: iso(authTime), limits, features: { drive, htmlContent: true, fileLinks: false }, state: box ? state(box) : `${workspace.id}-no-mailbox`,
         };
       },
       async listViews() {
@@ -1085,6 +1095,19 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
       },
       // The fake has no link storage: no deployment config and no save check to run.
       async listLinkLocations() { return { deployment: false, items: [] }; },
+      // No link storage in the fake: uploads are unavailable and no link exists.
+      async createLinkUpload() { return fail('feature_unavailable'); },
+      async getLinkUpload() { return fail('feature_unavailable'); },
+      async putLinkPart() { return fail('feature_unavailable'); },
+      async completeLinkUpload() { return fail('feature_unavailable'); },
+      async deleteLinkUpload() { return fail('feature_unavailable'); },
+      async listLinks(query) {
+        const box = mailbox();
+        fields(query, ROUTES.listLinks.query);
+        return page<FileLink>([], box.directory.id, 'listLinks', query, (link) => [link.createdAt, link.id], byTime);
+      },
+      async revokeLink() { mailbox(); return fail('not_found'); },
+      async deleteLink() { mailbox(); },
       async createLinkLocation() { return fail('feature_unavailable'); },
       async rotateLinkLocationCredentials() { return fail('feature_unavailable'); },
       async deleteLinkLocation() {},

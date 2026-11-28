@@ -2,7 +2,8 @@ import { authVerdict, AUTH_VERDICT, INTERNAL_VERDICT } from './auth-verdict.ts';
 import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
-import { MailJournal, type JournalEvent, type JournalRow, type SendRecipientKind, type SentCopy } from './mail-journal.ts';
+import { MailJournal, type JournalEvent, type JournalRow, type SendRecipientKind, type SendRecord, type SentCopy } from './mail-journal.ts';
+import { isLinkId } from './file-links.ts';
 import {
   checkDispatch, checkFence, checkKinds, checkMark, checkReleaseEntry, checkSendRecord, epochMs, LEDGER_STATES, SEND_FAILURES, sendRow, sentCopyId,
   TERMINAL, validReason, validSendId,
@@ -693,6 +694,7 @@ export class MailboxIndex {
           VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, 0)`, send.id, send.draftId, send.createdAt, send.undoUntil, send.draft.holder,
         JSON.stringify(send), this.journal.revision() + 1);
         for (const id of new Set(send.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);
+        this.insertSendLinks(send);
         // The send keeps the revision, its objects and their pending
         // confirmations: deleting the draft row releases nothing (section 2.7).
         // A draft marked unusable (live sendDraft refuses one; a restore can mark it
@@ -776,6 +778,17 @@ export class MailboxIndex {
         this.sql.exec('UPDATE mailbox_sends SET undo_until = ? WHERE id = ?', event.undoUntil, row.id);
         break;
       }
+      case 'link_state': {
+        // A revocation, or a deletion (which also revokes), of one link of a send; the first time of each stays.
+        const { sendId, linkId, revokedAt, deletedAt } = event;
+        if (!validSendId(sendId) || !isLinkId(linkId) || !epochMs(revokedAt) || (deletedAt !== undefined && !epochMs(deletedAt))) {
+          throw new Error('Invalid link state');
+        }
+        const updated = this.sql.exec(`UPDATE mailbox_send_links SET revoked_at = coalesce(revoked_at, ?), deleted_at = coalesce(deleted_at, ?)
+          WHERE link_id = ? AND send_id = ? RETURNING link_id`, revokedAt, deletedAt ?? null, linkId, sendId).toArray();
+        if (updated.length !== 1) throw new Error('Invalid link state');
+        break;
+      }
       case 'send_progress': {
         const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
         const final = event.state === 'sent' || event.state === 'partial' || event.state === 'failed';
@@ -827,6 +840,13 @@ export class MailboxIndex {
         break;
       }
       default: throw new Error('Unexpected journal event');
+    }
+  }
+
+  // A send's link rows, derived from its frozen record (M3-13).
+  private insertSendLinks(send: SendRecord): void {
+    for (const [idx, link] of (send.links ?? []).entries()) {
+      this.sql.exec('INSERT INTO mailbox_send_links (link_id, send_id, idx, created_at) VALUES (?, ?, ?, ?)', link.id, send.id, idx, send.createdAt);
     }
   }
 
@@ -930,6 +950,9 @@ export class MailboxIndex {
         INSERT INTO backup_capture(kind, value)
         SELECT 'send_release', json_object('sendId', send_id, 'epoch', epoch, 'attempt', attempt) FROM mailbox_send_release_list;
         INSERT INTO backup_capture(kind, value)
+        SELECT 'link_state', json_object('sendId', send_id, 'linkId', link_id, 'revokedAt', revoked_at, 'deletedAt', deleted_at)
+        FROM mailbox_send_links WHERE revoked_at IS NOT NULL;
+        INSERT INTO backup_capture(kind, value)
         SELECT 'pending_release', json_object('seq', seq, 'key', object_key, 'holder', holder) FROM mailbox_pending_releases;
         INSERT INTO backup_capture(kind, value)
         SELECT 'pending_confirmation', json_object('seq', seq, 'key', object_key, 'holder', holder, 'publishedAt', published_at)
@@ -971,6 +994,7 @@ export class MailboxIndex {
       DELETE FROM mailbox_send_marks; DELETE FROM mailbox_send_fences; DELETE FROM mailbox_send_release_list; DELETE FROM mailbox_send_dispatch;
       DELETE FROM mailbox_send_stalls; DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
       DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches; DELETE FROM mailbox_send_handoffs;
+      DELETE FROM mailbox_send_links; DELETE FROM mailbox_link_routes;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
     this.sql.exec('DELETE FROM timers WHERE kind <> ?', JOURNAL_FLUSH);
@@ -1025,6 +1049,7 @@ export class MailboxIndex {
         terminal_seq, message_id, reason, finish_pending, raw_key, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, send.id,
         send.draftId, send.state, send.createdAt, send.undoUntil, send.holder, JSON.stringify(send.record), send.createdSeq, send.releaseSeq,
         send.queuedSeq, send.terminalSeq, send.messageId, send.reason, send.finishPending, send.rawKey ?? null, send.releasedAt ?? null);
+      this.insertSendLinks(send.record);
       const finished = send.finishPending === 0 && TERMINAL.includes(send.state as never);
       if (!finished && send.state !== 'cancelled') {
         for (const id of new Set(send.record.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);
@@ -1037,6 +1062,10 @@ export class MailboxIndex {
       this.sql.exec('INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, ?, ?)', entry.sendId, entry.idx, entry.kind, entry.state, entry.reason);
     } else if (row.kind === 'send_dispatch' || row.kind === 'send_fence' || row.kind === 'send_mark' || row.kind === 'send_release') {
       this.restoreSendDispatch(row.kind, value);
+    } else if (row.kind === 'link_state') {
+      const entry = (value ?? {}) as { sendId?: unknown; linkId?: unknown; revokedAt?: unknown; deletedAt?: unknown };
+      this.apply({ type: 'link_state', sendId: entry.sendId as string, linkId: entry.linkId as string, revokedAt: entry.revokedAt as number,
+        ...(entry.deletedAt !== null && entry.deletedAt !== undefined && { deletedAt: entry.deletedAt as number }) });
     } else if (row.kind === 'pending_release') {
       const entry = value as { seq: number; key: string; holder: string };
       this.enqueueRelease(entry.seq, entry.key, entry.holder);

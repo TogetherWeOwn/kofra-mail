@@ -39,6 +39,8 @@ export interface Features {
   htmlContent: boolean;
   /** Outbound sends, undo and draft attachments. Omitted by older implementations. */
   m3?: boolean;
+  /** Link uploads and `file_link` attachments (section 8.8). Omitted by older implementations. */
+  fileLinks?: boolean;
 }
 
 // ---------------------------------------------------------------- views, threads, messages
@@ -213,15 +215,28 @@ export interface Upload {
   expiresAt: UTCDate;
 }
 
+/**
+ * How long a file link stays live after the message's `Date`: a number of whole
+ * days (7, 30 or 90 are the offered choices; any value from 1 to
+ * `limits.linkExpiryMaxDays` is accepted), or `'never'` (live until revoked or deleted).
+ */
+export type LinkExpiry = number | 'never';
+
 export type DraftAttachmentRef =
   | { kind: 'upload'; uploadId: Id }
   | { kind: 'message'; messageId: Id; part: number }
-  | { kind: 'link'; url: string; name: string };
+  | { kind: 'link'; url: string; name: string }
+  /**
+   * A completed link upload (section 8.8), sent as a revocable download link
+   * instead of an attached file. `expiry` defaults to `limits.linkExpiryDefaultDays`.
+   */
+  | { kind: 'file_link'; linkUploadId: Id; expiry?: LinkExpiry };
 
 export type DraftAttachment =
   | { kind: 'upload'; uploadId: Id; name: string; type: string; size: number }
   | { kind: 'message'; messageId: Id; part: number; name: string; type: string; size: number }
-  | { kind: 'link'; url: string; name: string };
+  | { kind: 'link'; url: string; name: string }
+  | { kind: 'file_link'; linkUploadId: Id; name: string; size: number; expiry: LinkExpiry };
 
 export interface DraftInput {
   from: string;
@@ -275,6 +290,44 @@ export interface Send {
 }
 
 export interface SendQuery { active?: boolean; cursor?: string; limit?: number }
+
+/**
+ * A file link of a sent message (section 8.8). The URL carries the link's
+ * token: anyone who has it can download the file while the link is `live`.
+ * - `pending`: the message is not released yet (its undo window, or release in progress);
+ * - `live`: downloads work;
+ * - `expired`: `expiresAt` has passed;
+ * - `revoked`: the sender revoked it.
+ */
+export interface FileLink {
+  id: Id;
+  sendId: Id;
+  name: string;
+  size: number;
+  url: string;
+  createdAt: UTCDate;
+  /** Absent for a link that never expires. */
+  expiresAt?: UTCDate;
+  state: 'pending' | 'live' | 'expired' | 'revoked';
+}
+
+/**
+ * A file uploaded for a file link, in `limits.linkPartBytes` parts streamed
+ * through the mail app to the workspace's link storage (section 8.8). Only a
+ * `complete` upload can be attached to a draft as a `file_link`.
+ */
+export interface LinkUpload {
+  id: Id;
+  name: string;
+  size: number;
+  /** Every part is this size except the last, which is the remainder. */
+  partSize: number;
+  parts: number;
+  state: 'uploading' | 'complete';
+  /** Released at this time unless a draft refers to it. */
+  expiresAt: UTCDate;
+}
+export interface LinkUploadInput { name: string; size: number }
 
 /** Result of a Drive pick: copies become uploads, links become link attachments. */
 export interface DriveImport { attachments: DraftAttachment[] }

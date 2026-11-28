@@ -1,3 +1,4 @@
+import { separateOrigins, type ContentOrigins } from './origins.ts';
 // Remote-image proxy policy (docs/content-origin.md section 5, rules 1-5 and 7).
 //
 // This module decides which remote URLs may be fetched and how. It never logs:
@@ -463,34 +464,11 @@ function reservedImageBody(bytes: Uint8Array, release: () => void) {
 
 // ---- Rule 4 and section 3.1: outgoing headers, rebuilt from scratch ----
 
-export interface ContentOrigins {
-  /** `https://content.<content-domain>` */
-  contentOrigin: string;
-  /** `https://mail.<suite-domain>` */
-  appOrigin: string;
-  /** Local HTTP fixtures only; both origins must be different loopback hosts. */
-  localLoopback?: boolean;
-}
-
-function bareOrigin(value: string, localLoopback: boolean): URL {
-  let url: URL | undefined;
-  try {
-    url = new URL(value);
-  } catch {
-    url = undefined;
-  }
-  const loopback = url?.hostname === 'localhost' || url?.hostname === '127.0.0.1';
-  if (!url || url.origin !== value || (url.protocol !== 'https:' && !(localLoopback && loopback && url.protocol === 'http:'))) {
-    throw new TypeError('invalid content or app origin');
-  }
-  return url;
-}
+export type { ContentOrigins } from './origins.ts';
 
 /** The section 3.1 headers that every content-origin response carries. */
 export function contentSecurityHeaders(origins: ContentOrigins): Headers {
-  const content = bareOrigin(origins.contentOrigin, origins.localLoopback === true);
-  const app = bareOrigin(origins.appOrigin, origins.localLoopback === true);
-  if (content.protocol !== app.protocol || content.hostname === app.hostname) throw new TypeError('content and app origins must be separate');
+  const { content, app } = separateOrigins(origins);
   return new Headers({
     'content-security-policy': `default-src 'none'; img-src ${content.origin} data:; style-src 'unsafe-inline'; font-src data:; `
       + `base-uri 'none'; form-action 'none'; frame-ancestors ${app.origin}; sandbox allow-popups allow-popups-to-escape-sandbox`,
