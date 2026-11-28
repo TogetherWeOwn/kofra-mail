@@ -11,8 +11,8 @@ import {
 import { iso } from './mailbox-api-input.ts';
 import { sendRow, type SendRow } from './mailbox-send-store.ts';
 
-type LinkRow = { linkId: string; sendId: string; idx: number; createdAt: number; revokedAt: number | null; deletedAt: number | null };
-const columns = `link_id AS linkId, send_id AS sendId, idx, created_at AS createdAt, revoked_at AS revokedAt, deleted_at AS deletedAt`;
+type LinkRow = { linkId: string; sendId: string; idx: number; createdAt: number; revokedAt: number | null; deletedAt: number | null; expiredAt: number | null };
+const columns = `link_id AS linkId, send_id AS sendId, idx, created_at AS createdAt, revoked_at AS revokedAt, deleted_at AS deletedAt, expired_at AS expiredAt`;
 
 const flushed = (sql: SqlStorage) => sql.exec<{ flushed: number }>('SELECT flushed FROM state WHERE id = 1').one().flushed;
 
@@ -39,7 +39,7 @@ export type LiveLink = { send: SendRow; link: SendLink };
 /** The link if it is live at `now`: release published, not revoked, deleted or undone, unexpired. */
 export function liveLink(sql: SqlStorage, linkId: string, now: number): LiveLink | undefined {
   const row = linkRow(sql, linkId);
-  if (!row || row.revokedAt !== null || row.deletedAt !== null) return undefined;
+  if (!row || row.revokedAt !== null || row.deletedAt !== null || row.expiredAt !== null) return undefined;
   const send = sendRow(sql, row.sendId);
   const link = send?.record.links?.[row.idx];
   if (!send || !link || link.id !== linkId || send.state === 'cancelled' || send.queuedSeq === null || send.queuedSeq > flushed(sql)) return undefined;
@@ -104,7 +104,7 @@ export function linkTarget(live: LiveLink, sql: SqlStorage, now: number, budget:
 
 export function wireFileLink(sql: SqlStorage, row: LinkRow, send: SendRow, link: SendLink, now: number): FileLink {
   const published = send.queuedSeq !== null && send.queuedSeq <= flushed(sql);
-  const state = row.revokedAt !== null ? 'revoked' : !published ? 'pending' : linkUnexpired(link, now) ? 'live' : 'expired';
+  const state = row.revokedAt !== null ? 'revoked' : !published ? 'pending' : row.expiredAt === null && linkUnexpired(link, now) ? 'live' : 'expired';
   return { id: link.id, sendId: send.id, name: link.name, size: link.size, url: linkUrl(link), createdAt: iso(row.createdAt),
     ...(link.expiresAt !== null && { expiresAt: iso(link.expiresAt) }), state };
 }
@@ -119,7 +119,7 @@ export function fileLink(sql: SqlStorage, linkId: string, now: number): FileLink
 export function linkPage(sql: SqlStorage, limit: number, now: number, position?: [number, string]): FileLink[] {
   const where = position ? 'AND (l.created_at < ? OR (l.created_at = ? AND l.link_id < ?))' : '';
   const rows = sql.exec<LinkRow>(`SELECT l.link_id AS linkId, l.send_id AS sendId, l.idx, l.created_at AS createdAt, l.revoked_at AS revokedAt,
-      l.deleted_at AS deletedAt FROM mailbox_send_links l JOIN mailbox_sends s ON s.id = l.send_id
+      l.deleted_at AS deletedAt, l.expired_at AS expiredAt FROM mailbox_send_links l JOIN mailbox_sends s ON s.id = l.send_id
     WHERE l.deleted_at IS NULL AND s.state <> 'cancelled' AND NOT (s.state = 'failed' AND s.queued_seq IS NULL) AND s.created_seq <= ? ${where}
     ORDER BY l.created_at DESC, l.link_id DESC LIMIT ?`, flushed(sql), ...(position ? [position[0], position[0], position[1]] : []), limit).toArray();
   return rows.flatMap(row => {

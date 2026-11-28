@@ -6,7 +6,7 @@ export async function directoryMigrationBatches({ localApi = false } = {}): Prom
     '0004_mailbox_replay.sql', '0005_delivery_fencing.sql', '0006_mail_alerts.sql',
     '0007_backup_watermark.sql'];
   if (localApi) names.push('0008_local_mail_api.sql');
-  names.push('0009_send_results.sql', '0010_link_storage.sql', '0011_internal_delivery.sql', '0012_file_links.sql');
+  names.push('0009_send_results.sql', '0010_link_storage.sql', '0011_internal_delivery.sql', '0012_file_links.sql', '0013_link_objects.sql');
   return Promise.all(names.map(async name => {
     const sql = await readFile(new URL(`../../migrations/${name}`, import.meta.url), 'utf8');
     // Keep the semicolons inside the SQLite trigger bodies.

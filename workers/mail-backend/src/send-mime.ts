@@ -27,6 +27,7 @@ function invalid(field: string, code: NonNullable<Problem['errors']>[number]['co
 }
 
 export const SEND_MIME_VERSION = 1;
+export const LINK_SEND_MIME_VERSION = 2;
 
 export interface SendMimeAttachment {
   readonly name: string;
@@ -44,6 +45,7 @@ type MimeFields = {
   readonly subject: string;
   /** Final plain text, with any link attachments already included by the caller. */
   readonly text: string;
+  readonly html?: string;
   readonly frozenReplyTo?: Readonly<AddressInput>;
   /** Parent id and space-joined References captured when the draft was saved. */
   readonly threading?: Readonly<ThreadingHeaders>;
@@ -260,10 +262,10 @@ const encodingHeader = (name: string) => `Content-Transfer-Encoding: ${name}${CR
 const qpHeader = encodingHeader('quoted-printable');
 const base64Header = encodingHeader('base64');
 
-function textPart(value: string, multipart: boolean): [string, string | Uint8Array] {
+function textPart(value: string, multipart: boolean, type = textType): [string, string | Uint8Array] {
   const bytes = encoder.encode(canonicalMailText(value));
   const qp = quotedPrintable(bytes, base64Size(bytes.length) + base64Header.length - qpHeader.length, multipart ? CRLF : '');
-  return qp !== undefined ? [textType + qpHeader, qp] : [textType + base64Header, bytes];
+  return qp !== undefined ? [type + qpHeader, qp] : [type + base64Header, bytes];
 }
 
 function requestHeaders(input: MimeFields): SendRequestHeaders {
@@ -301,7 +303,7 @@ type Piece = string | Uint8Array | { part: number; size: number };
 // Strings are wire ASCII; binary text and attachment references are wrapped
 // base64. The same plan gives exact size using only the file metadata.
 function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>,
-  sizeOf: (attachment: Attachment) => number) {
+  sizeOf: (attachment: Attachment) => number, html?: string) {
   const { to, cc, bcc, attachments, subject, from, dateAt, sendId } = input;
   checkAddress(from, '/from', 'invalid_sender');
   checkHeader(subject, '/subject');
@@ -350,8 +352,14 @@ function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachmen
   if (input.frozenReplyTo) pieces.push(fold('Reply-To', addressWords(input.frozenReplyTo)));
   pieces.push(`MIME-Version: 1.0${CRLF}`);
   if (files.length) pieces.push(`Content-Type: multipart/mixed; boundary="${boundary}"${CRLF}${CRLF}--${boundary}${CRLF}`);
-  const [textHeader, textBody] = textPart(input.text, files.length > 0);
-  pieces.push(textHeader, CRLF, textBody);
+  const [textHeader, textBody] = textPart(input.text, files.length > 0 || html !== undefined);
+  if (html === undefined) pieces.push(textHeader, CRLF, textBody);
+  else {
+    const alt = `${boundary}-alt`;
+    const [htmlHeader, htmlBody] = textPart(html, true, `Content-Type: text/html; charset=UTF-8${CRLF}`);
+    pieces.push(`Content-Type: multipart/alternative; boundary="${alt}"${CRLF}${CRLF}--${alt}${CRLF}`,
+      textHeader, CRLF, textBody, `--${alt}${CRLF}`, htmlHeader, CRLF, htmlBody, `--${alt}--${CRLF}`);
+  }
   for (const [i, file] of files.entries()) {
     pieces.push(`--${boundary}${CRLF}Content-Type: ${storedAttachmentType(file.type)}${CRLF}`, base64Header,
       contentDisposition(file.name), CRLF, { part: i, size: file.size });
@@ -364,7 +372,8 @@ function planV1<Attachment extends AttachmentHeaders>(input: MimeInput<Attachmen
 
 function plan<Attachment extends AttachmentHeaders>(input: MimeInput<Attachment>, sizeOf: (attachment: Attachment) => number) {
   switch (input.builderVersion) {
-    case 1: return planV1(input, sizeOf);
+    case SEND_MIME_VERSION: return planV1(input, sizeOf);
+    case LINK_SEND_MIME_VERSION: return planV1(input, sizeOf, input.html);
     default: throw new SendMimeInvariantError('Unsupported MIME builder version');
   }
 }
@@ -430,6 +439,7 @@ export function buildSendRequest(input: SendMimeInput): SendRequest {
   }));
   const message = {
     from: destination(input.from), subject: input.subject, text: input.text, attachments, headers,
+    ...(input.builderVersion === LINK_SEND_MIME_VERSION && input.html !== undefined && { html: input.html }),
     ...(input.frozenReplyTo && { replyTo: destination(input.frozenReplyTo) }),
     ...(cc.length && { cc }), ...(bcc.length && { bcc }),
   };

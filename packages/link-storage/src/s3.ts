@@ -24,7 +24,7 @@ export function objectUrl(fields: LinkLocationFields, key: string): URL {
 
 export interface S3RequestInit {
   method: 'GET' | 'HEAD' | 'PUT' | 'POST' | 'DELETE';
-  body?: string | Uint8Array<ArrayBuffer>;
+  body?: string | Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array>;
   headers?: Record<string, string>;
   timeoutMs: number;
 }
@@ -32,18 +32,23 @@ export interface S3RequestInit {
 /** Sends one request, signed if `credentials` is given, anonymous otherwise. Network failures throw. */
 export async function s3Request(fetcher: Fetcher, fields: LinkLocationFields, credentials: S3Credentials | undefined,
   url: URL, init: S3RequestInit): Promise<Response> {
+  const stream = init.body instanceof ReadableStream ? init.body : undefined;
   const request: RequestInit = {
     method: init.method,
     headers: { ...init.headers },
-    body: init.body,
+    body: stream ? undefined : init.body,
     redirect: 'manual',
     signal: AbortSignal.timeout(init.timeoutMs),
   };
-  if (!credentials) return fetcher(new Request(url, request));
+  const attach = (signed: Request) => {
+    const streaming = { body: stream, duplex: 'half' } as const;
+    return stream ? new Request(signed, streaming) : signed;
+  };
+  if (!credentials) return fetcher(attach(new Request(url, request)));
   const { accessKeyId, secretAccessKey } = credentials.reveal();
   const client = new AwsClient({ accessKeyId, secretAccessKey, service: 's3', region: fields.region, retries: 0 });
-  // UNSIGNED-PAYLOAD, as streamed link parts will use (aws4fetch's default for S3).
-  return fetcher(await client.sign(url.href, request));
+  // Sign metadata without inspecting the stream. aws4fetch signs S3 with UNSIGNED-PAYLOAD.
+  return fetcher(attach(await client.sign(url.href, request)));
 }
 
 /** Reads at most `max` bytes of a body as UTF-8; undefined if larger or not text. */

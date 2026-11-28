@@ -4,7 +4,7 @@ import { sendEventTitle, type DailySendAlert } from './send-alert-events.ts';
 
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
-  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant' | 'handoff_stuck' | 'link_reported';
+  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant' | 'handoff_stuck' | 'link_reported' | 'link_confirm_stale' | 'delete_failed';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
 type GateAlert = { code: 'send_quota_gate_hit'; key: string; environment: string; time: number };
 type SendAlert = DailySendAlert | { code: 'send_dlq'; environment: string; time: number; occurrence: string };
@@ -22,6 +22,8 @@ const TITLE: Record<Event['code'], string> = {
   send_invariant: 'A send is held after a release invariant failed',
   handoff_stuck: 'An internal delivery handoff keeps failing',
   link_reported: 'A file link was reported for abuse',
+  link_confirm_stale: 'A file link upload is still unconfirmed',
+  delete_failed: 'A file link object could not be deleted for 24 hours',
 };
 
 export function mailAlert(binding?: AlertBinding) {

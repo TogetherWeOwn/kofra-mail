@@ -4,11 +4,11 @@
 import { AwsV4Signer } from 'aws4fetch';
 
 export type S3Op = 'HeadBucket' | 'PutObject' | 'GetObject' | 'DeleteObject' | 'DeleteObjectVersion' | 'ListObjects' | 'CreateMultipart'
-  | 'UploadPart' | 'ListParts' | 'CompleteMultipart' | 'AbortMultipart';
+  | 'UploadPart' | 'ListParts' | 'CompleteMultipart' | 'AbortMultipart' | 'ListMultipartUploads';
 export const ALL_OPS: readonly S3Op[] = ['HeadBucket', 'PutObject', 'GetObject', 'DeleteObject', 'DeleteObjectVersion', 'ListObjects',
-  'CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart'];
+  'CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart', 'ListMultipartUploads'];
 export const READ_OPS: readonly S3Op[] = ['GetObject'];
-export const MULTIPART_OPS: readonly S3Op[] = ['CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'AbortMultipart'];
+export const MULTIPART_OPS: readonly S3Op[] = ['CreateMultipart', 'UploadPart', 'ListParts', 'CompleteMultipart', 'ListMultipartUploads', 'AbortMultipart'];
 
 export interface FakeKey { secret: string; ops: Set<S3Op> }
 export interface FakeS3Options {
@@ -31,12 +31,16 @@ export interface FakeS3Options {
   objectHeaders?: Record<string, string>;
 }
 
-export interface FakeCall { op: S3Op | 'unknown'; key: string; signedBy: string | null; status: number }
+export interface FakeCall { op: S3Op | 'unknown'; key: string; signedBy: string | null; status: number; unsignedPayload?: boolean }
 
 export function fakeS3(options: FakeS3Options) {
   const region = options.region ?? 'auto';
   const objects = new Map<string, Uint8Array<ArrayBuffer>>();
   const uploads = new Map<string, Map<number, Uint8Array<ArrayBuffer>>>();
+  const uploadKeys = new Map<string, string>();
+  const failures = new Map<S3Op, number>();
+  let loseUploadId = false;
+  let loseCompleted = false;
   // Stored versions (with versioning on): delete markers are not kept here.
   const versions: { key: string; versionId: string }[] = [];
   const markers: { key: string; versionId: string }[] = [];
@@ -82,7 +86,8 @@ export function fakeS3(options: FakeS3Options) {
   }
 
   function operation(method: string, key: string, query: URLSearchParams): S3Op | 'unknown' {
-    if (!key) return method === 'HEAD' ? 'HeadBucket' : method === 'GET' && query.get('list-type') === '2' ? 'ListObjects' : 'unknown';
+    if (!key) return method === 'HEAD' ? 'HeadBucket' : method === 'GET' && query.has('uploads') ? 'ListMultipartUploads'
+      : method === 'GET' && query.get('list-type') === '2' ? 'ListObjects' : 'unknown';
     if (method === 'POST' && query.has('uploads')) return 'CreateMultipart';
     if (method === 'PUT' && query.has('uploadId') && query.has('partNumber')) return 'UploadPart';
     if (method === 'GET' && query.has('uploadId')) return 'ListParts';
@@ -103,7 +108,8 @@ export function fakeS3(options: FakeS3Options) {
     const op = operation(request.method, where.key, url.searchParams);
     const signedBy = await signer(request, body);
     const record = (response: Response) => {
-      calls.push({ op, key: where.key, signedBy: signedBy || null, status: response.status });
+      calls.push({ op, key: where.key, signedBy: signedBy || null, status: response.status,
+        ...(op === 'UploadPart' && { unsignedPayload: request.headers.get('x-amz-content-sha256') === 'UNSIGNED-PAYLOAD' }) });
       return response;
     };
     if (where.bucket !== options.bucket) return record(error('NoSuchBucket', 404));
@@ -112,6 +118,8 @@ export function fakeS3(options: FakeS3Options) {
     const allowed = signedBy === null ? (options.anonymous ?? []).includes(op) : options.keys[signedBy].ops.has(op);
     if (!allowed) return record(signedBy === null && options.anonymousRefusal
       ? error('InvalidArgument', options.anonymousRefusal) : error('AccessDenied', 403));
+    const remaining = failures.get(op) ?? 0;
+    if (remaining > 0) { failures.set(op, remaining - 1); return record(error('ServiceUnavailable', 503)); }
     const uploadId = url.searchParams.get('uploadId') ?? '';
     switch (op) {
       case 'HeadBucket': return record(new Response(null, { status: 200 }));
@@ -131,8 +139,9 @@ export function fakeS3(options: FakeS3Options) {
           return record(new Response(request.method === 'HEAD' ? null : part, { status: 206, headers: { ...extra,
             'content-range': `bytes ${start}-${end}/${size}`, 'content-length': String(part.byteLength) } }));
         }
+        const version = versions.findLast(v => v.key === where.key)?.versionId;
         return record(new Response(request.method === 'HEAD' ? null : value, { status: 200,
-          headers: { ...extra, 'content-length': String(value.byteLength) } }));
+          headers: { ...extra, 'content-length': String(value.byteLength), ...(version && { 'x-amz-version-id': version }) } }));
       }
       case 'DeleteObject': {
         objects.delete(where.key);
@@ -156,9 +165,16 @@ export function fakeS3(options: FakeS3Options) {
         const keys = [...objects.keys()].filter(k => k.startsWith(prefix)).map(k => `<Contents><Key>${k}</Key></Contents>`).join('');
         return record(xml(`<ListBucketResult>${keys}</ListBucketResult>`));
       }
+      case 'ListMultipartUploads': {
+        const prefix = url.searchParams.get('prefix') ?? '';
+        const entries = [...uploadKeys].filter(([, key]) => key.startsWith(prefix));
+        return record(xml(`<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>${entries.map(([id, key]) => `<Upload><Key>${key}</Key><UploadId>${id}</UploadId></Upload>`).join('')}</ListMultipartUploadsResult>`));
+      }
       case 'CreateMultipart': {
         const id = `upload-${++uploadCounter}`;
         uploads.set(id, new Map());
+        uploadKeys.set(id, where.key);
+        if (loseUploadId) { loseUploadId = false; return record(error('ServiceUnavailable', 503)); }
         return record(xml(`<InitiateMultipartUploadResult><Bucket>${options.bucket}</Bucket><Key>${where.key}</Key><UploadId>${id}</UploadId></InitiateMultipartUploadResult>`));
       }
       case 'UploadPart': {
@@ -171,21 +187,24 @@ export function fakeS3(options: FakeS3Options) {
       case 'ListParts': {
         const parts = uploads.get(uploadId);
         if (!parts) return record(error('NoSuchUpload', 404));
-        return record(xml(`<ListPartsResult>${[...parts.keys()].map(n => `<Part><PartNumber>${n}</PartNumber><ETag>"part-${n}"</ETag></Part>`).join('')}</ListPartsResult>`));
+        return record(xml(`<ListPartsResult><IsTruncated>false</IsTruncated>${[...parts].map(([n, data]) => `<Part><PartNumber>${n}</PartNumber><ETag>"part-${n}"</ETag><Size>${data.byteLength}</Size></Part>`).join('')}</ListPartsResult>`));
       }
       case 'CompleteMultipart': {
         const parts = uploads.get(uploadId);
         if (!parts) return record(error('NoSuchUpload', 404));
         if (options.completeError) return record(xml('<Error><Code>InternalError</Code></Error>'));
-        const headers = write(where.key, new Uint8Array(Buffer.concat([...parts.values()])));
+        const headers = write(where.key, new Uint8Array(Buffer.concat([...parts].sort(([a], [b]) => a - b).map(([, bytes]) => bytes))));
         uploads.delete(uploadId);
+        uploadKeys.delete(uploadId);
+        if (loseCompleted) { loseCompleted = false; return record(xml('<Error><Code>InternalError</Code></Error>')); }
         const done = xml(`<CompleteMultipartUploadResult><Key>${where.key}</Key><ETag>"done"</ETag></CompleteMultipartUploadResult>`);
         for (const [name, value] of Object.entries(headers)) done.headers.set(name, value);
         return record(done);
       }
-      case 'AbortMultipart': uploads.delete(uploadId); return record(new Response(null, { status: 204 }));
+      case 'AbortMultipart': uploads.delete(uploadId); uploadKeys.delete(uploadId); return record(new Response(null, { status: 204 }));
     }
   }
 
-  return { fetch: handle, objects, uploads, versions, markers, calls };
+  return { fetch: handle, objects, uploads, versions, markers, calls,
+    fail(op: S3Op, count = 1) { failures.set(op, count); }, loseNextUploadId() { loseUploadId = true; }, loseNextComplete() { loseCompleted = true; } };
 }

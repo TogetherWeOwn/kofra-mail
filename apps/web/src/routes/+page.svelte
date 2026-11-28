@@ -611,6 +611,7 @@
 {#if draft}
   {@const activeDraft = draft}
   <Compose bind:this={composer} initial={activeDraft} {restoredEdits} {identities} {api} m3={session?.features.m3 === true}
+    fileLinks={session?.features.fileLinks === true} limits={session?.limits}
     onClose={() => { if (draft === activeDraft) { draft = undefined; restoredEdits = undefined; void refresh(); } }}
     onStatus={(message) => { if (draft === activeDraft) status = message; }} />
 {/if}

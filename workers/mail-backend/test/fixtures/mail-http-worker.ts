@@ -1308,6 +1308,10 @@ export default {
       MAIL_DEV_SESSION: { resolve, members: async (ws) => [...new Map(Object.values(env.ACCOUNTS).filter((p) => p.ws === ws).map((p) => [p.userId, p])).values()]
         .map((p) => ({ id: p.userId, name: p.name, email: p.address, status: p.status ?? 'active' })) },
       LINK_USAGE: fileLinkUsage(env.DIRECTORY),
+      MAIL_FILE_LINKS_ENABLED: env.MAIL_FILE_LINKS_ENABLED, MAIL_RATE_LINK_PARTS: limiter('MAIL_RATE_LINK_PARTS'), LINK_HOST: env.LINK_HOST,
+      LINK_CRED_KEK: env.LINK_CRED_KEK, LINK_REFUSED_ZONES: env.LINK_REFUSED_ZONES, LINK_LOCATIONS: env.LINK_LOCATIONS,
+      LINK_WRITE_CREDENTIALS: env.LINK_WRITE_CREDENTIALS, LINK_FILE_BYTES: env.LINK_FILE_BYTES,
+      LINK_DAILY_BYTES: env.LINK_DAILY_BYTES, LINK_LIVE_BYTES: env.LINK_LIVE_BYTES, LINK_WORKSPACE_LIMITS: env.LINK_WORKSPACE_LIMITS,
       MAIL_CONTENT_ENABLED: 'on', MAIL_CONTENT_ORIGIN: env.REAL_CONTENT_ORIGIN ?? contentOrigin(url, env),
       MAIL_CONTENT: env.MAIL_CONTENT ?? { mintForWeb: (purpose, claims) => mint(contentOrigin(url, env), purpose, claims, env) },
     };

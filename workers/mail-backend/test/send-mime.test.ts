@@ -301,5 +301,5 @@ test('restore rerun uses frozen inputs and ignores later settings and undo chang
   assert.deepEqual(buildSendRequest(rerun), buildSendRequest(input));
   assert.notDeepEqual(buildSentCopy({ ...input, sendId: 'send_002' }).bytes, original.bytes);
   assert.notDeepEqual(buildSentCopy({ ...input, dateAt: frozen.dateAt + 60_000 }).bytes, original.bytes);
-  assert.throws(() => buildSentCopy({ ...input, builderVersion: 2 }), /unsupported MIME builder version/i);
+  assert.throws(() => buildSentCopy({ ...input, builderVersion: 99 }), /unsupported MIME builder version/i);
 });

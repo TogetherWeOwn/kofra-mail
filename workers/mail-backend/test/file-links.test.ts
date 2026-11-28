@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+import PostalMime from 'postal-mime';
 import type { FileLink, LinkExpiry, MailService } from '../../../contracts/mail-api/src/index.ts';
 import { locationFingerprint } from '../../../packages/link-storage/src/location.ts';
 import type { SendLink, StoredFileLink } from '../src/file-links.ts';
@@ -61,6 +62,300 @@ const path = (link: Pick<SendLink, 'token'>, action = '') => `/f/${link.token}${
 const emailCalls = async (h: Fixture) => (await h.consumer<EmailCall[]>('emailCalls')).length + await h.sends.emailCalls();
 const ledgerOf = (state: { ledger: { kind: string; state: string; reason: string | null }[] }) =>
   state.ledger.map(({ kind, state: s, reason }) => `${kind}:${s}${reason ? `:${reason}` : ''}`);
+
+test('link upload create replays the same upload and Complete can be retried', () => withLinks(async (h, mail) => {
+  const bytes = new Blob([bytesOf(700)]);
+  const options = { idempotencyKey: 'link-upload-replay' };
+  const input = { name: 'replay.bin', size: bytes.size };
+  const upload = await mail.createLinkUpload(input, options);
+  assert.equal(upload.state, 'uploading');
+  assert.deepEqual(await mail.createLinkUpload(input, options), upload);
+  await assert.rejects(mail.createLinkUpload({ ...input, size: 701 }, options), { code: 'idempotency_key_reused' });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  const completed = await mail.completeLinkUpload(upload.id);
+  assert.equal(completed.state, 'complete');
+  assert.deepEqual(await mail.completeLinkUpload(upload.id), completed);
+  assert.deepEqual(await mail.getLinkUpload(upload.id), completed);
+  assert.equal((await h.directoryRows('SELECT size FROM link_objects')).length, 1);
+}, { fileLinks: { uploads: true } }));
+
+test('a completed link upload belongs to one draft lineage until removal or draft deletion', () => withLinks(async (_h, mail, from) => {
+  const bytes = new Blob([bytesOf(80)]);
+  const upload = await mail.createLinkUpload({ name: 'owned.bin', size: bytes.size }, { idempotencyKey: 'link-upload-claim' });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  await mail.completeLinkUpload(upload.id);
+  const body = { from, to: [{ email: OUTSIDE }], cc: [], bcc: [], subject: 'One lineage', body: 'Draft' };
+  const attachment = { kind: 'file_link' as const, linkUploadId: upload.id, expiry: 7 };
+  const make = (id: number) => mail.createDraft({ ...body, attachments: [attachment] }, { idempotencyKey: `draft-claim-${id}` });
+  const first = await make(1);
+  await assert.rejects(make(2), { code: 'upload_in_use' });
+  await mail.replaceDraft(first.id, { ...body, attachments: [] }, { ifMatch: first.revision });
+  const second = await make(2);
+  await mail.deleteDraft(second.id, { ifMatch: second.revision });
+  assert.equal((await make(3)).attachments[0].kind, 'file_link');
+}, { fileLinks: { uploads: true } }));
+
+const uploadOptions = { fileLinks: { uploads: true } };
+async function realUpload(mail: MailService, key: string, bytes = new Blob([bytesOf(90)])) {
+  const upload = await mail.createLinkUpload({ name: `${key}.bin`, size: bytes.size }, { idempotencyKey: key });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  return mail.completeLinkUpload(upload.id);
+}
+const bodyOf = (from: string) => ({ from, to: [{ email: OUTSIDE }], cc: [], bcc: [], subject: 'Files', body: 'Draft' });
+
+test('link upload creation shares the mailbox idempotency-key scope', () => withLinks(async (_h, mail, from) => {
+  const input = { name: 'keys.bin', size: 20 };
+  const first = { idempotencyKey: 'used-by-link' }, second = { idempotencyKey: 'used-by-draft' };
+  await mail.createLinkUpload(input, first);
+  await assert.rejects(mail.createDraft({ ...bodyOf(from), attachments: [] }, first), { code: 'idempotency_key_reused' });
+  await mail.createDraft({ ...bodyOf(from), attachments: [] }, second);
+  await assert.rejects(mail.createLinkUpload(input, second), { code: 'idempotency_key_reused' });
+}, uploadOptions));
+async function realDraft(mail: MailService, from: string, id: string, expiry: LinkExpiry = 'never') {
+  return mail.createDraft({ ...bodyOf(from), attachments: [{ kind: 'file_link', linkUploadId: id, expiry }] }, { idempotencyKey: `draft-${id}` });
+}
+
+test('streams two exact parts with UNSIGNED-PAYLOAD and recovers a completed object by HEAD', () => withLinks(async (_h, mail, _from, links) => {
+  const part = 16 * 1024 * 1024;
+  const first = Buffer.alloc(part, 81);
+  const last = Buffer.alloc(9, 27);
+  const upload = await mail.createLinkUpload({ name: 'two-parts.bin', size: part + last.length }, { idempotencyKey: 'link-two-parts' });
+  assert.equal(upload.parts, 2);
+  assert.equal(upload.partSize, part);
+  await mail.putLinkPart(upload.id, 1, { bytes: new Blob([first]) });
+  await mail.putLinkPart(upload.id, 2, { bytes: new Blob([last]) });
+  const store = links.stores.workspace;
+  assert.deepEqual(store.calls.filter(call => call.op === 'UploadPart').map(call => call.unsignedPayload), [true, true]);
+  store.loseNextComplete();
+  await assert.rejects(mail.completeLinkUpload(upload.id), { code: 'unavailable' });
+  assert.equal((await mail.completeLinkUpload(upload.id)).state, 'complete');
+  assert.equal(store.calls.filter(call => call.op === 'CompleteMultipart').length, 1);
+  assert.equal(sha([...store.objects.values()][0]), createHash('sha256').update(first).update(last).digest('hex'));
+}, uploadOptions));
+
+test('multipart rejects another mailbox, wrong part size and a size lie, then accepts a resent failed part', () => withLinks(async (h, mail, _from, links) => {
+  const upload = await mail.createLinkUpload({ name: 'size.bin', size: 90 }, { idempotencyKey: 'link-upload-parts' });
+  const bytes = new Blob([bytesOf(90)]);
+  await assert.rejects(h.as('other').putLinkPart(upload.id, 1, { bytes }), { code: 'not_found' });
+  await assert.rejects(mail.putLinkPart(upload.id, 1, { bytes: bytes.slice(1) }), { code: 'invalid_request' });
+  await assert.rejects(mail.putLinkPart(upload.id, 2, { bytes }), { code: 'invalid_request' });
+  assert.equal(links.stores.workspace.calls.filter(row => row.op === 'UploadPart').length, 0);
+  links.stores.workspace.fail('UploadPart');
+  await assert.rejects(mail.putLinkPart(upload.id, 1, { bytes }), { code: 'unavailable' });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  const [parts] = links.stores.workspace.uploads.values();
+  parts.set(1, bytesOf(89)); // A provider reports fewer bytes than the declared size.
+  await assert.rejects(mail.completeLinkUpload(upload.id), { code: 'invalid_request' });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  assert.equal((await mail.completeLinkUpload(upload.id)).size, 90);
+}, uploadOptions));
+
+test('the part number is validated independently of its content length', () => withLinks(async (_h, mail, _from, links) => {
+  const upload = await mail.createLinkUpload({ name: 'number.bin', size: 90 }, { idempotencyKey: 'link-upload-number' });
+  // A normal non-final part would be exactly this length. Only the number is invalid.
+  const bytes = new Blob([Buffer.alloc(upload.partSize)]);
+  await assert.rejects(mail.putLinkPart(upload.id, upload.parts + 1, { bytes }), { code: 'invalid_request' });
+  assert.equal(links.stores.workspace.calls.filter(call => call.op === 'UploadPart').length, 0);
+}, uploadOptions));
+
+test('the dedicated part limiter refuses a part without reaching storage', () => withLinks(async (h, mail, _from, links) => {
+  const upload = await mail.createLinkUpload({ name: 'limited.bin', size: 5 }, { idempotencyKey: 'link-upload-limit' });
+  await h.sends.rateCap('MAIL_RATE_LINK_PARTS', 0);
+  await assert.rejects(mail.putLinkPart(upload.id, 1, { bytes: new Blob(['bytes']) }), { code: 'rate_limited' });
+  assert.equal(links.stores.workspace.calls.filter(call => call.op === 'UploadPart').length, 0);
+}, uploadOptions));
+
+test('a registered link must still have a usable registry row after a rewind', () => withLinks(async (h, mail, from, links) => {
+  const upload = await realUpload(mail, 'retiring-link');
+  const draft = await realDraft(mail, from, upload.id);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-retiring-link', ifMatch: draft.revision });
+  const [link] = await frozen(h, send.id);
+  await h.advance(UNDO);
+  assert.equal((await links.fetch(path(link))).status, 200);
+  // The mailbox consults the non-rewindable registry before opening a link even when
+  // the mailbox's journal does not yet show the revocation that retired the object.
+  await h.directoryChange("UPDATE link_objects SET state = 'retiring' WHERE id = ?", upload.id);
+  assert.equal((await links.fetch(path(link))).status, 404);
+}, uploadOptions));
+
+test('an opted-in mailbox still reports file links off without configured storage', () => withLinks(async (_h, mail) => {
+  assert.equal((await mail.getSession()).features.fileLinks, false);
+  await assert.rejects(mail.createLinkUpload({ name: 'unconfigured.bin', size: 1 }, { idempotencyKey: 'link-no-storage' }), { code: 'feature_unavailable' });
+}, { fileLinks: { uploads: true, deploymentOnly: true }, configureWorkers: worker => {
+  const { LINK_LOCATIONS: _locations, LINK_WRITE_CREDENTIALS: _write, ...other } = worker.bindings ?? {};
+  worker.bindings = other;
+} }));
+
+test('configured deployment storage works without a workspace override', () => withLinks(async (_h, mail, _from, links) => {
+  assert.equal((await mail.getSession()).features.fileLinks, true);
+  await realUpload(mail, 'deployment-upload');
+  assert.equal(links.stores.deployment.objects.size, 1);
+  assert.equal(links.stores.workspace.objects.size, 0);
+}, { fileLinks: { uploads: true, deploymentOnly: true } }));
+
+test('cron finds and aborts a lost upload id, removes abandoned objects and releases live bytes', () => withLinks(async (h, mail, _from, links) => {
+  links.stores.workspace.loseNextUploadId();
+  await assert.rejects(mail.createLinkUpload({ name: 'lost.bin', size: 100 }, { idempotencyKey: 'link-upload-lost' }), { code: 'idempotency_in_progress' });
+  const ready = await realUpload(mail, 'abandoned');
+  assert.equal(links.stores.workspace.uploads.size, 1);
+  assert.equal(links.stores.workspace.objects.size, 1);
+  await h.advance(7 * day + minute);
+  await h.backendCron();
+  assert.equal(links.stores.workspace.uploads.size, 0);
+  assert.equal(links.stores.workspace.objects.size, 0);
+  await assert.rejects(mail.getLinkUpload(ready.id), { code: 'not_found' });
+  assert.deepEqual(await h.directoryRows('SELECT size FROM link_live_bytes'), [{ size: 0 }]);
+}, uploadOptions));
+
+test('undo keeps a real object and the restored draft sends; revocation deletes it and frees its location', () => withLinks(async (h, mail, from, links) => {
+  const upload = await realUpload(mail, 'undo');
+  const draft = await realDraft(mail, from, upload.id);
+  const first = await mail.sendDraft(draft.id, { idempotencyKey: 'send-link-undo', ifMatch: draft.revision });
+  await mail.undoSend(first.id, { idempotencyKey: 'undo-link-undo' });
+  const restored = await mail.getDraft(draft.id);
+  assert.equal(links.stores.workspace.objects.size, 1);
+  const send = await mail.sendDraft(restored.id, { idempotencyKey: 'send-link-again', ifMatch: restored.revision });
+  const [link] = await frozen(h, send.id);
+  await h.advance(UNDO);
+  assert.equal((await links.fetch(path(link, '/download'))).status, 200);
+  await h.consumer('drain', WS, MB);
+  await mail.revokeLink(link.id);
+  await h.backendCron();
+  assert.equal((await links.fetch(path(link, '/download'))).status, 404);
+  assert.equal(links.stores.workspace.objects.size, 0);
+  assert.equal((await h.as('admin').listLinkLocations()).items.length, 1);
+  await h.as('admin').deleteLinkLocation(WORKSPACE_LOCATION_ID);
+  assert.equal((await h.as('admin').listLinkLocations()).items.length, 0);
+}, uploadOptions));
+
+test('a missing uploaded object at release is a lost source and never reaches EMAIL', () => withLinks(async (h, mail, from, links) => {
+  const upload = await realUpload(mail, 'missing');
+  const draft = await realDraft(mail, from, upload.id);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-link-missing', ifMatch: draft.revision });
+  const [link] = await frozen(h, send.id);
+  assert.ok(links.stores.workspace.objects.delete(link.key));
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(send.id)).state, 'failed');
+  assert.deepEqual(ledgerOf(await h.sendState(send.id)), ['external:failed:delivery_error']);
+  assert.equal(await emailCalls(h), 0);
+}, uploadOptions));
+
+test('test-only expiry sets the frozen lifetime and a published expiry deletes the object', () => withLinks(async (h, mail, from, links) => {
+  const upload = await realUpload(mail, 'expiry');
+  const draft = await realDraft(mail, from, upload.id, 7);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-link-expiry', ifMatch: draft.revision });
+  const [link] = await frozen(h, send.id);
+  assert.equal(link.expiresAt, (await h.sends.row(send.id))!.undo_until + 120 * second);
+  await h.advance(UNDO);
+  await h.backendCron();
+  await h.consumer('drain', WS, MB);
+  assert.equal((await mail.getSend(send.id)).state, 'sent');
+  assert.equal((await links.fetch(path(link, '/download'))).status, 200);
+  await h.advance(120 * second);
+  await h.backendCron();
+  assert.equal((await links.fetch(path(link, '/download'))).status, 404);
+  assert.equal(links.stores.workspace.objects.size, 0, JSON.stringify(await h.directoryRows('SELECT state, confirmed, sweep_at, delete_since FROM link_objects WHERE id = ?', upload.id)));
+  assert.equal((await mail.listLinks({})).items[0].state, 'expired');
+}, { ...uploadOptions, configureWorkers: worker => { worker.bindings = { ...worker.bindings, LINK_TEST_EXPIRY_SECONDS: '120' }; } }));
+
+test('test-only expiry is refused in production', () => withLinks(async (h, mail, from) => {
+  const upload = await realUpload(mail, 'production-expiry');
+  const draft = await realDraft(mail, from, upload.id, 7);
+  await assert.rejects(mail.sendDraft(draft.id, { idempotencyKey: 'send-expiry-prod', ifMatch: draft.revision }), { code: 'feature_unavailable' });
+  assert.equal((await h.as('member').listSends({})).items.length, 0);
+}, { ...uploadOptions, configureWorkers: worker => { worker.bindings = { ...worker.bindings, LINK_TEST_EXPIRY_SECONDS: '120', MAIL_ENVIRONMENT: 'production' }; } }));
+
+test('a restore that rewinds an unpublished attach keeps the object registered and claimable', () => withLinks(async (h, mail, from, links) => {
+  const upload = await realUpload(mail, 'rewind-attach');
+  assert.ok(await h.forceSnapshot());
+  await h.publishFailure(true);
+  await realDraft(mail, from, upload.id);
+  await h.publishFailure(false);
+  await h.restore();
+  assert.equal((await mail.listDrafts({})).items.length, 0);
+  assert.equal((await h.directoryRows('SELECT state FROM link_objects WHERE id = ?', upload.id))[0]?.state, 'complete');
+  const draft = await realDraft(mail, from, upload.id);
+  assert.equal(draft.attachments[0].kind, 'file_link');
+  assert.equal(links.stores.workspace.objects.size, 1);
+}, uploadOptions));
+
+test('a restore that rewinds an unpublished revoke never opens a link to deleted bytes', () => withLinks(async (h, mail, from, links) => {
+  const draft = await realDraft(mail, from, (await realUpload(mail, 'rewind-revoke')).id);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-after-rewind', ifMatch: draft.revision });
+  const [link] = await frozen(h, send.id);
+  await h.advance(UNDO);
+  await h.consumer('drain', WS, MB);
+  assert.ok(await h.forceSnapshot());
+  await h.publishFailure(true);
+  await assert.rejects(mail.revokeLink(link.id), { code: 'unavailable' });
+  await h.backendCron();
+  assert.equal(links.stores.workspace.objects.size, 1);
+  await h.publishFailure(false);
+  await h.restore();
+  await h.advance(minute);
+  assert.equal((await links.fetch(path(link, '/download'))).status, 200);
+  await mail.revokeLink(link.id);
+  await h.advance(minute);
+  await h.backendCron();
+  assert.equal(links.stores.workspace.objects.size, 0);
+  await h.restore();
+  assert.equal((await links.fetch(path(link, '/download'))).status, 404);
+}, uploadOptions));
+
+test('workspace byte caps hold across mailboxes and deletion refunds only live usage', () => withLinks(async (h, mail) => {
+  const results = await Promise.allSettled([mail.createLinkUpload({ name: 'a.bin', size: 60 }, { idempotencyKey: 'cap-a' }),
+    h.as('other').createLinkUpload({ name: 'b.bin', size: 60 }, { idempotencyKey: 'cap-b' })]);
+  assert.deepEqual(results.map(r => r.status).sort(), ['fulfilled', 'rejected']);
+  const winner = results.findIndex(r => r.status === 'fulfilled');
+  await assert.rejects(Promise.reject((results[1 - winner] as PromiseRejectedResult).reason), { code: 'limit_reached' });
+  await (winner === 0 ? mail : h.as('other')).deleteLinkUpload((results[winner] as PromiseFulfilledResult<{ id: string }>).value.id);
+  await h.advance(minute);
+  await h.backendCron();
+  await assert.rejects(mail.createLinkUpload({ name: 'c.bin', size: 85 }, { idempotencyKey: 'cap-c' }), { code: 'limit_reached' });
+  assert.equal((await mail.createLinkUpload({ name: 'd.bin', size: 10 }, { idempotencyKey: 'cap-d' })).size, 10);
+}, { ...uploadOptions, configureWorkers: worker => {
+  worker.bindings = { ...worker.bindings, LINK_WORKSPACE_LIMITS: JSON.stringify({ [WS]: { liveBytes: 100, dailyBytes: 140 } }) };
+} }));
+
+test('a provider delete that fails for 24 hours alerts and keeps the workspace location in use', () => withLinks(async (h, mail, from, links) => {
+  const draft = await realDraft(mail, from, (await realUpload(mail, 'delete-failed')).id);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-delete-failed', ifMatch: draft.revision });
+  const [link] = await frozen(h, send.id);
+  await h.advance(UNDO);
+  await mail.revokeLink(link.id);
+  links.stores.workspace.fail('DeleteObject', 2);
+  await h.backendCron();
+  assert.equal(links.stores.workspace.objects.size, 1);
+  await assert.rejects(h.as('admin').deleteLinkLocation(WORKSPACE_LOCATION_ID), { code: 'location_in_use' });
+  await h.advance(day + minute);
+  await h.backendCron();
+  await h.backendCron();
+  assert.ok((await links.alerts()).some(alert => alert.source === 'mail:delete_failed'));
+}, uploadOptions));
+
+test('the frozen link block is escaped in HTML and release replay builds identical bytes', () => withLinks(async (h, mail, from) => {
+  const name = `quote <img> & ${String.fromCodePoint(0x202e)}.bin`;
+  const bytes = new Blob([bytesOf(60)]);
+  const upload = await mail.createLinkUpload({ name, size: bytes.size }, { idempotencyKey: 'link-mime-upload' });
+  await mail.putLinkPart(upload.id, 1, { bytes });
+  await mail.completeLinkUpload(upload.id);
+  const draft = await realDraft(mail, from, upload.id);
+  const send = await mail.sendDraft(draft.id, { idempotencyKey: 'send-link-mime', ifMatch: draft.revision });
+  await h.sends.crashAfter('stored');
+  await h.advance(UNDO);
+  const first = (await h.sends.registration(send.id))!;
+  const firstBytes = h.objects.get(`/mail-w1/${first.key}`)!;
+  const parsed = await PostalMime.parse(firstBytes);
+  assert.ok(/quote <img> & \.bin \(60 bytes\): https:\/\/files\.example\.test\/f\/[\w-]+ \(no expiry date\)/.test(parsed.text ?? ''), 'plain MIME includes the frozen link block');
+  assert.ok(/<ul><li>quote &lt;img&gt; &amp; \.bin \(60 bytes\): <a href=/.test(parsed.html ?? ''), 'HTML MIME includes the escaped link list');
+  assert.equal(/<img>|\p{Bidi_Control}/u.test(parsed.html ?? ''), false);
+  await h.restore();
+  assert.equal((await mail.getSend(send.id)).state, 'pending');
+  await h.advance(UNDO);
+  assert.equal((await mail.getSend(send.id)).state, 'sending');
+  assert.deepEqual(await h.sends.registration(send.id), first);
+  assert.deepEqual(h.objects.get(`/mail-w1/${first.key}`), firstBytes);
+}, uploadOptions));
 
 test('a sent file link routes by its token hash, serves its page and its bytes, and only the hash is stored', () => withLinks(async (h, mail, from, links) => {
   const bytes = bytesOf(70_000);

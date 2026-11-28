@@ -46,5 +46,9 @@ const second: SendMimeBuilder = {
 
 export function fixtureBuilders(mode: 'base' | 'bumped' | 'dropped'): SendMimeBuilders {
   if (mode === 'dropped') return mimeBuilders(recording(second));
-  return mode === 'bumped' ? mimeBuilders(recording(current), recording(second)) : mimeBuilders(recording(current));
+  if (mode === 'bumped') return mimeBuilders(recording(current), recording(second));
+  return { current: current.version, get: version => {
+    const builder = builders.get(version);
+    return builder && recording(builder);
+  } };
 }

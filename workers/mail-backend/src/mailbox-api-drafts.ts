@@ -30,6 +30,11 @@ export function draftObjectKeys(draft: DraftObject): string[] {
 export function draftUploadIds(draft: DraftObject): string[] {
   return [...new Set((draft.attachments ?? []).flatMap(({ wire }) => wire.kind === 'upload' ? [wire.uploadId] : []))];
 }
+
+export function draftLinkUploadIds(draft: DraftObject): string[] {
+  return (draft.attachments ?? []).flatMap(attachment => 'link' in attachment && attachment.link.uploadId ? [attachment.link.uploadId] : []);
+}
+export type ResolveLinkUpload = (draftId: string, uploadId: string) => Promise<{ name: string; size: number; link: StoredFileLink }>;
 // A one-byte body control can escape to six JSON bytes. Include the bounded
 // address/header/metadata envelope in the same limit on both reads and writes.
 const MAX_DRAFT_OBJECT_BYTES = 6 * LIMITS.bodyBytes + 512 * 1024;
@@ -182,7 +187,7 @@ export function sender(value: unknown, canSendAs: readonly string[]): string {
 }
 
 export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: unknown, canSendAs: string[], now: number,
-  previous?: DraftObject, enableAttachments = false): Promise<DraftObject> {
+  previous?: DraftObject, enableAttachments = false, resolveLink?: (id: string) => ReturnType<ResolveLinkUpload>): Promise<DraftObject> {
   const args = object(input, ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'inReplyTo', 'forwardOf', 'attachments']);
   if (typeof args.from === 'string' && hasHeaderControl(args.from)) fail('invalid_header', { errors: [{ field: '/from', code: 'invalid' }] });
   const from = sender(args.from, canSendAs);
@@ -260,13 +265,18 @@ export async function draftInput(sql: SqlStorage, index: MailboxIndex, input: un
         if (expiry === undefined) return invalid(`${path}/expiry`);
         if (!enableAttachments) break;
         // A file link already on the draft keeps its upload; only the expiry choice may change.
+        if (stored.some(({ wire }) => wire.kind === 'file_link' && wire.linkUploadId === linkUploadId)) return invalid(`${path}/linkUploadId`);
         const carried = previous?.attachments?.find(({ wire }) => wire.kind === 'file_link' && wire.linkUploadId === linkUploadId);
-        if (carried && 'link' in carried && carried.wire.kind === 'file_link') {
+        // Older journal entries had no registry id. New references always go through the registry,
+        // including a retained upload after a restore (a deleted object cannot be reattached).
+        if (carried && 'link' in carried && carried.wire.kind === 'file_link' && !carried.link.uploadId) {
           stored.push({ wire: { ...carried.wire, expiry }, link: carried.link });
           break;
         }
-        // Link uploads (M3-15b) attach here once they exist; until then none can be found.
-        return fail('not_found');
+        if (!resolveLink) return fail('not_found');
+        const { name, size, link } = await resolveLink(linkUploadId);
+        stored.push({ wire: { kind: 'file_link', linkUploadId, expiry, name, size }, link });
+        break;
       }
       default: return invalid(`${path}/kind`);
     }
