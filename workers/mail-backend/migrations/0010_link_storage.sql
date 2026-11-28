@@ -17,8 +17,8 @@ CREATE TABLE link_location_fingerprints (
 --
 -- Anything that will reference a location (links, pending deletes, draft
 -- attachments, unfinished uploads) must be written by a statement that requires
--- the location's `state = 'active'`: a delete first sets `deleting`, then checks
--- that nothing references the location, and only then removes the row.
+-- the location's `state = 'active'`: a delete first sets `deleting` with its claim,
+-- then checks that nothing references the location, and only then removes the row.
 CREATE TABLE link_storage_locations (
   workspace_id TEXT NOT NULL CHECK (length(workspace_id) BETWEEN 1 AND 58 AND workspace_id NOT GLOB '*[^a-z0-9-]*' AND workspace_id NOT GLOB '*-'
     AND workspace_id NOT GLOB '*--*' AND workspace_id NOT GLOB '*-s3alias' AND instr(workspace_id, char(0)) = 0
@@ -31,6 +31,9 @@ CREATE TABLE link_storage_locations (
   path_style INTEGER NOT NULL CHECK (path_style IN (0, 1)),
   fingerprint TEXT NOT NULL CHECK (length(fingerprint) = 64 AND NOT fingerprint GLOB '*[^0-9a-f]*'),
   state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'deleting')),
+  -- The running delete's claim (random) and its time; a stale claim can be taken over.
+  delete_claim TEXT,
+  delete_claimed_at INTEGER,
   current INTEGER NOT NULL CHECK (current IN (0, 1)),
   read_key_last4 TEXT NOT NULL CHECK (length(read_key_last4) = 4),
   read_key_version INTEGER NOT NULL CHECK (typeof(read_key_version) = 'integer' AND read_key_version BETWEEN 1 AND 255),
@@ -40,7 +43,9 @@ CREATE TABLE link_storage_locations (
   write_sealed TEXT NOT NULL CHECK (length(write_sealed) BETWEEN 40 AND 2048),
   created_at INTEGER NOT NULL,
   rotated_at INTEGER,
-  PRIMARY KEY (workspace_id, location_id)
+  PRIMARY KEY (workspace_id, location_id),
+  CHECK ((state = 'active' AND delete_claim IS NULL AND delete_claimed_at IS NULL)
+    OR (state = 'deleting' AND delete_claim IS NOT NULL AND typeof(delete_claimed_at) = 'integer'))
 );
 CREATE UNIQUE INDEX link_storage_current ON link_storage_locations (workspace_id) WHERE current = 1;
 -- The rewrap job's ordered walk and the version check's seeks, by key version.

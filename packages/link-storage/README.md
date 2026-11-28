@@ -29,11 +29,11 @@ mail-content gets a workspace override's read-only key from the backend's `Conte
 
 An admin adds the workspace's own location through `createLinkLocation` (contract section 8.7). Its fields never change; its keys rotate in place after passing the check. Both keys are sealed with AES-256-GCM under the current KEK version. The AAD is (workspace, location, key version, role), so a value copied to another row or column fails to open.
 
-**Deleting** first sets the row to `deleting`, then asks `LinkLocationUsage.inUse`, and deletes only if nothing uses the location; otherwise it sets the row back. Every writer of a reference to a location (links, pending deletes, draft attachments, unfinished uploads) must require `state = 'active'` in the same statement. M3-13 and M3-15b provide the usage port; until then deletes answer `feature_unavailable`.
+**Deleting** first sets the row to `deleting` with a claim, then asks `LinkLocationUsage.inUse`, and deletes only if nothing uses the location; otherwise it sets the row back. A usage check that takes longer than 20 seconds counts as in use, and a claim left by a failed delete can be taken over after 60 seconds. Every writer of a reference to a location (links, pending deletes, draft attachments, unfinished uploads) must require `state = 'active'` in the same statement. M3-13 and M3-15b provide the usage port; until then deletes answer `feature_unavailable`.
 
 ## Rotating the KEK
 
 1. Add a new version to `LINK_CRED_KEK` and switch `current` to it.
-2. Deploy. Credentials are rewrapped under the new version on their next use by mail-web or the sweeper (the content lookup only reads).
+2. Deploy. Write paths that open a credential (uploads and the sweeper, M3-15b) rewrap it under the new version; the content lookup only reads, and until M3-15b nothing else opens credentials, so step 3 is what migrates them.
 3. Run `MailAdmin.rewrapLinkCredentials(100, next)`, passing back each answer's `next`, until `next` is null. Values it cannot open are counted in `failed` and left in place.
 4. Remove the old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it.

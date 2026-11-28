@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { inspect } from 'node:util';
 import test from 'node:test';
 import {
-  CredentialSealError, credentialSecret, deploymentLocations, linkKek, linkSecretViolations, LinkStorageStore, LocationRepointedError,
+  CredentialSealError, credentialSecret, DELETE_CLAIM_MS, USAGE_TIMEOUT_MS, deploymentLocations, linkKek, linkSecretViolations, LinkStorageStore, LocationRepointedError,
   newLocationId, openCredential, S3Credentials, sealCredential, type LinkKek, type LinkLocationFields, type LinkLocationUsage,
 } from '../src/index.ts';
 import { testDatabase } from './d1.ts';
@@ -223,7 +223,34 @@ test('a content-lookup read does not rewrap, and a failed final delete keeps the
   } };
   await assert.rejects(new LinkStorageStore(failing).delete('ws-a', id, { inUse: async () => false }), /d1 down/);
   assert.ok(await store.get('ws-a', id));
+  // Both the delete and its restore fail: the row stays `deleting` until its claim expires,
+  // then the next delete takes the claim over and finishes.
+  const broken = { ...db, prepare(sql: string) {
+    const statement = db.prepare(sql);
+    const fails = sql.startsWith('DELETE FROM link_storage_locations') || sql.includes("SET state = 'active'");
+    return fails ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
+  } };
+  await assert.rejects(new LinkStorageStore(broken).delete('ws-a', id, { inUse: async () => false }, 10_000), /d1 down/);
+  assert.equal(await store.get('ws-a', id), null);
+  assert.equal(await store.delete('ws-a', id, { inUse: async () => false }, 10_000 + DELETE_CLAIM_MS - 1), 'pending');
+  let asked = false;
+  assert.equal(await store.delete('ws-a', id, { inUse: async () => { asked = true; return true; } }, 10_000 + DELETE_CLAIM_MS), 'in_use');
+  assert.ok(asked);
+  assert.ok(await store.get('ws-a', id));
   assert.equal(await store.delete('ws-a', id, { inUse: async () => false }), 'deleted');
+});
+
+test('a usage check that hangs counts as in use', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const id = await created(store, db, await kek(1, [1]));
+  const pending = store.delete('ws-a', id, { inUse: () => new Promise<boolean>(() => {}) });
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  t.mock.timers.tick(USAGE_TIMEOUT_MS);
+  await assert.rejects(pending, /timed out/);
+  assert.ok(await store.get('ws-a', id));
 });
 
 test('a deployment location id is never silently repointed', async () => {

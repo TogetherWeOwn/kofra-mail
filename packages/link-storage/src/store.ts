@@ -17,6 +17,11 @@ export interface LinkDatabase {
   batch(statements: LinkStatement[]): Promise<unknown[]>;
 }
 
+/** How long a delete's claim holds before another delete may take it over. */
+export const DELETE_CLAIM_MS = 60_000;
+/** The longest a delete waits for its usage check. */
+export const USAGE_TIMEOUT_MS = 20_000;
+
 /** A workspace may keep a few locations at once: the current one, and older ones its links still use. */
 export const MAX_WORKSPACE_LOCATIONS = 8;
 
@@ -154,37 +159,50 @@ export class LinkStorageStore {
    * Deletes a location unless something still uses it. It first marks the row
    * `deleting`, so no new reference can be written (writers require `active`),
    * then asks `usage`; a location in use is set back to `active`. While another
-   * delete is checking, the answer is `pending`.
+   * delete is checking, the answer is `pending`; a claim left by a failed delete
+   * expires after `DELETE_CLAIM_MS`, and the next delete takes it over.
    */
-  async delete(workspaceId: string, locationId: string, usage: LinkLocationUsage): Promise<'deleted' | 'in_use' | 'pending' | 'not_found'> {
-    const marked = await this.#db.prepare(`UPDATE link_storage_locations SET state = 'deleting'
-      WHERE workspace_id = ? AND location_id = ? AND state = 'active'`).bind(workspaceId, locationId).run();
+  async delete(workspaceId: string, locationId: string, usage: LinkLocationUsage, now = Date.now()):
+    Promise<'deleted' | 'in_use' | 'pending' | 'not_found'> {
+    // A claim stamps the row; only its holder may restore or delete it. A claim older
+    // than DELETE_CLAIM_MS (its holder failed or gave up) can be taken over, so a
+    // location is never left hidden for good.
+    const claim = crypto.randomUUID();
+    const marked = await this.#db.prepare(`UPDATE link_storage_locations SET state = 'deleting', delete_claim = ?, delete_claimed_at = ?
+      WHERE workspace_id = ? AND location_id = ? AND (state = 'active' OR (state = 'deleting' AND delete_claimed_at <= ?))`)
+      .bind(claim, now, workspaceId, locationId, now - DELETE_CLAIM_MS).run();
     if (!marked.meta.changes) {
-      // Another delete of this location may be checking its usage right now.
+      // Another delete of this location is checking its usage right now.
       const pending = await this.#db.prepare(`SELECT 1 AS pending FROM link_storage_locations
         WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`).bind(workspaceId, locationId).first();
       return pending ? 'pending' : 'not_found';
     }
+    const restore = () => this.#db.prepare(`UPDATE link_storage_locations SET state = 'active', delete_claim = NULL, delete_claimed_at = NULL
+      WHERE workspace_id = ? AND location_id = ? AND state = 'deleting' AND delete_claim = ?`).bind(workspaceId, locationId, claim).run();
     let used = true;
     try {
-      used = await usage.inUse({ workspaceId, locationId });
-    } finally {
-      if (used !== false) {
-        await this.#db.prepare(`UPDATE link_storage_locations SET state = 'active'
-          WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`).bind(workspaceId, locationId).run();
+      // A usage check that takes too long counts as in use, well before the claim can be taken over.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<boolean>((_, reject) => { timer = setTimeout(() => reject(new Error('Link location usage check timed out')), USAGE_TIMEOUT_MS); });
+      try {
+        used = await Promise.race([usage.inUse({ workspaceId, locationId }), timeout]);
+      } finally {
+        clearTimeout(timer);
       }
+    } finally {
+      if (used !== false) await restore();
     }
     if (used !== false) return 'in_use';
+    let deleted;
     try {
-      await this.#db.prepare(`DELETE FROM link_storage_locations WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`)
-        .bind(workspaceId, locationId).run();
+      deleted = await this.#db.prepare(`DELETE FROM link_storage_locations
+        WHERE workspace_id = ? AND location_id = ? AND state = 'deleting' AND delete_claim = ?`).bind(workspaceId, locationId, claim).run();
     } catch (error) {
-      // A failed delete must not leave the row hidden but still counted against the workspace.
-      await this.#db.prepare(`UPDATE link_storage_locations SET state = 'active'
-        WHERE workspace_id = ? AND location_id = ? AND state = 'deleting'`).bind(workspaceId, locationId).run().catch(() => {});
+      // If this restore fails too, the claim expires and a retried delete takes it over.
+      await restore().catch(() => {});
       throw error;
     }
-    return 'deleted';
+    return deleted.meta.changes ? 'deleted' : 'pending';
   }
 
   /**
