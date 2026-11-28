@@ -44,9 +44,11 @@ CREATE TABLE IF NOT EXISTS quota_released (
   PRIMARY KEY (ws, mb, send_id, epoch, attempt)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS quota_released_by_seen ON quota_released (last_seen_at);
-CREATE TABLE IF NOT EXISTS quota_gate_alerts (day TEXT PRIMARY KEY, created_at INTEGER NOT NULL, sent_at INTEGER) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS quota_gate_alerts (
+  day TEXT PRIMARY KEY, created_at INTEGER NOT NULL, last_attempt_at INTEGER, sent_at INTEGER
+) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS quota_alerts_sent ON quota_gate_alerts (sent_at) WHERE sent_at IS NOT NULL;
-CREATE INDEX IF NOT EXISTS quota_alerts_pending ON quota_gate_alerts (created_at) WHERE sent_at IS NULL;
+CREATE INDEX IF NOT EXISTS quota_alerts_pending ON quota_gate_alerts (last_attempt_at, created_at) WHERE sent_at IS NULL;
 `;
 
 type Charge = { day: string; month: string; expires_at: number | null };
@@ -166,13 +168,18 @@ export class SendQuota extends DurableObject<SendQuotaConfig> implements QuotaPo
     const now = this.now();
     const pending = await this.alertWork.run(async () => {
       this.pruneAlerts(now);
+      // First attempts and least recently attempted alerts go first so that a
+      // rejected page cannot block newer alerts behind it.
       const rows = this.sql.exec<{ day: string }>(`SELECT day FROM quota_gate_alerts
-        WHERE sent_at IS NULL ORDER BY created_at LIMIT ?`, PRUNE_PAGE).toArray();
+        WHERE sent_at IS NULL ORDER BY last_attempt_at NULLS FIRST, created_at LIMIT ?`, PRUNE_PAGE).toArray();
       if (rows.length) await this.armAlert(now + ALERT_RETRY_MS);
       return rows;
     });
     const deliver = mailAlert(this.env.ALERTS);
     for (const { day } of pending) {
+      const attempted = this.sql.exec(`UPDATE quota_gate_alerts SET last_attempt_at = max(coalesce(last_attempt_at, 0), ?)
+        WHERE day = ? AND sent_at IS NULL RETURNING day`, this.now(), day).toArray();
+      if (!attempted.length) continue;
       try { await deliver({ code: ALERT_CODE, key: `send_quota_gate:${day}` }); }
       catch { continue; } // Missing binding or non-2xx: never acknowledge, retry on the next alarm.
       this.sql.exec('UPDATE quota_gate_alerts SET sent_at = ? WHERE day = ? AND sent_at IS NULL', this.now(), day);

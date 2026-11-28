@@ -7,6 +7,7 @@ export function quotaFixture<Env extends QuotaFixtureEnv>(clock: (env: Env) => n
   return class FixtureSendQuota extends SendQuota {
     private clockOverride?: number;
     private failures = new Map<string, number>();
+    private unavailableUntil = 0;
     constructor(ctx: DurableObjectState, private readonly fixtureEnv: Env) { super(ctx, fixtureEnv); }
     protected override now() { return this.clockOverride ?? clock(this.fixtureEnv); }
     setTime(now: number) { this.clockOverride = now; }
@@ -29,7 +30,9 @@ export function quotaFixture<Env extends QuotaFixtureEnv>(clock: (env: Env) => n
       };
     }
     failNext(method: string, times = 1) { this.failures.set(method, times); }
+    setUnavailableUntil(at: number) { this.unavailableUntil = at; }
     private fail(method: string) {
+      if (this.now() < this.unavailableUntil) throw new Error('Fixture quota object unavailable');
       const count = this.failures.get(method) ?? 0;
       if (count > 0) {
         this.failures.set(method, count - 1);

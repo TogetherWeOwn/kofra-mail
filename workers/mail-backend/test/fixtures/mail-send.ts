@@ -5,6 +5,7 @@ import { Response, type Request } from 'miniflare';
 import type { ResultNotice } from '../../src/send-consumer.ts';
 import type { SendDispatch } from '../../src/worker.ts';
 import { startMailHttpFixture } from './mail-http.ts';
+import type { ProviderStart } from './mail-send-worker.ts';
 
 export const SEND = 'send', DLQ = 'send-dlq';
 export const WS = 'w1', MB = 'mailbox-a';
@@ -15,7 +16,11 @@ const compiled = () => build({ entryPoints: [entry], bundle: true, platform: 'br
   external: ['cloudflare:workers'], write: false });
 let bundle: ReturnType<typeof compiled> | undefined;
 
-export async function startMailSendFixture({ quota = true, email = true, environment = 'test' } = {}) {
+type RealQuota = NonNullable<Parameters<typeof startMailHttpFixture>[0]>['realQuota'];
+
+export async function startMailSendFixture({ quota = true, email = true, environment = 'test', realQuota }: {
+  quota?: boolean; email?: boolean; environment?: string; realQuota?: RealQuota;
+} = {}) {
   const { outputFiles } = await (bundle ??= compiled());
   const notices: ResultNotice[] = [];
   const noticeStatuses: number[] = [];
@@ -23,6 +28,7 @@ export async function startMailSendFixture({ quota = true, email = true, environ
   const alerted = Promise.withResolvers<void>();
   const alertStatuses: number[] = [];
   const providerErrors: string[] = [];
+  const providerStarts: ProviderStart[] = [];
   let emailCalls = 0;
   const probe = async (request: Request) => {
     switch (new URL(request.url).pathname) {
@@ -34,6 +40,8 @@ export async function startMailSendFixture({ quota = true, email = true, environ
       }
       case '/email': {
         emailCalls++;
+        const start = request.headers.get('x-fixture-provider-start');
+        if (start) providerStarts.push(JSON.parse(start) as ProviderStart);
         const code = providerErrors.shift();
         return Response.json(code ? { code } : { messageId: 'provider-acceptance' }, { status: code ? 400 : 200 });
       }
@@ -45,16 +53,17 @@ export async function startMailSendFixture({ quota = true, email = true, environ
       default: throw new Error('Unexpected outbound fixture request');
     }
   };
-  const h = await startMailHttpFixture({ send: true, startedAt: START, configureWorkers(backend, workers) {
+  const h = await startMailHttpFixture({ send: true, startedAt: START, realQuota, configureWorkers(backend, workers) {
     backend.serviceBindings = { ...backend.serviceBindings, SEND_PROBE: probe, ALERTS: probe };
     backend.bindings = { ...backend.bindings, MAIL_ENVIRONMENT: environment };
     workers.push({
       name: 'mail-send', compatibilityDate: '2026-06-25',
       modules: [{ type: 'ESModule', path: 'mail-send-fixture.mjs', contents: outputFiles[0].text }],
       durableObjects: { MAILBOX: { className: 'HttpMailbox', scriptName: 'mail-backend' },
-        ...(quota && { SEND_QUOTA: { className: 'FakeSendQuota', scriptName: 'mail-backend' } }) },
+        ...(quota && { SEND_QUOTA: { className: realQuota ? 'RealSendQuota' : 'FakeSendQuota', scriptName: 'mail-backend' } }) },
       d1Databases: ['DIRECTORY'], serviceBindings: { ALERTS: probe, PROBE: probe },
-      bindings: { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: environment, SEND_QUEUE_NAME: SEND, SEND_DLQ_NAME: DLQ, FIXTURE_EMAIL: email },
+      bindings: { MAIL_SEND_ENABLED: 'on', MAIL_ENVIRONMENT: environment, SEND_QUEUE_NAME: SEND, SEND_DLQ_NAME: DLQ, FIXTURE_EMAIL: email,
+        FIXTURE_TRACK_AUTH: !!realQuota },
       queueProducers: { SEND, FIXTURE_DLQ: DLQ },
       queueConsumers: { [SEND]: { maxBatchSize: 1, maxBatchTimeout: 0, maxRetries: 3, deadLetterQueue: DLQ },
         [DLQ]: { maxBatchSize: 1, maxBatchTimeout: 0 } },
@@ -70,7 +79,7 @@ export async function startMailSendFixture({ quota = true, email = true, environ
       return await res.json() as string[];
     },
     submit: (body: SendDispatch) => queue.send(body),
-    alerts, alerted: alerted.promise, alertStatuses, notices, noticeStatuses, providerErrors,
+    alerts, alerted: alerted.promise, alertStatuses, notices, noticeStatuses, providerErrors, providerStarts,
     providerCalls: () => emailCalls,
   });
 }

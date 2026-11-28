@@ -24,7 +24,13 @@ for (const local of [false, true]) test(`mail-send ${local ? 'local' : 'producti
   assert.equal(send.vars.MAIL_ENVIRONMENT, backend.vars.MAIL_ENVIRONMENT);
   assert.equal(send.vars.SEND_QUEUE_NAME, 'send');
   assert.equal(send.vars.SEND_DLQ_NAME, 'send-dlq');
-  assert.deepEqual(send.durable_objects.bindings, [{ name: 'MAILBOX', class_name: 'Mailbox', script_name: backend.name }]);
+  assert.deepEqual(send.durable_objects.bindings, [
+    { name: 'MAILBOX', class_name: 'Mailbox', script_name: backend.name },
+    { name: 'SEND_QUOTA', class_name: 'SendQuota', script_name: backend.name },
+  ]);
+  assert.ok(backend.durable_objects.bindings.some(({ name, class_name }: { name: string; class_name: string }) =>
+    name === 'SEND_QUOTA' && class_name === 'SendQuota'));
+  assert.deepEqual(backend.migrations.at(-1), { tag: 'send-quota-v1', new_sqlite_classes: ['SendQuota'] });
   assert.deepEqual(send.d1_databases, backend.d1_databases);
   assert.ok(send.services.some(({ binding }: { binding: string }) => binding === 'ALERTS'));
   assert.ok(backend.services.some(({ binding }: { binding: string }) => binding === 'ALERTS'));

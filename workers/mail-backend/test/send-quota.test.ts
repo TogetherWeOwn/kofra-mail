@@ -266,6 +266,35 @@ test('an acknowledged gate alert is pruned two days after delivery rather than c
   assert.deepEqual((await quota.retained()).alerts, []);
 }, { daily: '2', alert: () => 204 }));
 
+test('an alarm page of rejected quota alerts does not starve a newer alert', async () => {
+  const newest = '2026-12-31';
+  const accepted: string[] = [];
+  let attempted = 0;
+  await withQuota(async quota => {
+    // The configured zero ceiling creates one refusal per quota day without any provider calls.
+    for (let i = 0; i <= 32; i++) {
+      const clock = NOW + i * dayMs;
+      await quota.setTime(clock);
+      assert.equal((await quota.reserve(scope(`queued-alert-${i}`), fence(), [0], [], clock + 1000)).status, 'exhausted');
+    }
+    assert.equal((await quota.retained()).alerts.at(-1)?.day, newest);
+    await quota.runAlarm();
+    assert.equal(attempted, 32, 'one bounded delivery page');
+    assert.deepEqual(accepted, []);
+    await quota.setTime(NOW + 32 * dayMs + 60_000);
+    await quota.runAlarm();
+    assert.deepEqual(accepted, [`send_quota_gate:${newest}`], 'the second alarm reaches the new alert despite older failures');
+    assert.equal(attempted, 64);
+    assert.equal((await quota.retained()).alerts.filter(row => row.sent_at === null).length, 32, 'failed deliveries stay pending');
+  }, { monthly: '0', alert(body) {
+    attempted++;
+    const { key } = body as { key: string };
+    if (key !== `send_quota_gate:${newest}`) return 503;
+    accepted.push(key);
+    return 204;
+  } });
+});
+
 test('pruning keeps fence rows observed again within 35 days', () => withQuota(async quota => {
   const day = 24 * 60 * 60_000;
   const old = scope('forget-fence');
