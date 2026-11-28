@@ -444,3 +444,20 @@ test('a claim right after a restore never moves a delayed send\'s drive row past
   await h.advance(0);
   assert.deepEqual(ledgerOf(await h.sendState(id)), ['external:pending', 'internal:sent']);
 }));
+
+test('a release that runs long after the undo window starts the handoff\'s stall clock at the release', () => withInternal(async (h, mail, from) => {
+  await outboxDown(h, true);
+  const id = await submit(mail, from, 'late-release', [OTHER]);
+  // No alarm runs for 25 hours past the undo window; the release happens only then.
+  await h.advance(UNDO + 25 * hour, 'clock-only');
+  await h.advance(0);
+  const released = await h.sendState(id);
+  assert.deepEqual(ledgerOf(released), ['internal:pending']);
+  const stalled = async () => (await h.directoryRows("SELECT source FROM mail_alerts WHERE source = 'mail:send_stalled'")).length;
+  await h.advance(hour);
+  await h.advance(hour);
+  assert.equal(await stalled(), 0, 'not 24 hours after the undo window: the release was just now');
+  await h.advance(23 * hour);
+  await h.advance(hour);
+  assert.equal(await stalled(), 1, '24 hours after the release');
+}));

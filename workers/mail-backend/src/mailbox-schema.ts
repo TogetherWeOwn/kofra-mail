@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS mailbox_sends (
   id TEXT PRIMARY KEY, draft_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, undo_until INTEGER NOT NULL,
   holder TEXT NOT NULL, record TEXT NOT NULL, created_seq INTEGER NOT NULL, release_seq INTEGER, queued_seq INTEGER,
   terminal_seq INTEGER, message_id TEXT, reason TEXT, finish_pending INTEGER NOT NULL DEFAULT 0 CHECK (finish_pending IN (0, 1)),
-  raw_key TEXT
+  raw_key TEXT, released_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS mailbox_send_page ON mailbox_sends(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS mailbox_send_message ON mailbox_sends(message_id) WHERE message_id IS NOT NULL;
@@ -45,8 +45,8 @@ CREATE TABLE IF NOT EXISTS mailbox_send_drivers (
 CREATE TABLE IF NOT EXISTS mailbox_send_breaches (send_id TEXT PRIMARY KEY, since INTEGER NOT NULL);
 -- Local, like the drivers: the next retry of a send's internal handoff (M3-8),
 -- which no move of the drive row passes while an internal recipient is pending,
--- and its stall clock's start (the send's release, from its journalled
--- undo_until), which no external activity or restore moves.
+-- and its stall clock's start (the send's journalled release time), which no
+-- external activity or restore moves.
 CREATE TABLE IF NOT EXISTS mailbox_send_handoffs (send_id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, since INTEGER NOT NULL);
 -- The consumer's side of the state machine (section 2.4, M3-5), non-derived
 -- like the ledger. mailbox_send_dispatch holds a send's attempt counter, its
@@ -192,10 +192,12 @@ ${SEND_SCHEMA}`;
 // Columns added after the first mailboxes were written (M3-8). New and
 // existing objects gain them by ALTER TABLE at the end of their tables, so both
 // share one column order. `folder_rev` counts a message's folder changes (non-derived,
-// journalled with the folder); `raw_key` is a released send's raw object.
+// journalled with the folder); `raw_key` is a released send's raw object and
+// `released_at` when its release started (both journalled).
 const ADDED_COLUMNS = [
   ['messages', 'folder_rev', 'folder_rev INTEGER NOT NULL DEFAULT 0'],
   ['mailbox_sends', 'raw_key', 'raw_key TEXT'],
+  ['mailbox_sends', 'released_at', 'released_at INTEGER'],
 ] as const;
 const upgraded = new WeakSet<SqlStorage>();
 

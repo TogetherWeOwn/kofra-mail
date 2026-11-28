@@ -143,6 +143,8 @@ test('an alias moved to the sender after release files the sent copy, from Archi
     await mail.updateThreads({ ids: [await sentCopyThread(h)], set: { folder: 'archive' } });
     await h.directoryChange("UPDATE deliveries SET state = 'pending', done_at = NULL, next_attempt_at = 0 WHERE id = ?", child.id);
     assert.deepEqual(await h.runDeliveries(), [child.id], 'redelivered through the real outbox');
+    const [redelivered] = await h.directoryRows('SELECT state FROM deliveries WHERE id = ?', child.id);
+    assert.equal(redelivered?.state, 'done', 'the redelivery completed');
     const [after] = await messages(h, 'member');
     assert.deepEqual([folderOf(after.flags), after.folder_rev], ['archive', 2]);
   }));

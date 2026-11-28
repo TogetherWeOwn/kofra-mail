@@ -725,8 +725,9 @@ export class MailboxIndex {
       }
       case 'send_release': {
         const row = validSendId(event.id) ? sendRow(this.sql, event.id) : undefined;
-        if (!row || row.state !== 'pending') throw new Error('Invalid send release');
-        this.sql.exec(`UPDATE mailbox_sends SET state = 'releasing', release_seq = ? WHERE id = ?`, this.journal.revision() + 1, row.id);
+        if (!row || row.state !== 'pending' || (event.at !== undefined && !epochMs(event.at))) throw new Error('Invalid send release');
+        this.sql.exec(`UPDATE mailbox_sends SET state = 'releasing', release_seq = ?, released_at = ? WHERE id = ?`, this.journal.revision() + 1,
+          event.at ?? null, row.id);
         break;
       }
       case 'send_queued': {
@@ -909,7 +910,8 @@ export class MailboxIndex {
         INSERT INTO backup_capture(kind, value)
         SELECT 'send', json_object('id', id, 'draftId', draft_id, 'state', state, 'createdAt', created_at, 'undoUntil', undo_until,
           'holder', holder, 'record', json(record), 'createdSeq', created_seq, 'releaseSeq', release_seq, 'queuedSeq', queued_seq,
-          'terminalSeq', terminal_seq, 'messageId', message_id, 'reason', reason, 'finishPending', finish_pending, 'rawKey', raw_key) FROM mailbox_sends;
+          'terminalSeq', terminal_seq, 'messageId', message_id, 'reason', reason, 'finishPending', finish_pending, 'rawKey', raw_key,
+          'releasedAt', released_at) FROM mailbox_sends;
         INSERT INTO backup_capture(kind, value)
         SELECT 'send_recipient', json_object('sendId', send_id, 'idx', idx, 'kind', kind, 'state', state, 'reason', reason)
         FROM mailbox_send_recipients;
@@ -1006,7 +1008,7 @@ export class MailboxIndex {
     } else if (row.kind === 'send') {
       const send = value as { id: string; draftId: string; state: string; createdAt: number; undoUntil: number; holder: string;
         record: Parameters<typeof checkSendRecord>[0]; createdSeq: number; releaseSeq: number | null; queuedSeq: number | null;
-        terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number; rawKey?: string | null };
+        terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number; rawKey?: string | null; releasedAt?: number | null };
       checkSendRecord(send.record);
       const seqs = [send.releaseSeq, send.queuedSeq, send.terminalSeq];
       // send_window events only extend the undo deadline, so a restored row never has an earlier one than its record.
@@ -1016,11 +1018,13 @@ export class MailboxIndex {
           !epochMs(send.createdAt) || !epochMs(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
           (send.messageId !== null && send.messageId !== sentCopyId(send.id)) ||
           (send.reason !== null && !SEND_FAILURES.includes(send.reason as never)) ||
-          (send.rawKey != null && parseObjectKey(send.rawKey)?.kind !== 'raw')) throw new Error('Invalid snapshot send');
+          (send.rawKey != null && parseObjectKey(send.rawKey)?.kind !== 'raw') || (send.releasedAt != null && !epochMs(send.releasedAt))) {
+        throw new Error('Invalid snapshot send');
+      }
       this.sql.exec(`INSERT INTO mailbox_sends (id, draft_id, state, created_at, undo_until, holder, record, created_seq, release_seq, queued_seq,
-        terminal_seq, message_id, reason, finish_pending, raw_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, send.id, send.draftId, send.state,
-        send.createdAt, send.undoUntil, send.holder, JSON.stringify(send.record), send.createdSeq, send.releaseSeq, send.queuedSeq,
-        send.terminalSeq, send.messageId, send.reason, send.finishPending, send.rawKey ?? null);
+        terminal_seq, message_id, reason, finish_pending, raw_key, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, send.id,
+        send.draftId, send.state, send.createdAt, send.undoUntil, send.holder, JSON.stringify(send.record), send.createdSeq, send.releaseSeq,
+        send.queuedSeq, send.terminalSeq, send.messageId, send.reason, send.finishPending, send.rawKey ?? null, send.releasedAt ?? null);
       const finished = send.finishPending === 0 && TERMINAL.includes(send.state as never);
       if (!finished && send.state !== 'cancelled') {
         for (const id of new Set(send.record.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);

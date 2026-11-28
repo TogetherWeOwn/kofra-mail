@@ -523,7 +523,7 @@ export class SendDriver {
     if (row.state === 'pending') {
       if (!await ports.publishThrough(row.createdSeq)) return;
       const released = await this.commit(start, ['pending'], (_timers, _row, index) => {
-        index.commitEvents([{ type: 'send_release', id: this.ref }]);
+        index.commitEvents([{ type: 'send_release', id: this.ref, at: this.timer.now }]);
         this.resetBackoff();
         return sendRow(ports.sql, this.ref)!;
       });
@@ -672,13 +672,13 @@ export class SendDriver {
       // The handler's re-arm is the handoff's next retry: while an internal row
       // is pending, no later move of the drive row passes it (section 2.2).
       // The stall clock counts from the release, from the send's journalled
-      // undo_until (release runs once it passes), so a restore, which clears this
-      // local row, rebuilds the same deadline. The backup lane, which raises the
+      // release time (undo_until for a release journalled before it was kept), so
+      // a restore, which clears this local row, rebuilds the same deadline. The backup lane, which raises the
       // alert, learns of the row on its first write.
       const retry = timers.due(SEND_DRIVE, this.ref);
       const first = !ports.sql.exec('SELECT 1 FROM mailbox_send_handoffs WHERE send_id = ?', this.ref).toArray().length;
       if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at, since)
-        SELECT ?1, ?2, undo_until FROM mailbox_sends WHERE id = ?1
+        SELECT ?1, ?2, coalesce(released_at, undo_until) FROM mailbox_sends WHERE id = ?1
         ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry);
       if (retry !== null && first) ports.journalDue(timers);
       // A send queued before the raw key was kept on its row falls back to its sent copy's index row.
