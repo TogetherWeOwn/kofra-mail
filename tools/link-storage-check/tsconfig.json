@@ -1,0 +1,5 @@
+{
+  "extends": "../limiter-verify/tsconfig.json",
+  "compilerOptions": { "erasableSyntaxOnly": true, "skipLibCheck": true, "lib": ["ES2024", "DOM", "DOM.Iterable"] },
+  "include": ["*.ts", "../../packages/link-storage/src/*.ts", "../../packages/link-storage/test/*.ts"]
+}

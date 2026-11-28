@@ -1,0 +1,9 @@
+{
+  "name": "@kofra/link-storage",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": { "check": "tsc --noEmit" },
+  "dependencies": { "aws4fetch": "1.0.20" }
+}

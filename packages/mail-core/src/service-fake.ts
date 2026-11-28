@@ -1083,6 +1083,11 @@ export function createFakeMailHarness(options: { contentOrigin?: string; start?:
         const items = [...members.values()].map((m): Member => ({ ...m, hasMailbox: ownerBox(workspace, m.id) !== undefined }));
         return page(items, workspace.id, 'listMembers', query, (m) => [m.name, m.id], ascending);
       },
+      // The fake has no link storage: no deployment config and no save check to run.
+      async listLinkLocations() { return { deployment: false, items: [] }; },
+      async createLinkLocation() { return fail('feature_unavailable'); },
+      async rotateLinkLocationCredentials() { return fail('feature_unavailable'); },
+      async deleteLinkLocation() {},
     };
     // All callers get detached snapshots; access checks precede route validation and replay.
     return new Proxy(service, {

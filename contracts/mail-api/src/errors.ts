@@ -14,6 +14,7 @@ export const ERROR_STATUS = {
   label_exists: 409,
   address_taken: 409,
   domain_exists: 409,
+  location_in_use: 409,
   send_not_pending: 409,
   idempotency_in_progress: 409,
   revision_mismatch: 412,
@@ -28,6 +29,7 @@ export const ERROR_STATUS = {
   message_too_large: 422,
   limit_reached: 422,
   domain_not_in_workspace: 422,
+  storage_check_failed: 422,
   precondition_required: 428,
   rate_limited: 429,
   internal: 500,
@@ -40,6 +42,20 @@ export const ERROR_STATUS = {
 export type MailErrorCode = keyof typeof ERROR_STATUS;
 
 export const ERROR_CODES = Object.keys(ERROR_STATUS) as MailErrorCode[];
+
+/**
+ * Why a link storage location failed its save check (`storage_check_failed`):
+ * - `endpoint`: not `https:` on port 443, an IP literal, or a refused host;
+ * - `redirect`: the endpoint answered a 3xx, which is never followed;
+ * - `public_bucket`: an anonymous read or list of the probe object was not refused;
+ * - `read_key_writable`: the read-only key is the write key, or may write or delete;
+ * - `auth`: a key was refused for an object or bucket operation it needs;
+ * - `bucket`: the bucket is missing or answered unexpectedly;
+ * - `multipart`: a multipart operation (create, part, list parts, complete, abort) failed;
+ * - `network`: the endpoint could not be reached in time.
+ */
+export const STORAGE_CHECK_REASONS = ['endpoint', 'redirect', 'public_bucket', 'read_key_writable', 'auth', 'bucket', 'multipart', 'network'] as const;
+export type StorageCheckReason = (typeof STORAGE_CHECK_REASONS)[number];
 
 /** A field-level problem inside `invalid_request` or `invalid_header`; `field` is a JSON Pointer into the request body. */
 export interface FieldError {
@@ -71,6 +87,8 @@ export interface Problem {
   retryAfterSeconds?: number;
   /** For `reauth_required`: the `max_age` the client sends to the account service. */
   maxAgeSeconds?: number;
+  /** For `storage_check_failed`: the fixed reason. Never a provider message, status or header. */
+  reason?: StorageCheckReason;
 }
 
 /** `typePrefix` is `PROBLEM_TYPE_PREFIX` or a deployment-configured documentation base ending in `/`. */

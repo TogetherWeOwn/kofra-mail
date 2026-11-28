@@ -1,6 +1,7 @@
 import { API_PREFIX, LIMITS, ROUTES, MailApiError, problem } from '@kofra/mail-contract';
 import type { ContentUrl, MailErrorCode, Member, Operation, Problem, RouteSpec, Session } from '@kofra/mail-contract';
 import { contentFrameUrl, separateContentOrigin } from '../content-origin.ts';
+import { LINK_STORAGE_OPS, runLinkStorage, type LinkStorageEnvironment } from './link-storage.ts';
 import { Directory, type DirectoryDatabase } from './mail-directory.ts';
 
 export interface LocalPrincipal {
@@ -36,7 +37,7 @@ interface RateLimitBinding {
 }
 type RateLimitBindings = Partial<Record<(typeof rateBindings)[RateBucket], RateLimitBinding>>;
 
-export interface MailApiEnvironment extends RateLimitBindings {
+export interface MailApiEnvironment extends RateLimitBindings, LinkStorageEnvironment {
   MAIL_LOCAL_API?: string;
   MAIL_DRAFT_UPLOADS_ENABLED?: string;
   MAIL_SEND_ENABLED?: string;
@@ -72,6 +73,7 @@ const jsonFields: Partial<Record<Operation, readonly string[]>> = {
   createDraft: ['from', 'to', 'cc', 'bcc', 'subject', 'body', 'attachments', 'inReplyTo', 'forwardOf'],
   addDomain: ['name', 'kind', 'aliasOf'], createMailbox: ['primaryAddress', 'displayName', 'ownerUserId'],
   updateMailbox: ['displayName', 'ownerUserId'], createAlias: ['mailboxId', 'address', 'sendAs'],
+  rotateLinkLocationCredentials: ['read', 'write'],
 };
 jsonFields.replaceDraft = jsonFields.createDraft;
 
@@ -232,7 +234,9 @@ export async function handleMailApi(request: Request, env: MailApiEnvironment = 
 
     let result: OperationResult;
     if (route.access === 'admin') {
-      result = await directory.run(op, params, input, idempotencyKey);
+      result = LINK_STORAGE_OPS.has(op)
+        ? await runLinkStorage(op, { db: env.DIRECTORY, workspaceId: principal.workspaceId, principal, env, params, input, idempotencyKey })
+        : await directory.run(op, params, input, idempotencyKey);
     } else if (op === 'listIdentities' && mailbox) {
       result = { body: { items: await directory.identities(mailbox.id) } };
     } else {

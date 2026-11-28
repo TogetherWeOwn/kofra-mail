@@ -45,6 +45,8 @@ export type Env = KofraConfig & {
   // The bound on clock differences of the send path, in seconds (default 30).
   MAIL_SEND_CLOCK_SKEW_SECONDS?: string;
   MAIL_ENVIRONMENT?: string;
+  // Secret: the link storage credential KEK (packages/link-storage, kek.ts).
+  LINK_CRED_KEK?: string;
   SEND?: { send(message: SendDispatch): Promise<unknown> } & Partial<NoticeBatchProducer>;
   SEND_QUOTA?: SendQuotaBinding;
   DIRECTORY: D1Database;

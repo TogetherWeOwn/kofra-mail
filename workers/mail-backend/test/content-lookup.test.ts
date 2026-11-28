@@ -4,6 +4,15 @@ import { fileURLToPath, URL } from 'node:url';
 import { after, before, test } from 'node:test';
 import { build } from 'esbuild';
 import { Miniflare } from 'miniflare';
+import { linkKek } from '../../../packages/link-storage/src/kek.ts';
+import { S3Credentials } from '../../../packages/link-storage/src/credentials.ts';
+import { LinkStorageStore, type LinkDatabase } from '../../../packages/link-storage/src/store.ts';
+
+// Synthetic link storage keys (M3-15a): mail-content may receive only the read one.
+const LINK_KEK = JSON.stringify({ current: '1', keys: { 1: Buffer.alloc(32, 5).toString('base64') } });
+const LINK_READ = { accessKeyId: 'FAKEREADKEY0001', secretAccessKey: 'fake-read-secret-value-0001' };
+const LINK_WRITE = { accessKeyId: 'FAKEWRITEKEY002', secretAccessKey: 'fake-write-secret-value-0002' };
+const LINK_LOCATION = 'abcdefghijklmnopqrstuvwxyz';
 
 let mf: Miniflare;
 before(async () => {
@@ -14,7 +23,7 @@ before(async () => {
   mf = new Miniflare({ workers: [{
     name: 'lookup', compatibilityDate: '2026-06-25',
     modules: [{ type: 'ESModule', path: 'lookup.mjs', contents: outputFiles[0].text }],
-    bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_CONTENT_ENABLED: 'on' },
+    bindings: { MAIL_BACKEND_ENABLED: 'on', MAIL_CONTENT_ENABLED: 'on', LINK_CRED_KEK: LINK_KEK },
     d1Databases: ['DIRECTORY'], durableObjects: { MAILBOX: { className: 'LookupMailbox', useSQLite: true } },
     serviceBindings: { MAIL_LOOKUP: { name: 'lookup', entrypoint: 'ContentLookup' } },
   }] });
@@ -25,6 +34,12 @@ before(async () => {
     await db.prepare("INSERT INTO mailboxes VALUES (?, 'w', ?, ?)").bind(mb, `owner-${mb}`, `${mb}@mail.example`).run();
   }
   await db.prepare("INSERT INTO mailboxes VALUES ('opaque-owner', 'w', 'account:member', 'opaque@mail.example')").run();
+  const links = await readFile(new URL('../migrations/0010_link_storage.sql', import.meta.url), 'utf8');
+  for (const statement of links.split(/;\s*\n/).filter(s => /CREATE/.test(s))) await db.prepare(statement).run();
+  const store = new LinkStorageStore(db as unknown as LinkDatabase);
+  await db.batch(await store.createStatements((await linkKek(LINK_KEK))!, 'w', LINK_LOCATION,
+    { endpoint: 'https://s3.storage-fixture.test', region: 'auto', bucket: 'links', prefix: '', pathStyle: true },
+    { read: S3Credentials.from(LINK_READ)!, write: S3Credentials.from(LINK_WRITE)! }, 1) as unknown as D1PreparedStatement[]);
 });
 after(() => mf?.dispose());
 async function call(...args: unknown[]) {
@@ -33,8 +48,22 @@ async function call(...args: unknown[]) {
   return response.json();
 }
 
-test('ContentLookup has exactly two own RPC methods and directly extends WorkerEntrypoint', async () => {
-  assert.deepEqual(await call('surface'), { names: ['constructor', 'mailboxOwner', 'messageRecord'], direct: true });
+test('ContentLookup has exactly three own RPC methods and directly extends WorkerEntrypoint', async () => {
+  assert.deepEqual(await call('surface'), { names: ['constructor', 'linkReadCredential', 'mailboxOwner', 'messageRecord'], direct: true });
+});
+test('mail-content can receive only the read-only key of a workspace link location', async () => {
+  const answer = await call('linkReadCredential', 'w', LINK_LOCATION);
+  assert.deepEqual(answer, { value: LINK_READ });
+  assert.ok(!JSON.stringify(answer).includes(LINK_WRITE.secretAccessKey));
+  for (const args of [['other', LINK_LOCATION], ['w', 'bcdefghijklmnopqrstuvwxyza'], ['w', 'not-a-location'], ['W', LINK_LOCATION], [{}, LINK_LOCATION]]) {
+    assert.deepEqual(await call('linkReadCredential', ...args), { value: null }, JSON.stringify(args));
+  }
+  // With the columns swapped, the read path refuses the write key instead of returning it.
+  const db = await mf.getD1Database('DIRECTORY', 'lookup');
+  await db.prepare('UPDATE link_storage_locations SET read_sealed = write_sealed, write_sealed = read_sealed').run();
+  assert.deepEqual(await call('linkReadCredential', 'w', LINK_LOCATION), { value: null });
+  await db.prepare('UPDATE link_storage_locations SET read_sealed = write_sealed, write_sealed = read_sealed').run();
+  assert.deepEqual(await call('linkReadCredential', 'w', LINK_LOCATION), { value: LINK_READ });
 });
 test('MAIL_LOOKUP exposes only the named façade, not mailApi, deliver or another name', async () => {
   assert.deepEqual(await call('mailboxOwner', 'w', 'ready'), { value: 'owner-ready' });
