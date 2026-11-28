@@ -521,7 +521,20 @@ export async function startMailHttpFixture({ demo = false, draftsUploads: upload
       sendEvent: (code: string, principal: 'member' | 'other' = 'member') => controlAction('send-event', JSON.stringify({ code, principal })),
       contentRawReads: () => contentRawReads,
       fetchContent: contentWorker ? (path: string, method = 'GET') => contentWorker.fetch(`${contentOrigin}${path}`, { method }) : undefined,
-      sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId), close: () => mf.dispose() };
+      sentHeaders: (messageId: string) => readControl<Record<string, string>>('sent-headers', messageId),
+      // Internal delivery (M3-8): the pipeline's queue consumer for every pending delivery, the reconciler's
+      // handoff part (with a bound on each call), a second expander, a principal's mailbox and a workspace's sweeper.
+      runDeliveries: () => readControl<string[]>('run-deliveries'),
+      handoffCron: (callMs?: number) => readControl<{ errors: number }>('handoff-cron', callMs === undefined ? '' : String(callMs)),
+      expand: (key: string) => readControl<string>('expand', key),
+      box: <T>(principal: keyof typeof accounts, method: string, ...args: unknown[]) => readControl<T>('box', JSON.stringify({ principal, method, args })),
+      sweeper: <T>(workspace: string, method: string, ...args: unknown[]) => readControl<T>('sweeper', JSON.stringify({ workspace, method, args })),
+      deliverRaw: async (mime: string, to: keyof typeof accounts, from: string) => {
+        const res = await call('deliver', mime, { 'x-fixture-to': accounts[to].address, 'x-fixture-from': from });
+        if (!res.ok) throw new Error(`Fixture delivery HTTP ${res.status}: ${await res.text()}`);
+        return res.json() as Promise<{ threadId: string; messageId: string }>;
+      },
+      close: () => mf.dispose() };
   } catch (error) {
     await mf.dispose();
     throw error;

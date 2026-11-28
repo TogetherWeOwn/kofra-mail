@@ -46,6 +46,9 @@ export type JournalEvent =
   | { type: 'message'; id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
       subjectKey: string; auth: string; attKeys: string[] }
   | { type: 'receipt'; id: string }
+  // A `file_sent` child delivery (M3-8): its receipt, and the sent copy filed into
+  // Inbox only if its folder_rev still equals `folderRev`.
+  | { type: 'file_sent'; id: string; messageId: string; folderRev: number }
   | { type: 'flags'; id: string; flags: number; labels: string[]; expiresAt?: number | null }
   | { type: 'label'; id: string; name: string }
   | { type: 'label_delete'; id: string }

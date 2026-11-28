@@ -1,4 +1,4 @@
-import { authVerdict, AUTH_VERDICT } from './auth-verdict.ts';
+import { authVerdict, AUTH_VERDICT, INTERNAL_VERDICT } from './auth-verdict.ts';
 import { MAX_RAW_BYTES, sha256 } from './bytes.ts';
 import { isObjectKey } from './kofra.ts';
 import { ObjectInvalidError, ObjectMissingError } from './object-errors.ts';
@@ -7,7 +7,8 @@ import {
   checkDispatch, checkFence, checkKinds, checkMark, checkReleaseEntry, checkSendRecord, epochMs, LEDGER_STATES, SEND_FAILURES, sendRow, sentCopyId,
   TERMINAL, validReason, validSendId,
 } from './mailbox-send-store.ts';
-import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA } from './mailbox-schema.ts';
+import { ATTACHMENT_SEARCH_BOUNDARY, MAILBOX_SCHEMA, upgradeMailboxSchema } from './mailbox-schema.ts';
+import { FOLDER_MASK, SENT } from './mailbox-api-messages.ts';
 import { JOURNAL_FLUSH } from './mailbox-timers.ts';
 import { IDEM_EXPIRY } from './mailbox-upload.ts';
 import type { ConfirmAnswer, ConfirmEntry, HoldTarget } from './sweep-ledger.ts';
@@ -42,7 +43,7 @@ type Prepared = Omit<ParsedMail, 'attachments'> & { attachments: Array<{
 }> };
 type SnapshotTable = 'messages' | 'labels' | 'drafts' | 'bayes' | 'settings';
 export type SnapshotRow = { row_no: number; kind: string; value: string };
-type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[]; expiresAt?: number | null };
+type SnapshotMessage = Omit<MessageEvent, 'type'> & { flags: number; gmailId: string | null; labels: string[]; expiresAt?: number | null; folderRev?: number };
 export type ApiDraftRef = { id: string; rawKey: string; holder: string; revision: string; updatedAt: number };
 export type PendingConfirmation = ConfirmEntry & { seq: number; publishedAt: number | null };
 export type HolderConfirmationCursor = [seq: number, key: string, holder: string];
@@ -68,6 +69,7 @@ function validMessage(m: Partial<MessageEvent>, snapshot = false): asserts m is 
 
 export function storedLifecycle<T>(storage: DurableObjectStorage): T | null {
   storage.sql.exec(MAILBOX_SCHEMA);
+  upgradeMailboxSchema(storage.sql);
   const row = storage.sql.exec<{ value: string }>('SELECT value FROM lifecycle WHERE id = 1').toArray()[0];
   return row ? JSON.parse(row.value) as T : null;
 }
@@ -85,6 +87,7 @@ export class MailboxIndex {
     this.holderScope = holderScope;
     this.sql = storage.sql;
     this.sql.exec(MAILBOX_SCHEMA);
+    upgradeMailboxSchema(this.sql);
     this.journal = new MailJournal(this.sql);
   }
 
@@ -108,13 +111,15 @@ export class MailboxIndex {
 
   transaction<T>(operation: () => T): T { return this.storage.transactionSync(operation); }
 
-  async ingest(id: string, rawKey: string, createdAt: number, authResults: string | null = null): Promise<void> {
+  // `internal`: a child delivery of an internal handoff (M3-8). Its sender is
+  // trusted only from the delivery row's source column, never from a header.
+  async ingest(id: string, rawKey: string, createdAt: number, authResults: string | null = null, internal = false): Promise<void> {
     if (!isDeliveryId(id) || !Number.isSafeInteger(createdAt) || createdAt < 0) throw new Error('Invalid delivery for mailbox');
     if (this.received(id)) return;
     const parsed = await this.parse(rawKey);
     const source: MessageSource = { id, rawKey, createdAt };
     const prepared = this.known(parsed.dedupeKey) ? null : await this.holdAndStore(source, parsed);
-    const auth = authVerdict(authResults, parsed.sender, parsed.singleFrom);
+    const auth = internal ? INTERNAL_VERDICT : authVerdict(authResults, parsed.sender, parsed.singleFrom);
     this.storage.transactionSync(() => {
       if (this.received(id)) return;
       if (this.known(parsed.dedupeKey)) {
@@ -124,6 +129,19 @@ export class MailboxIndex {
         if (!prepared) throw new Error('Mailbox fingerprint changed unexpectedly');
         this.journal.append(this.insertMessage(source, prepared, auth));
       }
+    });
+  }
+
+  // A `file_sent` child (M3-8): instead of a second copy, file this mailbox's
+  // own sent copy into Inbox if its folder_rev still equals the one recorded at
+  // release, with the delivery's receipt. Live delivery and restore replay both
+  // come here, never to ingest; a missing sent copy makes it a no-op.
+  fileSent(id: string, messageId: string, folderRev: number): void {
+    const event = { type: 'file_sent', id, messageId, folderRev } as const;
+    this.storage.transactionSync(() => {
+      if (this.received(id)) return;
+      this.apply(event);
+      this.journal.append(event);
     });
   }
 
@@ -591,7 +609,9 @@ export class MailboxIndex {
       case 'flags': {
         if (!isDeliveryId(event.id) || !count(event.flags) || !Array.isArray(event.labels) || event.labels.length > 64 ||
             event.labels.some(id => !bounded(id, 256))) throw new Error('Invalid flags');
-        const updated = this.sql.exec('UPDATE messages SET flags = ? WHERE id = ?', event.flags, event.id);
+        // Every folder change increments the message's folder_rev, in the same event as the folder.
+        const updated = this.sql.exec(`UPDATE messages SET folder_rev = folder_rev + CASE WHEN (flags & ${FOLDER_MASK}) = (?1 & ${FOLDER_MASK}) THEN 0 ELSE 1 END,
+          flags = ?1 WHERE id = ?2`, event.flags, event.id);
         if (!updated.rowsWritten) throw new Error('Missing message for flag change');
         this.sql.exec('DELETE FROM message_labels WHERE message_id = ?', event.id);
         for (const id of new Set(event.labels)) this.sql.exec('INSERT INTO message_labels VALUES (?, ?)', event.id, id);
@@ -655,6 +675,17 @@ export class MailboxIndex {
         // Receipts and fingerprints survive deletion: stale queue retries cannot resurrect it.
         break;
       }
+      case 'file_sent': {
+        if (!isDeliveryId(event.id) || !isDeliveryId(event.messageId) || !count(event.folderRev)) throw new Error('Invalid sent-copy filing');
+        this.sql.exec('INSERT INTO receipts VALUES (?)', event.id);
+        // Only this mailbox's own sent copy, only if nobody changed its folder since release.
+        const copy = this.sql.exec<{ flags: number; rev: number }>(`SELECT m.flags, m.folder_rev AS rev FROM messages m
+          WHERE m.id = ? AND EXISTS (SELECT 1 FROM mailbox_sends s WHERE s.message_id = m.id)`, event.messageId).toArray()[0];
+        if (!copy || copy.rev !== event.folderRev || !(copy.flags & SENT) || (copy.flags & FOLDER_MASK) === 0) break;
+        this.sql.exec('UPDATE messages SET flags = ?, folder_rev = folder_rev + 1 WHERE id = ?', copy.flags & ~FOLDER_MASK, event.messageId);
+        this.sql.exec('DELETE FROM mailbox_api_expiry WHERE id = ?', event.messageId);
+        break;
+      }
       case 'send_create': {
         const { send, result } = event;
         checkSendRecord(send);
@@ -705,7 +736,7 @@ export class MailboxIndex {
         delete (message as Partial<SentCopy>).flags;
         validMessage(message);
         if (!count(flags)) throw new Error('Invalid sent copy');
-        this.queuedState(event.id, message.id, event.kinds);
+        this.queuedState(event.id, message.id, event.kinds, message.rawKey);
         this.upsertThread(message.threadId, '', message.subjectKey, message.createdAt);
         this.insertRestoredMessage(message, flags);
         break;
@@ -799,12 +830,13 @@ export class MailboxIndex {
   }
 
   // Release step 4's state change, shared by the live commit and replay.
-  private queuedState(id: string, messageId: string, kinds: SendRecipientKind[]): void {
+  private queuedState(id: string, messageId: string, kinds: SendRecipientKind[], rawKey: string): void {
     const row = validSendId(id) ? sendRow(this.sql, id) : undefined;
-    if (!row || row.state !== 'releasing' || messageId !== sentCopyId(row.id)) throw new Error('Invalid queued send');
+    if (!row || row.state !== 'releasing' || messageId !== sentCopyId(row.id) || parseObjectKey(rawKey)?.kind !== 'raw') throw new Error('Invalid queued send');
     checkKinds(kinds, row.record);
-    this.sql.exec(`UPDATE mailbox_sends SET state = 'queued', message_id = ?, queued_seq = ? WHERE id = ?`,
-      messageId, this.journal.revision() + 1, row.id);
+    // The raw object stays the send's after its sent copy is deleted: the internal handoff delivers it (M3-8).
+    this.sql.exec(`UPDATE mailbox_sends SET state = 'queued', message_id = ?, queued_seq = ?, raw_key = ? WHERE id = ?`,
+      messageId, this.journal.revision() + 1, rawKey, row.id);
     this.sql.exec('DELETE FROM mailbox_send_recipients WHERE send_id = ?', row.id);
     for (const [idx, kind] of kinds.entries()) this.sql.exec(`INSERT INTO mailbox_send_recipients VALUES (?, ?, ?, 'pending', NULL)`, row.id, idx, kind);
   }
@@ -820,7 +852,7 @@ export class MailboxIndex {
     const { type: _type, ...message } = this.insertMessage({ id: messageId, rawKey, createdAt }, prepared, 'none');
     this.sql.exec('UPDATE messages SET flags = ? WHERE id = ?', flags, messageId);
     const event: JournalEvent = { type: 'send_queued', id, message: { ...message, flags }, kinds };
-    this.queuedState(id, messageId, kinds);
+    this.queuedState(id, messageId, kinds, rawKey);
     this.journal.append(event);
   }
 
@@ -859,7 +891,7 @@ export class MailboxIndex {
         SELECT 'label', json_object('id', id, 'name', name) FROM labels;
         INSERT INTO backup_capture(kind, value)
         SELECT 'message', json_object('id', id, 'rawKey', raw_key, 'createdAt', internal_date, 'threadId', thread_id,
-          'flags', flags, 'gmailId', gmail_id, 'dedupeKey', dedupe_key, 'auth', auth, 'attKeys', json(att_keys),
+          'flags', flags, 'folderRev', folder_rev, 'gmailId', gmail_id, 'dedupeKey', dedupe_key, 'auth', auth, 'attKeys', json(att_keys),
           'expiresAt', (SELECT expires_at FROM mailbox_api_expiry WHERE id = m.id),
           'labels', json((SELECT json_group_array(label_id) FROM message_labels WHERE message_id = m.id)))
         FROM messages AS m;
@@ -877,7 +909,7 @@ export class MailboxIndex {
         INSERT INTO backup_capture(kind, value)
         SELECT 'send', json_object('id', id, 'draftId', draft_id, 'state', state, 'createdAt', created_at, 'undoUntil', undo_until,
           'holder', holder, 'record', json(record), 'createdSeq', created_seq, 'releaseSeq', release_seq, 'queuedSeq', queued_seq,
-          'terminalSeq', terminal_seq, 'messageId', message_id, 'reason', reason, 'finishPending', finish_pending) FROM mailbox_sends;
+          'terminalSeq', terminal_seq, 'messageId', message_id, 'reason', reason, 'finishPending', finish_pending, 'rawKey', raw_key) FROM mailbox_sends;
         INSERT INTO backup_capture(kind, value)
         SELECT 'send_recipient', json_object('sendId', send_id, 'idx', idx, 'kind', kind, 'state', state, 'reason', reason)
         FROM mailbox_send_recipients;
@@ -936,7 +968,7 @@ export class MailboxIndex {
       DELETE FROM mailbox_unusable_sources;
       DELETE FROM mailbox_send_marks; DELETE FROM mailbox_send_fences; DELETE FROM mailbox_send_release_list; DELETE FROM mailbox_send_dispatch;
       DELETE FROM mailbox_send_stalls; DELETE FROM mailbox_send_recipients; DELETE FROM mailbox_send_uploads; DELETE FROM mailbox_sends;
-      DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches;
+      DELETE FROM mailbox_send_drivers; DELETE FROM mailbox_send_breaches; DELETE FROM mailbox_send_handoffs;
       DELETE FROM settings; DELETE FROM mailbox_api_settings; DELETE FROM mailbox_api_idempotency; DELETE FROM mailbox_api_in_progress;
       DELETE FROM journal; DELETE FROM backup_capture; UPDATE state SET modseq=0, flushed=0 WHERE id=1;`);
     this.sql.exec('DELETE FROM timers WHERE kind <> ?', JOURNAL_FLUSH);
@@ -957,6 +989,9 @@ export class MailboxIndex {
       if (!count(message.flags) || (message.gmailId !== null && !bounded(message.gmailId, 256))) throw new Error('Invalid snapshot message');
       this.insertRestoredMessage({ ...message, type: 'message' }, 0, message.gmailId);
       this.apply({ type: 'flags', id: message.id, flags: message.flags, labels: message.labels, expiresAt: message.expiresAt });
+      // Applying the flags counted a folder change from the inserted row; the snapshot's count governs.
+      if (message.folderRev !== undefined && !count(message.folderRev)) throw new Error('Invalid snapshot message');
+      this.sql.exec('UPDATE messages SET folder_rev = ? WHERE id = ?', message.folderRev ?? 0, message.id);
     } else if (row.kind === 'thread') {
       const thread = value as { id: string; assigned: number; lastDate: number; count: number; subjectKey: string };
       if (!isDeliveryId(thread.id) || !count(thread.assigned) || !count(thread.lastDate) || !count(thread.count) ||
@@ -971,7 +1006,7 @@ export class MailboxIndex {
     } else if (row.kind === 'send') {
       const send = value as { id: string; draftId: string; state: string; createdAt: number; undoUntil: number; holder: string;
         record: Parameters<typeof checkSendRecord>[0]; createdSeq: number; releaseSeq: number | null; queuedSeq: number | null;
-        terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number };
+        terminalSeq: number | null; messageId: string | null; reason: string | null; finishPending: number; rawKey?: string | null };
       checkSendRecord(send.record);
       const seqs = [send.releaseSeq, send.queuedSeq, send.terminalSeq];
       // send_window events only extend the undo deadline, so a restored row never has an earlier one than its record.
@@ -980,10 +1015,12 @@ export class MailboxIndex {
           !['pending', 'releasing', 'queued', 'sending', 'delayed', ...TERMINAL].includes(send.state) || !count(send.createdSeq) ||
           !epochMs(send.createdAt) || !epochMs(send.undoUntil) || seqs.some(seq => seq !== null && !count(seq)) || (send.finishPending !== 0 && send.finishPending !== 1) ||
           (send.messageId !== null && send.messageId !== sentCopyId(send.id)) ||
-          (send.reason !== null && !SEND_FAILURES.includes(send.reason as never))) throw new Error('Invalid snapshot send');
-      this.sql.exec('INSERT INTO mailbox_sends VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', send.id, send.draftId, send.state,
+          (send.reason !== null && !SEND_FAILURES.includes(send.reason as never)) ||
+          (send.rawKey != null && parseObjectKey(send.rawKey)?.kind !== 'raw')) throw new Error('Invalid snapshot send');
+      this.sql.exec(`INSERT INTO mailbox_sends (id, draft_id, state, created_at, undo_until, holder, record, created_seq, release_seq, queued_seq,
+        terminal_seq, message_id, reason, finish_pending, raw_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, send.id, send.draftId, send.state,
         send.createdAt, send.undoUntil, send.holder, JSON.stringify(send.record), send.createdSeq, send.releaseSeq, send.queuedSeq,
-        send.terminalSeq, send.messageId, send.reason, send.finishPending);
+        send.terminalSeq, send.messageId, send.reason, send.finishPending, send.rawKey ?? null);
       const finished = send.finishPending === 0 && TERMINAL.includes(send.state as never);
       if (!finished && send.state !== 'cancelled') {
         for (const id of new Set(send.record.uploadIds)) this.sql.exec('INSERT INTO mailbox_send_uploads VALUES (?, ?)', send.id, id);

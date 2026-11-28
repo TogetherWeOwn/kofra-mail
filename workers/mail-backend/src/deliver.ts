@@ -1,11 +1,12 @@
-import { isDeliveryId, type Outbox } from './outbox.ts';
+import { isDeliveryId, type DeliverySource, type Outbox } from './outbox.ts';
 
 export type MailboxOutcome = 'indexed' | 'deferred' | 'rejected';
 
 export type DeliveryPorts = {
   outbox: Pick<Outbox, 'get' | 'claim' | 'complete' | 'defer' | 'reject'>;
   index(workspaceId: string, mailboxId: string, deliveryId: string): Promise<MailboxOutcome>;
-  release(workspaceId: string, rawKey: string, deliveryId: string): Promise<void>;
+  // An internal child's holder is tombstoned, never deleted (section 2.4, release step 6).
+  release(workspaceId: string, rawKey: string, deliveryId: string, source: DeliverySource): Promise<void>;
   now(): number;
 };
 
@@ -22,7 +23,7 @@ export async function deliver(body: unknown, ports: DeliveryPorts, queueMessageI
   if (!row) {
     // A retry after completion only reprises the idempotent holder release.
     const completed = await ports.outbox.get(body);
-    if (completed?.state === 'done') await ports.release(completed.workspaceId, completed.rawKey, completed.id);
+    if (completed?.state === 'done') await ports.release(completed.workspaceId, completed.rawKey, completed.id, completed.source);
     return;
   }
   let outcome: MailboxOutcome;
@@ -38,7 +39,7 @@ export async function deliver(body: unknown, ports: DeliveryPorts, queueMessageI
   } else if (outcome === 'rejected') {
     await ports.outbox.reject(row.id, row.lease, queueMessageId, ports.now());
   } else if (await ports.outbox.complete(row.id, row.lease, ports.now(), queueMessageId)) {
-    await ports.release(row.workspaceId, row.rawKey, row.id);
+    await ports.release(row.workspaceId, row.rawKey, row.id, row.source);
   }
 }
 

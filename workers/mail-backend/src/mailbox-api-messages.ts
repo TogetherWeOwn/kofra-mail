@@ -12,7 +12,7 @@ const FOLDERS = ['inbox', 'archive', 'spam', 'trash'] as const;
 // M1 uses zero for new inbound mail. Reserve a separate bit range so its
 // existing numeric flags are not reinterpreted as new folder or keyword state.
 const FOLDER_SHIFT = 16;
-const FOLDER_MASK = 3 << FOLDER_SHIFT;
+export const FOLDER_MASK = 3 << FOLDER_SHIFT;
 const READ = 1 << 18;
 const STARRED = 1 << 19;
 // A copy this mailbox wrote through the send path; folder changes keep it.

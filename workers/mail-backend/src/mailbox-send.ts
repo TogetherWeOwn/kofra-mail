@@ -35,6 +35,9 @@ import { ObjectInvalidError } from './object-errors.ts';
 import { parseObjectKey } from './object-key.ts';
 import { parseMail, RawDigestMismatch } from './parse-mail.ts';
 import type { SendDispatch, SweeperReferences } from './worker.ts';
+import {
+  acknowledgeHandoff, expandHandoff, handoffHolder, handoffKey, handoffLinkFloorBelow, readHandoff, writeHandoff, type HandoffAddress, type HandoffPorts,
+} from './internal-handoff.ts';
 import { ulid } from 'ulid';
 
 export type SendScope = { workspaceId: string; mailboxId: string; holderScope: string };
@@ -59,7 +62,9 @@ export type SendPorts = {
   mime: SendMimeBuilders;
   put(workspaceId: string, key: string, bytes: Uint8Array<ArrayBuffer>): Promise<void>;
   // The consumer's side after release (M3-5a): stored results and the drive decisions.
-  dispatcher: Pick<SendDispatcher, 'drive' | 'storedSettled'>;
+  dispatcher: Pick<SendDispatcher, 'drive' | 'storedSettled' | 'handedOff'>;
+  // The internal handoff and the pipeline's expansion (M3-8); without it internal recipients wait.
+  handoff?: HandoffPorts;
   quota(): QuotaPort | undefined;
   alert?(code: SendEventCode): Promise<void>;
   // Called after each completed release step; tests inject crashes here.
@@ -617,6 +622,8 @@ export class SendDriver {
     const { row } = start;
     if (row.queuedSeq === null) return;
     if (!await this.ports.publishThrough(row.queuedSeq)) return;
+    // Release step 6, gated like the claim on the published release; then the external state.
+    await this.handoff(start);
     // The restore epilogue moves this row to now, so results stored meanwhile are recorded here.
     // Until every stored result is recorded, nothing is enqueued: a retry could resend an accepted call.
     // First, best effort, every stored result that can apply now: a terminal
@@ -647,6 +654,69 @@ export class SendDriver {
     await this.ports.checkpoint?.('enqueued');
   }
 
+  // Release step 6 (section 2.4; M3-8): hold, decide and write, then commit the
+  // internal rows. Runs in the drive handler only, once the release commit is
+  // published, in any non-terminal state; it needs no quota and no send(). A
+  // failure leaves the rows pending for the drive row and its backoff: our own
+  // outage never fails an internal recipient.
+  private async handoff(start: Start): Promise<void> {
+    const { ports } = this;
+    const pipeline = ports.handoff;
+    if (!pipeline) return;
+    const { workspaceId, mailboxId } = start.scope;
+    const open = await ports.local(timers => {
+      const rows = ledger(ports.sql, this.ref).filter(entry => entry.kind === 'internal');
+      if (!rows.some(entry => entry.state === 'pending')) return null;
+      // The handler's re-arm is the handoff's next retry: while an internal row
+      // is pending, no later move of the drive row passes it (section 2.2).
+      const retry = timers.due(SEND_DRIVE, this.ref);
+      if (retry !== null) ports.sql.exec(`INSERT INTO mailbox_send_handoffs (send_id, retry_at) VALUES (?, ?)
+        ON CONFLICT (send_id) DO UPDATE SET retry_at = excluded.retry_at`, this.ref, retry);
+      // A send queued before the raw key was kept on its row falls back to its sent copy's index row.
+      const rawKey = ports.sql.exec<{ rawKey: string | null }>(`SELECT coalesce(s.raw_key, (SELECT m.raw_key FROM messages m WHERE m.id = s.message_id))
+        AS rawKey FROM mailbox_sends s WHERE s.id = ?`, this.ref).one().rawKey;
+      return { idxs: rows.map(entry => entry.idx), rawKey };
+    });
+    if (!open) return;
+    try {
+      const { record } = start.row;
+      if (!open.rawKey) throw new Error('Released send without its raw key');
+      const key = handoffKey(workspaceId, mailboxId, this.ref);
+      // The internal recipients' addresses, never their mailboxes: those are resolved at expansion.
+      const addresses = open.idxs.map((idx): HandoffAddress => {
+        const { email } = record.recipients[idx];
+        const normalized = normalizeAddress(email);
+        const at = normalized.lastIndexOf('@');
+        return [idx, normalized.slice(0, at), normalized.slice(at + 1), email];
+      });
+      // Step 1, hold before write. The send's raw holder keeps the generation live.
+      await pipeline.checkpoint?.('handoff:hold');
+      await pipeline.sweeper(workspaceId).hold(open.rawKey, handoffHolder(key));
+      // Step 2, decide and write: one statement; the first row written is the decision.
+      await pipeline.checkpoint?.('handoff:decide');
+      await writeHandoff(pipeline.db, { key, workspaceId, mailboxId, sendId: this.ref, rawKey: open.rawKey, sender: record.from.email,
+        ownerUserId: record.ownerUserId, addresses, messageId: sentCopyId(this.ref), linkFloorBelow: handoffLinkFloorBelow(record, this.timer.now),
+        now: this.timer.now });
+      await pipeline.checkpoint?.('handoff:decided');
+      const row = await readHandoff(pipeline.db, key);
+      // It counts as this send's handoff only if it matches this send.
+      if (!row || row.workspaceId !== workspaceId || row.mailboxId !== mailboxId || row.sendId !== this.ref || row.rawKey !== open.rawKey) {
+        return this.breach(start);
+      }
+      // An accepted handoff goes to the pipeline at once; the reconciler expands it if this fails.
+      if (row.decision === 'accepted') {
+        try { await expandHandoff(pipeline, key, this.timer.now); }
+        catch { console.error({ code: 'handoff_expand_retry' }); }
+      }
+      // Step 3: `sent` (handed to our inbound pipeline), or failed with the decision's reason.
+      await pipeline.checkpoint?.('handoff:commit');
+      await this.commit(start, ['queued', 'sending', 'delayed'], (timers, current, index) =>
+        ports.dispatcher.handedOff(index, current, timers, ports.ready()!, row.decision === 'accepted' ? null : row.reason ?? 'invalid_sender'));
+    } catch {
+      console.error({ code: 'send_handoff_retry' });
+    }
+  }
+
   // The finish rule (section 2.4), from its step 2: publish, release, then clear.
   private async finish(start: Start): Promise<void> {
     const { ports } = this;
@@ -661,6 +731,11 @@ export class SendDriver {
     const fences = await ports.local(() => finishReleases(ports.sql, this.ref));
     await this.releaseFences(start, fences);
     await ports.sweeper(start.scope.workspaceId).releaseSend(start.scope.mailboxId, row.id, mode);
+    // The handoff's part of step 3 (M3-8): a rejected handoff's holder, tombstoned, then the acknowledgement mark.
+    if (ports.handoff && await ports.local(() => ledger(ports.sql, this.ref).some(entry => entry.kind === 'internal'))) {
+      const { workspaceId, mailboxId } = start.scope;
+      await acknowledgeHandoff(ports.handoff, handoffKey(workspaceId, mailboxId, this.ref), workspaceId, mailboxId, this.timer.now);
+    }
     await this.commit(start, TERMINAL, (timers, current, index) => {
       if (!current.finishPending) return;
       index.commitEvents([{ type: 'send_finish', id: this.ref }]);
@@ -671,6 +746,7 @@ export class SendDriver {
       }
       ports.sql.exec('DELETE FROM mailbox_send_drivers WHERE send_id = ?', this.ref);
       ports.sql.exec('DELETE FROM mailbox_send_breaches WHERE send_id = ?', this.ref);
+      ports.sql.exec('DELETE FROM mailbox_send_handoffs WHERE send_id = ?', this.ref);
       ports.journalDue(timers);
     });
   }

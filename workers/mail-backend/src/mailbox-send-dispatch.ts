@@ -169,6 +169,8 @@ class SendModel {
   recipient(idx: number): LedgerRow | undefined { return this.rows.get(idx); }
   externals(): LedgerRow[] { return [...this.rows.values()].filter(entry => entry.kind === 'external'); }
   openExternals(): LedgerRow[] { return this.externals().filter(entry => !isTerminalRecipient(entry.state)); }
+  // Internal recipients not yet handed off (M3-8): only their handoff ends them.
+  pendingInternals(): LedgerRow[] { return [...this.rows.values()].filter(entry => entry.kind === 'internal' && entry.state === 'pending'); }
   allTerminal(): boolean { return this.rows.size > 0 && [...this.rows.values()].every(entry => isTerminalRecipient(entry.state)); }
   fence(fence: SendFence): SendFenceRow | undefined { return this.fences.get(fenceKey(fence)); }
   markSet(fence: SendFence): SendMarkRow[] { return [...this.marks.values()].filter(mark => sameFence(mark, fence)); }
@@ -368,10 +370,10 @@ export class SendDispatcher {
     const event = m.event();
     if (event) {
       ready.index.commitEvents([event]);
-      if (m.terminal || !m.openExternals().length) this.stalls.clear(m.row.id);
+      if (m.terminal || (!m.openExternals().length && !m.pendingInternals().length)) this.stalls.clear(m.row.id);
       this.ports.journalDue(timers);
     }
-    if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, Math.max(1, driveAt));
+    if (driveAt !== null) timers.set(SEND_DRIVE, m.row.id, handoffBound(this.ports.sql, m.row.id, driveAt));
     // A report or a state change resets the drive backoff; a claim does not.
     if (report) this.ports.sql.exec('UPDATE mailbox_send_drivers SET backoff = 0 WHERE send_id = ?', m.row.id);
     return event ? ready.index.journal.revision() : 0;
@@ -420,7 +422,7 @@ export class SendDispatcher {
       const ctx = this.ctx(ready);
       const gated = this.gate(m, ctx, ready.index.journal.flushed());
       if (gated) {
-        if (gated.driveAt !== undefined) timers.set(SEND_DRIVE, id, Math.max(1, gated.driveAt));
+        if (gated.driveAt !== undefined) timers.set(SEND_DRIVE, id, handoffBound(ports.sql, id, gated.driveAt));
         return gated.answer;
       }
       if (sender === undefined) {
@@ -1059,20 +1061,31 @@ export class SendDispatcher {
     });
   }
 
+  // Release step 6.3 (M3-8), inside the drive handler's conditional commit: the
+  // pending internal rows end `sent` (handed to the inbound pipeline) or, for a
+  // rejected handoff, `failed` with its reason. Journalled; the finish rule
+  // publishes them before they are reported.
+  handedOff(index: MailboxIndex, row: SendRow, timers: TimerTable, ready: Omit<Ready, 'index'>, reason: string | null): void {
+    const m = new SendModel(this.ports.sql, row);
+    for (const entry of m.pendingInternals()) m.setRecipient(entry.idx, reason === null ? 'sent' : 'failed', reason);
+    this.commit(m, { ...ready, index }, timers, null, true);
+  }
+
   // The drive handler's decision for a released send (section 2.2's table,
   // from `queued` on), inside its own conditional commit.
   drive(index: MailboxIndex, row: SendRow, timers: TimerTable, ready: Omit<Ready, 'index'>, now: number): 'enqueue' | 'finish' | 'release' | null {
     const m = new SendModel(this.ports.sql, row);
     const r: Ready = { ...ready, index };
     const ctx: Ctx = { now, epoch: ready.epoch, restoredAt: ready.restoredAt, skew: this.ports.clockSkewMs };
+    // A handoff still pending 24 hours after release raises the stall alert too (release step 6).
     const watch = () => {
-      if (this.ports.sending && m.openExternals().length && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
+      if (this.ports.sending && (m.openExternals().length || m.pendingInternals().length) && this.stalls.start(row.id, now)) this.ports.journalDue(timers);
     };
     if (m.state === 'queued' || m.state === 'sending') watch();
     this.expirePreMark(row.id, now, timers);
     if (m.d.heldAt !== null) {
       // Held after repeated crashes of our own: never failed, never claimed; an operator resumes it.
-      timers.set(SEND_DRIVE, row.id, now + HOLD_RECHECK_MS);
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, now + HOLD_RECHECK_MS));
       return releaseList(this.ports.sql, row.id).length ? 'release' : null;
     }
     if (m.d.graceUntil !== null) {
@@ -1087,7 +1100,7 @@ export class SendDispatcher {
         this.commit(m, r, timers, null);
       }
       if (now < until) {
-        timers.set(SEND_DRIVE, row.id, until);
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, until));
         return null;
       }
       // The hold ended without a result: the protected recipients fail too.
@@ -1107,7 +1120,7 @@ export class SendDispatcher {
     }
     if (m.state === 'delayed') {
       if (m.d.delayedUntil !== null && now < m.d.delayedUntil) {
-        timers.set(SEND_DRIVE, row.id, m.d.delayedUntil);
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.delayedUntil));
         return null;
       }
       m.state = 'queued';
@@ -1119,22 +1132,31 @@ export class SendDispatcher {
     // drive row keeps the backoff its handler set before acting (5 minutes doubling to 1 hour).
     if (!m.openExternals().length) return null;
     if (m.lease() && leaseLive(m.d.leaseUntil, ctx)) {
-      timers.set(SEND_DRIVE, row.id, m.d.leaseUntil! + ctx.skew);
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.leaseUntil! + ctx.skew));
       return null;
     }
     for (const entry of m.openExternals()) {
       const fence = entry.state === 'attempting' ? m.attemptingFence(entry.idx) : undefined;
       if (fence && leaseLive(fence.leaseUntil, ctx)) {
-        timers.set(SEND_DRIVE, row.id, fence.leaseUntil + ctx.skew);
+        timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, fence.leaseUntil + ctx.skew));
         return null;
       }
     }
     if (now < m.d.nextAttemptAt) {
-      timers.set(SEND_DRIVE, row.id, m.d.nextAttemptAt);
+      timers.set(SEND_DRIVE, row.id, handoffBound(this.ports.sql, row.id, m.d.nextAttemptAt));
       return null;
     }
     return 'enqueue';
   }
+}
+
+// Section 2.2: while an internal recipient is not yet handed off, a move of the
+// drive row takes the earlier of the step's own time and the handoff's next
+// retry, so a quota wait, a lease or a backoff never postpones an internal delivery.
+function handoffBound(sql: SqlStorage, id: string, at: number): number {
+  const retry = sql.exec<{ at: number }>(`SELECT h.retry_at AS at FROM mailbox_send_handoffs h WHERE h.send_id = ?1 AND EXISTS (
+    SELECT 1 FROM mailbox_send_recipients r WHERE r.send_id = ?1 AND r.kind = 'internal' AND r.state = 'pending')`, id).toArray()[0]?.at;
+  return Math.max(1, retry === undefined ? at : Math.min(at, retry));
 }
 
 // Finish rule step 3's quota part: every fence on the release list.

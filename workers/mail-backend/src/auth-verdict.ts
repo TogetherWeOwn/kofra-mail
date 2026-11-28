@@ -5,7 +5,10 @@
 //   unaligned  DMARC passed, but for another domain (or From is not one address)
 //   <result>   any other DMARC result, such as fail, none, temperror or permerror
 //   none       no Cloudflare result or no DMARC result in it
+//   internal   a child delivery of this workspace's own send (M3-8), set only
+//              from the delivery row's source column, never from any header
 export const AUTH_VERDICT = /^[a-z]{1,16}$/;
+export const INTERNAL_VERDICT = 'internal';
 
 // `singleFrom` is false unless the message has exactly one From field naming exactly one mailbox.
 export function authVerdict(results: string | null, from: string, singleFrom = true): string {
@@ -13,7 +16,8 @@ export function authVerdict(results: string | null, from: string, singleFrom = t
   const dmarc = /(?:^|;)\s*dmarc=([a-z]+)([^;]*)/i.exec(results);
   if (!dmarc) return 'none';
   const result = dmarc[1].toLowerCase();
-  if (!AUTH_VERDICT.test(result)) return 'none';
+  // A header can never claim the internal verdict.
+  if (!AUTH_VERDICT.test(result) || result === INTERNAL_VERDICT) return 'none';
   if (result !== 'pass') return result;
   const headerFrom = /(?:^|\s)header\.from=([^\s;()]+)/i.exec(dmarc[2])?.[1].toLowerCase();
   const address = from.trim();

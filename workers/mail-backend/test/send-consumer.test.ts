@@ -115,8 +115,8 @@ const perRecipient = (list: EmailCall[]) => {
   for (const call of list) for (const address of [...call.to, ...call.cc, ...call.bcc]) counts[address] = (counts[address] ?? 0) + 1;
   return counts;
 };
-// The internal handoff is M3-8's; this stub ends an internal row as handed off.
-const handOff = (h: Fixture, id: string, idx: number) => h.sends.setRecipientState(id, idx, 'sent');
+// The internal handoff (M3-8) waits while the outbox is down, and completes on the next drive run after it recovers.
+const outbox = (h: Fixture, down: boolean) => h.box('member', 'setOutboxDown', down);
 const changeOwner = (h: Fixture) => h.directoryChange("UPDATE mailboxes SET user_id = 'new-admin' WHERE workspace_id = ? AND id = ?", WS, MB);
 const logged = (h: Fixture, code: string) => h.logs().filter(line => line.includes(`'${code}'`));
 // The quota fake's day rolls only when told: the next day starts at the old day's end.
@@ -207,6 +207,7 @@ test('a redelivery within the lease is acknowledged, and the drive row at the le
 }));
 
 test('three ambiguous provider errors end the external recipients with delivery_error, rate limits never do; the mixed send finishes after its handoff', () => withConsumer(async (h, mail, from) => {
+  await outbox(h, true);
   const id = await queued(h, mail, from, 'cap', MIXED);
   assert.deepEqual((await h.sendState(id)).ledger.map(({ kind }) => kind), ['external', 'internal']);
   const next = async () => {
@@ -227,7 +228,7 @@ test('three ambiguous provider errors end the external recipients with delivery_
   assert.equal(capped.row?.state, 'sending', 'the internal handoff is still pending');
   assert.equal(capped.dispatch?.ambiguous, 3);
   assert.equal((await calls(h)).length, 7);
-  await handOff(h, id, 1);
+  await outbox(h, false);
   await h.advance(hour);
   const done = await finished(h, id);
   assert.deepEqual(ledgerOf(done), ['failed:delivery_error', 'sent']);
@@ -386,7 +387,6 @@ test('a partial failure gives partial with per-recipient reasons', () => withCon
   const id = await queued(h, mail, from, 'partial', MIXED);
   await script(h, { result: 'reject', code: 'E_VALIDATION_ERROR' });
   assert.equal(step(await consume(h, id)), 'recorded');
-  await handOff(h, id, 1);
   await h.advance(hour);
   const done = await finished(h, id);
   assert.deepEqual(ledgerOf(done), ['failed:rejected', 'sent']);
@@ -637,6 +637,7 @@ test('the same with a restore longer than a lease: the hold starts at the end of
 }));
 
 test('an empty claim: a duplicate dispatch for a mixed send whose external recipients are terminal takes no lease, attempt or reservation and leaves send_drive alone', () => withConsumer(async (h, mail, from) => {
+  await outbox(h, true);
   const id = await queued(h, mail, from, 'empty', MIXED);
   assert.equal(step(await consume(h, id)), 'recorded');
   const before = await h.sendState(id);
@@ -648,7 +649,7 @@ test('an empty claim: a duplicate dispatch for a mixed send whose external recip
   assert.equal(after.dispatch?.lease_epoch, null);
   assert.deepEqual(after.drive, before.drive);
   assert.equal((await h.quota<unknown[]>('calls')).length, quotaCalls);
-  await handOff(h, id, 1);
+  await outbox(h, false);
   await h.advance(hour);
   assert.equal((await finished(h, id)).row?.state, 'sent');
   assert.equal((await calls(h)).length, 1);

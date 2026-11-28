@@ -9,8 +9,16 @@ export type NewDelivery = {
   createdAt: number;
 };
 
+// `internal`: a child of an internal handoff (M3-8), written only by its expansion.
+export type DeliverySource = 'inbound' | 'internal';
+// `file_sent`: files the sender's own sent copy into Inbox instead of a second copy.
+export type DeliveryKind = 'deliver' | 'file_sent';
 export type Delivery = Omit<NewDelivery, 'mailboxId'> & {
   state: 'pending' | 'done' | 'failed';
+  source: DeliverySource;
+  kind: DeliveryKind;
+  fileMessageId: string | null;
+  fileFolderRev: number | null;
   attempts: number;
   lease: number;
   retries: number;
@@ -51,7 +59,7 @@ function decode(row: Row | null): Delivery | null {
 const FIELDS = `id, workspace_id AS workspaceId, envelope_from AS envelopeFrom,
   envelope_to AS envelopeTo, resolved_mailbox_ids AS encodedMailboxIds, raw_key AS rawKey,
   auth_results AS authResults, state, attempts, lease, retries, next_attempt_at AS nextAttemptAt,
-  created_at AS createdAt, done_at AS doneAt`;
+  created_at AS createdAt, done_at AS doneAt, source, kind, file_message_id AS fileMessageId, file_folder_rev AS fileFolderRev`;
 
 const MAILBOX_DONE = `workspace_id = ?1 AND json_extract(resolved_mailbox_ids, '$[0]') = ?2 AND state = 'done'`;
 
@@ -70,7 +78,8 @@ const FAILED_ALERT_KEY = `'delivery_failed:' || id || CASE WHEN redrives > 0 THE
 export const PRUNE_COVERED = `DELETE FROM deliveries WHERE id IN (SELECT id FROM deliveries
   WHERE ${MAILBOX_DONE} AND done_at <= ?3 ORDER BY done_at LIMIT ?4)`;
 
-export type ReplayDelivery = { id: string; rawKey: string; createdAt: number; doneAt: number; authResults: string | null };
+export type ReplayDelivery = { id: string; rawKey: string; createdAt: number; doneAt: number; authResults: string | null;
+  source: DeliverySource; kind: DeliveryKind; fileMessageId: string | null; fileFolderRev: number | null };
 
 export class Outbox {
   private readonly db: D1Database;
@@ -119,8 +128,10 @@ export class Outbox {
   }
 
   async replayPage(workspaceId: string, mailboxId: string, after: number): Promise<ReplayDelivery[]> {
+    // The replay projection carries a child's kind and its filing fields (M3-8).
     const page = await this.db.withSession('first-primary').prepare(`SELECT id, raw_key AS rawKey,
-      created_at AS createdAt, done_at AS doneAt, auth_results AS authResults FROM deliveries WHERE ${MAILBOX_DONE} AND done_at > ?3
+      created_at AS createdAt, done_at AS doneAt, auth_results AS authResults, source, kind, file_message_id AS fileMessageId,
+      file_folder_rev AS fileFolderRev FROM deliveries WHERE ${MAILBOX_DONE} AND done_at > ?3
       ORDER BY done_at, id LIMIT 64`).bind(workspaceId, mailboxId, after).all<ReplayDelivery>();
     return page.results;
   }

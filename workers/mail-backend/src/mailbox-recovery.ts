@@ -576,7 +576,9 @@ export class MailboxRecovery {
           // Deduplicated by receipt and by Message-ID plus body hash.
           let skipped = life.skipped;
           try {
-            await this.index.ingest(row.id, row.rawKey, row.createdAt, row.authResults);
+            // A file_sent child files the sent copy again through the conditional filing, never through ingest (M3-8).
+            if (row.kind === 'file_sent') this.index.fileSent(row.id, row.fileMessageId!, row.fileFolderRev!);
+            else await this.index.ingest(row.id, row.rawKey, row.createdAt, row.authResults, row.source === 'internal');
           } catch (error) {
             if (!(error instanceof MissingMailError)) throw error;
             this.index.skipMissing(row.id);
