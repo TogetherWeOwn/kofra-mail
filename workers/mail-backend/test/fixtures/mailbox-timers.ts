@@ -49,6 +49,7 @@ export class TimerMailbox extends Mailbox {
       hold: async () => {}, release: async () => {},
       holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
       registerSend: async () => { throw new Error('Unexpected fixture send registration'); },
+      releaseTombstoned: async () => { throw new Error('Unexpected fixture tombstone'); },
       releaseSend: async () => { throw new Error('Unexpected fixture send release'); },
     }) } });
     this.fixtureSchema();

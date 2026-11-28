@@ -445,7 +445,8 @@ for (const marked of [false, true]) test(`restoring a ${marked ? 'sending' : 'qu
 test('mixed sends do not alert after all external recipients are terminal', () => run(async h => {
   const id = await queued(h, 'stall-mixed', 'member', [TO, 'other@example.com']);
   assert.deepEqual(await h.batch(SEND, dispatch(id)), ['ack']);
-  assert.deepEqual((await h.sendState(id)).ledger.map(({ kind, state }) => [kind, state]), [['external', 'sent'], ['internal', 'pending']]);
+  // The internal handoff (M3-8) completed at release.
+  assert.deepEqual((await h.sendState(id)).ledger.map(({ kind, state }) => [kind, state]), [['external', 'sent'], ['internal', 'sent']]);
   await h.advance(25 * HOUR);
   await h.backendCron();
   assert.ok(!sources(h).includes(stalledSource), 'nothing external is stalled');

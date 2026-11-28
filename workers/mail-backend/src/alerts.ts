@@ -4,7 +4,7 @@ import { sendEventTitle, type DailySendAlert } from './send-alert-events.ts';
 
 export type AlertBinding = Pick<Fetcher, 'fetch'>;
 export type MailboxAlertCode = 'backup_stale' | 'restore_blocked' | 'restore_skipped' | 'backup_conflict' |
-  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant';
+  'holder_confirm_stale' | 'holder_source_lost' | 'send_invariant' | 'handoff_stuck';
 type Event = AlertEvent | { code: MailboxAlertCode; key: string };
 type GateAlert = { code: 'send_quota_gate_hit'; key: string; environment: string; time: number };
 type SendAlert = DailySendAlert | { code: 'send_dlq'; environment: string; time: number; occurrence: string };
@@ -20,6 +20,7 @@ const TITLE: Record<Event['code'], string> = {
   holder_confirm_stale: 'A published mailbox holder is still unconfirmed',
   holder_source_lost: 'A mailbox source object is missing',
   send_invariant: 'A send is held after a release invariant failed',
+  handoff_stuck: 'An internal delivery handoff keeps failing',
 };
 
 export function mailAlert(binding?: AlertBinding) {

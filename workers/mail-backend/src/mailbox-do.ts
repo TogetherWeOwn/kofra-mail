@@ -31,6 +31,7 @@ import {
   type ReportAnswer, type RequestAnswer, type StoredAnswer,
 } from './mailbox-send-dispatch.ts';
 import { accountSendQuota, validFence, type QuotaPort, type SendFence } from './mailbox-send-quota.ts';
+import { HANDOFF_CALL_MS, type HandoffPorts, type HandoffStep } from './internal-handoff.ts';
 import { isDeliveryId, Outbox, PRUNE_PAGE } from './outbox.ts';
 import { RETENTION_MS } from './reconcile.ts';
 import { enabled, mailboxName, type Env } from './worker.ts';
@@ -167,8 +168,29 @@ export class Mailbox extends DurableObject<Env> {
       quota: () => this.sendQuota(),
       alert: code => this.sendOperatorEvent(code),
       checkpoint: step => this.sendCheckpoint(step),
+      get handoff() { return self.handoffPorts(); },
     };
   }
+
+  // The internal handoff and the pipeline's expansion (M3-8), in the directory database.
+  protected handoffPorts(): HandoffPorts {
+    return {
+      db: this.handoffDatabase(),
+      sweeper: workspaceId => this.env.SWEEPER.getByName(workspaceId),
+      put: (workspaceId, key, bytes) => kofra(this.env, workspaceId).put(key, bytes),
+      enqueue: async id => { await this.env.DELIVER?.send(id); },
+      checkpoint: step => this.handoffCheckpoint(step),
+      callMs: this.handoffCallMs,
+    };
+  }
+
+  // The bound on the drive handler's inline expansion of an accepted handoff.
+  protected handoffCallMs = HANDOFF_CALL_MS;
+
+  // The database the handoff writes; a test seam for an outbox outage.
+  protected handoffDatabase(): D1Database { return this.env.DIRECTORY; }
+  // A test seam at each handoff and expansion step; does nothing here.
+  protected async handoffCheckpoint(_step: HandoffStep): Promise<void> {}
 
   // Without the account quota binding, a release or reset lookup is retried.
   protected sendQuota(): QuotaPort | undefined {
@@ -840,7 +862,9 @@ export class Mailbox extends DurableObject<Env> {
       if (!await this.ready(index, scope)) return 'deferred';
       await this.armFor(FLAGS_FLUSH_MS);
       try {
-        await index.ingest(row.id, row.rawKey, row.createdAt, row.authResults);
+        // A child of an internal handoff (M3-8): its kind and source come only from the row the expansion wrote.
+        if (row.kind === 'file_sent') index.fileSent(row.id, row.fileMessageId!, row.fileFolderRev!);
+        else await index.ingest(row.id, row.rawKey, row.createdAt, row.authResults, row.source === 'internal');
       } catch (error) {
         if (error instanceof PermanentMailError) return 'rejected';
         throw error;
@@ -1224,7 +1248,8 @@ export class Mailbox extends DurableObject<Env> {
     const unapplied = resultAlert('unapplied');
     // A stored result that can apply but keeps failing to record.
     const stuck = resultAlert('stuck');
-    const stallAt = life?.state === 'ready' && this.env.MAIL_SEND_ENABLED === 'on' ? new SendStalls(sql).next() : Infinity;
+    const stalls = new SendStalls(sql);
+    const stallAt = life?.state === 'ready' && this.env.MAIL_SEND_ENABLED === 'on' ? Math.min(stalls.next(), stalls.handoffNext()) : Infinity;
     const conditions: Array<[MailboxAlertCode | SendEventCode, boolean]> = [
       ['backup_stale', !!stale], ['restore_blocked', blocked], ['restore_skipped', skipped], ['backup_conflict', conflict],
       ['holder_confirm_stale', confirmStaleAt <= now], ['holder_source_lost', holderLost], ['send_invariant', breach], ['send_held', held],

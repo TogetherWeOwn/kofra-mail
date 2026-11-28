@@ -15,7 +15,8 @@ import { deltaRange, journalPrefix } from '../../src/journal-backup.ts';
 import { Outbox } from '../../src/outbox.ts';
 import { Sweeper as MailSweeper } from '../../src/sweeper-do.ts';
 import { SweepLedger, type ConfirmEntry } from '../../src/sweep-ledger.ts';
-import { handleScheduled, mailboxName, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
+import { handleScheduled, handoffPorts, mailboxName, releaseDeliveryHolder, type Env as BackendEnv, type SendDispatch } from '../../src/worker.ts';
+import { expandHandoff, reconcileHandoffs, type HandoffStep } from '../../src/internal-handoff.ts';
 import { SEND_DRIVE } from '../../src/mailbox-send-store.ts';
 import type { SendStep } from '../../src/mailbox-send.ts';
 import { SendMimeError } from '../../src/send-mime.ts';
@@ -175,6 +176,51 @@ export class HttpMailbox extends Mailbox {
     this.failRecordTimes--;
     throw new Error('Fixture record failure');
   }
+  // The internal handoff (M3-8): a pause or a crash at a step, and an outbox (D1) outage for its statements.
+  private handoffCrash?: { step: string; times: number };
+  crashAtHandoff(step: string, times = 1) { this.handoffCrash = times > 0 ? { step, times } : undefined; }
+  private outboxDown = false;
+  setOutboxDown(down: boolean) { this.outboxDown = down; }
+  shortenHandoffBound(ms: number) { this.handoffCallMs = ms; }
+  protected override async handoffCheckpoint(step: HandoffStep) {
+    await this.gate(step);
+    const crash = this.handoffCrash;
+    if (step !== crash?.step) return;
+    if (--crash.times <= 0) this.handoffCrash = undefined;
+    throw new Error(`Fixture crash at ${step}`);
+  }
+  protected override handoffDatabase(): D1Database {
+    return downable(super.handoffDatabase(), () => this.outboxDown, query => this.statementGate(query));
+  }
+  // Holds the next handoff statement whose SQL contains `fragment` at the D1 boundary, just before it runs.
+  private statementHold?: { fragment: string; reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  private armedStatement?: { reached: PromiseWithResolvers<void>; resume: PromiseWithResolvers<void> };
+  pauseStatement(fragment: string) {
+    const hold = { fragment, reached: Promise.withResolvers<void>(), resume: Promise.withResolvers<void>() };
+    this.statementHold = this.armedStatement = hold;
+  }
+  async statementPaused() { await this.armedStatement!.reached.promise; }
+  resumeStatement() { this.armedStatement?.resume.resolve(); }
+  private async statementGate(query: string) {
+    const hold = this.statementHold;
+    if (!hold || !query.includes(hold.fragment)) return;
+    this.statementHold = undefined;
+    hold.reached.resolve();
+    await hold.resume.promise;
+  }
+  // The mailbox's messages as stored, for copy counts, folders and verdicts.
+  messageRows() {
+    return this.ctx.storage.sql.exec(`SELECT id, raw_key, flags, folder_rev, auth, indexed, subject FROM messages ORDER BY id`).toArray();
+  }
+  receipts() { return this.ctx.storage.sql.exec<{ id: string }>('SELECT id FROM receipts ORDER BY id').toArray().map(row => row.id); }
+  async rawText(ws: string, id: string) {
+    const row = this.ctx.storage.sql.exec<{ raw_key: string }>('SELECT raw_key FROM messages WHERE id = ?', id).one();
+    return new TextDecoder().decode(await this.fixtureIndex(ws).readObject(row.raw_key));
+  }
+  // A repeated filing of a file_sent child, as a redelivery or a replay would make it.
+  fileSentAgain(ws: string, id: string, messageId: string, folderRev: number) {
+    return this.workLane(async () => this.fixtureIndex(ws).fileSent(id, messageId, folderRev));
+  }
   // The consumer's side of one send, as stored (M3-5a).
   sendState(id: string) {
     const sql = this.ctx.storage.sql;
@@ -242,6 +288,8 @@ export class HttpMailbox extends Mailbox {
         record('fixture_send_queue', body);
       } },
       ...{ EMAIL: { send: async (message: unknown) => { record('fixture_email', { kind: typeof message }); return {}; } } },
+      // The delivery queue: child deliveries of a handoff are recorded; the fixture's pipeline runs them.
+      DELIVER: { send: async (id: string) => { record('fixture_deliver_queue', id); } } as unknown as Queue<string>,
       ALERTS: { fetch: async (input, init) => {
         const { source } = await new Request(input, init).json<{ source: string }>();
         if (mailbox.failAlert) return new Response(null, { status: 503 });
@@ -647,6 +695,34 @@ export class Sweeper extends MailSweeper {
     // The sweeper's answer for a source whose object a test declares lost.
     return answers.map((answer, i) => entries[i].holder === this.lostHolder ? 'lost' as const : answer);
   }
+  // Tombstoning releases that never answer, for a workspace whose sweeper keeps timing out.
+  private stallTombstone = false;
+  stallTombstones(stalled: boolean) { this.stallTombstone = stalled; }
+  private failTombstone = false;
+  failTombstones(failing: boolean) { this.failTombstone = failing; }
+  readonly tombstoned: { key: string; holder: string }[] = [];
+  override async releaseTombstoned(key: string, holder: string) {
+    if (this.stallTombstone) await new Promise<void>(() => {});
+    if (this.failTombstone) throw new Error('Fixture sweeper outage');
+    await super.releaseTombstoned(key, holder);
+    this.tombstoned.push({ key, holder });
+  }
+  tombstones() { return this.tombstoned; }
+  // Holds that always fail, for a workspace sweeper that is down for good.
+  private failHold = false;
+  failHolds(failing: boolean) { this.failHold = failing; }
+  override async hold(key: string, holder: string) {
+    if (this.failHold) throw new Error('Fixture sweeper outage');
+    return super.hold(key, holder);
+  }
+  // registerSend commits, then its reply is lost.
+  private loseRegisterReply = false;
+  loseNextRegisterReply() { this.loseRegisterReply = true; }
+  override async registerSend(...args: Parameters<MailSweeper['registerSend']>) {
+    const result = await super.registerSend(...args);
+    if (this.loseRegisterReply) { this.loseRegisterReply = false; throw new Error('Fixture lost registration reply'); }
+    return result;
+  }
   override async releaseSend(...args: Parameters<MailSweeper['releaseSend']>) {
     if (this.failSendRelease) throw new Error('Fixture sweeper outage');
     return super.releaseSend(...args);
@@ -761,6 +837,65 @@ async function content(url: URL, env: FixtureEnv): Promise<Response> {
   } catch { return missing(); }
 }
 
+// A D1 database whose statements fail while `down()` holds: an outbox outage.
+function downable(db: D1Database, down: () => boolean, before: (query: string) => Promise<void> = async () => {}): D1Database {
+  const real = new WeakMap<object, D1PreparedStatement>();
+  const outage = () => { throw new Error('Fixture outbox outage'); };
+  const statement = (inner: D1PreparedStatement, query: string): D1PreparedStatement => {
+    const wrapped = new Proxy(inner, { get(target, property) {
+      if (property === 'bind') return (...values: unknown[]) => statement(target.bind(...values), query);
+      if (property === 'run' || property === 'first' || property === 'all' || property === 'raw') {
+        return async (...args: unknown[]) => {
+          await before(query);
+          if (down()) outage();
+          return (target[property] as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      const value: unknown = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    } });
+    real.set(wrapped, inner);
+    return wrapped;
+  };
+  const prepared = (source: { prepare(query: string): D1PreparedStatement }) => (query: string) => statement(source.prepare(query), query);
+  return new Proxy(db, { get(target, property) {
+    if (property === 'prepare') return prepared(target);
+    if (property === 'batch') return async (list: D1PreparedStatement[]) => {
+      if (down()) outage();
+      return target.batch(list.map(item => real.get(item) ?? item));
+    };
+    if (property === 'withSession') return (constraint: D1SessionConstraint) => {
+      const session = target.withSession(constraint);
+      return new Proxy(session, { get(inner, key) {
+        if (key === 'prepare') return prepared(inner);
+        const value: unknown = Reflect.get(inner, key);
+        return typeof value === 'function' ? value.bind(inner) : value;
+      } });
+    };
+    const value: unknown = Reflect.get(target, property);
+    return typeof value === 'function' ? value.bind(target) : value;
+  } });
+}
+
+// The delivery pipeline's queue consumer for every pending delivery, on the
+// fixture clock: the real deliver() with the Worker's own holder release.
+async function runDeliveries(env: FixtureEnv): Promise<string[]> {
+  const outbox = new Outbox(env.DIRECTORY);
+  const { results } = await env.DIRECTORY.prepare("SELECT id FROM deliveries WHERE state = 'pending' ORDER BY id").all<{ id: string }>();
+  for (const { id } of results) {
+    await deliver(id, {
+      outbox,
+      index: (ws, mb, delivery) => env.MAILBOX.getByName(mailboxName(ws, mb)).deliver(delivery),
+      release: (ws, rawKey, delivery, source) => releaseDeliveryHolder(env.SWEEPER.getByName(ws), rawKey, delivery, source),
+      now: () => now(env),
+    }, crypto.randomUUID());
+  }
+  return results.map(({ id }) => id);
+}
+
+// The handoff ports of the backend Worker, as the reconciler and the queue use them.
+const pipelinePorts = (env: FixtureEnv) => handoffPorts(env as unknown as BackendEnv);
+
 async function incoming(req: Request, env: FixtureEnv, to: string, from: string): Promise<Response> {
   const bytes = await req.arrayBuffer();
   let delivery: string | undefined;
@@ -779,7 +914,7 @@ async function incoming(req: Request, env: FixtureEnv, to: string, from: string)
   await deliver(delivery, {
     outbox: insert,
     index: (ws, mb, id) => env.MAILBOX.getByName(mailboxName(ws, mb)).deliver(id),
-    release: (ws, rawKey, id) => env.SWEEPER.getByName(ws).release(rawKey, `delivery:${id}`),
+    release: (ws, rawKey, id, source) => releaseDeliveryHolder(env.SWEEPER.getByName(ws), rawKey, id, source),
     now: () => now(env),
   }, delivery);
   const box = env.MAILBOX.getByName(mailboxName(row.workspaceId, row.mailboxIds[0]));
@@ -796,6 +931,10 @@ async function seedHttpDirectory(env: FixtureEnv, migrations: string[][]): Promi
   for (const statements of migrations) await db.batch(statements.map(statement => db.prepare(statement)));
   await db.batch([['w1', 'example.com'], ['w2', 'example.net']].map(([ws, domain]) =>
     db.prepare("INSERT INTO domains VALUES (?, ?, ?, 'primary', NULL, 'active', 'active')").bind(ws, ws, domain)));
+  // Any other workspace's domain comes from its accounts' addresses.
+  const others = new Map(Object.values(env.ACCOUNTS).filter(a => a.mailboxId && a.ws !== 'w1' && a.ws !== 'w2')
+    .map(a => [a.ws, a.address.slice(a.address.lastIndexOf('@') + 1)]));
+  for (const [ws, domain] of others) await db.prepare("INSERT INTO domains VALUES (?, ?, ?, 'primary', NULL, 'active', 'active')").bind(ws, ws, domain).run();
   for (const principal of Object.values(env.ACCOUNTS).filter(a => a.mailboxId && !a.stale)) {
     await db.batch([
       db.prepare('INSERT INTO mailboxes (id, workspace_id, user_id, primary_address) VALUES (?, ?, ?, ?)').bind(principal.mailboxId, principal.ws, principal.userId, principal.address),
@@ -860,6 +999,38 @@ export default {
         if (url.pathname === '/__fixture/directory-rows') return Response.json((await query.all()).results);
         await query.run();
         return new Response(null, { status: 204 });
+      }
+      // M3-8: the pipeline, the reconciler's handoff part, a second expander, and stored state.
+      if (url.pathname === '/__fixture/run-deliveries') return Response.json(await runDeliveries(env));
+      if (url.pathname === '/__fixture/handoff-cron') {
+        // `callMs`, or `callMs,failTake`: the failTake-th take of release rows fails.
+        const [callMs, failTake] = (await req.text()).split(',').map(value => Number(value) || undefined);
+        const ports = pipelinePorts(env);
+        let takes = 0;
+        if (failTake) ports.db = downable(ports.db, () => false, async query => {
+          if (query.includes('INDEXED BY internal_handoffs_release') && ++takes === failTake) throw new Error('Fixture take failure');
+        });
+        return Response.json(await reconcileHandoffs(ports, now(env), callMs));
+      }
+      if (url.pathname === '/__fixture/expand') return Response.json(await expandHandoff(pipelinePorts(env), await req.text(), now(env)));
+      if (url.pathname === '/__fixture/box') {
+        const { principal, method, args } = await req.json<{ principal: string; method: string; args: unknown[] }>();
+        const allowed = ['pauseAt', 'pausedAt', 'resumeAt', 'crashAtHandoff', 'setOutboxDown', 'shortenHandoffBound', 'pauseStatement',
+          'statementPaused', 'resumeStatement', 'messageRows', 'receipts', 'rawText', 'fileSentAgain',
+          'sendState', 'sendIds', 'publishFailure', 'timers', 'restoreFixture'];
+        if (!allowed.includes(method)) throw new Error('Unknown fixture mailbox method');
+        const { ws, mailboxId } = env.ACCOUNTS[principal];
+        const target = env.MAILBOX.getByName(mailboxName(ws, mailboxId!)) as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+        const scoped = ['rawText', 'fileSentAgain'].includes(method) ? [ws, ...args] : method === 'restoreFixture' ? [ws, mailboxId, ...args] : args;
+        return Response.json(await target[method](...scoped) ?? null);
+      }
+      if (url.pathname === '/__fixture/sweeper') {
+        const { workspace, method, args } = await req.json<{ workspace: string; method: string; args: unknown[] }>();
+        if (!['stallTombstones', 'failTombstones', 'failHolds', 'tombstones', 'loseNextRegisterReply', 'holderDetails', 'generation', 'sweepAt', 'registration'].includes(method)) {
+          throw new Error('Unknown fixture sweeper method');
+        }
+        const refs = env.SWEEPER.getByName(workspace) as unknown as Record<string, (...values: unknown[]) => Promise<unknown>>;
+        return Response.json(await refs[method](...(method === 'sweepAt' ? [workspace, ...args] : args)) ?? null);
       }
       if (url.pathname === '/__fixture/holders') {
         const { workspace, key } = await req.json<{ workspace: string; key: string }>();

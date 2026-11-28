@@ -318,6 +318,16 @@ export class SweepLedger {
     if (state !== 'provisional') this.count(key, 1, now);
   }
 
+  // Releases a holder of an internal handoff or an internal delivery (section
+  // 2.4, release step 6) by leaving a tombstone: it stops counting, and a later
+  // hold or register of the same holder adds nothing, so a repeated handoff or
+  // expansion never resurrects it. The tombstone goes with its retired generation.
+  retire(key: string, holder: string, now: number): void {
+    this.validate(holder, now);
+    this.checkKey(key);
+    this.storage.transactionSync(() => this.tombstone(key, holder, now));
+  }
+
   release(key: string, holder: string, now: number): void {
     this.validate(holder, now);
     if (!isObjectKey(key)) throw new Error('Invalid sweeper reference');

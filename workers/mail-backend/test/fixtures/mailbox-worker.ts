@@ -22,6 +22,7 @@ export class AlarmMailbox extends Mailbox {
       hold: async () => {}, release: async () => {},
       holdProvisional: async () => { throw new Error('Unexpected fixture holder'); }, confirm: async () => { throw new Error('Unexpected fixture confirmation'); },
       registerSend: async () => { throw new Error('Unexpected fixture send registration'); },
+      releaseTombstoned: async () => { throw new Error('Unexpected fixture tombstone'); },
       releaseSend: async () => { throw new Error('Unexpected fixture send release'); },
     }) } });
   }
@@ -200,7 +201,8 @@ export class FixtureMailbox extends DurableObject<Env> {
     const result = await this.recovery(index, life.scope.mailboxId).restoreStep(life, {
       now: Date.now, fence: async () => null, release: async () => {},
       replayPage: async after => deliveries.filter(row => row[3] > after)
-        .map(([id, rawKey, createdAt, doneAt]) => ({ id, rawKey, createdAt, doneAt, authResults: null })),
+        .map(([id, rawKey, createdAt, doneAt]) => ({ id, rawKey, createdAt, doneAt, authResults: null, source: 'inbound' as const,
+          kind: 'deliver' as const, fileMessageId: null, fileFolderRev: null })),
     });
     return result.state;
   }

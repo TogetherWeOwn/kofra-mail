@@ -46,6 +46,9 @@ export type JournalEvent =
   | { type: 'message'; id: string; rawKey: string; createdAt: number; threadId: string; dedupeKey: string;
       subjectKey: string; auth: string; attKeys: string[] }
   | { type: 'receipt'; id: string }
+  // A `file_sent` child delivery (M3-8): its receipt, and the sent copy filed into
+  // Inbox only if its folder_rev still equals `folderRev`.
+  | { type: 'file_sent'; id: string; messageId: string; folderRev: number }
   | { type: 'flags'; id: string; flags: number; labels: string[]; expiresAt?: number | null }
   | { type: 'label'; id: string; name: string }
   | { type: 'label_delete'; id: string }
@@ -67,7 +70,8 @@ export type JournalEvent =
   // undoSend: cancelled, and the draft restored under its id with a new revision.
   | { type: 'send_undo'; id: string; revision: string; updatedAt: number; result: JournalResult }
   // Release step 1: pending to releasing.
-  | { type: 'send_release'; id: string }
+  // `at`: when release started, the start of a pending handoff's stall clock (M3-8); absent in older events.
+  | { type: 'send_release'; id: string; at?: number }
   // Release step 4: the sent copy's index row and one pending ledger row per recipient.
   | { type: 'send_queued'; id: string; message: SentCopy; kinds: SendRecipientKind[] }
   // A release-time failure (step 2): terminal, with one failed ledger row per recipient.

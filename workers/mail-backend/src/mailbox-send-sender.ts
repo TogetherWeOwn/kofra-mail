@@ -13,11 +13,19 @@ export type SenderCheck = { workspaceId: string; mailboxId: string; ownerUserId:
 // Both primary and alias senders must match an active addresses row exactly.
 // Read ownership in the same statement to distinguish a lost mailbox from
 // an inactive identity without a second read.
-export const SENDER_CHECK = `SELECT m.user_id = ?3 AS owner,
-    EXISTS (SELECT 1 FROM addresses a WHERE a.address_norm = ?4 AND a.workspace_id = m.workspace_id
+const active = (from: string) => `EXISTS (SELECT 1 FROM addresses a WHERE a.address_norm = ${from} AND a.workspace_id = m.workspace_id
       AND a.target_kind = 'mailbox' AND a.target_id = m.id AND a.send_as_policy = 'active'
-      AND (a.kind = 'alias' OR (a.kind = 'primary' AND a.address_norm = m.primary_address))) AS active
+      AND (a.kind = 'alias' OR (a.kind = 'primary' AND a.address_norm = m.primary_address)))`;
+export const SENDER_CHECK = `SELECT m.user_id = ?3 AS owner,
+    ${active('?4')} AS active
   FROM mailboxes m WHERE m.workspace_id = ?1 AND m.id = ?2`;
+
+// The same statement as a condition, for a write that decides inside itself:
+// the internal handoff's insert (section 2.4, release step 6; M3-8). The
+// arguments are the statement's own parameter placeholders, never values.
+export const senderHolds = (workspace: string, mailbox: string, owner: string, from: string) =>
+  `EXISTS (SELECT 1 FROM mailboxes m WHERE m.workspace_id = ${workspace} AND m.id = ${mailbox} AND m.user_id = ${owner}
+    AND ${active(from)})`;
 
 // `not_owner`: the mailbox is gone or belongs to someone else now.
 // `inactive`: the owner still has the mailbox, but `from` is not its active identity.

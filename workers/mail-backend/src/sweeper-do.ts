@@ -58,6 +58,19 @@ export class Sweeper extends DurableObject<Env> {
     });
   }
 
+  // A tombstoning release, armed as release is (handoff and internal delivery holders).
+  async releaseTombstoned(key: string, holder: string): Promise<void> {
+    const ledger = this.ledger();
+    await this.alarms.run(async () => {
+      const now = Date.now();
+      if (parseObjectKey(key)) {
+        const due = Math.min(now + RETENTION_MS, ledger.nextSweepAt() ?? Infinity);
+        await this.arm(this.env.MAIL_SWEEP_ENABLED === 'on' ? due : Math.max(due, now + DISABLED_RECHECK_MS));
+      }
+      ledger.retire(key, holder, now);
+    });
+  }
+
   // Adds protection only, so it needs no wake-up.
   async registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders): Promise<SendRegistration> {
     return this.ledger().registerSend(mailbox, sendId, digest, holders, Date.now());

@@ -9,7 +9,8 @@ import { kofra, type KofraConfig } from './kofra.ts';
 import { MailAlerts } from './mail-alerts.ts';
 import { mailboxName } from './mailbox-name.ts';
 import type { SendQuotaBinding } from './mailbox-send-quota.ts';
-import { Outbox } from './outbox.ts';
+import { deliveryHolder, reconcileHandoffs, type HandoffPorts } from './internal-handoff.ts';
+import { Outbox, type DeliverySource } from './outbox.ts';
 import { reconcile } from './reconcile.ts';
 import { reconcileSendResults, type NoticeBatchProducer } from './reconcile-send-results.ts';
 import { sendAlertEnvironment } from './send-alert-events.ts';
@@ -27,6 +28,8 @@ export type SweeperReferences = ObjectReferences & {
   // The send registration of section 2.4, release step 3 (M3-3).
   registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders): Promise<SendRegistration>;
   releaseSend(mailbox: string, sendId: string, mode: SendReleaseMode): Promise<void>;
+  // Releases a handoff's or an internal delivery's holder as a tombstone (M3-8).
+  releaseTombstoned(key: string, holder: string): Promise<void>;
 };
 // The send queue's dispatch message (section 1): ids only.
 export type SendDispatch = { kind: 'dispatch'; ws: string; mb: string; sendId: string };
@@ -60,6 +63,14 @@ export type Env = KofraConfig & {
 };
 
 export { mailboxName } from './mailbox-name.ts';
+
+// A delivery's holder after its mailbox indexed it: an internal child's is
+// tombstoned (section 2.4, release step 6), an inbound one's deleted.
+export function releaseDeliveryHolder(sweeper: Pick<SweeperReferences, 'release' | 'releaseTombstoned'>, key: string, id: string,
+  source: DeliverySource): Promise<void> {
+  const holder = deliveryHolder(id);
+  return source === 'internal' ? sweeper.releaseTombstoned(key, holder) : sweeper.release(key, holder);
+}
 
 export function enabled(env: { MAIL_BACKEND_ENABLED?: string }): boolean {
   return env.MAIL_BACKEND_ENABLED === 'on';
@@ -104,7 +115,7 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
         await deliver(message.body, {
           outbox,
           index: (workspaceId, mailboxId, id) => env.MAILBOX.getByName(mailboxName(workspaceId, mailboxId)).deliver(id),
-          release: (workspaceId, key, id) => env.SWEEPER.getByName(workspaceId).release(key, `delivery:${id}`),
+          release: (workspaceId, key, id, source) => releaseDeliveryHolder(env.SWEEPER.getByName(workspaceId), key, id, source),
           now: Date.now,
         }, message.id);
       }
@@ -113,6 +124,16 @@ export async function handleQueue(batch: MessageBatch<unknown>, env: Env): Promi
       message.retry();
     }
   }
+}
+
+// The pipeline's handoff ports in the backend Worker.
+export function handoffPorts(env: Env): HandoffPorts {
+  return {
+    db: env.DIRECTORY,
+    sweeper: workspaceId => env.SWEEPER.getByName(workspaceId),
+    put: (workspaceId, key, bytes) => kofra(env, workspaceId).put(key, bytes),
+    enqueue: async id => { await env.DELIVER.send(id); },
+  };
 }
 
 export async function handleScheduled(_event: ScheduledController, env: Env, now = Date.now): Promise<void> {
@@ -126,11 +147,13 @@ export async function handleScheduled(_event: ScheduledController, env: Env, now
       await reconcileSendResults(env.DIRECTORY, { sendBatch }, now());
     })().catch(() => console.error({ code: 'send_result_reconcile_failed' }))
     : undefined;
+  // Internal handoffs (M3-8): unexpanded accepted handoffs, pending holder releases and old tombstones.
+  const handoffs = reconcileHandoffs(handoffPorts(env), now()).catch(() => console.error({ code: 'handoff_reconcile_failed' }));
   const alert = mailAlert(env.ALERTS);
   const [result] = await Promise.all([reconcile({
     outbox: new Outbox(env.DIRECTORY), mailAlerts: new MailAlerts(env.DIRECTORY), now,
     send: async id => { await env.DELIVER.send(id); }, alert, sendAlert: alert,
-  }), outbound]);
+  }), outbound, handoffs]);
   if (result.enqueueErrors || result.alertErrors) console.error({ code: 'mail_reconcile_partial', ...result });
 }
 

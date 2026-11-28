@@ -122,6 +122,30 @@ test('releaseSend before any registration leaves a tombstone, so an in-flight re
   assert.deepEqual(await ledger.candidates(200 + RETENTION), [], 'no generation was minted');
 });
 
+// Handoff and internal delivery holders (section 2.4, release step 6; M3-8).
+test('a tombstoning release stops counting, a repeated hold or register never resurrects it, and it goes with its retired generation', async () => {
+  const ledger = fresh();
+  const key = await ledger.register('raw', digest('7'), 'send:scope:raw', 100);
+  for (const holder of ['handoff:internal:w1:mailbox-a:01JSEND0000000000000000000', 'delivery:01JCHILD000000000000000000']) {
+    await ledger.hold(key, holder, 110);
+    await ledger.retire(key, holder, 120);
+    await ledger.retire(key, holder, 125);
+    await ledger.hold(key, holder, 130);
+    assert.equal(await ledger.register('raw', digest('7'), holder, 140), key);
+  }
+  // Retiring a holder that was never taken still leaves its tombstone, so a late hold adds nothing.
+  await ledger.retire(key, 'delivery:01JLATE0000000000000000000', 150);
+  await ledger.hold(key, 'delivery:01JLATE0000000000000000000', 160);
+  assert.deepEqual(states(await ledger.holders(key)), ['delivery:01JCHILD000000000000000000=tombstone', 'delivery:01JLATE0000000000000000000=tombstone',
+    'handoff:internal:w1:mailbox-a:01JSEND0000000000000000000=tombstone', 'send:scope:raw=held']);
+  assert.equal((await generation(ledger, key))?.holder_count, 1, 'tombstones never count');
+  await ledger.release(key, 'send:scope:raw', 200);
+  assert.deepEqual(await ledger.sweep(200 + RETENTION), [key]);
+  assert.deepEqual(await ledger.sweep(200 + RETENTION + DAY), [key]);
+  assert.equal(await generation(ledger, key), null);
+  assert.deepEqual(await ledger.holders(key), [], 'the tombstones were deleted with their retired generation');
+});
+
 test('the second delete removes an object recreated between the two deletes, and only then drops the row', async () => {
   const ledger = fresh();
   const { old, due } = await unheld(ledger, digest('7'));

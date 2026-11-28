@@ -41,6 +41,7 @@ export class ProvisionalLedger extends DurableObject {
   async holdProvisional(target: HoldTarget, holder: string, now: number) { return this.ledger().holdProvisional(target, holder, now); }
   async confirm(entries: ConfirmEntry[], now: number) { return this.ledger().confirm(entries, now); }
   async release(key: string, holder: string, now: number) { this.ledger().release(key, holder, now); }
+  async retire(key: string, holder: string, now: number) { this.ledger().retire(key, holder, now); }
   async candidates(now: number) { return this.ledger().candidates(now); }
   async registerSend(mailbox: string, sendId: string, digest: string, holders: SendHolders, now: number) {
     return JSON.stringify(this.ledger().registerSend(mailbox, sendId, digest, holders, now));

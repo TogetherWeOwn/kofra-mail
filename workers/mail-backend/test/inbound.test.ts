@@ -203,7 +203,7 @@ test('the indexed mailbox cursor replays a later acknowledgement at the same wal
   assert.ok(laterClaim);
   assert.ok(await outbox.complete(later, laterClaim.lease, 200, 'later'));
   assert.deepEqual(await outbox.replayPage('workspace', 'cursor', before), [
-    { id: later, rawKey, createdAt: 100, doneAt: before + 1, authResults: null },
+    { id: later, rawKey, createdAt: 100, doneAt: before + 1, authResults: null, source: 'inbound', kind: 'deliver', fileMessageId: null, fileFolderRev: null },
   ]);
   assert.deepEqual(await outbox.replayPage('other', 'cursor', before), []);
 });
