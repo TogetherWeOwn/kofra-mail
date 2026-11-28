@@ -29,7 +29,7 @@ mail-content gets a workspace override's read-only key from the backend's `Conte
 
 An admin adds the workspace's own location through `createLinkLocation` (contract section 8.7). Its fields never change; its keys rotate in place after passing the check. Both keys are sealed with AES-256-GCM under the current KEK version. The AAD is (workspace, location, key version, role), so a value copied to another row or column fails to open.
 
-**Deleting** first sets the row to `deleting` with a claim, then asks `LinkLocationUsage.inUse`, and deletes only if nothing uses the location; otherwise it sets the row back. A usage check that takes longer than 20 seconds counts as in use, and a claim left by a failed delete can be taken over after 60 seconds. Every writer of a reference to a location (links, pending deletes, draft attachments, unfinished uploads) must require `state = 'active'` in the same statement. M3-13 and M3-15b provide the usage port; until then deletes answer `feature_unavailable`.
+**Deleting** first sets the row to `deleting` with a claim, then asks `LinkLocationUsage.inUse`, and deletes only if nothing uses the location; otherwise it sets the row back. A usage check that takes longer than 20 seconds keeps the location and fails the delete (the API answers 503 with `Retry-After`), and a claim left by a failed delete can be taken over after 60 seconds. Every writer of a reference to a location (links, pending deletes, draft attachments, unfinished uploads) must require `state = 'active'` in the same statement. M3-13 and M3-15b provide the usage port; until then deletes answer `feature_unavailable`.
 
 ## Rotating the KEK
 

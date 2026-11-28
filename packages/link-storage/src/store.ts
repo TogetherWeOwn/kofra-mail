@@ -181,7 +181,7 @@ export class LinkStorageStore {
       WHERE workspace_id = ? AND location_id = ? AND state = 'deleting' AND delete_claim = ?`).bind(workspaceId, locationId, claim).run();
     let used = true;
     try {
-      // A usage check that takes too long counts as in use, well before the claim can be taken over.
+      // A usage check that takes too long keeps the location and fails, well before the claim can be taken over.
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<boolean>((_, reject) => { timer = setTimeout(() => reject(new Error('Link location usage check timed out')), USAGE_TIMEOUT_MS); });
       try {

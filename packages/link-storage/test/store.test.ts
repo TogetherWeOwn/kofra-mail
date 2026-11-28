@@ -240,7 +240,39 @@ test('a content-lookup read does not rewrap, and a failed final delete keeps the
   assert.equal(await store.delete('ws-a', id, { inUse: async () => false }), 'deleted');
 });
 
-test('a usage check that hangs counts as in use', async (t) => {
+test('a delete whose claim was taken over can neither delete nor restore the location', async () => {
+  const db = testDatabase();
+  const store = new LinkStorageStore(db);
+  const id = await created(store, db, await kek(1, [1]));
+  const state = () => db.raw.prepare('SELECT state, delete_claim FROM link_storage_locations').get() as { state: string; delete_claim: string } | undefined;
+  for (const lateAnswer of [false, true]) {
+    let answer!: (value: boolean) => void;
+    let checking!: () => void;
+    const started = new Promise<void>(resolve => { checking = resolve; });
+    const first = store.delete('ws-a', id, { inUse: () => { checking(); return new Promise<boolean>(resolve => { answer = resolve; }); } }, 1_000);
+    await started;
+    const firstClaim = state()!.delete_claim;
+    // The second delete takes the stale claim over and holds it while it checks.
+    let release!: (value: boolean) => void;
+    let secondChecking!: () => void;
+    const secondStarted = new Promise<void>(resolve => { secondChecking = resolve; });
+    const second = store.delete('ws-a', id, { inUse: () => { secondChecking(); return new Promise<boolean>(resolve => { release = resolve; }); } },
+      1_000 + DELETE_CLAIM_MS);
+    await secondStarted;
+    const secondClaim = state()!.delete_claim;
+    assert.notEqual(secondClaim, firstClaim);
+    // The late first delete answers now: it may not delete (false) or reactivate (true) the row.
+    answer(lateAnswer);
+    assert.equal(await first, lateAnswer ? 'in_use' : 'pending');
+    assert.deepEqual({ ...state() }, { state: 'deleting', delete_claim: secondClaim });
+    // The second delete decides: in use, so the row is active again.
+    release(true);
+    assert.equal(await second, 'in_use');
+    assert.deepEqual({ ...state() }, { state: 'active', delete_claim: null });
+  }
+});
+
+test('a usage check that hangs keeps the location and fails the delete', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const db = testDatabase();
   const store = new LinkStorageStore(db);
