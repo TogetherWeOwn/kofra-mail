@@ -48,6 +48,13 @@ CREATE TABLE link_storage_locations (
     OR (state = 'deleting' AND delete_claim IS NOT NULL AND typeof(delete_claimed_at) = 'integer'))
 );
 CREATE UNIQUE INDEX link_storage_current ON link_storage_locations (workspace_id) WHERE current = 1;
+-- Until when an idempotency fingerprint under each KEK version may still be stored
+-- (directory_api_keys, keyed by that version). One row per version.
+CREATE TABLE link_fingerprint_versions (
+  key_version INTEGER PRIMARY KEY CHECK (typeof(key_version) = 'integer' AND key_version BETWEEN 1 AND 255),
+  used_until INTEGER NOT NULL
+);
+
 -- The rewrap job's ordered walk and the version check's seeks, by key version.
 CREATE INDEX link_storage_read_version ON link_storage_locations (read_key_version, workspace_id, location_id);
 CREATE INDEX link_storage_write_version ON link_storage_locations (write_key_version, workspace_id, location_id);

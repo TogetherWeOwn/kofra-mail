@@ -310,9 +310,26 @@ export class LinkStorageStore {
     return { rewrapped, failed, next: role < roles.length ? JSON.stringify([role, version, ws, loc]) : null };
   }
 
-  /** Every KEK version a stored credential uses. An old version can be removed once it is not listed. */
-  async keyVersionsInUse(): Promise<number[]> {
+  /**
+   * A statement recording that an idempotency fingerprint under KEK `version` may be
+   * stored until `until` (a create writes it with its claim).
+   */
+  fingerprintVersionStatement(version: number, until: number): LinkStatement {
+    return this.#db.prepare(`INSERT INTO link_fingerprint_versions (key_version, used_until) VALUES (?, ?)
+      ON CONFLICT (key_version) DO UPDATE SET used_until = max(used_until, excluded.used_until)`).bind(version, until);
+  }
+
+  /**
+   * Every KEK version still in use: by a stored credential, or by an idempotency
+   * fingerprint that may not have expired yet. An old version can be removed only
+   * once it is not listed.
+   */
+  async keyVersionsInUse(now = Date.now()): Promise<number[]> {
     const versions = new Set<number>();
+    // At most 255 rows: one per version.
+    const { results } = await this.#db.prepare('SELECT key_version FROM link_fingerprint_versions WHERE used_until > ? LIMIT 255')
+      .bind(now).all<{ key_version: number }>();
+    for (const row of results) versions.add(row.key_version);
     for (const column of ['read_key_version', 'write_key_version'] as const) {
       // Each step is one index seek past the previous version: at most 255 seeks per column.
       let after = 0;

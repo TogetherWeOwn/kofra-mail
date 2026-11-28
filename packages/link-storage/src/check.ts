@@ -134,6 +134,8 @@ export async function checkLinkLocation(fields: LinkLocationFields, credentials:
     const refusedAnonymously = (response: Response) => {
       discard(response);
       if (response.ok) throw new CheckFailure('public_bucket');
+      // A timeout or rate limit says nothing about authorization.
+      if (response.status === 408 || response.status === 429) throw new CheckFailure('bucket');
       if (response.status < 400 || response.status >= 500) throw new CheckFailure('bucket');
     };
     refusedAnonymously(await call(undefined, 'GET', objectAt(probeKey)));

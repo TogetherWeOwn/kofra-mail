@@ -135,6 +135,8 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
           db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND expires_at <= ?').bind(ws, key, now),
           db.prepare('INSERT INTO directory_api_keys (workspace_id, key, fingerprint, result, expires_at) VALUES (?, ?, ?, ?, ?)')
             .bind(ws, key, fingerprint, claim, now + IN_PROGRESS_MS),
+          // The KEK version stays in use while a record may hold a fingerprint under it.
+          store.fingerprintVersionStatement(kek.current, now + IN_PROGRESS_MS + LIMITS.idempotencyRetentionSeconds * 1000),
         ]);
       } catch {
         return (await replay()) ?? fail('unavailable');
@@ -160,15 +162,12 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
           return fail('unavailable');
         }
         if (await store.get(ws, locationId)) return { body };
-        const replaced = await replay().catch((error: unknown) => {
-          // Our claim is still there: the workspace was full.
-          if (error instanceof MailApiError && error.code === 'idempotency_in_progress') return undefined;
-          throw error;
-        });
-        if (replaced) return replaced;
+        // Still holding our claim: nothing committed because the workspace was full.
         const ours = await db.prepare('SELECT 1 AS held FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?')
           .bind(ws, key, claim).first();
-        return ours ? fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS }) : fail('unavailable', { retryAfterSeconds: 1 });
+        if (ours) return fail('limit_reached', { limit: MAX_WORKSPACE_LOCATIONS });
+        // Superseded: answer as any retry would (the replacement's result, or 409 while it runs).
+        return (await replay()) ?? fail('unavailable', { retryAfterSeconds: 1 });
       } finally {
         // Release only this attempt's claim (a no-op once it has committed), so a retry runs again.
         await db.prepare('DELETE FROM directory_api_keys WHERE workspace_id = ? AND key = ? AND result = ?').bind(ws, key, claim).run()
@@ -186,6 +185,8 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       const verdict = await check(location, credentials, zones);
       if (!verdict.ok) return fail('storage_check_failed', { reason: verdict.reason });
       if (!await store.rotate(kek, ws, locationId, credentials, now)) return fail('not_found');
+      // An expired delete claim is healed first, so the answer never shows a stale `deleting`.
+      await store.healStaleDeletes(ws, now);
       const rotated = await store.get(ws, locationId);
       return rotated ? { body: asLinkLocation(rotated) } : fail('not_found');
     }

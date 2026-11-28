@@ -36,4 +36,4 @@ An admin adds the workspace's own location through `createLinkLocation` (contrac
 1. Add a new version to `LINK_CRED_KEK` and switch `current` to it.
 2. Deploy. Write paths that open a credential (uploads and the sweeper, M3-15b) rewrap it under the new version; the content lookup only reads, and until M3-15b nothing else opens credentials, so step 3 is what migrates them.
 3. Run `MailAdmin.rewrapLinkCredentials(100, next)`, passing back each answer's `next`, until `next` is null. Values it cannot open are counted in `failed` and left in place.
-4. Remove the old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it.
+4. Remove the old version only when `MailAdmin.linkCredentialKeyVersions()` no longer lists it: no credential and no unexpired create fingerprint uses it. Fingerprints keep a version listed for `idempotencyRetentionSeconds` (24 hours) plus 5 minutes after its last create, so this is at least that long after step 1.

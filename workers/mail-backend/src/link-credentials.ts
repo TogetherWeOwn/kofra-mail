@@ -41,5 +41,5 @@ export async function rewrapLinkCredentials(env: LinkCredentialEnv, limit: numbe
 
 /** The KEK versions still in use; a version can be removed from the secret once it is not listed. */
 export async function linkCredentialKeyVersions(env: LinkCredentialEnv): Promise<number[]> {
-  return store(env).keyVersionsInUse();
+  return store(env).keyVersionsInUse(Date.now());
 }

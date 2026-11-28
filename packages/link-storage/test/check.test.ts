@@ -101,10 +101,12 @@ test('an endpoint that refuses unsigned requests with 400 (as R2 does) is privat
   for (const status of [404, 401, 403, 451]) {
     assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: provider({ anonymousRefusal: status }).fetch }), { ok: true }, String(status));
   }
-  // A 5xx to an unsigned request is unexpected, never a pass.
-  const broken = provider({ anonymousRefusal: 503 });
-  assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: broken.fetch }), { ok: false, reason: 'bucket' });
-  assert.equal(broken.objects.size, 0);
+  // A 5xx, a timeout or a rate limit to an unsigned request says nothing about authorization: never a pass.
+  for (const status of [503, 408, 429]) {
+    const broken = provider({ anonymousRefusal: status });
+    assert.deepEqual(await checkLinkLocation(fields, credentials, zones, { fetch: broken.fetch }), { ok: false, reason: 'bucket' }, String(status));
+    assert.equal(broken.objects.size, 0);
+  }
 });
 
 test('a write key that cannot read objects fails with auth', async () => {

@@ -305,3 +305,70 @@ test('deleting a location that does not exist answers 204 even before the usage 
   assert.deepEqual([existing.status, existing.body.code], [501, 'feature_unavailable']);
   assert.equal(f.db.dump('link_storage_locations').length, 1);
 });
+
+test('a KEK version stays in use while a create fingerprint under it may be replayed', async (t) => {
+  const f = fixture(t);
+  const first = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  assert.equal(first.status, 201);
+  // Rotate to version 2 and rewrap every credential.
+  const both = JSON.stringify({ current: '2', keys: { 1: Buffer.alloc(32, 7).toString('base64'), 2: Buffer.alloc(32, 8).toString('base64') } });
+  f.env.LINK_CRED_KEK = both;
+  const store = new LinkStorageStore(f.db);
+  assert.equal((await store.rewrapStale((await linkKek(both))!, 100)).next, null);
+  // Version 1 is still listed: removing it now would break the retry below.
+  assert.deepEqual(await store.keyVersionsInUse(Date.now()), [1, 2]);
+  const retry = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  assert.deepEqual([retry.status, retry.body], [201, first.body]);
+  // (Had version 1 been removed, the same retry would be refused.)
+  f.env.LINK_CRED_KEK = JSON.stringify({ current: '2', keys: { 2: Buffer.alloc(32, 8).toString('base64') } });
+  assert.equal((await f.call('createLinkLocation', { json: location, key: 'create-1' })).body.code, 'idempotency_key_reused');
+  // Once the record's retention has passed, version 1 is no longer listed.
+  assert.deepEqual(await store.keyVersionsInUse(Date.now() + 24 * 3600_000 + 6 * 60_000), [2]);
+});
+
+test('a superseded create answers as a retry would, and never removes its replacement\'s claim', async (t) => {
+  const f = fixture(t);
+  const gates: (() => void)[] = [];
+  const reached: (() => void)[] = [];
+  const started = [0, 1].map((i) => new Promise<void>((resolve) => { reached[i] = resolve; }));
+  const held = [0, 1].map((i) => new Promise<void>((resolve) => { gates[i] = resolve; }));
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async (request: Request) => {
+    const n = calls++;
+    if (n < 2) { reached[n](); await held[n]; }
+    return f.s3.fetch(request);
+  });
+  const t0 = Date.now();
+  const ctx = (now: number) => ({ db: f.db, workspaceId: admin.workspaceId, principal: { role: 'admin' as const, authTime: now },
+    env: f.env, params: {}, input: structuredClone(location) as Record<string, unknown>, idempotencyKey: 'create-1', now });
+  const a = runLinkStorage('createLinkLocation', ctx(t0));
+  await started[0];
+  // B takes over A's expired claim and is still running its check.
+  const b = runLinkStorage('createLinkLocation', ctx(t0 + 6 * 60_000));
+  await started[1];
+  gates[0]();
+  await assert.rejects(a, (error: { problem?: { code: string; retryAfterSeconds?: number } }) =>
+    error.problem?.code === 'idempotency_in_progress' && error.problem.retryAfterSeconds === 1);
+  const claims = (f.db.dump('directory_api_keys') as { result: string }[]).map((row) => row.result);
+  assert.equal(claims.length, 1);
+  assert.match(claims[0], /^in-progress:/);
+  gates[1]();
+  const done = await b;
+  assert.ok(done.body && !done.replayed);
+  assert.equal(f.db.dump('link_storage_locations').length, 1);
+});
+
+test('rotating a location whose delete claim expired answers it as active', async (t) => {
+  const f = fixture(t);
+  const { body: created } = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  // A delete whose restore failed leaves the row `deleting` with a claim at 5 000 ms.
+  const broken = { ...f.db, prepare(sql: string) {
+    const statement = f.db.prepare(sql);
+    return sql.includes("SET state = 'active'") ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
+  } };
+  await assert.rejects(new LinkStorageStore(broken).delete(admin.workspaceId, created.id, { inUse: async () => true }, 5_000), /d1 down/);
+  const now = 5_000 + 60_000;
+  const rotated = await runLinkStorage('rotateLinkLocationCredentials', { db: f.db, workspaceId: admin.workspaceId,
+    principal: { role: 'admin', authTime: now }, env: f.env, params: { locationId: created.id }, input: { read: READ2, write: WRITE2 }, now });
+  assert.equal((rotated.body as LinkLocation).state, 'active');
+});
