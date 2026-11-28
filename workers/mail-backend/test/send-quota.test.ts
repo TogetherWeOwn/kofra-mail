@@ -12,7 +12,6 @@ const at = (s: string) => Date.parse(s);
 const NOW = at('2026-11-30T14:59:00Z');
 const TODAY = at('2026-11-30T15:00:00Z');
 const DEC = at('2026-12-01T15:00:00Z');
-const JAN = at('2027-01-01T15:00:00Z');
 const scope = (name: string, mailboxId = 'mb') => ({ workspaceId: 'ws', mailboxId,
   sendId: `01${createHash('sha256').update(name).digest('hex').slice(0, 24).toUpperCase()}` });
 const fence = (attempt = 1, epoch = 0) => ({ epoch, attempt });
@@ -91,6 +90,16 @@ test('reservations, released fences and gate-alert deduplication survive a resta
   assert.equal(logs.filter(line => line.includes('send_quota_gate_hit')).length, 2, 'one redacted alert per quota day, even after restart');
 }, { daily: '2', persist: true }));
 
+test('an unconfirmed reservation survives restart and blocks a competing claim', () => withQuota(async (quota, restart) => {
+  const original = scope('provisional-restart');
+  const expires = NOW + 10_000;
+  assert.equal((await quota.reserve(original, fence(), [0], [], expires)).status, 'ok');
+  const reopened = await restart();
+  assert.deepEqual(await reopened.reserve(scope('competing-claim'), fence(), [0], [], expires),
+    { status: 'exhausted', resetAt: TODAY });
+  assert.equal((await reopened.confirm(original, fence(), [0])).status, 'ok');
+}, { daily: '2', persist: true }));
+
 test('confirmation moves the charge across a non-midnight daily reset and release finds it there', () => withQuota(async quota => {
   const s = scope('move');
   assert.deepEqual(await quota.reserve(s, fence(), [0], [], TODAY + 10_000), { status: 'ok', day: '2026-11-29', dayEnd: TODAY });
@@ -104,16 +113,22 @@ test('confirmation moves the charge across a non-midnight daily reset and releas
   assert.deepEqual(await quota.confirm(s, fence(), [0]), { status: 'stale' });
 }, { daily: '2', monthly: '1' }));
 
-test('the configured non-midnight reset starts a new calendar month on the first', () => withQuota(async quota => {
-  const s = scope('november');
-  assert.equal(await quota.resetAt(), DEC);
-  assert.equal((await quota.reserve(s, fence(), [0], [], DEC + 10_000)).status, 'ok');
-  assert.equal((await quota.confirm(s, fence(), [0])).status, 'ok');
-  assert.deepEqual(await quota.reserve(scope('old-blocked'), fence(), [0], [], DEC + 10_000), { status: 'exhausted', resetAt: DEC });
-  await quota.setTime(DEC + 1);
-  assert.equal((await quota.reserve(scope('december'), fence(), [0], [], DEC + 10_000)).status, 'ok');
-  assert.deepEqual(await quota.reserve(scope('new-blocked'), fence(), [0], [], DEC + 10_000), { status: 'exhausted', resetAt: JAN });
-}, { now: DEC - 1, monthly: '1' }));
+test('the monthly ceiling rolls over at the configured hour and minute on the first', () => {
+  const cutoff = at('2026-12-01T03:45:00Z');
+  const expires = cutoff + 10_000;
+  return withQuota(async quota => {
+    const november = scope('november');
+    const december = scope('december');
+    assert.equal(await quota.resetAt(), cutoff);
+    assert.equal((await quota.reserve(november, fence(), [0], [], expires)).status, 'ok');
+    assert.equal((await quota.confirm(november, fence(), [0])).status, 'ok');
+    assert.deepEqual(await quota.reserve(december, fence(), [0], [], expires), { status: 'exhausted', resetAt: cutoff });
+    await quota.setTime(cutoff);
+    assert.equal((await quota.reserve(december, fence(), [0], [], expires)).status, 'ok');
+    assert.deepEqual(await quota.reserve(scope('new-blocked'), fence(), [0], [], expires),
+      { status: 'exhausted', resetAt: at('2027-01-01T03:45:00Z') });
+  }, { now: cutoff - 1, reset: '03:45', monthly: '1' });
+});
 
 test('expired provisional charges free capacity and confirmation must reserve again', () => withQuota(async quota => {
   const s = scope('expired');
