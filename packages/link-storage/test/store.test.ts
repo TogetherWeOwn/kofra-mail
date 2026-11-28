@@ -100,7 +100,7 @@ test('credentials rotate in place', async () => {
   const k = await kek(1, [1]);
   const id = await created(store, db, k);
   const before = (await store.get('ws-a', id))!;
-  assert.equal(await store.rotate(k, 'ws-a', id, rotated, 2_000), true);
+  assert.equal((await store.rotate(k, 'ws-a', id, rotated, 2_000))?.locationId, id);
   const after = (await store.get('ws-a', id))!;
   // Same location, same fields, still current; only the credentials changed.
   assert.deepEqual({ ...after, readKeyLast4: before.readKeyLast4, writeKeyLast4: before.writeKeyLast4, rotatedAt: null }, before);
@@ -108,8 +108,8 @@ test('credentials rotate in place', async () => {
   assert.deepEqual((await store.credential(k, 'ws-a', id, 'read'))!.reveal(), READ2);
   assert.deepEqual((await store.credential(k, 'ws-a', id, 'write'))!.reveal(), WRITE2);
   assert.equal(db.dump('link_storage_locations').length, 1);
-  assert.equal(await store.rotate(k, 'ws-a', newLocationId(), rotated, 3_000), false);
-  assert.equal(await store.rotate(k, 'ws-b', id, rotated, 3_000), false);
+  assert.equal(await store.rotate(k, 'ws-a', newLocationId(), rotated, 3_000), null);
+  assert.equal(await store.rotate(k, 'ws-b', id, rotated, 3_000), null);
 });
 
 test('a location still in use cannot be deleted', async () => {

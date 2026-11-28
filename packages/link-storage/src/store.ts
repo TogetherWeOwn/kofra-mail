@@ -166,15 +166,21 @@ export class LinkStorageStore {
 
   /** Replaces both credentials of a location in place (a pending delete does not block it). False if there is no such location. */
   async rotate(kek: LinkKek, workspaceId: string, locationId: string, credentials: { read: S3Credentials; write: S3Credentials },
-    now: number): Promise<boolean> {
+    now: number): Promise<StoredLocation | null> {
     const read = await sealCredential(kek, workspaceId, locationId, 'read', credentials.read);
     const write = await sealCredential(kek, workspaceId, locationId, 'write', credentials.write);
-    const { meta } = await this.#db.prepare(`UPDATE link_storage_locations SET read_key_last4 = ?, read_key_version = ?, read_sealed = ?,
-        write_key_last4 = ?, write_key_version = ?, write_sealed = ?, rotated_at = ?
-      WHERE workspace_id = ? AND location_id = ?`).bind(
+    // One statement: the new keys, and the heal of a delete claim already expired at `now`
+    // (a live claim is left alone). It returns the row it wrote, so nothing can fail after it.
+    const stale = `(state = 'deleting' AND delete_claimed_at <= ?10)`;
+    const row = await this.#db.prepare(`UPDATE link_storage_locations SET read_key_last4 = ?1, read_key_version = ?2, read_sealed = ?3,
+        write_key_last4 = ?4, write_key_version = ?5, write_sealed = ?6, rotated_at = ?7,
+        state = CASE WHEN ${stale} THEN 'active' ELSE state END,
+        delete_claim = CASE WHEN ${stale} THEN NULL ELSE delete_claim END,
+        delete_claimed_at = CASE WHEN ${stale} THEN NULL ELSE delete_claimed_at END
+      WHERE workspace_id = ?8 AND location_id = ?9 RETURNING ${columns}`).bind(
       credentials.read.keyIdLast4, read.version, read.sealed, credentials.write.keyIdLast4, write.version, write.sealed, now,
-      workspaceId, locationId).run();
-    return (meta.changes ?? 0) > 0;
+      workspaceId, locationId, now - DELETE_CLAIM_MS).first<LocationRow>();
+    return row && asLocation(row);
   }
 
   /**

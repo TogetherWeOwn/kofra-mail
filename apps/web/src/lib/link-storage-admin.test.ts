@@ -372,3 +372,59 @@ test('rotating a location whose delete claim expired answers it as active', asyn
     principal: { role: 'admin', authTime: now }, env: f.env, params: { locationId: created.id }, input: { read: READ2, write: WRITE2 }, now });
   assert.equal((rotated.body as LinkLocation).state, 'active');
 });
+
+test('a rotation is applied with its 200 or not at all: nothing can fail after the credential write', async (t) => {
+  const f = fixture(t);
+  const { body: created } = await f.call('createLinkLocation', { json: location, key: 'create-1' });
+  const kek = (await linkKek(KEK))!;
+  const store = new LinkStorageStore(f.db);
+  const rotate = (db: typeof f.db) => runLinkStorage('rotateLinkLocationCredentials', { db, workspaceId: admin.workspaceId,
+    principal: { role: 'admin', authTime: Date.now() }, env: f.env, params: { locationId: created.id }, input: { read: READ2, write: WRITE2 } });
+  // Every statement after the credential write fails: the rotation still answers 200 with what it wrote.
+  let written = false;
+  const afterWrite = { ...f.db, prepare(sql: string) {
+    if (written) throw new Error('d1 down after the write');
+    const statement = f.db.prepare(sql);
+    if (!sql.includes('SET read_key_last4')) return statement;
+    return { ...statement, bind: (...values: (string | number | null)[]) => {
+      const bound = statement.bind(...values);
+      return { ...bound, first: async <T>() => { const row = await bound.first<T>(); written = true; return row; } };
+    } } as typeof statement;
+  } };
+  const done = await rotate(afterWrite);
+  assert.deepEqual([(done.body as LinkLocation).readKeyIdLast4, (done.body as LinkLocation).writeKeyIdLast4], ['0003', 'Y004']);
+  assert.deepEqual((await store.credential(kek, admin.workspaceId, created.id, 'write'))!.reveal(), WRITE2);
+  // The write itself fails: an error, and the stored keys are unchanged.
+  const failing = { ...f.db, prepare(sql: string) {
+    if (sql.includes('SET read_key_last4')) throw new Error('d1 down at the write');
+    return f.db.prepare(sql);
+  } };
+  const keysBefore = JSON.stringify(f.db.dump('link_storage_locations'));
+  await assert.rejects(rotate(failing), /d1 down at the write/);
+  assert.equal(JSON.stringify(f.db.dump('link_storage_locations')), keysBefore);
+});
+
+test('a delete claim that expires during the rotation check is healed by the write; a live one is left alone', async (t) => {
+  for (const [advance, expected] of [[1, 'active'], [0, 'deleting']] as const) {
+    const f = fixture(t);
+    const { body: created } = await f.call('createLinkLocation', { json: location, key: `create-${advance}` });
+    const broken = { ...f.db, prepare(sql: string) {
+      const statement = f.db.prepare(sql);
+      return sql.includes("SET state = 'active'") ? { ...statement, bind: () => ({ ...statement, run: async () => { throw new Error('d1 down'); } }) } as typeof statement : statement;
+    } };
+    // The claim is taken at 5 000 ms; the request starts with 1 ms of the claim left.
+    await assert.rejects(new LinkStorageStore(broken).delete(admin.workspaceId, created.id, { inUse: async () => true }, 5_000), /d1 down/);
+    let clock = 5_000 + 60_000 - 1;
+    let first = true;
+    t.mock.method(globalThis, 'fetch', async (request: Request) => {
+      // The S3 check takes `advance` ms.
+      if (first) { first = false; clock += advance; }
+      return f.s3.fetch(request);
+    });
+    const rotated = await runLinkStorage('rotateLinkLocationCredentials', { db: f.db, workspaceId: admin.workspaceId,
+      principal: { role: 'admin', authTime: clock }, env: f.env, params: { locationId: created.id }, input: { read: READ2, write: WRITE2 },
+      now: clock, clock: () => clock });
+    assert.equal((rotated.body as LinkLocation).state, expected, `advance ${advance}`);
+    assert.equal((await new LinkStorageStore(f.db).get(admin.workspaceId, created.id))?.state, expected);
+  }
+});

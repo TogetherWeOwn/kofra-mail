@@ -36,6 +36,8 @@ export interface LinkStorageContext {
   input: Record<string, unknown>;
   idempotencyKey?: string;
   now?: number;
+  /** The clock for write-time decisions; defaults to `now`, else `Date.now`. */
+  clock?: () => number;
   fetch?: Fetcher;
 }
 
@@ -184,10 +186,9 @@ export async function runLinkStorage(op: Operation, ctx: LinkStorageContext): Pr
       const credentials = credentialPair(ctx.input);
       const verdict = await check(location, credentials, zones);
       if (!verdict.ok) return fail('storage_check_failed', { reason: verdict.reason });
-      if (!await store.rotate(kek, ws, locationId, credentials, now)) return fail('not_found');
-      // An expired delete claim is healed first, so the answer never shows a stale `deleting`.
-      await store.healStaleDeletes(ws, now);
-      const rotated = await store.get(ws, locationId);
+      // The write heals a delete claim expired by now (the check may have taken a while) and
+      // returns the row it wrote: the rotation is applied with this answer, or not at all.
+      const rotated = await store.rotate(kek, ws, locationId, credentials, (ctx.clock ?? (() => ctx.now ?? Date.now()))());
       return rotated ? { body: asLinkLocation(rotated) } : fail('not_found');
     }
 
